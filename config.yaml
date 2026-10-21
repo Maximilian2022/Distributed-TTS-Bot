@@ -1,0 +1,404 @@
+bot:
+  command_prefix: "!"
+  # 自動参加対象のボイスチャンネルID (0の場合は無効)
+  auto_join_vc_id: 0
+  # 自動参加時に紐付けるテキストチャンネルID (0の場合は無効)
+  auto_join_text_channel_id: 0
+  # 読み上げ最大文字数 (超過部分は切り捨てて「以下略」を付与)
+  max_text_length: 50
+  # 重複抑制の閾値秒数 (この秒数以内の同一短文はスキップ)
+  dedup_window_seconds: 5.0
+  # 重複抑制の最大文字数
+  dedup_max_length: 10
+  # 読み上げを行わないプレフィックス文字リスト (デフォルト: セミコロン「;」「；」)
+  ignore_prefixes:
+    - ";"
+    - "；"
+
+storage:
+  cache_dir: "/app/cache"
+  db_path: "/app/data/bot.db"
+  log_file: "/app/logs/bot.log"
+  # クラウドキャッシュ上限サイズ (10GB = 10 * 1024 * 1024 * 1024)
+  cache_max_size_bytes: 10737418240
+  # クリーンアップ後の目標容量 (8.5GB = 8.5 * 1024 * 1024 * 1024)
+  cache_target_size_bytes: 9126805504
+  # VOICEVOX専用キャッシュ設定 (20GB Volume)
+  voicevox_cache_dir: "/app/cache_voicevox"
+  voicevox_cache_max_size_bytes: 21474836480 # 20GB
+  voicevox_cache_target_size_bytes: 18253611008 # 17GB
+  # 定期クリーンアップ間隔 (秒)
+  cache_cleanup_interval_seconds: 300
+
+tts:
+  primary: "azure"
+  fallback: "google"
+  google_monthly_limit_chars: 950000 # 無料枠(100万文字)の95%で自動フォールバック
+  azure:
+    region: "japaneast"
+    timeout_seconds: 5.0
+  google:
+    # 東京リージョンエンドポイント
+    endpoint: "asia-northeast1-texttospeech.googleapis.com"
+    timeout_seconds: 5.0
+  voicevox:
+    base_url: "http://192.168.11.245:50021"
+    timeout_seconds: 10.0
+    default_fallback_style_id: 3 # ずんだもん (ノーマル)
+    nodes:
+      - id: "local_master"
+        url: "http://192.168.11.245:50021"
+        priority: 2          # 優先度 (1=GPU, 2=通常CPU, 3=予備)
+        max_concurrent: 1    # 共用マシン配慮 (同時実行上限)
+        enabled: false       # 完全Worker分離に伴い、worker_MasterUbuntu から動的登録されるため無効化
+      - id: "debian_worker"
+        url: "http://192.168.11.248:50021" # DebianサーバーのIPとポート
+        priority: 2
+        max_concurrent: 1
+        enabled: false       # Worker Agent から動的登録されるため静的定義は無効
+      - id: "win_gpu_1"
+        url: "http://192.168.11.200:50021" # OMEN PC (GPU)
+        priority: 1          # GPU最優先
+        max_concurrent: 2
+        enabled: false       # Worker Agent から動的登録されるため静的定義は無効
+  sharevox:
+    base_url: "http://192.168.11.245:50025"
+    timeout_seconds: 10.0
+    nodes:
+      - id: "local_master"
+        url: "http://192.168.11.245:50025"
+        priority: 2
+        max_concurrent: 1
+        enabled: false       # 完全Worker分離に伴い、worker_MasterUbuntu から動的登録されるため無効化
+      - id: "debian_worker"
+        url: "http://192.168.11.248:50025"
+        priority: 2
+        max_concurrent: 1
+        enabled: false
+  coeiroink:
+    base_url: "http://192.168.11.245:50031"
+    timeout_seconds: 25.0
+    nodes:
+      - id: "local_master"
+        url: "http://192.168.11.245:50031"
+        priority: 2
+        max_concurrent: 1
+        enabled: false       # 完全Worker分離に伴い、worker_MasterUbuntu から動的登録されるため無効化
+      - id: "debian_worker"
+        url: "http://192.168.1.100:50031"
+        priority: 2
+        max_concurrent: 1
+        enabled: false
+      - id: "win_gpu_1"
+        url: "http://192.168.1.101:50031"
+        priority: 1
+        max_concurrent: 2
+        enabled: false
+  openjtalk:
+    voices_dir: "/app/openjtalk_voices"
+    dic_dir: "/var/lib/mecab/dic/open-jtalk/naist-jdic"
+    timeout_seconds: 5.0
+
+
+# 利用可能な話者定義 (スラッシュコマンド /voice や WebUI で選択可能)
+voices:
+  # ==========================================
+  # Azure AI Speech (東日本リージョン)
+  # ==========================================
+  nanami:
+    id: "nanami"
+    name: "ナナミ (Azure)"
+    provider: "azure"
+    gender: "female"
+    description: "明るく自然な女性の声 (推奨)"
+    azure_voice: "ja-JP-NanamiNeural"
+    google_voice: "ja-JP-Neural2-B"
+  keita:
+    id: "keita"
+    name: "ケイタ (Azure)"
+    provider: "azure"
+    gender: "male"
+    description: "落ち着いた男性の声"
+    azure_voice: "ja-JP-KeitaNeural"
+    google_voice: "ja-JP-Neural2-C"
+  aoi:
+    id: "aoi"
+    name: "アオイ (Azure)"
+    provider: "azure"
+    gender: "female"
+    description: "爽やかで聴き取りやすい女性の声"
+    azure_voice: "ja-JP-AoiNeural"
+    google_voice: "ja-JP-Wavenet-A"
+  daichi:
+    id: "daichi"
+    name: "ダイチ (Azure)"
+    provider: "azure"
+    gender: "male"
+    description: "深みのある力強い男性の声"
+    azure_voice: "ja-JP-DaichiNeural"
+    google_voice: "ja-JP-Wavenet-D"
+  mayu:
+    id: "mayu"
+    name: "マユ (Azure)"
+    provider: "azure"
+    gender: "female"
+    description: "優しく柔らかな女性の声"
+    azure_voice: "ja-JP-MayuNeural"
+    google_voice: "ja-JP-Neural2-B"
+  naoki:
+    id: "naoki"
+    name: "ナオキ (Azure)"
+    provider: "azure"
+    gender: "male"
+    description: "若々しく明瞭な男性の声"
+    azure_voice: "ja-JP-NaokiNeural"
+    google_voice: "ja-JP-Neural2-D"
+  shiori:
+    id: "shiori"
+    name: "シオリ (Azure)"
+    provider: "azure"
+    gender: "female"
+    description: "知性的でアナウンサー調の女性の声"
+    azure_voice: "ja-JP-ShioriNeural"
+    google_voice: "ja-JP-Neural2-B"
+
+  # ==========================================
+  # Google Cloud Text-to-Speech (東京リージョン・月100万文字無料)
+  # ==========================================
+  g_neural_b:
+    id: "g_neural_b"
+    name: "Neural 女声 (Google)"
+    provider: "google"
+    gender: "female"
+    description: "Google高精度AIの明瞭な女性の声"
+    voice_name: "ja-JP-Neural2-B"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-NanamiNeural"
+  g_neural_c:
+    id: "g_neural_c"
+    name: "Neural 男声 (Google)"
+    provider: "google"
+    gender: "male"
+    description: "Google高精度AIの落ち着いた男性の声"
+    voice_name: "ja-JP-Neural2-C"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-KeitaNeural"
+  g_neural_d:
+    id: "g_neural_d"
+    name: "Neural 若者男声 (Google)"
+    provider: "google"
+    gender: "male"
+    description: "Google高精度AIの明るい若者男性の声"
+    voice_name: "ja-JP-Neural2-D"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-NaokiNeural"
+  g_neural_f:
+    id: "g_neural_f"
+    name: "Neural 穏やか女声 (Google)"
+    provider: "google"
+    gender: "female"
+    description: "Google高精度AIの優しく穏やかな女性の声"
+    voice_name: "ja-JP-Neural2-B"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-MayuNeural"
+  g_wavenet_a:
+    id: "g_wavenet_a"
+    name: "WaveNet 女声 (Google)"
+    provider: "google"
+    gender: "female"
+    description: "自然で滑らかな音調の女性の声"
+    voice_name: "ja-JP-Wavenet-A"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-AoiNeural"
+  g_wavenet_c:
+    id: "g_wavenet_c"
+    name: "WaveNet 男声 (Google)"
+    provider: "google"
+    gender: "male"
+    description: "自然で安定感のある男性の声"
+    voice_name: "ja-JP-Wavenet-C"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-KeitaNeural"
+  g_wavenet_d:
+    id: "g_wavenet_d"
+    name: "WaveNet 低音男声 (Google)"
+    provider: "google"
+    gender: "male"
+    description: "深みと重厚感のある低音男性の声"
+    voice_name: "ja-JP-Wavenet-D"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-DaichiNeural"
+  g_wavenet_b:
+    id: "g_wavenet_b"
+    name: "WaveNet 男声B (Google)"
+    provider: "google"
+    gender: "male"
+    description: "WaveNetモデルの明瞭な若者男性の声"
+    voice_name: "ja-JP-Wavenet-B"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-KeitaNeural"
+  g_standard_a:
+    id: "g_standard_a"
+    name: "Standard 女声A (Google)"
+    provider: "google"
+    gender: "female"
+    description: "Google標準のハキハキとした女性の声"
+    voice_name: "ja-JP-Standard-A"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-NanamiNeural"
+  g_standard_b:
+    id: "g_standard_b"
+    name: "Standard 女声B (Google)"
+    provider: "google"
+    gender: "female"
+    description: "Google標準の落ち着いた女性の声"
+    voice_name: "ja-JP-Standard-B"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-NanamiNeural"
+  g_standard_c:
+    id: "g_standard_c"
+    name: "Standard 男声C (Google)"
+    provider: "google"
+    gender: "male"
+    description: "Google標準の明瞭な男性の声"
+    voice_name: "ja-JP-Standard-C"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-KeitaNeural"
+  g_standard_d:
+    id: "g_standard_d"
+    name: "Standard 男声D (Google)"
+    provider: "google"
+    gender: "male"
+    description: "Google標準の深みのある男性の声"
+    voice_name: "ja-JP-Standard-D"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-KeitaNeural"
+
+  # ==========================================
+  # Microsoft Edge TTS (完全無料・無制限・クラウド合成)
+  # ==========================================
+  edge_nanami:
+    id: "edge_nanami"
+    name: "Nanami (Edge)"
+    provider: "edge"
+    gender: "female"
+    description: "Microsoft Edge の高品位ニューラル女性音声 (完全無料)"
+    azure_voice: "ja-JP-NanamiNeural"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-NanamiNeural"
+  edge_keita:
+    id: "edge_keita"
+    name: "Keita (Edge)"
+    provider: "edge"
+    gender: "male"
+    description: "Microsoft Edge の落ち着いたニューラル男性音声 (完全無料)"
+    azure_voice: "ja-JP-KeitaNeural"
+    fallback_provider: "azure"
+    fallback_voice: "ja-JP-KeitaNeural"
+
+  # ==========================================
+  # OpenJTalk (名古屋工業大学 & ゆっくり風 完全ローカル合成)
+  # ==========================================
+  ojt_mei_normal:
+    id: "ojt_mei_normal"
+    name: "メイ (ノーマル)"
+    provider: "openjtalk"
+    gender: "female"
+    description: "OpenJTalk: 名工大 メイ (ノーマル) 超低遅延"
+    voice_name: "ojt_mei_normal"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-NanamiNeural"
+  ojt_mei_happy:
+    id: "ojt_mei_happy"
+    name: "メイ (ハッピー)"
+    provider: "openjtalk"
+    gender: "female"
+    description: "OpenJTalk: 名工大 メイ (ハッピー)"
+    voice_name: "ojt_mei_happy"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-NanamiNeural"
+  ojt_mei_angry:
+    id: "ojt_mei_angry"
+    name: "メイ (怒り)"
+    provider: "openjtalk"
+    gender: "female"
+    description: "OpenJTalk: 名工大 メイ (怒り)"
+    voice_name: "ojt_mei_angry"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-NanamiNeural"
+  ojt_mei_sad:
+    id: "ojt_mei_sad"
+    name: "メイ (悲しみ)"
+    provider: "openjtalk"
+    gender: "female"
+    description: "OpenJTalk: 名工大 メイ (悲しみ)"
+    voice_name: "ojt_mei_sad"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-NanamiNeural"
+  ojt_mei_bashful:
+    id: "ojt_mei_bashful"
+    name: "メイ (ツンツン)"
+    provider: "openjtalk"
+    gender: "female"
+    description: "OpenJTalk: 名工大 メイ (ツンツン)"
+    voice_name: "ojt_mei_bashful"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-NanamiNeural"
+  ojt_takumi_normal:
+    id: "ojt_takumi_normal"
+    name: "たくみ (ノーマル)"
+    provider: "openjtalk"
+    gender: "male"
+    description: "OpenJTalk: 名工大 たくみ (ノーマル)"
+    voice_name: "ojt_takumi_normal"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-KeitaNeural"
+  ojt_takumi_happy:
+    id: "ojt_takumi_happy"
+    name: "たくみ (ハッピー)"
+    provider: "openjtalk"
+    gender: "male"
+    description: "OpenJTalk: 名工大 たくみ (ハッピー)"
+    voice_name: "ojt_takumi_happy"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-KeitaNeural"
+  ojt_takumi_angry:
+    id: "ojt_takumi_angry"
+    name: "たくみ (怒り)"
+    provider: "openjtalk"
+    gender: "male"
+    description: "OpenJTalk: 名工大 たくみ (怒り)"
+    voice_name: "ojt_takumi_angry"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-KeitaNeural"
+  ojt_takumi_sad:
+    id: "ojt_takumi_sad"
+    name: "たくみ (悲しみ)"
+    provider: "openjtalk"
+    gender: "male"
+    description: "OpenJTalk: 名工大 たくみ (悲しみ)"
+    voice_name: "ojt_takumi_sad"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-KeitaNeural"
+  ojt_nitech:
+    id: "ojt_nitech"
+    name: "名工大 男声"
+    provider: "openjtalk"
+    gender: "male"
+    description: "OpenJTalk: 名古屋工業大学 標準男声"
+    voice_name: "ojt_nitech"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-KeitaNeural"
+  ojt_yukkuri:
+    id: "ojt_yukkuri"
+    name: "ゆっくり風 (SofTalk調)"
+    provider: "openjtalk"
+    gender: "female"
+    description: "OpenJTalk: ゆっくり風 (機械調・抑揚低め)"
+    voice_name: "ojt_yukkuri"
+    fallback_provider: "edge"
+    fallback_voice: "ja-JP-NanamiNeural"
+
+default_speaker: "nanami"
+default_pitch: "0%"
+default_speed: 1.0

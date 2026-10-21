@@ -1,0 +1,1908 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discord 超低遅延 TTS Bot - 設定ダッシュボード</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v={{ASSET_V}}">
+  <script id="server-data" type="application/json">
+    {
+      "is_logged_in": {{IS_LOGGED_IN}},
+      "client_configured": {{CLIENT_CONFIGURED}},
+      "user_data": {{USER_DATA}}
+    }
+  </script>
+  <script>
+    const serverDataEl = document.getElementById("server-data");
+    const serverData = JSON.parse(serverDataEl ? serverDataEl.textContent : "{}");
+    window.APP_IS_LOGGED_IN = serverData.is_logged_in;
+    window.APP_CLIENT_CONFIGURED = serverData.client_configured;
+    window.APP_USER_DATA = serverData.user_data;
+    window.switchMetricsNode = function(nodeKey) {
+      if (typeof window.doSwitchMetricsNode === 'function') {
+        window.doSwitchMetricsNode(nodeKey);
+      } else {
+        window._pendingMetricsNode = nodeKey;
+      }
+    };
+  </script>
+</head>
+<body>
+
+  <!-- ナビゲーションヘッダー -->
+  <header>
+    <div class="nav-container">
+      <div class="logo-area">
+        <div class="bot-avatar">柴</div>
+        <div class="logo-text">
+          <h1>柴ヴォ TTS <span class="badge">Online</span> <span class="build-tag" style="font-size:10px;font-weight:500;opacity:0.65;background:rgba(255,255,255,0.1);padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:6px;" title="ビルド: {{BUILD_ID}} ({{BUILD_DATE}})">{{BUILD_ID}}</span></h1>
+        </div>
+      </div>
+
+      <div class="nav-right-area" style="display:flex;align-items:center;gap:16px;flex-shrink:0;">
+        <!-- サーバー切り替えセレクター (ログイン時のみ表示) -->
+        <div id="guild-selector-area" class="guild-selector-container" style="display:none;">
+          <span class="guild-selector-label">サーバー:</span>
+          <select id="guild-select" class="form-input form-input-sm guild-select" onchange="onGuildChanged(this.value)">
+            <option value="">サーバー取得中...</option>
+          </select>
+        </div>
+
+        <div class="user-profile">
+          <script>
+            if (window.APP_IS_LOGGED_IN) {
+              document.write(`
+                <div class="user-info">
+                  <img id="user-avatar-img" class="user-avatar" src="https://cdn.discordapp.com/embed/avatars/0.png" alt="Avatar">
+                  <span id="user-display-name" class="username">Loading...</span>
+                </div>
+                <a href="/logout" class="btn btn-secondary btn-sm">ログアウト</a>
+              `);
+            } else {
+              document.write(`
+                <a href="/login" class="btn btn-primary btn-sm">Discordでログイン</a>
+              `);
+            }
+          </script>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <script>
+      if (!window.APP_IS_LOGGED_IN) {
+        document.write(`
+          <div class="login-hero">
+            <div class="login-hero-icon">🎙️</div>
+            <h2>Discord TTS ダッシュボード</h2>
+            <p>
+              このBotが導入されているDiscordサーバーのメンバー向け設定画面です。<br>
+              Discordアカウントでログインして、あなたの専用声質や単語辞書、ボットの動作設定をカスタマイズできます。
+            </p>
+            ${!window.APP_CLIENT_CONFIGURED ? `
+              <div style="background:rgba(240, 178, 50, 0.15);border:1px solid rgba(240,178,50,0.3);border-radius:8px;padding:14px;margin-bottom:20px;font-size:13px;color:#f0b232;text-align:left;">
+                ⚠️ <strong>Discord OAuth2が未設定です</strong><br>
+                サーバー管理者は <code>.env</code> に <code>DISCORD_CLIENT_ID</code> および <code>DISCORD_CLIENT_SECRET</code> を設定してください。
+              </div>
+            ` : ''}
+            <a href="/login" class="btn btn-discord">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.893.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+              Discordでログインして利用する
+            </a>
+          </div>
+        `);
+      } else {
+        document.write(`
+          <!-- タブナビゲーション -->
+          <nav class="tabs-nav">
+            <button class="tab-btn active" data-tab="voice">🎙️ マイ音声設定 (個人設定)</button>
+            <button class="tab-btn" data-tab="dict">📖 単語辞書</button>
+            <button class="tab-btn" id="tab-btn-member-voices" data-tab="member-voices" style="display:none;">👥 メンバー音声設定</button>
+            <button class="tab-btn" id="tab-btn-config" data-tab="config">⚙️ ボット設定</button>
+            <button class="tab-btn" id="tab-btn-system" data-tab="system">📊 システム & ワーカー状況</button>
+            <button class="tab-btn" id="tab-btn-help" data-tab="help">ℹ️ ヘルプ・利用規約</button>
+          </nav>
+
+          <!-- 1. マイ音声設定タブ -->
+          <section id="tab-voice" class="tab-pane active">
+            <div class="section-title">🎙️ あなたの専用音声設定</div>
+            <div class="section-desc">Discordであなたが発言した際に読み上げられる声質・ピッチ・速度を設定します。設定は即座に反映されます。</div>
+
+            <!-- 他サーバーから設定同期バナー -->
+            <div class="card" style="background:rgba(88,101,242,0.1);border-color:rgba(88,101,242,0.3);margin-bottom:18px;padding:16px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                <div>
+                  <div style="font-weight:600;font-size:14px;display:flex;align-items:center;gap:6px;">
+                    <span>🔄 サーバー間での音声設定同期</span>
+                    <span id="sync-target-guild-badge" class="badge" style="background:var(--primary);color:white;font-size:11px;">対象: -</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    別のDiscordサーバーで設定したお好みの声質・ピッチ・速度を、ワンクリックで現在のサーバーに引き継ぎ・同期できます。
+                  </div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;">
+                  <select id="sync-source-guild-select" class="form-input" style="width:auto;min-width:200px;font-size:13px;padding:6px 10px;">
+                    <option value="">同期元のサーバーを選択...</option>
+                  </select>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="syncVoiceFromGuild()" style="white-space:nowrap;padding:7px 14px;">
+                    設定を同期 📥
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- 話者選択 & 詳細操作の2ペイン (Master-Detail) レイアウト -->
+            <div class="voice-selection-layout" style="display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap;">
+              
+              <!-- 左ペイン: 高密度モデル一覧 (Master) -->
+              <div class="card" style="flex:1 1 58%;min-width:340px;margin-bottom:0;padding:18px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+                  <label class="form-label" style="margin-bottom:0;font-weight:700;">話者（声質）一覧 <span id="voice-count-badge" class="badge" style="background:#5865f2;color:white;margin-left:4px;">全0モデル</span></label>
+                  
+                  <!-- 性別フィルターボタン群 -->
+                  <div class="gender-filter-tabs" style="display:flex;gap:4px;background:rgba(0,0,0,0.2);padding:3px;border-radius:6px;">
+                    <button type="button" class="gender-tab-btn active" data-gender="all" onclick="filterVoiceGender('all')">すべて</button>
+                    <button type="button" class="gender-tab-btn" data-gender="female" onclick="filterVoiceGender('female')">👩 女性</button>
+                    <button type="button" class="gender-tab-btn" data-gender="male" onclick="filterVoiceGender('male')">👨 男性</button>
+                    <button type="button" class="gender-tab-btn" data-gender="neutral" onclick="filterVoiceGender('neutral')">🤖 中性/他</button>
+                  </div>
+                </div>
+
+                <!-- プロバイダー切り替えボタン群 -->
+                <div class="voice-filter-tabs" style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:10px;">
+                  <button type="button" class="voice-tab-btn active" data-provider="all" onclick="filterVoiceProvider('all')">すべて</button>
+                  <button type="button" class="voice-tab-btn" data-provider="edge" onclick="filterVoiceProvider('edge')">Edge (無料)</button>
+                  <button type="button" class="voice-tab-btn" data-provider="azure" onclick="filterVoiceProvider('azure')">Azure</button>
+                  <button type="button" class="voice-tab-btn" data-provider="google" onclick="filterVoiceProvider('google')">Google</button>
+                  <button type="button" class="voice-tab-btn" data-provider="voicevox" onclick="filterVoiceProvider('voicevox')">VOICEVOX</button>
+                  <button type="button" class="voice-tab-btn" data-provider="sharevox" onclick="filterVoiceProvider('sharevox')">SHAREVOX</button>
+                  <button type="button" class="voice-tab-btn" data-provider="coeiroink" onclick="filterVoiceProvider('coeiroink')">COEIROINK</button>
+                  <button type="button" class="voice-tab-btn" data-provider="openjtalk" onclick="filterVoiceProvider('openjtalk')">OpenJTalk</button>
+                </div>
+
+                <!-- 話者検索バー -->
+                <div style="margin-bottom:12px;">
+                  <input type="text" id="voice-search-input" class="form-input" style="padding:8px 12px;font-size:13px;" placeholder="🔍 キャラ名やスタイルで絞り込み (例: ずんだもん, 四国めたん, 雨晴はう, 七海)..." oninput="onVoiceSearchInput(this.value)">
+                </div>
+
+                <!-- 高密度スリム横長チップコンテナ (3列グリッド) -->
+                <div id="speakers-container" class="speakers-chips-grid" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(180px, 1fr));gap:6px;max-height:560px;overflow-y:auto;padding-right:4px;">
+                  <!-- JSでスリム横長Boxを動的描画 -->
+                </div>
+              </div>
+
+              <!-- 右ペイン: 選択中モデル詳細 & パラメーター操作パネル (Detail) -->
+              <div class="card voice-detail-card" style="flex:1 1 38%;min-width:320px;margin-bottom:0;padding:18px;position:sticky;top:16px;background:var(--bg-card);border:1px solid var(--border-color);border-radius:10px;">
+                <div id="voice-detail-container">
+                  <!-- JSで選択中キャラクターの詳細がリアルタイム描画されます -->
+                  <div style="text-align:center;padding:40px 10px;color:var(--text-dim);">
+                    左側のリストからモデルを選択してください
+                  </div>
+                </div>
+              </div>
+
+            </div>
+          </section>
+
+          <!-- 2. 単語辞書タブ -->
+          <section id="tab-dict" class="tab-pane">
+            <div class="section-title">📖 単語辞書管理</div>
+            <div class="section-desc">読み間違えやすい単語や略語、ネットスラングの読み方をサーバーごとに設定します。辞書変更時はキャッシュが自動最新化されます。</div>
+
+            <!-- AI学習・提案候補セクション -->
+            <div class="card" id="ai-dict-card" style="border: 1px solid rgba(88, 101, 242, 0.3); background: linear-gradient(135deg, rgba(88, 101, 242, 0.05) 0%, rgba(35, 165, 90, 0.03) 100%);">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                    🤖 Gemini 2.5 Flash 自己学習・提案候補
+                    <span id="ai-sugg-count" class="badge" style="background:#5865f2;color:white;font-size:11px;">0件</span>
+                  </h3>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);">
+                  ユーザーの未知語発言や 🤔 ❌ リアクションから自動抽出・推論された読み候補です
+                </div>
+              </div>
+
+              <div id="ai-sugg-list" style="display:flex;flex-direction:column;gap:8px;">
+                <!-- 動的にレンダリング (未承認候補または空メッセージ) -->
+                <div style="font-size:13px;color:var(--text-muted);padding:10px 0;text-align:center;">
+                  現在、未承認のAI学習候補はありません。
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+                <h3 style="font-size:15px;margin:0;">➕ 新規単語登録</h3>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="openDictBatchImportModal()">📋 テキスト一括インポート</button>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="openUserImportModal()">📥 ユーザー名インポート</button>
+                </div>
+              </div>
+
+              <form onsubmit="addDictWord(event)" style="display:flex;gap:12px;flex-wrap:wrap;">
+                <input type="text" id="dict-new-word" class="form-input" style="flex:1;min-width:180px;" placeholder="登録する単語 (例: 草生える)" required>
+                <input type="text" id="dict-new-reading" class="form-input" style="flex:1;min-width:180px;" placeholder="読み方 (例: くさはえる)" required>
+                <button type="submit" class="btn btn-primary">辞書に追加</button>
+              </form>
+            </div>
+
+            <div class="card">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <h3 style="font-size:15px;">登録済み単語一覧 (<span id="dict-count">0件</span>)</h3>
+                <input type="text" id="dict-search-input" class="form-input" style="width:220px;" placeholder="単語または読みで検索..." oninput="filterDictionary()">
+              </div>
+
+              <div class="dict-table-container">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th style="width:40%;">単語</th>
+                      <th style="width:40%;">読み方</th>
+                      <th style="width:20%;text-align:right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="dict-table-body">
+                    <!-- 動的にレンダリング -->
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- 3. メンバー音声設定タブ (管理者専用) -->
+          <section id="tab-member-voices" class="tab-pane">
+            <div class="section-title">👥 メンバー音声設定管理 (管理者専用)</div>
+            <div class="section-desc">このサーバーで個人設定（声質・ピッチ・速度・音量）をカスタマイズしたメンバーの一覧を閲覧し、直接編集・リセットできます。</div>
+
+            <div id="member-voices-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
+              <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
+              <p style="color:var(--text-muted);font-size:14px;">このページはサーバー管理者、または管理ロールを保持するメンバーのみ閲覧・操作できます。</p>
+            </div>
+
+            <div id="member-voices-content-area">
+              <!-- コントロールバー -->
+              <div class="card" style="padding:14px 18px;margin-bottom:16px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                  <div style="display:flex;align-items:center;gap:10px;">
+                    <span id="member-voices-count-badge" class="badge" style="background:#5865f2;color:white;font-size:13px;padding:4px 10px;">
+                      👥 設定済みメンバー: 0名
+                    </span>
+                    <span style="font-size:12px;color:var(--text-muted);">
+                      ※ 個人設定が保存されているメンバーのみ表示されます。
+                    </span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="position:relative;width:260px;">
+                      <input type="text" id="member-voices-search-input" class="form-input" placeholder="🔍 ユーザー名・声質で検索..." oninput="onMemberVoiceSearchInput(this.value)" style="padding-left:12px;font-size:13px;" />
+                    </div>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="loadMemberVoices(currentGuildId)" title="再読み込み">
+                      🔄 更新
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- メンバー設定一覧テーブル -->
+              <div class="card" style="padding:0;overflow:hidden;">
+                <div class="table-container" style="max-height:650px;overflow-y:auto;">
+                  <table class="data-table" style="width:100%;margin-bottom:0;">
+                    <thead style="position:sticky;top:0;background:var(--card-bg);z-index:2;">
+                      <tr>
+                        <th style="width:26%;">メンバー</th>
+                        <th style="width:26%;">設定中の声質 (話者)</th>
+                        <th style="width:12%;">速度</th>
+                        <th style="width:10%;">ピッチ</th>
+                        <th style="width:10%;">音量</th>
+                        <th style="width:16%;text-align:right;">アクション</th>
+                      </tr>
+                    </thead>
+                    <tbody id="member-voices-table-body">
+                      <!-- 動的レンダリング -->
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <!-- メンバー設定 編集モーダル -->
+            <div id="member-voice-edit-modal" class="modal-overlay" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;backdrop-filter:blur(4px);">
+              <div class="modal-content" style="max-width:540px;width:95%;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,0.5);overflow:hidden;">
+                <div class="modal-header" style="padding:16px 20px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
+                  <h3 id="member-edit-modal-title" style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+                    <span>✏️ メンバー音声設定の編集</span>
+                  </h3>
+                  <button type="button" class="modal-close-btn" onclick="closeMemberVoiceModal()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-muted);">&times;</button>
+                </div>
+                <div class="modal-body" style="padding:18px 20px;">
+                  <!-- 対象ユーザー情報 -->
+                  <div style="display:flex;align-items:center;gap:12px;background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;margin-bottom:16px;">
+                    <div style="position:relative;width:44px;height:44px;flex-shrink:0;">
+                      <img id="member-edit-avatar-img" src="" alt="Avatar" style="width:44px;height:44px;border-radius:50%;border:2px solid var(--border-color);object-fit:cover;display:none;" onerror="this.style.display='none';document.getElementById('member-edit-avatar-fallback').style.display='flex';" />
+                      <div id="member-edit-avatar-fallback" style="width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,0.08);border:2px solid var(--border-color);display:flex;align-items:center;justify-content:center;font-size:22px;">👤</div>
+                    </div>
+                    <div>
+                      <div id="member-edit-name" style="font-weight:700;font-size:15px;color:var(--text-light);">ユーザー名</div>
+                      <div id="member-edit-id" style="font-size:11px;color:var(--text-muted);font-family:monospace;">ID: 000000000000</div>
+                    </div>
+                  </div>
+
+                  <input type="hidden" id="member-edit-user-id" value="" />
+
+                  <!-- 声質選択 (プロバイダーフィルター + ドロップダウン) -->
+                  <div class="form-group" style="margin-bottom:14px;">
+                    <label class="form-label" style="font-weight:600;font-size:13px;">声質（話者）</label>
+                    <select id="member-edit-speaker" class="form-input" style="font-size:13px;width:100%;">
+                      <!-- JSで全話者を追加 -->
+                    </select>
+                  </div>
+
+                  <!-- 速度スライダー -->
+                  <div class="form-group" style="margin-bottom:14px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                      <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">読み上げ速度</label>
+                      <span id="member-edit-speed-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">1.00x</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                      <input type="range" id="member-edit-speed" min="0.5" max="2.0" step="0.05" value="1.0" class="form-range" style="flex:1;" oninput="updateMemberEditSpeed(this.value)" />
+                      <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditSpeed(1.0)" style="padding:4px 8px;font-size:11px;">1.0x</button>
+                    </div>
+                  </div>
+
+                  <!-- ピッチスライダー -->
+                  <div class="form-group" style="margin-bottom:14px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                      <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">声の高さ (ピッチ)</label>
+                      <span id="member-edit-pitch-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">0%</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                      <input type="range" id="member-edit-pitch" min="-20" max="20" step="1" value="0" class="form-range" style="flex:1;" oninput="updateMemberEditPitch(this.value)" />
+                      <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditPitch(0)" style="padding:4px 8px;font-size:11px;">0%</button>
+                    </div>
+                  </div>
+
+                  <!-- 音量スライダー -->
+                  <div class="form-group" style="margin-bottom:14px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                      <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">音量 (ボリューム)</label>
+                      <span id="member-edit-volume-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">80%</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:10px;">
+                      <input type="range" id="member-edit-volume" min="0" max="200" step="5" value="80" class="form-range" style="flex:1;" oninput="updateMemberEditVolume(this.value)" />
+                      <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditVolume(80)" style="padding:4px 8px;font-size:11px;">80%</button>
+                    </div>
+                  </div>
+
+                  <!-- 括弧除去トグル -->
+                  <div class="form-group" style="margin-bottom:16px;">
+                    <label class="checkbox-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;">
+                      <input type="checkbox" id="member-edit-brackets" class="form-checkbox" checked />
+                      <span>名前読み上げ時に名前末尾の【】や（）等の括弧を除去する</span>
+                    </label>
+                  </div>
+
+                  <!-- 試聴ボタン -->
+                  <div style="display:flex;justify-content:flex-start;margin-bottom:10px;">
+                    <button type="button" id="member-edit-preview-btn" class="btn btn-secondary btn-sm" onclick="previewMemberVoiceInModal()" style="display:flex;align-items:center;gap:6px;">
+                      <span>🔊 設定内容を試聴</span>
+                    </button>
+                    <audio id="member-edit-audio" style="display:none;"></audio>
+                  </div>
+                </div>
+
+                <div class="modal-footer" style="padding:14px 20px;border-top:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,0.15);">
+                  <button type="button" class="btn btn-danger btn-sm" onclick="deleteMemberVoiceFromModal()" style="background:#ed4245;color:white;border:none;padding:7px 14px;">
+                    🗑️ 設定リセット
+                  </button>
+                  <div style="display:flex;gap:8px;">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="closeMemberVoiceModal()" style="padding:7px 14px;">キャンセル</button>
+                    <button type="button" id="member-edit-save-btn" class="btn btn-primary btn-sm" onclick="saveMemberVoiceFromModal()" style="padding:7px 16px;">
+                      💾 設定を保存
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 4. ボット設定タブ -->
+          <section id="tab-config" class="tab-pane">
+            <div class="section-title">⚙️ ボット設定 (サーバー固有)</div>
+            <div class="section-desc">読み上げの制限文字数や重複抑制、VC自動参加などの設定をサーバーごとに保持します。</div>
+
+            <div id="config-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
+              <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
+              <p style="color:var(--text-muted);font-size:14px;">この設定はサーバー管理者、または設定された管理ロールを保持するメンバーのみ閲覧・変更できます。</p>
+            </div>
+
+            <div id="config-form-card" class="card">
+              <form onsubmit="saveBotConfig(event)">
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                  <div class="form-group" style="grid-column: 1 / -1;">
+                    <label class="form-label">読み上げ最大文字数</label>
+                    <input type="number" id="cfg-max-len" class="form-input" min="10" max="300" required>
+                    <small style="color:var(--text-dim);font-size:12px;">超過部分は切り捨てて「以下略」が付与されます（デフォルト: 50文字）</small>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label">重複抑制ウィンドウ (秒)</label>
+                    <input type="number" step="0.5" id="cfg-dedup-sec" class="form-input" min="1" max="30" required>
+                    <small style="color:var(--text-dim);font-size:12px;">この秒数以内に投稿された同一短文をスキップ（デフォルト: 5.0秒）</small>
+                  </div>
+
+                  <div class="form-group">
+                    <label class="form-label">重複抑制の対象最大文字数</label>
+                    <input type="number" id="cfg-dedup-len" class="form-input" min="2" max="30" required>
+                    <small style="color:var(--text-dim);font-size:12px;">「おつ」「草」などの相槌短文の文字数上限（デフォルト: 10文字）</small>
+                  </div>
+
+                  <!-- 投機的フォールバック待機時間 (秒) -->
+                  <div class="form-group" style="grid-column: 1 / -1;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:14px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+                    <div style="flex:1;min-width:240px;">
+                      <label for="cfg-speculative-timeout" style="font-weight:600;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:6px;margin-bottom:2px;">
+                        ⚡ 投機的フォールバック待機時間 (秒)
+                        <span class="badge" style="background:#5865f2;color:white;font-size:10px;">超低遅延</span>
+                      </label>
+                      <small style="color:var(--text-dim);font-size:12px;">
+                        ローカルGPU推論が指定秒数を超過した際、高速なクラウド（Edge-TTS/Azure）へ並行投機リクエストを発行し、会話の詰まりを回避します（デフォルト: 1.5秒、推奨: 1.0〜2.0秒）
+                      </small>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                      <input type="number" step="0.1" min="0.2" max="5.0" id="cfg-speculative-timeout" class="form-input" style="width:100px;text-align:center;font-weight:bold;font-size:14px;" required>
+                      <span style="font-size:13px;color:var(--text-muted);">秒</span>
+                    </div>
+                  </div>
+
+                  <!-- 自動参加チャンネルペアリング (最大5組) -->
+                  <div class="form-group" style="grid-column: 1 / -1; background: rgba(0,0,0,0.2); border: 1px solid var(--border-color); border-radius: 8px; padding: 16px;">
+                    <div style="margin-bottom: 12px;">
+                      <label class="form-label" style="margin-bottom:2px; font-weight:700; display:flex; align-items:center; gap:8px;">
+                        🔗 自動参加チャンネル・ペアリング設定 (最大5組)
+                        <span class="badge" style="background:#5865f2; color:white; font-size:11px;">最大5VC同時</span>
+                      </label>
+                      <small style="color:var(--text-dim);font-size:12px;">
+                        設定したVCにユーザーが参加すると、空いているBot（1〜5号機）が自動で入室し、ペアとなるテキストチャンネルを読み上げます。
+                      </small>
+                    </div>
+
+                    <div id="auto-join-pairs-list" style="display:flex; flex-direction:column; gap:10px;">
+                      <!-- JSによって最大5組のペア（#1〜#5）が描画されます -->
+                    </div>
+                  </div>
+
+                  <!-- 読み上げ除外プレフィックス設定 -->
+                  <div class="form-group" style="grid-column: 1 / -1; background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 8px; padding: 16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 10px;">
+                      <div>
+                        <label class="form-label" style="margin-bottom:2px; font-weight:700; display:flex; align-items:center; gap:8px;">
+                          🚫 読み上げ除外プレフィックス（特定の文字から始まるテキストを除外）
+                          <span class="badge" style="background:#5865f2; color:white; font-size:11px;">複数指定可</span>
+                        </label>
+                        <small style="color:var(--text-dim);font-size:12px;">
+                          登録された文字・記号から始まるメッセージは読み上げをスキップします（メモやBotコマンド、独り言などの除外に最適です。デフォルト: セミコロン「;」「；」）。
+                        </small>
+                      </div>
+                      <button type="button" class="btn btn-secondary btn-sm" onclick="resetIgnorePrefixesUI()" style="font-size:12px; padding:4px 10px; white-space:nowrap;">
+                        🔄 デフォルトに戻す
+                      </button>
+                    </div>
+
+                    <!-- 登録済みバッジ一覧 -->
+                    <div id="cfg-ignore-prefixes-tags" style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; min-height:36px; padding:6px 10px; background:rgba(0,0,0,0.25); border:1px solid rgba(255,255,255,0.05); border-radius:6px; align-items:center;">
+                      <!-- JSでタグが描画されます -->
+                    </div>
+
+                    <!-- 新規追加入力欄 -->
+                    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                      <input type="text" id="cfg-ignore-prefix-input" class="form-input" placeholder="除外したい開始文字を入力（例: ; や // など）" style="flex:1; min-width:200px; max-width:320px;" onkeydown="if(event.key==='Enter'){event.preventDefault();addIgnorePrefixFromInput();}">
+                      <button type="button" class="btn btn-primary btn-sm" onclick="addIgnorePrefixFromInput()" style="padding:7px 16px; font-size:13px;">
+                        ➕ 追加
+                      </button>
+                      <small style="color:var(--text-muted); font-size:12px;">※カンマ区切りで複数同時追加も可能です</small>
+                    </div>
+                  </div>
+
+                  <!-- サーバーネーム読み上げオプション -->
+                  <div class="form-group" style="grid-column: 1 / -1;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:14px;display:flex;align-items:center;justify-content:space-between;">
+                    <div>
+                      <label for="cfg-read-username" style="font-weight:600;font-size:14px;cursor:pointer;display:block;margin-bottom:2px;">
+                        🗣️ 発言者名（サーバーネーム）を読み上げる
+                      </label>
+                      <small style="color:var(--text-dim);font-size:12px;">
+                        有効にすると「ニックネーム、本文」の形式で発言者の名前を前置して読み上げます（単語辞書に登録された読み方も自動適用されます）
+                      </small>
+                    </div>
+                    <input type="checkbox" id="cfg-read-username" style="width:22px;height:22px;cursor:pointer;accent-color:var(--accent);">
+                  </div>
+
+                  <!-- VC入退室通知読み上げオプション (デフォルト: OFF) -->
+                  <div class="form-group" style="grid-column: 1 / -1;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:14px;display:flex;align-items:center;justify-content:space-between;">
+                    <div>
+                      <label for="cfg-announce-vc" style="font-weight:600;font-size:14px;cursor:pointer;display:block;margin-bottom:2px;">
+                        🚪 VC入退室通知を読み上げる（デフォルト: OFF）
+                      </label>
+                      <small style="color:var(--text-dim);font-size:12px;">
+                        有効にすると、ユーザーがBotと同じVCに入室・退出した際に「〇〇さんが入室しました / 退出しました」とアナウンスします
+                      </small>
+                    </div>
+                    <input type="checkbox" id="cfg-announce-vc" style="width:22px;height:22px;cursor:pointer;accent-color:var(--accent);">
+                  </div>
+
+                  <!-- 防災速報（地震・津波・気象警報）設定 -->
+                  <div class="form-group" style="grid-column: 1 / -1; background: rgba(235, 77, 75, 0.08); border: 1px solid rgba(235, 77, 75, 0.3); border-radius: 8px; padding: 16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
+                      <label class="form-label" style="margin:0; font-weight:700; display:flex; align-items:center; gap:8px; color:#ff7675;">
+                        🚨 防災速報通知（地震・津波・気象警報）
+                        <span class="badge" style="background:#d63031; color:white; font-size:11px;">リアルタイム監視</span>
+                      </label>
+                      <label class="switch" style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                        <input type="checkbox" id="cfg-disaster-enabled" style="width:20px; height:20px; accent-color:#d63031;">
+                        <span style="font-size:13px; font-weight:600;">有効</span>
+                      </label>
+                    </div>
+                    <small style="color:var(--text-dim);font-size:12px; display:block; margin-bottom:14px;">
+                      気象庁およびP2P地震情報の速報データを常駐監視し、Botが参加中のVC（優先割り込み音声）とペアのテキストチャンネル（Embed）へ即座に速報通知します。
+                    </small>
+
+                    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-bottom:14px;">
+                      <div>
+                        <label class="form-label" style="font-size:12px;">地震通知の最小震度</label>
+                        <select id="cfg-disaster-min-scale" class="form-input" style="width:100%;">
+                          <option value="10">震度1以上</option>
+                          <option value="20">震度2以上</option>
+                          <option value="30">震度3以上 (推奨)</option>
+                          <option value="40">震度4以上</option>
+                          <option value="45">震度5弱以上</option>
+                          <option value="50">震度5強以上</option>
+                          <option value="60">震度6弱以上</option>
+                          <option value="70">震度7</option>
+                        </select>
+                        <small style="color:var(--text-dim);font-size:11px;">※緊急地震速報(警報)および津波情報は震度設定に関わらず即座に通知されます</small>
+                      </div>
+                      <div>
+                        <label class="form-label" style="font-size:12px;">地域フィルター (都道府県名)</label>
+                        <input type="text" id="cfg-disaster-pref" class="form-input" placeholder="例: 東京都, 神奈川県 (空欄で全国)">
+                        <small style="color:var(--text-dim);font-size:11px;">指定した都道府県で観測された地震・発令された警報のみに絞り込みます</small>
+                      </div>
+                    </div>
+
+                    <div style="display:flex; align-items:center; justify-content:space-between; padding-top:8px; border-top:1px solid rgba(255,255,255,0.06); margin-bottom:12px;">
+                      <div>
+                        <label for="cfg-disaster-weather" style="font-weight:600; font-size:13px; cursor:pointer;">
+                          🌧️ 気象警報・特別警報を通知する
+                        </label>
+                        <small style="color:var(--text-dim);font-size:11px; display:block;">
+                          大雨・暴風・大雪等の警報および特別警報の発表を通知します
+                        </small>
+                      </div>
+                      <input type="checkbox" id="cfg-disaster-weather" style="width:20px;height:20px;cursor:pointer;accent-color:#d63031;">
+                    </div>
+
+                    <!-- 防災速報の音量設定 -->
+                    <div style="padding:12px; background:rgba(0,0,0,0.18); border-radius:6px; margin-bottom:14px; border:1px solid rgba(255,255,255,0.06);">
+                      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                        <label for="cfg-disaster-volume" style="font-weight:600; font-size:13px; margin:0; display:flex; align-items:center; gap:6px;">
+                          📢 速報通知の読み上げ音量
+                        </label>
+                        <span id="cfg-disaster-volume-val" class="badge" style="background:#d63031; color:white; font-size:11px; font-weight:700;">100%</span>
+                      </div>
+                      <small style="color:var(--text-dim); font-size:11px; display:block; margin-bottom:8px;">
+                        地震・津波・気象警報の読み上げ時の音量を調整します（デフォルト: 100%）
+                      </small>
+                      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+                        <input type="range" id="cfg-disaster-volume" class="slider" min="0" max="200" step="5" value="100" style="flex:1; min-width:140px;" oninput="updateDisasterVolumeVal(this.value)">
+                        <div style="display:flex; gap:4px; flex-shrink:0;">
+                          <button type="button" class="btn btn-secondary btn-sm" onclick="setDisasterVolumePreset(50)" style="padding:2px 7px; font-size:10px;">50%</button>
+                          <button type="button" class="btn btn-secondary btn-sm" onclick="setDisasterVolumePreset(80)" style="padding:2px 7px; font-size:10px;">80%</button>
+                          <button type="button" class="btn btn-primary btn-sm" onclick="setDisasterVolumePreset(100)" style="padding:2px 7px; font-size:10px; background:#d63031; border-color:#d63031;">100% (標準)</button>
+                          <button type="button" class="btn btn-secondary btn-sm" onclick="setDisasterVolumePreset(120)" style="padding:2px 7px; font-size:10px;">120%</button>
+                          <button type="button" class="btn btn-secondary btn-sm" onclick="setDisasterVolumePreset(150)" style="padding:2px 7px; font-size:10px;">150%</button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- テスト発信ボタン -->
+                    <div style="background:rgba(0,0,0,0.2); padding:10px 12px; border-radius:6px; display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                      <span style="font-size:12px; color:var(--text-muted);">📢 動作テスト（現在参加中のVC・テキストへ模擬速報を送信）:</span>
+                      <div style="display:flex; gap:6px;">
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="triggerDisasterTest('earthquake')" style="font-size:11px; padding:4px 8px;">地震テスト</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="triggerDisasterTest('tsunami')" style="font-size:11px; padding:4px 8px;">津波テスト</button>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="triggerDisasterTest('weather')" style="font-size:11px; padding:4px 8px;">警報テスト</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- 管理者ロール設定 (管理者のみ操作可能) -->
+                  <div class="form-group" style="grid-column: 1 / -1;background:rgba(88,101,242,0.06);border:1px solid rgba(88,101,242,0.2);border-radius:8px;padding:14px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                      <label class="form-label" style="margin:0;">👑 ボット管理ロール設定 <span style="font-size:11px;color:#ff9f43;">(※サーバー管理者のみ変更可能)</span></label>
+                      <span id="role-admin-badge" class="badge" style="background:#5865f2;color:white;display:none;">管理者認証済</span>
+                    </div>
+                    <select id="cfg-admin-role" class="form-input" style="width:100%;">
+                      <option value="0">ロール指定なし (管理者のみ許可)</option>
+                    </select>
+                    <small style="color:var(--text-dim);font-size:12px;display:block;margin-top:4px;">
+                      ここで選択したロールを持つメンバーは、管理者でなくても「ボット設定」「システム＆キャッシュ状況」の閲覧・操作が可能になります。
+                    </small>
+                  </div>
+                </div>
+
+                <div style="margin-top:24px;display:flex;justify-content:flex-end;">
+                  <button type="submit" id="cfg-save-btn" class="btn btn-primary" style="padding:12px 28px;">設定を保存する</button>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <!-- 4. システム & キャッシュ状況タブ -->
+          <section id="tab-system" class="tab-pane">
+            <div class="section-title">📊 システム & 分散ワーカー・キャッシュ状況</div>
+            <div class="section-desc">分散コンピュートワーカーの稼働・リソース消費モニタリング、クラウドTTS利用状況、キャッシュ使用量、ボット接続状況とログを確認できます。</div>
+
+            <div id="system-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
+              <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
+              <p style="color:var(--text-muted);font-size:14px;">システム状況およびキャッシュ管理はサーバー管理者、または設定された管理ロールを保持するメンバーのみ閲覧できます。</p>
+            </div>
+
+            <div id="system-content-area">
+              <!-- 00. ⚡ 発話〜再生レイテンシ モニター (実測エンドツーエンド遅延) -->
+              <div class="card" id="playback-latency-card" style="margin-bottom:20px;border-left:4px solid #5865f2;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      <span>⚡</span> 発話〜再生レイテンシ モニター (実測ラグ)
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                      Discordテキスト送信からBot受信、並列分散推論、VC音声送出までの全フェーズをミリ秒精度で計測
+                    </div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span id="latency-overall-badge" class="badge" style="background:#3ba55c;color:white;font-weight:600;padding:5px 10px;border-radius:12px;font-size:11px;">
+                      ⚡ 計測待機中
+                    </span>
+                    <button class="btn btn-secondary btn-sm" onclick="fetchSystemMetrics()" style="padding:4px 8px;font-size:11px;" title="最新の計測値を更新">
+                      🔄 更新
+                    </button>
+                    <button class="btn btn-secondary btn-sm" onclick="resetLatencyMetrics()" style="padding:4px 8px;font-size:11px;color:#f39c12;border-color:rgba(243,156,18,0.4);" title="アイドル時の残存値をクリアして新セッションを開始">
+                      🗑️ リセット
+                    </button>
+                    <span id="latency-last-updated" style="font-size:11px;color:var(--text-dim, #72767d);">
+                      更新: --:--:--
+                    </span>
+                  </div>
+                </div>
+
+                <!-- KPI メーター グリッド (次世代先行ストリーミング ＆ RTF対応) -->
+                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(170px, 1fr));gap:10px;margin-bottom:18px;">
+                  <div id="lat-kpi-ttfs-card" style="background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;border:1px solid rgba(80,230,255,0.25);position:relative;overflow:hidden;transition:border-color 0.3s ease;">
+                    <div id="lat-kpi-ttfs-bar" style="position:absolute;top:0;left:0;width:3px;height:100%;background:#50e6ff;transition:background 0.3s ease;"></div>
+                    <div style="font-size:11px;color:#50e6ff;font-weight:700;letter-spacing:0.5px;">⚡ 初動ラグ (TTFS)</div>
+                    <div id="lat-kpi-ttfs" style="font-size:24px;font-weight:700;color:#50e6ff;margin:4px 0 2px 0;">-- ms</div>
+                    <div id="lat-kpi-ttfs-detail" style="font-size:10px;color:var(--text-dim);display:flex;gap:4px;flex-wrap:wrap;align-items:center;">キュー待ち除外・目標 &lt;250ms</div>
+                  </div>
+                  <div id="lat-kpi-seamless-card" style="background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;border:1px solid rgba(46,204,113,0.25);position:relative;overflow:hidden;">
+                    <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#2ecc71;"></div>
+                    <div style="font-size:11px;color:#2ecc71;font-weight:700;letter-spacing:0.5px;">✨ シームレス達成率</div>
+                    <div id="lat-kpi-seamless" style="font-size:24px;font-weight:700;color:#2ecc71;margin:4px 0 2px 0;">100 %</div>
+                    <div style="font-size:10px;color:var(--text-dim);">音飛びアンダーランゼロ率</div>
+                  </div>
+                  <div id="lat-kpi-rtf-card" style="background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;border:1px solid rgba(168,255,120,0.25);position:relative;overflow:hidden;">
+                    <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#a8ff78;"></div>
+                    <div style="font-size:11px;color:#a8ff78;font-weight:700;letter-spacing:0.5px;">⚡ 推論倍速比 (RTF)</div>
+                    <div id="lat-kpi-rtf" style="font-size:24px;font-weight:700;color:#a8ff78;margin:4px 0 2px 0;">-- x</div>
+                    <div style="font-size:10px;color:var(--text-dim);">推論時間 / 再生時間 (&lt;1.0)</div>
+                  </div>
+                  <div id="lat-kpi-headroom-card" style="background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;border:1px solid rgba(241,196,15,0.25);position:relative;overflow:hidden;transition:border-color 0.3s ease;">
+                    <div id="lat-kpi-headroom-bar" style="position:absolute;top:0;left:0;width:3px;height:100%;background:#f1c40f;transition:background 0.3s ease;"></div>
+                    <div style="font-size:11px;color:#f1c40f;font-weight:700;letter-spacing:0.5px;">🛡️ 最小バッファ余裕</div>
+                    <div id="lat-kpi-headroom" style="font-size:24px;font-weight:700;color:#f1c40f;margin:4px 0 2px 0;">+-- ms</div>
+                    <div id="lat-kpi-headroom-detail" style="font-size:10px;color:var(--text-dim);">再生期日への先回りリード</div>
+                  </div>
+                  <div style="background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);">
+                    <div style="font-size:11px;color:var(--text-muted);font-weight:600;">計測サンプル</div>
+                    <div id="lat-kpi-count" style="font-size:24px;font-weight:700;color:#f39c12;margin:4px 0 2px 0;">0 件</div>
+                    <div id="lat-kpi-minmax" style="font-size:10px;color:var(--text-dim);">最速 --ms / 最遅 --ms</div>
+                  </div>
+                </div>
+
+                <!-- レイテンシ内訳 (ブレイクダウン プログレスバー) -->
+                <div style="background:rgba(0,0,0,0.2);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);margin-bottom:16px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <span style="font-size:12px;font-weight:600;color:var(--text-normal);">⏱️ 平均フェーズ別遅延 内訳</span>
+                    <span id="lat-breakdown-total" style="font-size:11px;color:var(--text-muted);font-weight:600;">合計: -- ms</span>
+                  </div>
+                  <div style="height:12px;background:rgba(255,255,255,0.08);border-radius:6px;display:flex;overflow:hidden;margin-bottom:10px;">
+                    <div id="lat-bar-discord" style="height:100%;width:0%;background:#9b59b6;transition:width 0.4s ease;" title="Discord Gateway通信"></div>
+                    <div id="lat-bar-queue" style="height:100%;width:0%;background:#3498db;transition:width 0.4s ease;" title="キュー待機"></div>
+                    <div id="lat-bar-synth" style="height:100%;width:0%;background:#2ecc71;transition:width 0.4s ease;" title="TTS合成推論"></div>
+                    <div id="lat-bar-preroll" style="height:100%;width:0%;background:#e67e22;transition:width 0.4s ease;" title="Prerollバッファ蓄積"></div>
+                    <div id="lat-bar-prep" style="height:100%;width:0%;background:#f39c12;transition:width 0.4s ease;" title="再生準備 (FFmpeg/Stream)"></div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));gap:8px;font-size:11px;">
+                    <div style="display:flex;align-items:center;gap:6px;">
+                      <span style="display:inline-block;width:10px;height:10px;background:#9b59b6;border-radius:2px;"></span>
+                      <span style="color:var(--text-muted);">Discord通信:</span>
+                      <strong id="lat-val-discord" style="color:#eee;">-- ms</strong>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                      <span style="display:inline-block;width:10px;height:10px;background:#3498db;border-radius:2px;"></span>
+                      <span style="color:var(--text-muted);">キュー待機:</span>
+                      <strong id="lat-val-queue" style="color:#eee;">-- ms</strong>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                      <span style="display:inline-block;width:10px;height:10px;background:#2ecc71;border-radius:2px;"></span>
+                      <span style="color:var(--text-muted);">TTS推論:</span>
+                      <strong id="lat-val-synth" style="color:#eee;">-- ms</strong>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                      <span style="display:inline-block;width:10px;height:10px;background:#e67e22;border-radius:2px;"></span>
+                      <span style="color:var(--text-muted);">Preroll待機:</span>
+                      <strong id="lat-val-preroll" style="color:#eee;">-- ms</strong>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                      <span style="display:inline-block;width:10px;height:10px;background:#f39c12;border-radius:2px;"></span>
+                      <span style="color:var(--text-muted);">再生準備:</span>
+                      <strong id="lat-val-prep" style="color:#eee;">-- ms</strong>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 分散ワーカー別・推論速度サマリー -->
+                <div style="margin-bottom:16px;">
+                  <div style="font-size:12px;font-weight:600;color:var(--text-normal);margin-bottom:8px;display:flex;align-items:center;gap:6px;">
+                    <span>🖥️</span> <span>ワーカー別 推論速度プロファイラ (最強GPU自動選定 / ms・文字レート / 基本遅延)</span>
+                  </div>
+                  <div id="latency-worker-summary-cards" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(200px, 1fr));gap:10px;">
+                    <div style="color:var(--text-dim);font-size:12px;padding:8px;">計測データ待機中...</div>
+                  </div>
+                </div>
+
+                <!-- 直近15件 初動ラグ推移ミニグラフ (Sparkline) -->
+                <div style="background:rgba(0,0,0,0.2);padding:12px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);margin-bottom:16px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
+                    <div style="font-size:12px;font-weight:600;color:var(--text-normal);display:flex;align-items:center;gap:6px;">
+                      <span>📈</span> <span>直近15件の初動ラグ推移 (TTFS Trend)</span>
+                      <span id="latency-session-badge" class="badge" style="background:rgba(88,101,242,0.2);color:#8ea1e1;font-size:10px;padding:2px 6px;">セッション #1</span>
+                    </div>
+                    <div style="font-size:10px;color:var(--text-dim);display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                      <span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:8px;background:#50e6ff;border-radius:50%;display:inline-block;"></span> キャッシュ</span>
+                      <span style="display:flex;align-items:center;gap:4px;"><span style="width:8px;height:8px;background:#5865f2;border-radius:50%;display:inline-block;"></span> 実推論(GPU/CPU)</span>
+                      <span style="display:flex;align-items:center;gap:4px;"><span style="width:12px;height:2px;background:#2ecc71;border-bottom:1px dashed #2ecc71;display:inline-block;"></span> 目標250ms</span>
+                    </div>
+                  </div>
+                  <div id="latency-sparkline-container" style="width:100%;height:110px;position:relative;background:rgba(0,0,0,0.25);border-radius:6px;overflow:hidden;display:flex;align-items:center;justify-content:center;">
+                    <span style="color:var(--text-dim);font-size:11px;">計測データ待機中...</span>
+                  </div>
+                </div>
+
+                <!-- 直近再生タイムライン (最新15件) -->
+                <div>
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <span style="font-size:12px;font-weight:600;color:var(--text-normal);">📜 直近の再生レイテンシ履歴 (最新15件・パーツ詳細ガントチャート展開可能)</span>
+                    <span style="font-size:11px;color:var(--text-dim);">自動更新</span>
+                  </div>
+                  <div style="overflow-x:auto;background:rgba(0,0,0,0.2);border-radius:8px;border:1px solid rgba(255,255,255,0.06);max-height:380px;overflow-y:auto;">
+                    <table style="width:100%;border-collapse:collapse;font-size:11px;text-align:left;">
+                      <thead style="position:sticky;top:0;background:#202225;z-index:1;border-bottom:1px solid rgba(255,255,255,0.1);">
+                        <tr>
+                          <th style="padding:6px 8px;color:var(--text-muted);width:26px;"></th>
+                          <th style="padding:6px 8px;color:var(--text-muted);width:60px;">時刻</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);">発言者 / 内容</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);width:90px;">話者</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);width:150px;">ワーカー</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);text-align:right;width:105px;">初動 (TTFS)</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);text-align:right;width:75px;">倍速 (RTF)</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);text-align:right;width:75px;">余裕度</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);text-align:center;width:95px;">状態</th>
+                        </tr>
+                      </thead>
+                      <tbody id="latency-history-tbody">
+                        <tr>
+                          <td colspan="9" style="padding:14px;text-align:center;color:var(--text-dim);">まだ発話再生履歴がありません。VCで発言するとここに実測ラグが表示されます。</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <!-- 🚨 遅延・アンダーラン インシデント履歴 (原因調査用・DB永続化) -->
+                <details id="latency-incidents-panel" style="margin-top:14px;background:rgba(240,71,71,0.06);border:1px solid rgba(240,71,71,0.25);border-radius:8px;padding:10px 12px;" ontoggle="if(this.open) loadLatencyIncidents()">
+                  <summary style="cursor:pointer;font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px;">
+                    <span>🚨 遅延・アンダーラン インシデント履歴</span>
+                    <span id="latency-incidents-count" class="badge" style="background:rgba(240,71,71,0.25);color:#ff9b9b;font-size:10px;padding:2px 6px;">--</span>
+                    <span style="font-size:11px;color:var(--text-dim);font-weight:400;">音途切れ / プリロール上限 / 初動1.5s超 / RTF&gt;1.2 / クラウド切替 / キュー3s超</span>
+                  </summary>
+                  <div style="display:flex;justify-content:flex-end;margin:8px 0;">
+                    <button id="btn-reload-latency-incidents" class="btn btn-secondary btn-sm" onclick="loadLatencyIncidents()" style="padding:3px 8px;font-size:11px;">🔄 再読込</button>
+                  </div>
+                  <div style="overflow-x:auto;max-height:420px;overflow-y:auto;background:rgba(0,0,0,0.2);border-radius:6px;">
+                    <table style="width:100%;border-collapse:collapse;font-size:11px;text-align:left;">
+                      <thead style="position:sticky;top:0;background:#202225;z-index:1;">
+                        <tr>
+                          <th style="padding:6px 8px;color:var(--text-muted);width:120px;">発生日時</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);">発言者 / 内容</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);width:170px;">種別</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);width:200px;">推定原因</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);text-align:right;width:80px;">初動</th>
+                          <th style="padding:6px 8px;color:var(--text-muted);text-align:right;width:80px;">途切れ</th>
+                        </tr>
+                      </thead>
+                      <tbody id="latency-incidents-tbody">
+                        <tr><td colspan="6" style="padding:12px;text-align:center;color:var(--text-dim);">開くと読み込みます。</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+              </div>
+
+              <!-- 0. 📈 システムリソース & 各エンジン負荷推移 (30秒間隔・適応型並列制御) -->
+              <div class="card" id="system-metrics-card" style="margin-bottom:20px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      <span>📈</span> システムリソース & 各エンジン負荷推移
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                      ホストおよび各コンテナのCPU・メモリ使用量を30秒間隔で可視化（過去30分/最大60点）
+                    </div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span id="metrics-concurrency-badge" class="badge" style="background:#3ba55c;color:white;font-weight:600;padding:5px 10px;border-radius:12px;">
+                      ⚡ 並列合成モード (最大2並列)
+                    </span>
+                    <span id="metrics-active-slots-badge" class="badge" style="background:var(--bg-tertiary, #2f3136);color:var(--text-normal, #dcddde);border:1px solid var(--border-color, rgba(255,255,255,0.1));padding:5px 10px;border-radius:12px;">
+                      合成中: 0 / 2
+                    </span>
+                    <span id="metrics-last-updated" style="font-size:11px;color:var(--text-dim, #72767d);">
+                      更新: --:--:--
+                    </span>
+                  </div>
+                </div>
+
+                <!-- ノード選択タブ (MasterDebian / MasterUbuntu / OMEN2022 / OMEN2017) -->
+                <div style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:8px;flex-wrap:wrap;">
+                  <button id="metrics-tab-master" class="btn btn-sm metrics-node-tab active" onclick="switchMetricsNode('master')" style="background:#5865f2;color:white;font-weight:600;padding:4px 12px;border-radius:6px;font-size:11px;border:none;cursor:pointer;">
+                    🏢 MasterDebian (i7-7700K)
+                  </button>
+                  <button id="metrics-tab-masterubuntu" class="btn btn-sm metrics-node-tab btn-secondary" onclick="switchMetricsNode('masterubuntu')" style="padding:4px 12px;border-radius:6px;font-size:11px;cursor:pointer;">
+                    🐧 MasterUbuntu (8 Core)
+                  </button>
+                  <button id="metrics-tab-omen2022" class="btn btn-sm metrics-node-tab btn-secondary" onclick="switchMetricsNode('omen2022')" style="padding:4px 12px;border-radius:6px;font-size:11px;cursor:pointer;">
+                    🎮 OMEN2022 (RTX 3090)
+                  </button>
+                  <button id="metrics-tab-omen2017" class="btn btn-sm metrics-node-tab btn-secondary" onclick="switchMetricsNode('omen2017')" style="padding:4px 12px;border-radius:6px;font-size:11px;cursor:pointer;">
+                    💻 OMEN2017 (GTX 1060)
+                  </button>
+                </div>
+
+                <!-- グラフ凡例 -->
+                <div id="metrics-legend" style="display:flex;flex-wrap:wrap;gap:12px;font-size:12px;margin-bottom:14px;padding:8px 12px;background:rgba(0,0,0,0.2);border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
+                  <div style="display:flex;align-items:center;gap:5px;">
+                    <span style="display:inline-block;width:12px;height:12px;background:#95a5a6;border-radius:2px;"></span>
+                    <span style="color:var(--text-normal);">ホスト全体</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:5px;">
+                    <span style="display:inline-block;width:12px;height:12px;background:#5865f2;border-radius:2px;"></span>
+                    <span style="color:var(--text-normal);">Bot本体</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:5px;">
+                    <span style="display:inline-block;width:12px;height:12px;background:#2ecc71;border-radius:2px;"></span>
+                    <span style="color:var(--text-normal);">VOICEVOX</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:5px;">
+                    <span style="display:inline-block;width:12px;height:12px;background:#3498db;border-radius:2px;"></span>
+                    <span style="color:var(--text-normal);">SHAREVOX</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:5px;">
+                    <span style="display:inline-block;width:12px;height:12px;background:#9b59b6;border-radius:2px;"></span>
+                    <span style="color:var(--text-normal);">COEIROINK</span>
+                  </div>
+                </div>
+
+                <!-- グラフ表示グリッド (CPU & メモリ) -->
+                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:16px;">
+                  <!-- CPU推移グラフ -->
+                  <div style="background:rgba(0,0,0,0.15);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <span id="metrics-cpu-title" style="font-size:13px;font-weight:600;color:var(--text-normal);">🔥 CPU使用率推移 (%)</span>
+                      <span id="metrics-current-cpu" style="font-size:12px;color:#3ba55c;font-weight:600;">ホスト: --%</span>
+                    </div>
+                    <div style="position:relative;width:100%;height:180px;">
+                      <canvas id="metrics-cpu-chart" style="width:100%;height:100%;display:block;"></canvas>
+                    </div>
+                  </div>
+
+                  <!-- メモリ推移グラフ -->
+                  <div style="background:rgba(0,0,0,0.15);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                      <span id="metrics-mem-title" style="font-size:13px;font-weight:600;color:var(--text-normal);">💾 実質メモリ / VRAM使用量</span>
+                      <span id="metrics-current-mem" style="font-size:12px;color:var(--text-muted);font-weight:600;">ホスト: -- GB</span>
+                    </div>
+                    <div style="position:relative;width:100%;height:180px;">
+                      <canvas id="metrics-mem-chart" style="width:100%;height:100%;display:block;"></canvas>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- フッター説明 -->
+                <div style="margin-top:12px;font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">
+                  <span>💡</span>
+                  <span>CPU負荷適応型制御: 通常時は2並列処理、CPU 70%超過で直列化（1並列）、85%超過時はホスト保護のため即座にEdge-TTSへ退避します。</span>
+                </div>
+              </div>
+
+              <!-- 0.5. 🖥️ 分散コンピュートノード (Compute Worker) 稼働状況 -->
+              <div class="card" id="worker-nodes-card" style="margin-bottom:20px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      <span>🖥️</span> 分散コンピュートワーカー (マルチノード推論)
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                      外部GPUノードへ推論負荷を自動オフロード。VC在室連動スリープおよびオンデマンド遠隔起動に対応
+                    </div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <button id="btn-update-all-workers" class="btn btn-primary btn-sm" onclick="triggerRollingJob('update')" style="background:#5865f2;color:white;font-weight:600;padding:6px 12px;border-radius:6px;display:flex;align-items:center;gap:6px;cursor:pointer;border:none;transition:all 0.2s;" title="全ワーカーノードを1台ずつ順次ドレイン・更新・検証します">
+                      <span>⚡</span> 全ワーカー一括更新 (ローリング)
+                    </button>
+                    <button id="btn-restart-all-workers" class="btn btn-secondary btn-sm" onclick="triggerRollingJob('restart')" style="background:rgba(250,166,26,0.18);border:1px solid rgba(250,166,26,0.45);color:#ffcc66;font-weight:600;padding:6px 12px;border-radius:6px;display:flex;align-items:center;gap:6px;cursor:pointer;transition:all 0.2s;" title="全ワーカーのTTSエンジンおよびAgentコンテナを1台ずつ順次再起動します">
+                      <span>🔄</span> 全ワーカー再起動 (ローリング)
+                    </button>
+                    <span id="worker-latest-version-badge" class="badge" style="background:rgba(88,101,242,0.2);color:#8ea1e1;font-weight:600;padding:5px 10px;border-radius:12px;font-size:11px;border:1px solid rgba(88,101,242,0.3);">
+                      最新 Agent v3.13.2 (自律同期対応)
+                    </span>
+                  </div>
+                </div>
+
+                <!-- ノード一覧表示コンテナ (軽量・運用情報特化) -->
+                <div id="worker-nodes-container" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:12px;margin-bottom:12px;">
+                  <div style="background:rgba(0,0,0,0.2);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px;grid-column:1/-1;">
+                    <div style="font-size:24px;">🔄</div>
+                    <div style="flex:1;">
+                      <div style="font-weight:600;font-size:13px;color:var(--text-muted);">ワーカーノード情報を取得中...</div>
+                      <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">分散コンピュートワーカーの状態を確認しています</div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 運用手順案内リンク (ワンライナーUIはドキュメントへ集約) -->
+                <div style="background:rgba(0,0,0,0.15);padding:10px 14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);font-size:11px;color:var(--text-dim);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+                  <div>
+                    <span>💡 外部ワーカーの新規展開手順・ワンライナーコマンドは </span>
+                    <strong style="color:var(--text-normal);">WorkerAccess/README.md</strong>
+                    <span> に集約されています（主系: <code style="color:#50e6ff;">http://192.168.11.245:8088</code> / 副系: <code style="color:#50e6ff;">http://192.168.11.248:8088</code>）。</span>
+                  </div>
+                  <span class="badge" style="background:rgba(255,255,255,0.08);color:#eee;font-size:10px;padding:2px 6px;">Auto-Managed</span>
+                </div>
+              </div>
+
+              <!-- 1. ☁️ クラウドTTS 利用状況 & キャッシュ節約 (Azure / Google / Edge) -->
+              <div class="card" id="cloud-tts-usage-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                  <h3 style="font-size:15px;margin:0;">☁️ クラウドTTS 当月利用状況 (無料枠・API枠保護)</h3>
+                  <span id="tts-month-badge" class="badge" style="background:#3ba55c;color:white;">当月集計</span>
+                </div>
+
+                <!-- Azure Speech利用量 -->
+                <div style="margin-bottom:18px;">
+                  <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
+                    <span><strong>Azure Speech</strong> (東日本 japaneast / F0プラン)</span>
+                    <span id="azure-usage-text" style="font-weight:600;">0 / 500,000 文字 (0.0%)</span>
+                  </div>
+                  <div class="progress-bar-container">
+                    <div id="azure-progress-fill" class="progress-bar-fill" style="width:0%;background:linear-gradient(90deg, #0078d4, #50e6ff);"></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-top:4px;">
+                    <span id="azure-requests-text">リクエスト: 0回</span>
+                    <span id="azure-remaining-text">残り: 500,000文字 (無料枠)</span>
+                  </div>
+                </div>
+
+                <!-- Google Cloud TTS利用量 (95%ガード付き) -->
+                <div style="margin-bottom:18px;">
+                  <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
+                    <span><strong>Google Cloud TTS</strong> (東京 asia-northeast1 / <span style="color:#fbbc05;">無料枠95%リミット: 950,000文字</span>)</span>
+                    <span id="google-usage-text" style="font-weight:600;">0 / 950,000 文字 (0.0%)</span>
+                  </div>
+                  <div class="progress-bar-container">
+                    <div id="google-progress-fill" class="progress-bar-fill" style="width:0%;background:linear-gradient(90deg, #ea4335, #fbbc05);"></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-top:4px;">
+                    <span id="google-requests-text">リクエスト: 0回</span>
+                    <span id="google-remaining-text">残り: 950,000文字 (95%超過時は課金前に自動回避)</span>
+                  </div>
+                </div>
+
+                <!-- Microsoft Edge-TTS利用量 (完全無料・文字数無制限) -->
+                <div>
+                  <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
+                    <span><strong>Microsoft Edge-TTS</strong> (Neural Cloud / <span style="color:#23a55a;">完全無料・文字数無制限</span>)</span>
+                    <span id="edge-usage-text" style="font-weight:600;color:#79b8ff;">0 文字合成</span>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-top:4px;">
+                    <span id="edge-requests-text">リクエスト: 0回</span>
+                    <span style="color:#23a55a;">APIキー不要・完全無料クラウド音声</span>
+                  </div>
+                </div>
+
+                <!-- ⚡ クラウド スマートパーツキャッシュ節約状況 -->
+                <div style="margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.08);">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
+                    <span><strong>⚡ クラウド スマートパーツキャッシュ節約 (当月)</strong> (API枠保護)</span>
+                    <span id="savings-cloud-badge" style="font-weight:700;color:#79b8ff;font-size:12px;background:rgba(88,101,242,0.15);padding:4px 10px;border-radius:12px;border:1px solid rgba(88,101,242,0.3);">
+                      当月節約 0 文字 (ヒット率 0.0%)
+                    </span>
+                  </div>
+                  <div class="progress-bar-container" style="height:8px;background:rgba(255,255,255,0.08);margin-top:8px;">
+                    <div id="savings-cloud-fill" class="progress-bar-fill" style="width:0%;background:linear-gradient(90deg, #5865f2, #79b8ff);"></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-dim);margin-top:6px;">
+                    <span id="savings-cloud-hits">当月ヒット: 0回</span>
+                    <span id="savings-cloud-saved" style="color:#79b8ff;font-weight:600;">当月節約: 0文字</span>
+                    <span style="color:var(--text-muted);font-size:11px;">Azure / Google等のAPI無料枠消費を直接セーブ</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 2. 💻 ローカル音声エンジン 利用状況 & キャッシュ節約 (VOICEVOX / SHAREVOX / COEIROINK) -->
+              <div class="card" id="local-tts-usage-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                  <h3 style="font-size:15px;margin:0;">💻 ローカルTTS 当月利用状況 (完全無料・CPU負荷軽減)</h3>
+                  <div style="display:flex;align-items:center;gap:6px;">
+                    <span id="tts-month-badge-local" class="badge" style="background:#23a55a;color:white;">当月集計</span>
+                    <span class="badge" style="background:rgba(255,255,255,0.08);color:#eee;">完全無料・無制限</span>
+                  </div>
+                </div>
+
+                <!-- VOICEVOX利用量 (完全ローカル・無制限) -->
+                <div style="margin-bottom:16px;">
+                  <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
+                    <span><strong>VOICEVOX (Local Engine)</strong> (CPU版 / 全33キャラ99スタイル)</span>
+                    <span id="voicevox-usage-text" style="font-weight:600;color:#23a55a;">0 文字合成</span>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-top:4px;">
+                    <span id="voicevox-requests-text">リクエスト: 0回</span>
+                    <span style="color:#23a55a;">クラウド枠枯渇時のセーフティネットとしても常時待機</span>
+                  </div>
+                </div>
+
+                <!-- SHAREVOX利用量 -->
+                <div id="sharevox-usage-row" style="margin-bottom:16px;">
+                  <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
+                    <span><strong>SHAREVOX (Local Engine)</strong> (CPU版)</span>
+                    <span id="sharevox-usage-text" style="font-weight:600;color:#57f287;">0 文字合成</span>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-top:4px;">
+                    <span id="sharevox-requests-text">リクエスト: 0回</span>
+                    <span style="color:#57f287;">ローカル直列化ロックによりCPU競合ゼロで安定合成</span>
+                  </div>
+                </div>
+
+                <!-- COEIROINK利用量 -->
+                <div id="coeiroink-usage-row" style="margin-bottom:16px;">
+                  <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px;">
+                    <span><strong>COEIROINK (Local Engine)</strong> (CPU版)</span>
+                    <span id="coeiroink-usage-text" style="font-weight:600;color:#23a55a;">0 文字合成</span>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-top:4px;">
+                    <span id="coeiroink-requests-text">リクエスト: 0回</span>
+                    <span style="color:#23a55a;">高品質AI音声・ローカル完全無料</span>
+                  </div>
+                </div>
+
+                <!-- ⚡ ローカル スマートパーツキャッシュ節約状況 -->
+                <div style="margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.08);">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
+                    <span><strong>⚡ ローカル スマートパーツキャッシュ節約 (当月)</strong> (CPU負荷軽減)</span>
+                    <span id="savings-local-badge" style="font-weight:700;color:#57f287;font-size:12px;background:rgba(35,165,90,0.15);padding:4px 10px;border-radius:12px;border:1px solid rgba(35,165,90,0.3);">
+                      当月節約 0 文字 (ヒット率 0.0%)
+                    </span>
+                  </div>
+                  <div class="progress-bar-container" style="height:8px;background:rgba(255,255,255,0.08);margin-top:8px;">
+                    <div id="savings-local-fill" class="progress-bar-fill" style="width:0%;background:linear-gradient(90deg, #23a55a, #57f287);"></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-dim);margin-top:6px;">
+                    <span id="savings-local-hits">当月ヒット: 0回</span>
+                    <span id="savings-local-saved" style="color:#57f287;font-weight:600;">当月節約: 0文字</span>
+                    <span style="color:var(--text-muted);font-size:11px;">CPUニューラル推論を回避し0.01秒で即時再生</span>
+                  </div>
+                </div>
+              </div>
+              <!-- 📊 キャッシュ統計ダッシュボード (D-2) -->
+              <div class="card" id="cache-stats-summary-card" style="margin-bottom:16px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      📊 キャッシュ効率 ＆ 合成統計ダッシュボード
+                      <span id="cs-efficiency-badge" class="badge" style="background:linear-gradient(135deg, #23a55a, #57f287);color:black;font-weight:700;font-size:11px;">ヒット効率: --%</span>
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">永続DBおよびL1メモリキャッシュの累積ヒット・推論削減効果</div>
+                  </div>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="loadCacheStatsSummary()" style="padding:4px 10px;font-size:12px;">統計更新 🔄</button>
+                </div>
+
+                <!-- 4連サマリーメトリクス -->
+                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:12px;margin-bottom:14px;">
+                  <div style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:12px;">
+                    <div style="font-size:11px;color:var(--text-muted);">総キャッシュファイル</div>
+                    <div style="font-size:18px;font-weight:700;color:var(--text-main);margin-top:4px;" id="cs-total-files">--</div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:2px;" id="cs-total-bytes">容量: -- MB</div>
+                  </div>
+                  <div style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:12px;">
+                    <div style="font-size:11px;color:var(--text-muted);">累積ヒット回数</div>
+                    <div style="font-size:18px;font-weight:700;color:#57f287;margin-top:4px;" id="cs-total-hits">--</div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">推論完全スキップ</div>
+                  </div>
+                  <div style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:12px;">
+                    <div style="font-size:11px;color:var(--text-muted);">L1 インメモリキャッシュ</div>
+                    <div style="font-size:18px;font-weight:700;color:#00b0f4;margin-top:4px;" id="cs-l1-items">-- / 100 件</div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:2px;" id="cs-l1-bytes">メモリ使用: -- KB</div>
+                  </div>
+                  <div style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:12px;">
+                    <div style="font-size:11px;color:var(--text-muted);">今月のTTSリクエスト</div>
+                    <div style="font-size:18px;font-weight:700;color:#fee75c;margin-top:4px;" id="cs-monthly-reqs">-- 回</div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:2px;" id="cs-monthly-chars">文字数: -- 字</div>
+                  </div>
+                </div>
+
+                <!-- プロバイダー別キャッシュ内訳 & トップ単語 -->
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                  <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:12px;">
+                    <div style="font-size:12px;font-weight:600;margin-bottom:8px;color:var(--text-main);">🎙️ プロバイダー別キャッシュ保有</div>
+                    <div id="cs-providers-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px;">
+                      <span style="color:var(--text-muted);">集計中...</span>
+                    </div>
+                  </div>
+                  <div style="background:rgba(0,0,0,0.2);border-radius:8px;padding:12px;">
+                    <div style="font-size:12px;font-weight:600;margin-bottom:8px;color:var(--text-main);">🔥 高頻度ヒット単語 TOP 5</div>
+                    <div id="cs-top-words-list" style="display:flex;flex-direction:column;gap:6px;font-size:12px;">
+                      <span style="color:var(--text-muted);">集計中...</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 音声キャッシュ管理 (Cloud 10GB & VOICEVOX 20GB 完全分離) -->
+              <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">
+                  <h3 style="font-size:15px;margin:0;">💾 音声キャッシュ管理 (完全分離ストレージ)</h3>
+                  <div style="display:flex;gap:8px;">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="scanCacheIntegrity()" id="cache-scan-btn">キャッシュ健全性スキャン 🔍</button>
+                    <button type="button" class="btn btn-danger btn-sm" onclick="purgeCache('all')">全キャッシュパージ 🗑️</button>
+                  </div>
+                </div>
+
+                <!-- キャッシュ健全性スキャン診断結果 (動的表示) -->
+                <div id="cache-scan-result-card" style="display:none;background:rgba(88,101,242,0.1);border:1px solid rgba(88,101,242,0.3);border-radius:8px;padding:14px;margin-bottom:14px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-weight:600;font-size:13px;" id="cache-scan-title">🔍 キャッシュ診断結果</span>
+                    <span id="cache-scan-badge" class="badge" style="background:#23a55a;color:white;font-size:11px;">健全</span>
+                  </div>
+                  <div id="cache-scan-details" style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.5;"></div>
+                </div>
+
+                <!-- 1. クラウドTTS用キャッシュ (10GB) -->
+                <div style="background:rgba(0,0,0,0.2);padding:14px;border-radius:8px;margin-bottom:14px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-size:14px;font-weight:600;">☁️ クラウドTTS キャッシュ (Azure / Google)</span>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="purgeCache('cloud')" style="font-size:12px;padding:4px 10px;">Cloudのみパージ</button>
+                  </div>
+                  <div class="progress-bar-container" style="margin-top:10px;">
+                    <div id="cache-progress-fill" class="progress-bar-fill" style="width:0%;background:linear-gradient(90deg, #0078d4, #50e6ff);"></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-top:6px;">
+                    <span>使用量: <strong id="cache-used-text" style="color:var(--text-main);">0 MB</strong></span>
+                    <span>ファイル数: <strong id="cache-files-text" style="color:var(--text-main);">0 個</strong></span>
+                    <span>上限: <strong id="cache-max-text" style="color:var(--text-main);">10.0 GB</strong> (目標: 8.5 GB)</span>
+                  </div>
+                </div>
+
+                <!-- 2. ローカルエンジン用ボリューム キャッシュ (20GB) -->
+                <div style="background:rgba(0,0,0,0.2);padding:14px;border-radius:8px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-size:14px;font-weight:600;">🎙️ ローカルエンジン用キャッシュ (VOICEVOX / SHAREVOX / COEIROINK / OpenJTalk - 20GB)</span>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="purgeCache('voicevox')" style="font-size:12px;padding:4px 10px;">ローカル用のみパージ</button>
+                  </div>
+                  <div class="progress-bar-container" style="margin-top:10px;">
+                    <div id="vv-cache-progress-fill" class="progress-bar-fill" style="width:0%;background:linear-gradient(90deg, #23a55a, #57f287);"></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted);margin-top:6px;">
+                    <span>使用量: <strong id="vv-cache-used-text" style="color:var(--text-main);">0 MB</strong></span>
+                    <span>ファイル数: <strong id="vv-cache-files-text" style="color:var(--text-main);">0 個</strong></span>
+                    <span>上限: <strong id="vv-cache-max-text" style="color:var(--text-main);">20.0 GB</strong> (目標: 17.0 GB)</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 📁 キャッシュファイルエクスプローラー -->
+              <div class="card" id="cache-explorer-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      📁 キャッシュファイルエクスプローラー
+                      <span id="ce-count-badge" class="badge" style="background:#5865f2;color:white;font-size:11px;">0件</span>
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">ストレージ内のWAV音声をブラウザ上で直接試聴・検索・個別削除できます</div>
+                  </div>
+                  <!-- 切り替えタブ (Cloud / Local) -->
+                  <div style="display:flex;gap:6px;background:rgba(0,0,0,0.3);padding:3px;border-radius:6px;">
+                    <button type="button" class="btn btn-sm btn-primary" id="ce-tab-cloud" onclick="switchCacheExplorerTarget('cloud')" style="padding:4px 12px;font-size:12px;">☁️ クラウド (10GB)</button>
+                    <button type="button" class="btn btn-sm btn-secondary" id="ce-tab-local" onclick="switchCacheExplorerTarget('local')" style="padding:4px 12px;font-size:12px;">💻 ローカル (20GB)</button>
+                  </div>
+                </div>
+
+                <!-- ツールバー（検索・ソート・一括削除・更新） -->
+                <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;align-items:center;">
+                  <div style="flex:1;min-width:220px;">
+                    <input type="text" id="ce-search-input" placeholder="🔍 発言テキスト、話者名、ハッシュで検索..." class="input-field" style="width:100%;font-size:13px;padding:6px 10px;" oninput="onCacheExplorerSearch()">
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <button type="button" class="btn btn-danger btn-sm" id="ce-batch-delete-btn" onclick="deleteSelectedCacheFiles()" disabled style="padding:5px 12px;font-size:12px;display:none;">🗑️ 選択した 0件を削除</button>
+                    <label style="font-size:12px;color:var(--text-muted);">並び順:</label>
+                    <select id="ce-sort-select" class="input-field" style="font-size:12px;padding:5px 8px;width:auto;" onchange="loadCacheExplorerFiles()">
+                      <option value="mtime_desc">新しい順 ⏱️</option>
+                      <option value="mtime_asc">古い順 ⌛</option>
+                      <option value="hits_desc">再利用数順 🔥</option>
+                      <option value="size_desc">サイズ大 📦</option>
+                      <option value="size_asc">サイズ小 📄</option>
+                      <option value="text_asc">発言順 🔤</option>
+                    </select>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="loadCacheExplorerFiles()" title="一覧を更新">🔄 更新</button>
+                  </div>
+                </div>
+
+                <!-- ファイル一覧テーブル -->
+                <div style="overflow-x:auto;border:1px solid rgba(255,255,255,0.08);border-radius:6px;">
+                  <table style="width:100%;border-collapse:collapse;font-size:13px;text-align:left;">
+                    <thead>
+                      <tr style="background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.08);color:var(--text-muted);">
+                        <th style="padding:8px 10px;width:36px;text-align:center;">
+                          <input type="checkbox" id="ce-select-all" onchange="toggleSelectAllCacheFiles(this.checked)" style="cursor:pointer;">
+                        </th>
+                        <th style="padding:8px 10px;width:56px;text-align:center;">試聴</th>
+                        <th style="padding:8px 12px;min-width:180px;">発言テキスト (内容)</th>
+                        <th style="padding:8px 12px;width:140px;">話者 / モデル</th>
+                        <th style="padding:8px 10px;width:70px;text-align:center;">種別</th>
+                        <th style="padding:8px 10px;width:75px;text-align:center;">再利用</th>
+                        <th style="padding:8px 12px;width:105px;">サイズ / 秒</th>
+                        <th style="padding:8px 12px;width:160px;">保存日時 (JST)</th>
+                        <th style="padding:8px 12px;text-align:right;width:70px;">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="ce-file-list-tbody">
+                      <tr>
+                        <td colspan="9" style="text-align:center;padding:24px;color:var(--text-muted);">読み込み中...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <!-- ページネーション & 件数表示 -->
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--text-muted);">
+                  <span id="ce-pagination-info">0 - 0 / 全 0 件</span>
+                  <div style="display:flex;gap:6px;">
+                    <button type="button" class="btn btn-secondary btn-sm" id="ce-prev-btn" onclick="prevCacheExplorerPage()" disabled>&lt; 前へ</button>
+                    <span id="ce-page-indicator" style="display:flex;align-items:center;padding:0 8px;font-weight:600;">1 / 1</span>
+                    <button type="button" class="btn btn-secondary btn-sm" id="ce-next-btn" onclick="nextCacheExplorerPage()" disabled>次へ &gt;</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 🔄 音声モデル & エンジン更新管理 -->
+              <div class="card" id="models-updater-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      🔄 音声モデル & エンジン更新管理
+                      <span id="model-updater-total-badge" class="badge" style="background:#5865f2;color:white;font-size:11px;">集計中...</span>
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">COEIROINK公認モデル（全14キャラ・78スタイル）や各種エンジンの最新状態確認・一括追加が可能です</div>
+                  </div>
+                  <div style="display:flex;gap:8px;">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="checkModelsStatus()" id="check-models-btn">最新状態を確認 🔍</button>
+                    <button type="button" class="btn btn-primary btn-sm" onclick="triggerDownloadAllModels()" id="download-all-models-btn">COEIROINK公認モデルを一括取得 📥</button>
+                  </div>
+                </div>
+
+                <!-- プログレスバー（ダウンロード中のみ表示） -->
+                <div id="model-download-progress-container" style="display:none;background:rgba(88,101,242,0.1);border:1px solid rgba(88,101,242,0.3);border-radius:8px;padding:12px;margin-bottom:14px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;margin-bottom:6px;">
+                    <span id="model-progress-msg" style="font-weight:600;">ダウンロードを準備中...</span>
+                    <span id="model-progress-pct" style="font-weight:bold;color:var(--primary);">0%</span>
+                  </div>
+                  <div class="progress-bar-container">
+                    <div id="model-progress-fill" class="progress-bar-fill" style="width:0%;background:linear-gradient(90deg, #eb459e, #5865f2);"></div>
+                  </div>
+                </div>
+
+                <!-- 各エンジンのステータスチップ -->
+                <div id="engine-status-chips" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+                  <!-- 動的にチップを生成 -->
+                </div>
+
+                <!-- COEIROINK公認モデル導入状況テーブル -->
+                <div style="overflow-x:auto;border:1px solid rgba(255,255,255,0.08);border-radius:6px;">
+                  <table style="width:100%;border-collapse:collapse;font-size:13px;text-align:left;">
+                    <thead>
+                      <tr style="background:rgba(255,255,255,0.03);border-bottom:1px solid rgba(255,255,255,0.08);color:var(--text-muted);">
+                        <th style="padding:8px 12px;">キャラクター名</th>
+                        <th style="padding:8px 12px;width:100px;">バージョン</th>
+                        <th style="padding:8px 12px;width:140px;">導入スタイル</th>
+                        <th style="padding:8px 12px;width:120px;">ステータス</th>
+                        <th style="padding:8px 12px;text-align:right;width:120px;">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="coeiroink-models-tbody">
+                      <tr>
+                        <td colspan="5" style="text-align:center;padding:20px;color:var(--text-muted);">読み込み中...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <!-- 🎨 MYCOEIROINK 配布音声ライブラリ (有志配布モデル一覧) -->
+              <div class="card" id="mycoe-library-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      🎨 MYCOEIROINK 配布音声ライブラリ
+                      <span id="mycoe-total-badge" class="badge" style="background:#ec4899;color:white;font-size:11px;">取得中...</span>
+                      <span id="mycoe-installed-count-badge" class="badge" style="background:#23a55a;color:white;font-size:11px;display:none;">導入済: 0</span>
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
+                      COEIROINK公式に登録されている有志制作の配布キャラクター（600名以上）の情報を任意/一括取得し、試聴や配布元を確認できます
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <span id="mycoe-synced-time" style="font-size:11px;color:var(--text-dim);"></span>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="syncMyCoeiroink()" id="mycoe-sync-btn" style="border-color:#ec4899;color:#ec4899;">
+                      🔄 公式配布情報を一括同期
+                    </button>
+                  </div>
+                </div>
+
+                <!-- 検索 & フィルターバー -->
+                <div style="display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center;">
+                  <div style="flex:1;min-width:240px;">
+                    <input type="text" id="mycoe-search-input" placeholder="🔍 キャラクター名、スタイル名、UUIDで検索 (例: あみたろ, 松嘩りすく, 少年, 猫)..." class="input-field" style="width:100%;font-size:13px;padding:6px 10px;" oninput="onMyCoeSearchInput()">
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <select id="mycoe-filter-installed" class="input-field" style="font-size:12px;padding:6px 10px;width:auto;" onchange="onMyCoeFilterChange()">
+                      <option value="all">すべて表示</option>
+                      <option value="installed">導入済みのみ 🟢</option>
+                      <option value="not_installed">未導入のみ ⚪</option>
+                    </select>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="loadMyCoeiroinkList(1)" title="再読み込み">🔄</button>
+                  </div>
+                </div>
+
+                <!-- カードグリッドコンテナ -->
+                <div id="mycoe-cards-grid" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));gap:12px;max-height:560px;overflow-y:auto;padding-right:4px;">
+                  <div style="text-align:center;padding:30px;color:var(--text-muted);grid-column:1/-1;">読み込み中...</div>
+                </div>
+
+                <!-- ページネーションコントロール -->
+                <div id="mycoe-pagination" style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;">
+                  <button type="button" class="btn btn-secondary btn-sm" id="mycoe-prev-btn" onclick="changeMyCoePage(-1)" disabled>◀ 前のページ</button>
+                  <span id="mycoe-page-info" style="color:var(--text-muted);">1 / 1</span>
+                  <button type="button" class="btn btn-secondary btn-sm" id="mycoe-next-btn" onclick="changeMyCoePage(1)" disabled>次のページ ▶</button>
+                </div>
+              </div>
+
+
+              <!-- 稼働中Botプール一覧 (複数VC対応) -->
+              <div class="card" id="bot-pool-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                  <h3 style="font-size:15px;margin:0;">🤖 稼働中Botプール一覧 (複数VC・複数サーバー同時利用)</h3>
+                  <span id="bot-pool-count-badge" class="badge" style="background:#5865f2;color:white;">集計中...</span>
+                </div>
+                <div id="bot-pool-container" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));gap:10px;">
+                  <!-- 動的にレンダリング -->
+                </div>
+              </div>
+
+              <!-- Bot参加中サーバー -->
+              <div class="card">
+                <h3 style="font-size:15px;margin-bottom:12px;">🌐 Bot参加中サーバー & 接続VC</h3>
+                <div id="guilds-list-container">
+                  <!-- 動的にレンダリング -->
+                </div>
+              </div>
+
+              <!-- ログ表示 -->
+              <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+                  <div style="display:flex;align-items:center;gap:10px;">
+                    <h3 style="font-size:15px;margin:0;">📋 直近のログ (最新50行)</h3>
+                    <select id="log-type-select" class="form-input" style="padding:4px 10px;font-size:12px;width:auto;" onchange="loadLogs()">
+                      <option value="bot">bot.log (全体・VC読み上げ)</option>
+                      <option value="web">web.log (WebUIアクセス・認証)</option>
+                      <option value="engine">engine.log (ローカルエンジン集約)</option>
+                    </select>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:12px;">
+                    <label style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px;cursor:pointer;">
+                      <input type="checkbox" onchange="toggleLogAutoRefresh(this)"> 3秒ごとに自動更新
+                    </label>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="loadLogs()">再読み込み</button>
+                  </div>
+                </div>
+                <div id="log-terminal" class="log-terminal">ログを読み込み中...</div>
+              </div>
+
+              <!-- 🖥️ 分散ワーカーノード リアルタイムログ -->
+              <div class="card" id="worker-logs-card" style="border-left:4px solid #50e6ff;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+                  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:6px;">
+                      <span>🖥️</span> <span>分散ワーカーノード リアルタイムログ</span>
+                    </h3>
+                    <select id="worker-log-node-select" class="form-input" style="padding:4px 10px;font-size:12px;width:auto;" onchange="onWorkerLogNodeChanged()">
+                      <option value="worker_MASTERSOMEN2022">OMEN2022 (RTX 3090)</option>
+                      <option value="worker_MASTEROMEN2017">OMEN2017 (GTX 1080 Ti)</option>
+                      <option value="worker_MasterDebian">MasterDebian (CPU)</option>
+                      <option value="worker_MasterUbuntu">MasterUbuntu (8 Core)</option>
+                    </select>
+                    <div style="display:flex;gap:4px;background:rgba(0,0,0,0.3);padding:2px;border-radius:6px;" id="worker-log-target-tabs">
+                      <button type="button" class="btn btn-sm btn-primary" onclick="switchWorkerLogTarget('agent')" id="wlog-tab-agent" style="padding:3px 10px;font-size:11px;">Agent ログ</button>
+                      <button type="button" class="btn btn-sm btn-secondary" onclick="switchWorkerLogTarget('voicevox')" id="wlog-tab-voicevox" style="padding:3px 10px;font-size:11px;">VOICEVOX</button>
+                      <button type="button" class="btn btn-sm btn-secondary" onclick="switchWorkerLogTarget('coeiroink')" id="wlog-tab-coeiroink" style="padding:3px 10px;font-size:11px;">COEIROINK</button>
+                      <button type="button" class="btn btn-sm btn-secondary" onclick="switchWorkerLogTarget('sharevox')" id="wlog-tab-sharevox" style="padding:3px 10px;font-size:11px;">SHAREVOX</button>
+                    </div>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:12px;">
+                    <span id="worker-log-status-badge" class="badge" style="background:#5865f2;color:white;font-size:10px;padding:3px 7px;">待機中</span>
+                    <label style="font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px;cursor:pointer;">
+                      <input type="checkbox" id="worker-log-auto-refresh" onchange="toggleWorkerLogAutoRefresh(this)"> 5秒自動更新
+                    </label>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="loadWorkerLogs(true)" title="対象ワーカーへリアルタイム取得をリクエスト">🔄 最新取得</button>
+                  </div>
+                </div>
+                <div id="worker-log-terminal" class="log-terminal" style="max-height:360px;min-height:180px;font-family:Consolas, 'Courier New', monospace;font-size:11px;line-height:1.45;background:#0d1117;color:#c9d1d9;padding:12px;border-radius:6px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">ワーカーログを読み込み中...</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 5. ヘルプ・利用規約タブ -->
+          <section id="tab-help" class="tab-pane">
+            <div class="section-title">ℹ️ ヘルプ・利用規約 & クレジット表記ガイドライン</div>
+            <div class="section-desc">
+              本Botに搭載されている各種音声合成モデルの利用規約、クレジット表記の遵守事項、およびBotの使い方一覧です。<br>
+              ボットの読み上げ音声を録音・配信・動画投稿等に利用される場合は、各提供元の規約を必ず遵守してください。
+            </div>
+
+            <!-- クレジット表記ルール概要カード -->
+            <div class="card" style="border-left:4px solid #5865f2;margin-bottom:20px;">
+              <h3 style="margin-top:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+                <span>📜 音声合成エンジンのクレジット表記ルール (必須)</span>
+              </h3>
+              <p style="font-size:13px;line-height:1.6;color:var(--text-main);">
+                本Botで生成された音声や録音物、動画などを一般公開・配信される際は、以下の通りクレジット表記を行ってください。
+              </p>
+
+              <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:16px;margin-top:14px;">
+                <div style="background:var(--bg-card-hover);padding:14px;border-radius:8px;border:1px solid var(--border-color);">
+                  <div style="font-weight:700;color:#23a55a;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+                    <span class="badge" style="background:#23a55a;color:white;">VOICEVOX</span>
+                    <span>ローカル音声合成</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                    音声を利用・配信・動画化する際は、<strong>クレジット表記が必須</strong>です。<br>
+                    <strong>【表記例】</strong> <code>VOICEVOX:ずんだもん</code> / <code>VOICEVOX:四国めたん</code><br>
+                    🔗 <a href="https://voicevox.hiroshiba.jp/" target="_blank" rel="noopener" style="color:var(--primary);">VOICEVOX 公式サイト・共通利用規約 ↗</a><br>
+                    <span style="font-size:11px;color:var(--text-dim);">※各キャラクターごとの個別規約（商用利用条件等）も遵守してください。</span>
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:14px;border-radius:8px;border:1px solid var(--border-color);">
+                  <div style="font-weight:700;color:#f59e0b;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+                    <span class="badge" style="background:#f59e0b;color:white;">SHAREVOX</span>
+                    <span>ローカル音声合成</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                    音声を利用・配信・動画化する際は、<strong>クレジット表記が必須</strong>です。<br>
+                    <strong>【表記例】</strong> <code>SHAREVOX:小春音アミ</code> / <code>SHAREVOX:つくよみちゃん</code><br>
+                    🔗 <a href="https://sharevox.app/terms" target="_blank" rel="noopener" style="color:var(--primary);">SHAREVOX 公式利用規約 ↗</a><br>
+                    <span style="font-size:11px;color:var(--text-dim);">※各キャラクターごとの個別規約も遵守してください。</span>
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:14px;border-radius:8px;border:1px solid var(--border-color);">
+                  <div style="font-weight:700;color:#ec4899;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+                    <span class="badge" style="background:#ec4899;color:white;">COEIROINK</span>
+                    <span>ローカル音声合成</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                    音声を利用・配信・動画化する際は、<strong>クレジット表記が必須</strong>です。<br>
+                    <strong>【表記例】</strong> <code>COEIROINK:つくよみちゃん</code><br>
+                    🔗 <a href="https://coeiroink.com/terms" target="_blank" rel="noopener" style="color:var(--primary);">COEIROINK 公式利用規約 ↗</a><br>
+                    <span style="font-size:11px;color:var(--text-dim);">※各キャラクターごとの個別規約も遵守してください。</span>
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:14px;border-radius:8px;border:1px solid var(--border-color);">
+                  <div style="font-weight:700;color:#00a4ef;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+                    <span class="badge" style="background:#00a4ef;color:white;">Edge-TTS</span>
+                    <span>Microsoft Edge Neural</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                    Microsoft Edge の高品質ニューラル音声技術（Nanami, Keita）を利用しています。<br>
+                    <strong>【帰属表記】</strong> <code>Powered by Microsoft Edge Text-to-Speech</code><br>
+                    <span style="font-size:11px;color:var(--text-dim);">※個人利用・コミュニティVC向けに無料で提供されています。</span>
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:14px;border-radius:8px;border:1px solid var(--border-color);">
+                  <div style="font-weight:700;color:#0078d4;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+                    <span class="badge" style="background:#0078d4;color:white;">Azure Speech</span>
+                    <span>Microsoft Azure AI</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                    東日本リージョンの Microsoft Azure Cognitive Services Speech を利用しています。<br>
+                    <strong>【帰属表記】</strong> <code>Powered by Microsoft Azure AI Speech</code>
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:14px;border-radius:8px;border:1px solid var(--border-color);">
+                  <div style="font-weight:700;color:#ea4335;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+                    <span class="badge" style="background:#ea4335;color:white;">Google Cloud</span>
+                    <span>Text-to-Speech API</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                    東京リージョンの Google Cloud Text-to-Speech API (Neural2 / WaveNet / Standard) を利用しています。<br>
+                    <strong>【帰属表記】</strong> <code>Powered by Google Cloud Text-to-Speech</code>
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:14px;border-radius:8px;border:1px solid var(--border-color);">
+                  <div style="font-weight:700;color:#0ea5e9;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+                    <span class="badge" style="background:#0ea5e9;color:white;">OpenJTalk</span>
+                    <span>名古屋工業大学 & ゆっくり風</span>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                    名古屋工業大学の HTS Voice（メイ・たくみ・標準男声）およびゆっくり風音声を利用しています。<br>
+                    <strong>【表記例】</strong> <code>Open JTalk (名古屋工業大学 MMDAgent)</code><br>
+                    🔗 <a href="http://open-jtalk.sourceforge.net/" target="_blank" rel="noopener" style="color:var(--primary);">Open JTalk 公式サイト ↗</a><br>
+                    <span style="font-size:11px;color:var(--text-dim);">※非営利・個人利用は自由にご利用いただけます。</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- VOICEVOX全キャラクター個別規約テーブルカード -->
+            <div class="card" style="margin-bottom:20px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:14px;">
+                <h3 style="margin:0;font-size:16px;">👥 ローカルTTS (VOICEVOX / SHAREVOX / COEIROINK) 搭載キャラクター一覧 & 個別利用規約リンク</h3>
+                <input type="text" id="terms-search-input" class="form-input" placeholder="🔍 キャラクター名を検索..." style="width:auto;min-width:240px;font-size:12px;padding:6px 12px;" oninput="onTermsSearchInput(this.value)">
+              </div>
+              <div style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">
+                各キャラクターの声を外部配信や動画等で使用する際は、キャラクターごとの公式利用規約（商用利用ガイドラインやクレジット表記ルール）をご確認の上ご利用ください。
+              </div>
+
+              <div style="overflow-x:auto;">
+                <table class="table" style="width:100%;font-size:13px;border-collapse:collapse;" id="character-terms-table">
+                  <thead>
+                    <tr style="border-bottom:2px solid var(--border-color);text-align:left;">
+                      <th style="padding:10px 12px;">キャラクター名</th>
+                      <th style="padding:10px 12px;">推奨クレジット表記例</th>
+                      <th style="padding:10px 12px;">権利者・サークル</th>
+                      <th style="padding:10px 12px;text-align:center;">個別利用規約</th>
+                    </tr>
+                  </thead>
+                  <tbody id="character-terms-tbody">
+                    <!-- JavaScriptで動的生成 -->
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- Botの使い方・コマンド一覧カード -->
+            <div class="card">
+              <h3 style="margin-top:0;font-size:16px;margin-bottom:14px;">📖 Botの使い方 & スラッシュコマンド一覧</h3>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(300px, 1fr));gap:12px;">
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/join</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    コマンドを実行したユーザーが現在接続しているボイスチャンネルにBotを接続させます。
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/leave</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    現在接続しているボイスチャンネルからBotを切断します。
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/skip</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    現在再生中の音声および待機中の読み上げキューを直ちにスキップします。
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/voice</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    あなたの現在の個人音声設定を確認し、簡易ドロップダウンから声質を変更できます。
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/dict add &lt;単語&gt; &lt;読み&gt;</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    サーバー専用の単語辞書に単語と読み仮名を登録します（即座にキャッシュが更新されます）。
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/dict delete &lt;単語&gt;</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    サーバー専用の単語辞書から指定した単語を削除します。
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/dict list</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    現在サーバーに登録されている単語辞書の一覧を表示します。
+                  </div>
+                </div>
+
+                <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
+                  <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/info</div>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    Botの動作情報、搭載TTSエンジン、利用規約およびクレジット表記ルールを表示します。
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        `);
+      }
+    </script>
+
+  </main>
+
+  <!-- 単語辞書一括インポートモーダル -->
+  <div id="dict-batch-modal" class="modal-backdrop" style="display:none;" onclick="closeDictBatchImportModal(event)">
+    <div class="modal-card" style="max-width:720px;" onclick="event.stopPropagation()">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3 style="margin:0;font-size:17px;">📋 単語辞書のテキスト一括インポート</h3>
+        <button type="button" class="btn btn-secondary btn-sm" style="padding:2px 8px;font-size:12px;line-height:1;" onclick="closeDictBatchImportModal()">✕</button>
+      </div>
+      <p style="font-size:13px;color:var(--text-muted);line-height:1.5;margin-bottom:14px;">
+        「単語：読み方」形式のテキストを貼り付けて、まとめて辞書に追加・更新できます。<br>
+        <strong>完全重複（単語と読みが一致）は自動的にスキップ</strong>されます。読み方が異なる重複は選択できます。
+      </p>
+
+      <div style="margin-bottom:14px;">
+        <label class="form-label" style="font-size:12px;margin-bottom:6px;display:block;">入力テキスト (コピペ用):</label>
+        <textarea id="dict-batch-textarea" class="form-input" rows="6" style="width:100%;font-family:monospace;font-size:13px;resize:vertical;"
+          placeholder="m2o：えむつーおー&#10;【】ーnannanー【杖&宝珠】：なんなん&#10;【ど】henya【鎌】 —：へにゃ&#10;【ど】十文字【宝洋弓】：じゅうもんじ&#10;【ど】henya【鎌】：へにゃ&#10;【ど】oty【杖】：おつや"
+          oninput="onDictBatchInputChanged()"></textarea>
+      </div>
+
+      <!-- 解析結果プレビュー & 重複制御 -->
+      <div id="dict-batch-preview-container" style="margin-bottom:18px;display:none;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
+          <div style="font-size:12px;font-weight:600;color:var(--text-main);display:flex;align-items:center;gap:8px;">
+            <span>🔍 解析結果:</span>
+            <span class="badge" style="background:#23a55a;color:white;font-size:11px;" id="dict-batch-badge-new">新規: 0</span>
+            <span class="badge" style="background:#f39c12;color:white;font-size:11px;display:none;" id="dict-batch-badge-conflict">競合: 0</span>
+            <span class="badge" style="background:#5c6069;color:white;font-size:11px;" id="dict-batch-badge-identical">完全重複(除外): 0</span>
+            <span id="dict-batch-skip-info" style="font-size:11px;color:#ff9f43;display:none;"></span>
+          </div>
+          <!-- 競合一括切り替えボタン -->
+          <div id="dict-batch-conflict-actions" style="display:none;gap:6px;">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="setAllDictConflicts(true)" style="padding:2px 8px;font-size:11px;">競合を全て上書き</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="setAllDictConflicts(false)" style="padding:2px 8px;font-size:11px;">競合を全てスキップ</button>
+          </div>
+        </div>
+
+        <div style="max-height:220px;overflow-y:auto;background:rgba(0,0,0,0.3);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;">
+          <table style="width:100%;font-size:12px;border-collapse:collapse;" id="dict-batch-preview-table">
+            <thead>
+              <tr style="color:var(--text-muted);border-bottom:1px solid rgba(255,255,255,0.08);text-align:left;">
+                <th style="padding:6px 8px;width:110px;">ステータス/選択</th>
+                <th style="padding:6px 8px;">単語</th>
+                <th style="padding:6px 8px;">入力された読み方</th>
+                <th style="padding:6px 8px;width:150px;">既存の辞書</th>
+              </tr>
+            </thead>
+            <tbody id="dict-batch-preview-tbody">
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="display:flex;justify-content:flex-end;gap:10px;">
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeDictBatchImportModal()">キャンセル</button>
+        <button type="button" id="dict-batch-submit-btn" class="btn btn-primary btn-sm" onclick="executeDictBatchImport()" disabled>
+          インポートを実行 (0件)
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ユーザー名インポートモーダル -->
+  <div id="user-import-modal" class="modal-backdrop" style="display:none;" onclick="closeUserImportModal(event)">
+    <div class="modal-card" onclick="event.stopPropagation()">
+      <h3 style="margin-top:0;font-size:17px;">📥 サーバー表示名を単語辞書にインポート</h3>
+      <p style="font-size:13px;color:var(--text-muted);line-height:1.5;margin-bottom:18px;">
+        メンバーのサーバー表示名（ニックネーム等）を単語辞書に登録し、メンションや呼びかけが自然な発音で読み上げられるようにします。
+      </p>
+      <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:20px;">
+        <button type="button" class="btn btn-secondary" onclick="executeUserImport('me')" style="text-align:left;padding:14px;border:1px solid var(--border-color);border-radius:8px;">
+          <div style="font-weight:600;font-size:14px;color:var(--text-main);margin-bottom:4px;">👤 自分のみインポート</div>
+          <div style="font-size:12px;color:var(--text-dim);">あなたの現在のサーバー表示名（<span id="import-my-name-preview" style="color:var(--primary);font-weight:bold;">読み込み中</span>）を単語として追加します</div>
+        </button>
+        <button type="button" class="btn btn-primary" onclick="executeUserImport('all')" style="text-align:left;padding:14px;border-radius:8px;">
+          <div style="font-weight:600;font-size:14px;margin-bottom:4px;">👥 サーバー全員をインポート</div>
+          <div style="font-size:12px;color:rgba(255,255,255,0.85);">このサーバーの全参加メンバー（非Bot）の表示名を辞書に一括登録します</div>
+        </button>
+      </div>
+      <div style="display:flex;justify-content:flex-end;">
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeUserImportModal()">キャンセル</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MYCOEIROINK ZIP手動アップロードモーダル -->
+  <div id="mycoe-upload-modal" class="modal-backdrop" style="display:none;" onclick="closeMyCoeUploadModal(event)">
+    <div class="modal-card" style="max-width:540px;" onclick="event.stopPropagation()">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:6px;">
+          📁 MYCOEIROINK モデル ZIPアップロード
+        </h3>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeMyCoeUploadModal()" style="padding:2px 8px;">✕</button>
+      </div>
+      <p style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:14px;">
+        BOOTH等の外部サイトからダウンロードしたZIPファイルをアップロードして導入します。<br>
+        <span style="color:var(--text-dim);font-size:11px;">※Zip Slip対策・危険ファイル検査などの厳格な安全バリデーションを実施の上、COEIROINKエンジンに安全配置されます。</span>
+      </p>
+
+      <div id="mycoe-target-speaker-info" style="background:rgba(236,72,153,0.1);border:1px solid rgba(236,72,153,0.3);border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:12px;display:none;">
+        対象話者: <strong id="mycoe-target-speaker-name" style="color:#ec4899;">-</strong> (UUID: <code id="mycoe-target-speaker-uuid" style="font-size:11px;">-</code>)
+      </div>
+
+      <!-- ドロップゾーン -->
+      <div id="mycoe-drop-zone" style="border:2px dashed rgba(255,255,255,0.2);border-radius:10px;padding:32px 20px;text-align:center;background:rgba(0,0,0,0.2);cursor:pointer;transition:border-color 0.2s, background 0.2s;" onclick="document.getElementById('mycoe-zip-input').click()" ondragover="onMyCoeDragOver(event)" ondragleave="onMyCoeDragLeave(event)" ondrop="onMyCoeDrop(event)">
+        <div style="font-size:36px;margin-bottom:8px;">📦</div>
+        <div style="font-weight:600;font-size:14px;margin-bottom:4px;color:var(--text-main);">ZIPファイルをここにドラッグ＆ドロップ</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">またはクリックしてファイルを選択 (最大 500MB)</div>
+        <button type="button" class="btn btn-secondary btn-sm" style="pointer-events:none;">ファイルを選択 📂</button>
+        <input type="file" id="mycoe-zip-input" accept=".zip" style="display:none;" onchange="onMyCoeFileSelected(this.files)">
+      </div>
+
+      <!-- アップロード進行状態 -->
+      <div id="mycoe-upload-progress-container" style="display:none;margin-top:14px;">
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+          <span id="mycoe-upload-status-text">アップロード・安全検証中...</span>
+          <span id="mycoe-upload-percent-text">0%</span>
+        </div>
+        <div style="width:100%;height:6px;background:rgba(255,255,255,0.1);border-radius:3px;overflow:hidden;">
+          <div id="mycoe-upload-progress-bar" style="width:0%;height:100%;background:#ec4899;transition:width 0.2s;"></div>
+        </div>
+      </div>
+
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeMyCoeUploadModal()">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 🔁 ワーカーローリング処理 (更新 / 再起動) 進捗モーダル -->
+  <div id="rolling-progress-modal" class="modal-backdrop" style="display:none;" onclick="closeRollingProgressModal(event)">
+    <div class="modal-card" style="max-width:640px;width:95%;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,0.6);padding:20px;" onclick="event.stopPropagation()">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:10px;">
+        <h3 id="rolling-modal-title" style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+          <span>🔁</span> <span id="rolling-modal-title-text">ワーカー ローリング処理</span>
+        </h3>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeRollingProgressModal(true)" style="padding:2px 8px;font-size:12px;line-height:1;">✕</button>
+      </div>
+
+      <!-- ステータス概要 & プログレスバー -->
+      <div style="margin-bottom:16px;background:rgba(0,0,0,0.25);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:6px;">
+          <span id="rolling-status-summary" style="font-weight:600;color:var(--text-main);">準備中...</span>
+          <span id="rolling-status-ratio" style="font-family:monospace;font-size:12px;color:var(--text-muted);">0 / 0 台</span>
+        </div>
+        <div style="width:100%;height:8px;background:rgba(255,255,255,0.08);border-radius:4px;overflow:hidden;margin-bottom:6px;">
+          <div id="rolling-progress-bar" style="width:0%;height:100%;background:linear-gradient(90deg, #5865f2, #00b0f4);transition:width 0.3s ease;"></div>
+        </div>
+        <div id="rolling-current-detail" style="font-size:11px;color:#a8ff78;min-height:16px;"></div>
+      </div>
+
+      <!-- ノード別処理状況リスト -->
+      <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;">ノード別進行状況 (1台ずつドレイン・検証)</div>
+      <div id="rolling-nodes-list" style="max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;background:rgba(0,0,0,0.15);padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,0.04);">
+        <div style="color:var(--text-dim);font-size:11px;text-align:center;padding:8px;">ノード情報を取得中...</div>
+      </div>
+
+      <!-- フッター操作 -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.08);">
+        <span style="font-size:11px;color:var(--text-dim);">💡 処理中も通話中VCのリクエストは稼働中の別ノードへ自動退避されます</span>
+        <button type="button" id="rolling-modal-close-btn" class="btn btn-secondary btn-sm" onclick="closeRollingProgressModal(true)" style="padding:6px 14px;">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 画面右下のビルド番号ウォーターマーク（クリックでキャッシュ無視強制再読み込み） -->
+  <div id="build-watermark" class="build-watermark" title="ビルド日時: {{BUILD_DATE}}&#10;クリックでキャッシュをバイパスして強制再読み込み" onclick="forceHardReload()">
+    <span class="build-dot"></span>
+    <span class="build-text">Build: <strong>{{BUILD_ID}}</strong></span>
+    <span class="build-reload-icon">🔄</span>
+  </div>
+
+  <style>
+    .build-watermark {
+      position: fixed;
+      bottom: 12px;
+      right: 14px;
+      background: rgba(20, 20, 32, 0.88);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 20px;
+      padding: 4px 10px;
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.7);
+      z-index: 99999;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+      user-select: none;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .build-watermark:hover {
+      background: rgba(30, 30, 48, 0.96);
+      border-color: rgba(255, 255, 255, 0.35);
+      color: #fff;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
+    }
+    .build-watermark .build-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #10b981;
+      display: inline-block;
+      box-shadow: 0 0 6px #10b981;
+    }
+    .build-watermark .build-reload-icon {
+      font-size: 10px;
+      opacity: 0.6;
+      transition: transform 0.3s ease;
+    }
+    .build-watermark:hover .build-reload-icon {
+      opacity: 1;
+      transform: rotate(180deg);
+    }
+  </style>
+
+  <script>
+    function forceHardReload() {
+      if (typeof showToast === "function") {
+        showToast("キャッシュをバイパスして最新バージョンを読み込みます...", "info");
+      }
+      setTimeout(() => {
+        const u = new URL(window.location.href);
+        u.searchParams.set("nocache", Date.now());
+        window.location.href = u.toString();
+      }, 250);
+    }
+  </script>
+
+  <div id="toast-container" class="toast-container"></div>
+  <script src="/static/app.js?v={{ASSET_V}}"></script>
+</body>
+</html>

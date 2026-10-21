@@ -1,0 +1,596 @@
+[
+  {
+    "speakerName": "アメノちゃん",
+    "speakerUuid": "cc31327e-6617-446f-ba41-eb88f89b8fce",
+    "version": "2.0.0",
+    "prefix": "ameno",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/pxxpplz5zpydbhdz4zpuf/ameno-2.0.0.zip?rlkey=m0s8zvchb1ipqdkjiniqfjxrr&st=yte7hg3t&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 140,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/sxeddoplaol1fwfkqbt0u/140-1.0.0.zip?rlkey=cggazmg82bzur8m5gf5mfhj3d&st=q7yktof7&dl=1"
+      },
+      {
+        "styleName": "ギャル",
+        "styleId": 141,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/4qlt62i1eg4ft9q5wiw2t/141-1.0.0.zip?rlkey=0n71xxjcyrnzm0jiw2eahkshu&st=wlgm4368&dl=1"
+      },
+      {
+        "styleName": "熊本弁",
+        "styleId": 142,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/e3nr9y0z87oaw4ffli2kr/142-1.0.0.zip?rlkey=7jse95hyw15izb3bhruqon8or&st=7csk0kvn&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "つくよみちゃん",
+    "speakerUuid": "3c37646f-3881-5374-2a83-149267990abc",
+    "version": "2.0.0",
+    "prefix": "tsukuyomichan",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/2xzh92hf0s4tk7ptltypl/tsukuyomichan-2.0.0.zip?rlkey=sxrzgr3gferkk45o5jzbyvrfy&st=u5d6t01l&dl=1",
+    "styles": [
+      {
+        "styleName": "れいせい",
+        "styleId": 0,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/gueh24t2iqwhcouf4y48s/0-1.0.0.zip?rlkey=l0wkgov5x0c2g79o73gmrvjk9&st=dxfgrmgf&dl=1"
+      },
+      {
+        "styleName": "おしとやか",
+        "styleId": 5,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/82h4f9l4364q7wx77ogm7/5-1.0.0.zip?rlkey=mv3fk7ol54y4hwmb74kzn99r8&st=ujjiblgk&dl=1"
+      },
+      {
+        "styleName": "げんき",
+        "styleId": 6,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/s30548okwhdzr9pe01z11/6-1.0.0.zip?rlkey=pa56msqxdlhf5s09sgp7wfcgk&st=wxkevz27&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "MANA",
+    "speakerUuid": "292ea286-3d5f-f1cc-157c-66462a6a9d08",
+    "version": "2.1.0",
+    "prefix": "mana",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/v5zk5xoem22qdb230jpwh/mana-2.1.0.zip?rlkey=iu2ti7jy5jenfe4lgyfooxcj8&st=4khhk6ny&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 1,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/qnwsonb0w2gdyhxzqfanv/1-1.0.0.zip?rlkey=g9gk7lew508bg8cwifi2up155&st=pv6f0xhn&dl=1"
+      },
+      {
+        "styleName": "いっしょうけんめい",
+        "styleId": 7,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/dew3fgxtusfcsf6806150/7-1.0.0.zip?rlkey=lgrg6mstrceaj1nh4wes0lkl7&st=v1zkef44&dl=1"
+      },
+      {
+        "styleName": "ごきげん",
+        "styleId": 40,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/thp3do8h9envgmbrgn73f/40-1.0.0.zip?rlkey=hx68e6y0tftyt2a5z02mnbndj&st=4058axb7&dl=1"
+      },
+      {
+        "styleName": "どやがお",
+        "styleId": 45,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/x6xii9ctg0oj7ygwcx00g/45-1.0.0.zip?rlkey=al16m52hhv60gghvlit5ia3rl&st=t2mwh1b9&dl=1"
+      },
+      {
+        "styleName": "ふくれっつら",
+        "styleId": 41,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/57xct5sq4y43icgsinf40/41-1.0.0.zip?rlkey=ofoblha7wurjjx4dg2o4j20vq&st=p7m0ry8c&dl=1"
+      },
+      {
+        "styleName": "しょんぼり",
+        "styleId": 42,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/ryamn6g1ggq1j6pdxo9ua/42-1.0.0.zip?rlkey=z0j7jgvofizeinvk8mnwdhq5v&st=ctamng7n&dl=1"
+      },
+      {
+        "styleName": "ないしょばなし",
+        "styleId": 43,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/i51cqanlh99a3ofmdf5c9/43-1.0.0.zip?rlkey=ili7x50i5f9054d4hpqs8u7zc&st=ejh2chib&dl=1"
+      },
+      {
+        "styleName": "ひっさつわざ",
+        "styleId": 44,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/zk8hpiiq99f4wqq3mb9vs/44-1.0.0.zip?rlkey=a6ykp1bvcyo8gxaoxn07733n3&st=btwnvojf&dl=1"
+      },
+      {
+        "styleName": "ねむねむ",
+        "styleId": 46,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/uw5quokmjh08ek73psx3l/46-1.0.0.zip?rlkey=xmwii1820zk44i17wklvt7o2e&st=htlkk0e6&dl=1"
+      },
+      {
+        "styleName": "ぱじゃまぱーてぃー",
+        "styleId": 47,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/yyex5ybhgegykm0kxy0fe/47-1.0.0.zip?rlkey=gywm9uai19l3zkfgp7quaio0b&st=g3g6y1cz&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "KANA",
+    "speakerUuid": "297a5b91-f88a-6951-5841-f1e648b2e594",
+    "version": "2.0.0",
+    "prefix": "kana",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/sei5fkyyhd2j78c8bc59j/kana-2.0.0.zip?rlkey=p13w4euhbj6v2vyqdfg1874ar&st=tbwvz3we&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 30,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/s3oklk58h02hdpeg2ysas/30-1.0.0.zip?rlkey=7walpwub0611nw5ntx94lc80n&st=1pc3k6z5&dl=1"
+      },
+      {
+        "styleName": "えんげき",
+        "styleId": 31,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/z619oy3l3sfxbv95bmruq/31-1.0.0.zip?rlkey=7hrahp5l7i9x05qihlw6f4ure&st=6l3b78mh&dl=1"
+      },
+      {
+        "styleName": "ほうかご",
+        "styleId": 32,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/97pupiq30j4vd4uppqlj2/32-1.0.0.zip?rlkey=0eub198or9kszqahmz4w41hnl&st=212zzlck&dl=1"
+      },
+      {
+        "styleName": "ないしょばなし",
+        "styleId": 33,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/omtrmjh72mr11k8mu0erd/33-1.0.0.zip?rlkey=w6p8wo4xylzh9q7l4asrjtzjq&st=56tkj7dx&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "おふとんP",
+    "speakerUuid": "a60ebf6c-626a-7ce6-5d69-c92bf2a1a1d0",
+    "version": "2.1.1",
+    "prefix": "ofutonp",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/yfot5nio98szvcoka0cv8/ofutonp-2.1.1.zip?rlkey=vh0v7ea6tz6tp6w52mgsix56z&st=bkg79ha0&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまるv2",
+        "styleId": 2,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/kkmllmqp4wx4m8sodsuzg/2-1.0.0.zip?rlkey=hy2oxqr3s2qwkphm1af6o3pgl&st=rrdwskmp&dl=1"
+      },
+      {
+        "styleName": "のーまるv1",
+        "styleId": 29,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/um5uqdyycc46nzjbp7zhj/29-1.0.0.zip?rlkey=fvuddp057nyss8ty5mmda6sf3&st=jjc3h32r&dl=1"
+      },
+      {
+        "styleName": "よろこび",
+        "styleId": 21,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/woxw7jr1ceyjzb178ljfc/21-1.0.0.zip?rlkey=lcdk4uyi9msb1i737xq19m51f&st=06m36yi9&dl=1"
+      },
+      {
+        "styleName": "かなしみ",
+        "styleId": 9,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/edgt86pkuatvfjh8o9633/9-1.0.0.zip?rlkey=ew19lk966pmltm767igy8xgxw&st=w72xx9jd&dl=1"
+      },
+      {
+        "styleName": "あせり",
+        "styleId": 20,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/yopb3j8wt6iqvs0zincga/20-1.0.0.zip?rlkey=j78yo1ynbu7o2lgtibtgvs2md&st=qagu29iy&dl=1"
+      },
+      {
+        "styleName": "ささやき",
+        "styleId": 22,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/0yd5njezc3nlfackd4dac/22-1.0.0.zip?rlkey=9uk7zvp7xeflhnegxuzc2ze77&st=jk0iwruk&dl=1"
+      },
+      {
+        "styleName": "ナレーション",
+        "styleId": 8,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/i8or5s533t24om5z6sh4h/8-1.0.0.zip?rlkey=yxcpfwetqox8nht80s6kq9eww&st=o05chi5c&dl=1"
+      },
+      {
+        "styleName": "きざ",
+        "styleId": 23,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/wcusplwiruk7a5t49i8uq/23-1.0.0.zip?rlkey=3i3s2s9zj5wtsject0vzs7svp&st=sm5i35up&dl=1"
+      },
+      {
+        "styleName": "きざささやき",
+        "styleId": 24,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/k8lo6w8threo2vp0v1m3w/24-1.0.0.zip?rlkey=xexg8wnr5sboydwzex8smnrav&st=5kpo0w9d&dl=1"
+      },
+      {
+        "styleName": "はくしん",
+        "styleId": 25,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/tx07p9mmuvf8e8cjgvitt/25-1.0.0.zip?rlkey=i9y3xtzagbsdbg8j5dyo6zncz&st=o6xdolys&dl=1"
+      },
+      {
+        "styleName": "いらだち",
+        "styleId": 26,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/4udzqi0x288h896jj0yze/26-1.0.0.zip?rlkey=gsnovbh7t0viwy86oj4x2cxm2&st=mahjbndz&dl=1"
+      },
+      {
+        "styleName": "よわり",
+        "styleId": 27,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/f8e5069bbfk9rmy0nxvio/27-1.0.0.zip?rlkey=rjvj8arij98ppif6ta1mg43rq&st=o4g918u4&dl=1"
+      },
+      {
+        "styleName": "めんよう",
+        "styleId": 28,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/zawvzcxomr59vnpskjnen/28-1.0.0.zip?rlkey=vj8wf5ea489yelgt45utuehoe&st=yx884t29&dl=1"
+      },
+      {
+        "styleName": "どくはく",
+        "styleId": 80,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/omqvrrp714qpc66sh9j98/80-1.0.0.zip?rlkey=b8cgtkhdhq5co6sbuac50c9u9&st=pt878vhk&dl=1"
+      },
+      {
+        "styleName": "ホラー",
+        "styleId": 81,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/49tkw1qp4ba6fbggbot3w/81-1.0.0.zip?rlkey=kuv4khuc5ond0m14czzafyo94&st=uua9nkt5&dl=1"
+      },
+      {
+        "styleName": "おちつき",
+        "styleId": 82,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/iw3vupw3mg2olipflr5vz/82-1.0.0.zip?rlkey=a65pb7317m632vctweofbyw7u&st=doccqzm3&dl=1"
+      },
+      {
+        "styleName": "無声ささやき",
+        "styleId": 83,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/lq9mglaf89xoyx72r0d5i/83-1.0.0.zip?rlkey=mbfej2lfrfdu0ycdkd4rhk39f&st=rfhq0hzb&dl=1"
+      },
+      {
+        "styleName": "おーるど",
+        "styleId": 84,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/wtgcsk2ojfj2ab7hstypr/84-1.0.0.zip?rlkey=sshyexe7xqadjvg64fwkwf1ux&st=jndp3k3p&dl=1"
+      },
+      {
+        "styleName": "ラフ",
+        "styleId": 85,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/g15rkz43gqlhy9bba2yer/85-1.0.0.zip?rlkey=l4k1yoiosqmk5ni76su300mc5&st=3lixjk0z&dl=1"
+      },
+      {
+        "styleName": "ツッコミ",
+        "styleId": 86,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/fkm0h1axg14pkvikrrjpn/86-1.0.0.zip?rlkey=ou53n00m3j73h6uco8ezdqj07&st=tf3zw7d6&dl=1"
+      },
+      {
+        "styleName": "あきれ",
+        "styleId": 87,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/ozz5v3cs9j0zoc2wvwfr4/87-1.0.0.zip?rlkey=0s5m71rzfxrmqhtm5emi8ga05&st=oa85ezt4&dl=1"
+      },
+      {
+        "styleName": "ハイどくはく",
+        "styleId": 88,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/r8vitvnitcdqjz7tz4smu/88-1.0.0.zip?rlkey=fua00hs8j368hzq4qhxm6urhv&st=1uplc7q7&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "ディアちゃん",
+    "speakerUuid": "b28bb401-bc43-c9c7-77e4-77a2bbb4b283",
+    "version": "2.1.0",
+    "prefix": "dia",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/zwum56nzb4ryaf0dy6e4i/dia-2.1.0.zip?rlkey=58crzl034n6sdkqk1do2v3lp3&st=3sge99l0&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 3,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/1s15hbb2n8yz7c38bgbbq/3-1.0.0.zip?rlkey=aj7nj465nwb815vjgm1cys04m&st=y61s8c1d&dl=1"
+      },
+      {
+        "styleName": "セクシー",
+        "styleId": 130,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/dnpzlxs7jaw4ck690p0cy/130-1.0.0.zip?rlkey=0pcijclgq1omz3dmc84pafzka&st=e20l5z79&dl=1"
+      },
+      {
+        "styleName": "ひそひそ",
+        "styleId": 131,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/qvjlvusd0dz04t3zhlg89/131-1.0.0.zip?rlkey=lsgxq0deoeujthwx3qrm1bvw3&st=jz9c01di&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "アルマちゃん",
+    "speakerUuid": "c97966b1-d80c-04f5-aba5-d30a92843b59",
+    "version": "2.0.0",
+    "prefix": "arma",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/eq8zxwzqcqipdd4fjpubr/arma-2.0.0.zip?rlkey=9wtlpgyogpkbeq28a09wc6k9c&st=n06jl7et&dl=1",
+    "styles": [
+      {
+        "styleName": "表-v2",
+        "styleId": 10,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/106p8pl7ush6k21dnvsos/10-1.0.0.zip?rlkey=fvk9cydw392rxhfk9tzqdjyp8&st=634lm897&dl=1"
+      },
+      {
+        "styleName": "表-v1",
+        "styleId": 4,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/xjc305htltdkwqqgezvcz/4-1.0.0.zip?rlkey=s4h272nghahczl3c3bye36w55&st=2vi2zijv&dl=1"
+      },
+      {
+        "styleName": "裏",
+        "styleId": 11,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/tqk35h8m945p24g825ku8/11-1.0.0.zip?rlkey=svaiz1bn07zcad4o8pjckp6xi&st=svbbgyc7&dl=1"
+      },
+      {
+        "styleName": "泣き声",
+        "styleId": 12,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/t1ayilsgjbi3xqtoiu9i9/12-1.0.0.zip?rlkey=wpajp7zddfdj4k3vske7xg3g8&st=qfwtazwa&dl=1"
+      },
+      {
+        "styleName": "堕ちた悪魔",
+        "styleId": 13,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/d2hbkpnygwayxtpqob7cc/13-1.0.0.zip?rlkey=bv3l1n98uckegxhp5e1ibp9tv&st=8ecjrfr5&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "リリンちゃん",
+    "speakerUuid": "cb11bdbd-78fc-4f16-b528-a400bae1782d",
+    "version": "2.1.0",
+    "prefix": "lilin",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/lolb6u2nkwo1rvokccmxx/lilin-2.1.0.zip?rlkey=qphmdk5su6gt3cy5ieelyk3rz&st=sai0bezw&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 90,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/qe9gw2lh55hrpt1c0wgsq/90-1.0.0.zip?rlkey=2icuqow5idrtcz3wh5wbc6j96&st=zjwh01aa&dl=1"
+      },
+      {
+        "styleName": "ささやき",
+        "styleId": 91,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/q9y0bsvslwydh72r60sh5/91-1.0.0.zip?rlkey=98nufno78kuakcudwqwhnopga&st=ut2ndjrb&dl=1"
+      },
+      {
+        "styleName": "メスガキ",
+        "styleId": 92,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/mcc2zswly9zxdmxr6u0jn/92-1.0.0.zip?rlkey=m8613a2vticj1hmqsv4nuihcp&st=f0mixxcu&dl=1"
+      },
+      {
+        "styleName": "理解らされ",
+        "styleId": 93,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/3czwjmlucyz254dmbihkj/93-1.0.0.zip?rlkey=gzc6fwuv42cef5398drnt6azh&st=1qxosbes&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "クロワちゃん",
+    "speakerUuid": "cc1153b4-d20c-46dd-a308-73ca38c0e85a",
+    "version": "2.1.0",
+    "prefix": "croix",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/4gcqj07cwwo5sxd0eheyc/croix-2.1.0.zip?rlkey=6vx6veriy0qfai56k8bd1rpdy&st=y7lj7hi1&dl=1",
+    "styles": [
+      {
+        "styleName": "素顔の女騎士",
+        "styleId": 110,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/ydx0cmykjpbcz5mjyyjbr/110-1.0.0.zip?rlkey=uach0e9jx9uojczmr5d1lkajc&st=r3efcqve&dl=1"
+      },
+      {
+        "styleName": "気高き女騎士",
+        "styleId": 111,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/m0sid78t77x7st37bd2gq/111-1.0.0.zip?rlkey=pnsxo36wsbg7f12yzo52bk75o&st=m3ksdi0r&dl=1"
+      },
+      {
+        "styleName": "堕ちた女騎士A",
+        "styleId": 112,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/7i6ctqw5ooquu7h54mfr9/112-1.0.0.zip?rlkey=o0okaa6vlo0n864cvynbskebf&st=7d6gq91j&dl=1"
+      },
+      {
+        "styleName": "堕ちた女騎士B",
+        "styleId": 113,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/46gl01lya1uby674hzcrf/113-1.0.0.zip?rlkey=4uyvvntabxbjnayft433bs7e2&st=2o6lcggc&dl=1"
+      },
+      {
+        "styleName": "萌え出づる女騎士",
+        "styleId": 114,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/hthzn9svjyg809sk8dtqn/114-1.0.0.zip?rlkey=8ge5qu9lgz0q1xoqu9mljszie&st=hz88lbyn&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "アンジーさん",
+    "speakerUuid": "cc213e6d-d847-45b5-a1df-415744c890f2",
+    "version": "2.0.0",
+    "prefix": "andzie",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/q8mv2woxokhbedez0w9pj/andzie-2.0.0.zip?rlkey=lmqv638ufw4r81gnnzumycdqk&st=yrfb6tm1&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 120,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/k6zqeqzb2d6s8jgf6nmhw/120-1.0.0.zip?rlkey=qtpu5i2l6v8aqkm91havnm7by&st=aq1jygnn&dl=1"
+      },
+      {
+        "styleName": "セクシー",
+        "styleId": 121,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/x4sa1n6rba7i1fp44sy3n/121-1.0.0.zip?rlkey=yn51myyyoz3s1ey3hbrktbm5w&st=lib9nit5&dl=1"
+      },
+      {
+        "styleName": "ささやき",
+        "styleId": 122,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/7a59tu43opkk31p0a4v1h/122-1.0.0.zip?rlkey=8d4wn8mc65q708u92bmak5ktr&st=qw4cq3uu&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "AI声優-朱花",
+    "speakerUuid": "d1143ac1-c486-4273-92ef-a30938d01b91",
+    "version": "2.0.2",
+    "prefix": "ayaka",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/oxad99i0gd7m02l7a7d6k/ayaka-2.0.2.zip?rlkey=368h7vrpov320zmzpycxf2i7l&st=kajdui6v&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまるv2",
+        "styleId": 50,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/oi8xm8vpikob5fgtvunyc/50-1.0.0.zip?rlkey=u6xbekhjtzp29uf5ziwtkpcv4&st=tc03oysd&dl=1"
+      },
+      {
+        "styleName": "のーまるv1",
+        "styleId": 51,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/p00c8qsgbbklvldl20d8n/51-1.0.0.zip?rlkey=gjlf6jxarlvgb5umfq13db9kt&st=19vm43aa&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "AI声優-青葉",
+    "speakerUuid": "d219f5ab-a50b-4d99-a26a-a9fc213e9100",
+    "version": "2.0.1",
+    "prefix": "aoba",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/b3jevlw6age3c9hwcdq7k/aoba-2.0.1.zip?rlkey=f23b849frajd6eupbrs1vdash&st=8jsoghd9&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 60,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/gfubblwg45gxcr4py70ph/60-1.0.0.zip?rlkey=roke7mw8cxt17pxj9qd840gtr&st=as6jx260&dl=1"
+      },
+      {
+        "styleName": "感情的",
+        "styleId": 61,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/14dgiho4fdszzhwilfqpu/61-1.0.0.zip?rlkey=949n58fffkfvht1dv3fcv7i26&st=8g1s4tb9&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "AI声優-銀芽",
+    "speakerUuid": "d312d0fb-d38d-434e-825d-cbcbfd105ad0",
+    "version": "2.2.0",
+    "prefix": "ginga",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/7z9f5u2x7fgqpozhb2qgn/ginga-2.2.0.zip?rlkey=satc8n2eg6cxr9fsh1mtjttk1&st=ui69u4uq&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまるv2",
+        "styleId": 70,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/uirdlce8y2j2fwyhoah9n/70-1.0.0.zip?rlkey=xk37qqbfcfyppzsvzzvbmegnt&st=l7oop9sk&dl=1"
+      },
+      {
+        "styleName": "のーまるv1",
+        "styleId": 73,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/k2wj6a93s986gjz0mx54y/73-1.0.0.zip?rlkey=lsehuvrcisdm9oh6z438gnwzq&st=ln3q4i6p&dl=1"
+      },
+      {
+        "styleName": "感情的",
+        "styleId": 71,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/1s2q9go2syrgr0tzvvuca/71-1.0.0.zip?rlkey=ymp6okhtkx2ob9c36wwzgnbhl&st=vn5txdov&dl=1"
+      },
+      {
+        "styleName": "呆れ",
+        "styleId": 72,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/z3iagddj4y5a17f6pbges/72-1.0.0.zip?rlkey=geylh30jewhqvhiysypdbfqs1&st=87idvkvq&dl=1"
+      },
+      {
+        "styleName": "叫びβ",
+        "styleId": 74,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/7kjxrl8wl213rwb5dshmd/74-1.0.0.zip?rlkey=oa0xfzmb394325fjjbod954sq&st=dlxrd94f&dl=1"
+      },
+      {
+        "styleName": "囁きβ",
+        "styleId": 75,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/apkkjzm81224uet0otg5a/75-1.0.0.zip?rlkey=dzp9u2u3lt68l8evsxgpu3k97&st=fv14xwp1&dl=1"
+      }
+    ]
+  },
+  {
+    "speakerName": "AI声優-金苗",
+    "speakerUuid": "d41bcbd9-f4a9-4e10-b000-7a431568dd01",
+    "version": "2.1.0",
+    "prefix": "kanae",
+    "metaDownloadUrl": "https://www.dropbox.com/scl/fi/obphqwwu869orb216tr5h/kanae-2.1.0.zip?rlkey=dh5r5lihd4hqw8byq9mhmb97j&st=h2saumbx&dl=1",
+    "styles": [
+      {
+        "styleName": "のーまる",
+        "styleId": 100,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/llmws2to2lji4ztfg9ira/100-1.0.0.zip?rlkey=im8o8swo4ialo1wfepz806qjr&st=30lcxzge&dl=1"
+      },
+      {
+        "styleName": "愉悦 Aタイプ",
+        "styleId": 101,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/ifg011o5sm1lc5ll37tmd/101-1.0.0.zip?rlkey=1s7nt0w3ckrwbbc0azh853ho2&st=du9b44tz&dl=1"
+      },
+      {
+        "styleName": "愉悦 Bタイプ",
+        "styleId": 103,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/4mxp8u8tx6dqva9y5n367/103-1.0.0.zip?rlkey=pnjsfnikkkiuht2tmgwdvp2cd&st=eoy4l70z&dl=1"
+      },
+      {
+        "styleName": "喜び",
+        "styleId": 102,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/5nl53ievlb44prwdyfief/102-1.0.0.zip?rlkey=c3muvhzzokamkggifyty4o36g&st=l0ej11it&dl=1"
+      },
+      {
+        "styleName": "ふわふわ",
+        "styleId": 104,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/oi0i3kk5cixa2jwbfk7jg/104-1.0.0.zip?rlkey=3y0manzgpaj8558l0c55cxngs&st=ad16ssnv&dl=1"
+      },
+      {
+        "styleName": "ぷんぷん",
+        "styleId": 105,
+        "version": "1.0.0",
+        "downloadUrl": "https://www.dropbox.com/scl/fi/hc39bhv9tckf50sike6sd/105-1.0.0.zip?rlkey=kcus48sun5wy64odmm0l8enr5&st=xqlr86zq&dl=1"
+      }
+    ]
+  }
+]

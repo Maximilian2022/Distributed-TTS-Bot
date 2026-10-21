@@ -1,0 +1,82 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Credentials
+.env
+.env.*
+!.env.example
+gcp-key.json
+*.key
+*.pem
+credentials.json
+service-account*.json
+
+# Storage & Cache Data
+cache/
+*.wav
+*.mp3
+*.ogg
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs (keep remediation_history.md only)
+logs/*
+!logs/remediation_history.md
+
+# Temporary / Scratch files
+scratch/*
+!scratch/memo.md
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Worker Access & SSH Keys
+WorkerAccess/
+id_rsa
+id_rsa.pub
+
+# Agent configurations and skills
+.agents/
+
