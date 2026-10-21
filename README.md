@@ -45,8 +45,8 @@
 ### 1. リポジトリのクローンと準備
 
 ```bash
-git clone https://github.com/your-username/ttsbot.git
-cd ttsbot
+git clone https://github.com/Maximilian2022/ttsbot-oss.git
+cd ttsbot-oss
 
 # 設定テンプレートをコピー
 cp .env.example .env
