@@ -138,6 +138,7 @@ class TTSBot(commands.Bot):
         self.disaster_service: Optional[DisasterAlertService] = None
         self.prewarm_service: Optional[Any] = None
 
+        self.web_server = getattr(bot_pool, "web_server", None)
         if self.bot_index == 1:
             from src.cache_prewarm import IntelligentPrewarmService
             self.prewarm_service = IntelligentPrewarmService(
@@ -146,11 +147,7 @@ class TTSBot(commands.Bot):
                 db=self.db,
                 config=config
             )
-            self.disaster_service = DisasterAlertService(bot_pool=bot_pool, db=self.db, config=config)
-            self.web_server = WebServer(
-                self, config, self.db, self.cache_manager, self.tts_manager,
-                bot_pool=bot_pool, disaster_service=self.disaster_service
-            )
+            self.disaster_service = getattr(bot_pool, "disaster_service", None) or DisasterAlertService(bot_pool=bot_pool, db=self.db, config=config)
 
     async def setup_hook(self) -> None:
         # 1. メインBot (1号機) のみの初期化処理
@@ -217,13 +214,6 @@ class TTSBot(commands.Bot):
                 bot_pool=self.bot_pool
             )
             await self.add_cog(cache_updater_cog)
-
-            # WebUIサーバーの起動 (ポート8080)
-            if self.web_server:
-                try:
-                    await self.web_server.start()
-                except Exception as e:
-                    logging.error(f"Failed to start WebUI server: {e}")
 
             # スラッシュコマンドの同期 (1号機のみが代表して同期)
             safe_create_task(self._safe_sync_commands(), name="safe_sync_commands")
@@ -341,32 +331,12 @@ class TTSBot(commands.Bot):
 
         if self.cleanup_task and not self.cleanup_task.done():
             self.cleanup_task.cancel()
-        if self.disaster_service:
-            try:
-                self.disaster_service.stop()
-            except Exception as e:
-                logging.error(f"Error stopping DisasterAlertService: {e}")
-        if self.web_server:
-            try:
-                await self.web_server.stop()
-            except Exception as e:
-                logging.error(f"Error stopping WebUI server: {e}")
         if self.bot_index == 1:
             if self.prewarm_service:
                 try:
                     await self.prewarm_service.stop()
                 except Exception as e:
                     logging.error(f"Error stopping IntelligentPrewarmService: {e}")
-            try:
-                from src.utils.worker_log_collector import worker_log_collector
-                await worker_log_collector.stop()
-            except Exception as e:
-                logging.error(f"Error stopping WorkerLogCollector: {e}")
-            await self.tts_manager.close()
-            try:
-                await self.db.close()
-            except Exception as e:
-                logging.error(f"Error closing Database: {e}")
         await super().close()
         logging.info(f"Bot #{self.bot_index} shutdown complete.")
 
@@ -376,16 +346,18 @@ async def main():
 
     logging.info("Starting Discord TTS Bot Pool (Python 3.14)...")
 
-    tokens = config.get_discord_tokens()
-    if not tokens:
-        logging.critical("No DISCORD_TOKEN is set. Please set DISCORD_TOKEN in .env.")
-        sys.exit(1)
-
-    logging.info(f"Configured Bot count: {len(tokens)} (Indices: {[t[0] for t in tokens]})")
-
-    # 共有リソースの生成 & データベース先行初期化
+    # 1. 共有リソースの生成 & データベース先行初期化
     db = Database(config.db_path)
     await db.init_db()
+
+    # DBに保存された認証情報およびBotトークンを config に動的適用
+    try:
+        db_tokens = await db.get_bot_tokens()
+        credentials = await db.get_all_credentials()
+        config.apply_db_credentials(credentials, db_tokens)
+    except Exception as e:
+        logging.warning(f"Failed to load credentials from DB: {e}")
+
     cache_manager = CacheManager(
         cache_dir=config.cache_dir,
         max_size_bytes=config.cache_max_size_bytes,
@@ -397,6 +369,50 @@ async def main():
     resource_manager = LocalEngineResourceManager(bot=None, config=config, db=db)
     tts_manager = TTSManager(config, cache_manager, db, resource_manager=resource_manager)
     resource_manager.tts_manager = tts_manager
+
+    # 2. BotPoolManager の初期化 & Botインスタンス動的生成ファクトリの登録
+    bot_pool = BotPoolManager(config, db, cache_manager, tts_manager)
+
+    def create_bot(bot_idx: int) -> TTSBot:
+        return TTSBot(
+            config=config,
+            database=db,
+            cache_manager=cache_manager,
+            tts_manager=tts_manager,
+            bot_index=bot_idx,
+            bot_pool=bot_pool
+        )
+    bot_pool.set_bot_factory(create_bot)
+    resource_manager.bot_pool = bot_pool
+
+    # 3. 防災速報常駐監視サービス & WebServer の先行起動 (トークン0件でも常時起動)
+    disaster_service = DisasterAlertService(bot_pool=bot_pool, db=db, config=config)
+    bot_pool.disaster_service = disaster_service
+
+    web_server = WebServer(
+        bot=None,
+        config=config,
+        database=db,
+        cache_manager=cache_manager,
+        tts_manager=tts_manager,
+        bot_pool=bot_pool,
+        disaster_service=disaster_service
+    )
+    bot_pool.web_server = web_server
+
+    try:
+        await web_server.start()
+        logging.info(f"🌐 [WebUI] Server successfully started on http://{config.web_host}:{config.web_port}")
+    except Exception as e:
+        logging.error(f"Failed to start WebUI server: {e}")
+
+    # トークン確認 (0件でも即終了せずWebUIでのセットアップを案内)
+    tokens = config.get_discord_tokens()
+    if not tokens:
+        logging.warning("⚠️  [SETUP WIZARD REQUIRED] Discord Bot トークンが登録されていません。")
+        logging.warning(f"👉 ブラウザで http://localhost:{config.web_port} にアクセスし、管理パスワードでログインしてBotトークンを登録してください。")
+    else:
+        logging.info(f"Configured Bot count: {len(tokens)} (Indices: {[t[0] for t in tokens]})")
 
     # 個人設定ピン留めモデル (リリンちゃん等) を接続中全Workerへブロードキャスト先行昇格
     async def broadcast_pinned_models_to_workers():
@@ -442,7 +458,6 @@ async def main():
         safe_create_task(delayed_precache_previews(), name="delayed_precache_previews")
 
     # ローカルTTSエンジン（VOICEVOX / SHAREVOX / COEIROINK）の話者・スタイルを動的取得して config.voices に登録
-    # (停止中であっても load_cached_voices により永続キャッシュからモデル一覧が即時復元される)
     for engine_name, init_fn in [
         ("VOICEVOX", tts_manager.initialize_voicevox),
         ("SHAREVOX", tts_manager.initialize_sharevox),
@@ -453,30 +468,10 @@ async def main():
         except Exception as e:
             logging.warning(f"Could not connect to {engine_name} on startup (engine might be stopped): {e}")
 
-    # BotPoolManager の初期化
-    bot_pool = BotPoolManager(config, db, cache_manager, tts_manager)
-
-    bots: List[TTSBot] = []
-    for bot_idx, _ in tokens:
-        bot = TTSBot(
-            config=config,
-            database=db,
-            cache_manager=cache_manager,
-            tts_manager=tts_manager,
-            bot_index=bot_idx,
-            bot_pool=bot_pool
-        )
-        bot_pool.register_bot(bot_idx, bot)
-        bots.append(bot)
-
-    resource_manager.bot_pool = bot_pool
-    if bots:
-        resource_manager.bot = bots[0]
-
-    # シグナルハンドラ設定 (全Botを協調して安全に終了)
+    # シグナルハンドラ設定 (全Botおよび全サービスを協調して安全に終了)
     loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
 
-    # asyncio ループ内の未処理例外ハンドラ
     def loop_exception_handler(l, context):
         msg = context.get("message", "Unhandled asyncio exception")
         exc = context.get("exception")
@@ -498,8 +493,35 @@ async def main():
     loop.set_exception_handler(loop_exception_handler)
 
     async def shutdown_all():
-        logging.info("Received termination signal. Closing all bots safely...")
-        await asyncio.gather(*(b.close() for b in bots), return_exceptions=True)
+        logging.info("Received termination signal. Closing all bots and services safely...")
+        # 1. WebServer の停止
+        try:
+            await web_server.stop()
+        except Exception as e:
+            logging.error(f"Error stopping WebServer: {e}")
+
+        # 2. 防災サービスの停止
+        try:
+            disaster_service.stop()
+        except Exception:
+            pass
+
+        # 3. 稼働中Botの全停止
+        running_indices = list(bot_pool.bots.keys())
+        if running_indices:
+            await asyncio.gather(*(bot_pool.stop_bot(idx) for idx in running_indices), return_exceptions=True)
+
+        # 4. TTSマネージャーおよびDBのクローズ
+        try:
+            await tts_manager.close()
+        except Exception:
+            pass
+        try:
+            await db.close()
+        except Exception:
+            pass
+        logging.info("Process resources closed safely.")
+        shutdown_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -676,27 +698,27 @@ async def main():
     except Exception as e:
         logging.debug(f"Failed to query active_vcs for priority startup: {e}")
 
-    async def start_worker(bot_instance: TTSBot, token_str: str, delay: float):
+    async def start_worker(idx: int, token_str: str, delay: float):
         if delay > 0:
             await asyncio.sleep(delay)
-        logging.info(f"Starting connection for Bot #{bot_instance.bot_index} (delay={delay:.1f}s)...")
+        logging.info(f"Starting connection for Bot #{idx} (delay={delay:.1f}s)...")
         try:
-            await bot_instance.start(token_str)
+            await bot_pool.start_bot(idx, token_str)
         except Exception as e:
-            logging.error(f"Error in Bot #{bot_instance.bot_index}: {e}")
+            logging.error(f"Error starting Bot #{idx}: {e}")
 
     # 通話中担当Botは 0秒遅延、その他アイドルBotは1.5秒ずつずらしてレートリミット回避
     idle_delay_counter = 0
-    tasks = []
-    for b, (_, tok) in zip(bots, tokens):
-        if b.bot_index in active_bot_indices:
+    for bot_idx, tok in tokens:
+        if bot_idx in active_bot_indices:
             bot_delay = 0.0
         else:
             idle_delay_counter += 1
             bot_delay = idle_delay_counter * 1.5
-        tasks.append(start_worker(b, tok, bot_delay))
+        safe_create_task(start_worker(bot_idx, tok, bot_delay), name=f"start_bot_{bot_idx}")
 
-    await asyncio.gather(*tasks)
+    # プロセス常駐維持 (終了シグナル受信まで待機)
+    await shutdown_event.wait()
 
 if __name__ == "__main__":
     try:

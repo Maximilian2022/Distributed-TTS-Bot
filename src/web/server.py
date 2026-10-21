@@ -40,6 +40,18 @@ def _version_is_newer(remote: str, local: str) -> bool:
 
 
 class WebServer:
+    @property
+    def bot(self):
+        if getattr(self, "_bot", None):
+            return self._bot
+        if self.bot_pool:
+            return self.bot_pool.get_main_bot()
+        return None
+
+    @bot.setter
+    def bot(self, val):
+        self._bot = val
+
     def __init__(
         self,
         bot,
@@ -50,13 +62,15 @@ class WebServer:
         bot_pool=None,
         disaster_service=None
     ):
-        self.bot = bot
+        self._bot = bot
         self.config = config
         self.db = database
         self.cache_manager = cache_manager
         self.tts_manager = tts_manager
         self.bot_pool = bot_pool
         self.disaster_service = disaster_service
+        self.worker_ws_connections: Dict[str, Any] = {}
+        self.worker_ws_pending_requests: Dict[str, Any] = {}
         self.coeiroink_model_manager = CoeiroinkModelManager()
         self.mycoeiroink = MyCoeiroinkManager()
         self.auth = DiscordAuth(
@@ -217,6 +231,17 @@ class WebServer:
         self.app.router.add_get("/api/worker/models/manifest/{model_name}", self.api_worker_models_manifest)
         self.app.router.add_get("/api/worker/models/file/{model_name}/{file_path:.+}", self.api_worker_models_file)
         self.app.router.add_get("/api/worker/models/download/{model_name}", self.api_worker_models_download)
+
+        # パスワード認証 & Bot管理 & クレデンシャル管理 API (OSS動的管理)
+        self.app.router.add_post("/api/auth/login_password", self.api_auth_login_password)
+        self.app.router.add_get("/api/system/bots", self.api_system_get_bots)
+        self.app.router.add_post("/api/system/bots", self.api_system_save_bot)
+        self.app.router.add_delete("/api/system/bots/{idx}", self.api_system_delete_bot)
+        self.app.router.add_post("/api/system/bots/{idx}/toggle", self.api_system_toggle_bot)
+        self.app.router.add_get("/api/system/credentials", self.api_system_get_credentials)
+        self.app.router.add_post("/api/system/credentials", self.api_system_save_credentials)
+        self.app.router.add_post("/api/system/credentials/test", self.api_system_test_credentials)
+        self.app.router.add_get("/api/worker/ws", self.api_worker_ws)
 
         # テスト・シミュレーション API (ローカルまたは管理者用)
         self.app.router.add_post("/api/test/simulate", self.api_test_simulate)
@@ -441,11 +466,19 @@ class WebServer:
         if hasattr(self.tts_manager, "resource_manager") and self.tts_manager.resource_manager:
             mem_info = self.tts_manager.resource_manager.get_system_memory_info()
 
-        is_healthy = is_bot_ready and db_ok
+        has_configured_bots = bool(self.config.get_discord_tokens())
+        if not has_configured_bots:
+            # 初回起動・トークン0件待機状態: WebUIとDBが健全であればセットアップ待機(200 OK)
+            is_healthy = db_ok
+            overall_status = "waiting_setup" if db_ok else "unhealthy"
+        else:
+            is_healthy = is_bot_ready and db_ok
+            overall_status = "ok" if is_healthy else ("degraded" if db_ok else "unhealthy")
+
         status_code = 200 if is_healthy else 503
 
         data = {
-            "status": "ok" if is_healthy else ("degraded" if db_ok else "unhealthy"),
+            "status": overall_status,
             "timestamp": now,
             "version": BUILD_VERSION,
             "build_date": BUILD_DATE,
@@ -479,18 +512,22 @@ class WebServer:
         return user
 
     async def _is_admin_user(self, request: web.Request) -> bool:
-        """ログインユーザーがいずれかのBot所属ギルドで管理者権限（管理者またはオーナー）を持つか判定"""
+        """ログインユーザーが管理者権限を持つか判定 (パスワード認証の管理者 または Discordギルド管理者)"""
         user = self.auth.get_current_user(request)
         if not user or "user_id" not in user:
             return False
+        # パスワード認証による管理者フラグ、またはID 0
+        if user.get("is_admin") or user.get("user_id") == 0:
+            return True
         user_id = user["user_id"]
         admin_user_ids = getattr(self.config, "admin_user_ids", []) or []
         if user_id in admin_user_ids:
             return True
-        for guild in self.bot.guilds:
-            member = await self._get_or_fetch_member(guild, user_id)
-            if member and (member.guild_permissions.administrator or guild.owner_id == user_id):
-                return True
+        if self.bot and getattr(self.bot, "guilds", None):
+            for guild in self.bot.guilds:
+                member = await self._get_or_fetch_member(guild, user_id)
+                if member and (member.guild_permissions.administrator or guild.owner_id == user_id):
+                    return True
         return False
 
     async def _require_admin(self, request: web.Request) -> Dict[str, Any]:
@@ -2671,25 +2708,32 @@ class WebServer:
     def _verify_worker_auth(self, request: web.Request) -> bool:
         """
         Worker 認証検証:
-        1. WAN 経由のリクエストは拒絶
-        2. WORKER_SHARED_SECRET 設定時は X-Worker-Token ヘッダーを照合
-        3. トークンがない場合でもローカル LAN (192.168.11.*, 127.0.0.1) からの直接通信なら互換性のため許可
+        1. WORKER_SHARED_SECRET 設定時は Bearer / X-Worker-Token / クエリトークンを最優先で照合 (WAN/インターネット経由でも正当なWorkerとして許可)
+        2. トークンが有効であれば、WAN/LANにかかわらず承認
+        3. トークン未設定、またはリクエストに含まれない場合のみ、ローカルプライベートIPからの直接通信を許可
         """
+        secret = getattr(self.config, "worker_shared_secret", "").strip()
+        auth_header = request.headers.get("Authorization", "")
+        bearer_token = ""
+        if auth_header.startswith("Bearer "):
+            bearer_token = auth_header[7:].strip()
+
+        token = bearer_token or request.headers.get("X-Worker-Token") or request.query.get("token") or ""
+        import hmac
+        if secret and token:
+            if hmac.compare_digest(token, secret):
+                return True
+            else:
+                return False
+
+        # トークンなし、または未一致の場合: WAN経由は拒否
         if self._is_wan_request(request):
             return False
 
-        secret = getattr(self.config, "worker_shared_secret", "").strip()
-        if not secret:
-            return True
-
-        token = request.headers.get("X-Worker-Token") or request.query.get("token") or ""
-        import hmac
-        if token and hmac.compare_digest(token, secret):
-            return True
-
+        # ローカルプライベートIPは互換性のために許可
         peername = request.transport.get_extra_info('peername') if request.transport else None
         client_ip = peername[0] if peername else (request.remote or "")
-        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168.11."):
+        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
             return True
 
         return False
@@ -3740,6 +3784,284 @@ class WebServer:
             else:
                 logger.error(f"❌ [ModelDownload] 予期しないエラー ({err_name}): {e}", exc_info=True)
         return response
+
+    # --- OSS 動的Bot管理 & クレデンシャル & WebSocket API ---
+
+    async def api_auth_login_password(self, request: web.Request) -> web.Response:
+        """管理者パスワードによるWebUIログイン (Discord未連携時対応)"""
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        password = str(data.get("password", "")).strip()
+        expected = self.config.admin_password.strip()
+
+        if not expected:
+            return web.json_response({
+                "error": "管理者パスワードが未設定です。.env の ADMIN_PASSWORD を設定してください。"
+            }, status=403)
+
+        import hmac
+        if not hmac.compare_digest(password, expected):
+            return web.json_response({"error": "パスワードが正しくありません。"}, status=401)
+
+        user_data = {
+            "id": 0,
+            "username": "Administrator",
+            "global_name": "管理者",
+            "avatar": ""
+        }
+        token = self.auth.create_session_token(user_data, is_admin=True)
+
+        resp = web.json_response({"success": True, "message": "管理者としてログインしました。"})
+        resp.set_cookie(
+            "ttsbot_session",
+            token,
+            max_age=86400 * 7,
+            httponly=True,
+            samesite="Lax"
+        )
+        return resp
+
+    async def api_system_get_bots(self, request: web.Request) -> web.Response:
+        """1〜10号機の全スロット状態を取得 (管理者のみ)"""
+        await self._require_admin(request)
+        if not self.bot_pool:
+            return web.json_response({"bots": [], "max_slots": 10})
+        status_list = await self.bot_pool.get_full_pool_status()
+        return web.json_response({
+            "bots": status_list,
+            "max_slots": 10,
+            "client_id": self.config.discord_client_id
+        })
+
+    async def api_system_save_bot(self, request: web.Request) -> web.Response:
+        """Botトークンの追加・更新・即時接続 (管理者のみ)"""
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        bot_index = int(data.get("bot_index", 1))
+        token = str(data.get("token", "")).strip()
+        label = str(data.get("label", "")).strip()
+        is_enabled = bool(data.get("is_enabled", True))
+
+        if not (1 <= bot_index <= 10):
+            return web.json_response({"error": "bot_index は 1〜10 の範囲で指定してください。"}, status=400)
+        if not token:
+            return web.json_response({"error": "Botトークンは必須です。"}, status=400)
+
+        if not self.bot_pool:
+            return web.json_response({"error": "BotPool is not initialized."}, status=500)
+
+        success = await self.bot_pool.add_or_update_token(bot_index, token, label=label, is_enabled=is_enabled)
+        return web.json_response({
+            "success": success,
+            "bot_index": bot_index,
+            "message": f"Bot #{bot_index} のトークンを保存・接続開始しました。"
+        })
+
+    async def api_system_delete_bot(self, request: web.Request) -> web.Response:
+        """Botトークンの削除および停止 (管理者のみ)"""
+        await self._require_admin(request)
+        idx_str = request.match_info.get("idx")
+        try:
+            bot_index = int(idx_str)
+        except (ValueError, TypeError):
+            return web.json_response({"error": "Invalid bot index"}, status=400)
+
+        if not self.bot_pool:
+            return web.json_response({"error": "BotPool is not initialized."}, status=500)
+
+        await self.bot_pool.delete_token(bot_index)
+        return web.json_response({
+            "success": True,
+            "bot_index": bot_index,
+            "message": f"Bot #{bot_index} を切断・削除しました。"
+        })
+
+    async def api_system_toggle_bot(self, request: web.Request) -> web.Response:
+        """Botの有効/無効切替 (管理者のみ)"""
+        await self._require_admin(request)
+        idx_str = request.match_info.get("idx")
+        try:
+            bot_index = int(idx_str)
+        except (ValueError, TypeError):
+            return web.json_response({"error": "Invalid bot index"}, status=400)
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        is_enabled = bool(data.get("is_enabled", True))
+        if not self.bot_pool:
+            return web.json_response({"error": "BotPool is not initialized."}, status=500)
+
+        success = await self.bot_pool.toggle_token(bot_index, is_enabled)
+        return web.json_response({
+            "success": success,
+            "bot_index": bot_index,
+            "is_enabled": is_enabled
+        })
+
+    async def api_system_get_credentials(self, request: web.Request) -> web.Response:
+        """APIキー・設定情報の取得 (伏字表示, 管理者のみ)"""
+        await self._require_admin(request)
+
+        def _mask(val: str, keep_tail: int = 4) -> str:
+            if not val:
+                return ""
+            if len(val) <= keep_tail:
+                return "••••••••"
+            return f"{'•' * (len(val) - keep_tail)}{val[-keep_tail:]}"
+
+        return web.json_response({
+            "azure_speech_key": _mask(self.config.azure_speech_key),
+            "azure_speech_key_configured": bool(self.config.azure_speech_key),
+            "azure_speech_region": self.config.azure_speech_region or "japaneast",
+            "google_configured": bool(self.config.google_credentials_json or self.config.google_api_key or self.config.google_application_credentials),
+            "google_api_key": _mask(self.config.google_api_key),
+            "worker_shared_secret": self.config.worker_shared_secret,
+            "web_base_url": self.config.web_dashboard_url,
+            "admin_password_configured": bool(self.config.admin_password)
+        })
+
+    async def api_system_save_credentials(self, request: web.Request) -> web.Response:
+        """APIキー・設定の保存＆ホットリロード (管理者のみ)"""
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        if "azure_speech_key" in data and not str(data["azure_speech_key"]).startswith("•"):
+            k = str(data["azure_speech_key"]).strip()
+            await self.db.set_credential("azure_speech_key", k, is_secret=True)
+            self.config.azure_speech_key = k
+
+        if "azure_speech_region" in data:
+            reg = str(data["azure_speech_region"]).strip() or "japaneast"
+            await self.db.set_credential("azure_speech_region", reg)
+            self.config.azure_speech_region = reg
+
+        if "google_credentials_json" in data and not str(data["google_credentials_json"]).startswith("•"):
+            g_json = str(data["google_credentials_json"]).strip()
+            if g_json:
+                await self.db.set_credential("google_credentials_json", g_json, is_secret=True)
+                self.config.google_credentials_json = g_json
+
+        if "google_api_key" in data and not str(data["google_api_key"]).startswith("•"):
+            g_key = str(data["google_api_key"]).strip()
+            if g_key:
+                await self.db.set_credential("google_api_key", g_key, is_secret=True)
+                self.config.google_api_key = g_key
+
+        if "worker_shared_secret" in data:
+            w_sec = str(data["worker_shared_secret"]).strip()
+            if w_sec:
+                await self.db.set_credential("worker_shared_secret", w_sec, is_secret=True)
+                self.config.worker_shared_secret = w_sec
+
+        if "web_base_url" in data:
+            b_url = str(data["web_base_url"]).strip().rstrip("/")
+            if b_url:
+                await self.db.set_credential("web_base_url", b_url)
+                self.config.web_dashboard_url = b_url
+                self.config.discord_redirect_uri = f"{b_url}/callback"
+
+        if "admin_password" in data:
+            new_pwd = str(data["admin_password"]).strip()
+            if new_pwd:
+                await self.db.set_credential("admin_password", new_pwd, is_secret=True)
+                self.config.admin_password = new_pwd
+
+        if self.tts_manager:
+            self.tts_manager.reload_cloud_credentials(
+                azure_key=self.config.azure_speech_key,
+                azure_region=self.config.azure_speech_region,
+                google_json=self.config.google_credentials_json,
+                google_api_key=self.config.google_api_key
+            )
+
+        return web.json_response({"success": True, "message": "設定を保存し、ホットリロードしました。"})
+
+    async def api_system_test_credentials(self, request: web.Request) -> web.Response:
+        """指定TTSプロバイダの即時疎通・音声合成テスト (管理者のみ)"""
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        provider = str(data.get("provider", "azure")).strip()
+        voice_name = str(data.get("voice_name", "")).strip()
+
+        if not self.tts_manager:
+            return web.json_response({"success": False, "error": "TTSManager is not initialized."}, status=500)
+
+        success, message, elapsed_ms = await self.tts_manager.test_synthesis(provider, voice_name)
+        return web.json_response({
+            "success": success,
+            "provider": provider,
+            "message": message,
+            "latency_ms": elapsed_ms
+        })
+
+    async def api_worker_ws(self, request: web.Request) -> web.WebSocketResponse:
+        """
+        リモートWorkerノード用 WebSocket リバースプロキシ
+        Worker (GPU PC等) が外向きにMasterへ常時接続し、Masterからの音声合成要求を双方向中継する
+        """
+        if not self._verify_worker_auth(request):
+            raise web.HTTPUnauthorized(text="Unauthorized worker token")
+
+        ws = web.WebSocketResponse(heartbeat=20.0, max_msg_size=32 * 1024 * 1024)
+        await ws.prepare(request)
+
+        worker_node_id: Optional[str] = None
+        logger.info(f"🔌 [WorkerWS] New WebSocket connection from {request.remote}")
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+
+                    msg_type = data.get("type")
+                    if msg_type == "register":
+                        worker_node_id = data.get("node_id", f"ws_worker_{int(time.time())}")
+                        self.worker_ws_connections[worker_node_id] = ws
+                        await ws.send_json({"type": "registered", "node_id": worker_node_id, "status": "ok"})
+                        logger.info(f"✅ [WorkerWS] Worker registered: {worker_node_id} ({data.get('node_name', '')})")
+
+                    elif msg_type == "heartbeat":
+                        await ws.send_json({"type": "heartbeat_ack", "timestamp": time.time()})
+
+                    elif msg_type == "synthesize_response":
+                        req_id = data.get("req_id")
+                        fut = self.worker_ws_pending_requests.pop(req_id, None)
+                        if fut and not fut.done():
+                            if data.get("error"):
+                                fut.set_exception(Exception(data["error"]))
+                            else:
+                                import base64
+                                audio_bytes = base64.b64decode(data.get("audio_b64", ""))
+                                fut.set_result(audio_bytes)
+
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    break
+        finally:
+            if worker_node_id:
+                self.worker_ws_connections.pop(worker_node_id, None)
+                logger.info(f"🔌 [WorkerWS] Worker disconnected: {worker_node_id}")
+
+        return ws
 
     # --- ライフサイクル ---
 

@@ -99,7 +99,7 @@ class DiscordAuth:
         """
         ユーザーがBotの参加しているいずれかのサーバーに所属しているか検証
         """
-        if not self.bot.guilds:
+        if not self.bot or not getattr(self.bot, "guilds", None):
             logger.warning("Bot is currently not connected to any guild.")
             return False
 
@@ -116,13 +116,14 @@ class DiscordAuth:
 
         return False
 
-    def create_session_token(self, user_data: Dict[str, Any], max_age: int = 86400 * 7) -> str:
+    def create_session_token(self, user_data: Dict[str, Any], max_age: int = 86400 * 7, is_admin: bool = False) -> str:
         """HMAC署名付きセッショントークンを生成"""
         payload = {
-            "user_id": int(user_data["id"]),
-            "username": user_data.get("username", ""),
-            "global_name": user_data.get("global_name") or user_data.get("username", ""),
+            "user_id": int(user_data.get("id", 0)),
+            "username": user_data.get("username", "Admin"),
+            "global_name": user_data.get("global_name") or user_data.get("username", "Admin"),
             "avatar": user_data.get("avatar", ""),
+            "is_admin": bool(is_admin or user_data.get("is_admin", False)),
             "exp": int(time.time()) + max_age
         }
         raw_json = json.dumps(payload, separators=(',', ':'))

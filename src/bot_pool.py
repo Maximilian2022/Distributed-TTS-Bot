@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 import discord
 from discord.ext import commands
 
@@ -254,6 +254,18 @@ class BotPoolManager:
             self.config.discord_token = ""
         return True
 
+    async def toggle_token(self, bot_index: int, is_enabled: bool) -> bool:
+        """指定号機の有効/無効を切り替え、Botを起動または停止"""
+        await self.db.toggle_bot_token(bot_index, is_enabled)
+        if is_enabled:
+            tokens = await self.db.get_bot_tokens()
+            row = next((t for t in tokens if t["bot_index"] == bot_index), None)
+            if row and row.get("token"):
+                return await self.start_bot(bot_index, row["token"])
+            return False
+        else:
+            return await self.stop_bot(bot_index)
+
     def get_main_bot(self) -> Optional[commands.Bot]:
         """メインBot (1号機) を取得"""
         return self.bots.get(1)
@@ -265,6 +277,57 @@ class BotPoolManager:
     def get_all_bots(self) -> List[commands.Bot]:
         """登録されている全Botを取得"""
         return list(self.bots.values())
+
+    async def get_full_pool_status(self) -> List[Dict[str, Any]]:
+        """1〜10号機の全スロット状態（DB登録情報＋稼働ステータス）を取得"""
+        db_tokens = await self.db.get_bot_tokens()
+        token_map = {t["bot_index"]: t for t in db_tokens}
+
+        results = []
+        for idx in range(1, 11):
+            db_info = token_map.get(idx)
+            bot = self.bots.get(idx)
+
+            connected_vcs = []
+            if bot and bot.is_ready():
+                for g in bot.guilds:
+                    if g.voice_client and g.voice_client.is_connected() and g.voice_client.channel:
+                        vc_cog = bot.get_cog("VCHandlerCog")
+                        bound_text_id = None
+                        if vc_cog:
+                            state = vc_cog.get_guild_state(g.id)
+                            bound_text_id = state.bound_text_channel_id
+                        text_ch = g.get_channel(bound_text_id) if bound_text_id else None
+
+                        connected_vcs.append({
+                            "guild_id": g.id,
+                            "guild_name": g.name,
+                            "voice_channel_id": g.voice_client.channel.id,
+                            "voice_channel_name": g.voice_client.channel.name,
+                            "text_channel_id": bound_text_id,
+                            "text_channel_name": text_ch.name if text_ch else None
+                        })
+
+            masked_token = ""
+            if db_info and db_info.get("token"):
+                raw_tok = db_info["token"]
+                masked_token = f"••••••••{raw_tok[-4:]}" if len(raw_tok) >= 8 else "••••••••"
+
+            results.append({
+                "bot_index": idx,
+                "is_registered": db_info is not None,
+                "is_enabled": bool(db_info.get("is_enabled", 1)) if db_info else False,
+                "label": db_info.get("label", "") if db_info else "",
+                "masked_token": masked_token,
+                "is_running": bot is not None,
+                "is_ready": bot.is_ready() if bot else False,
+                "user": str(bot.user) if (bot and bot.user) else None,
+                "user_id": bot.user.id if (bot and bot.user) else None,
+                "guild_count": len(bot.guilds) if (bot and bot.is_ready()) else 0,
+                "connected_vcs": connected_vcs,
+                "is_busy": (len(connected_vcs) > 0 or self.is_bot_busy(bot)) if bot else False,
+            })
+        return results
 
     def get_pool_status(self) -> List[Dict[str, any]]:
         """全Botの現在の接続ステータス一覧を取得 (WebUIおよび管理用)"""

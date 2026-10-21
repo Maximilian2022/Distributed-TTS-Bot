@@ -103,6 +103,87 @@ class TTSManager:
         # 永続キャッシュからローカルエンジン話者を即座に復元 (停止時・再起動時でも一覧を保持)
         self.load_cached_voices()
 
+    def reload_cloud_credentials(
+        self,
+        azure_key: Optional[str] = None,
+        azure_region: Optional[str] = None,
+        google_json: Optional[str] = None,
+        google_api_key: Optional[str] = None
+    ) -> None:
+        """WebUI等からクラウドAPIキーが更新された際にクライアントを動的再初期化"""
+        if azure_key is not None:
+            self.config.azure_speech_key = azure_key.strip()
+        if azure_region is not None:
+            self.config.azure_speech_region = azure_region.strip()
+        if google_json is not None:
+            self.config.google_credentials_json = google_json.strip()
+        if google_api_key is not None:
+            self.config.google_api_key = google_api_key.strip()
+
+        # Azure クライアントの再初期化
+        old_azure = self.azure_client
+        self.azure_client = AzureTTSClient(
+            key=self.config.azure_speech_key,
+            region=self.config.azure_speech_region or "japaneast",
+            timeout_seconds=self.config.azure_timeout_seconds
+        )
+        if old_azure:
+            safe_create_task(old_azure.close(), name="close_old_azure_client")
+
+        # Google クライアントの再初期化
+        old_google = self.google_client
+        self.google_client = GoogleTTSClient(
+            credentials_path=self.config.google_application_credentials,
+            api_key=self.config.google_api_key,
+            credentials_json=self.config.google_credentials_json,
+            endpoint=self.config.google_endpoint,
+            timeout_seconds=self.config.google_timeout_seconds
+        )
+        if old_google:
+            safe_create_task(old_google.close(), name="close_old_google_client")
+
+        logger.info(
+            f"🔄 [TTSManager] Cloud credentials reloaded: "
+            f"Azure={'Available' if self.azure_client.is_available() else 'Disabled'}, "
+            f"Google={'Available' if self.google_client.is_available() else 'Disabled'}"
+        )
+
+    async def test_synthesis(self, provider: str, voice_name: str = "") -> Tuple[bool, str, float]:
+        """指定プロバイダの疎通・音声合成テストを実施 (成否, メッセージ, 所要ミリ秒)"""
+        start_ts = time.time()
+        test_text = "こんにちは、テスト音声です。"
+        prov = provider.lower().strip()
+
+        try:
+            if prov == "azure":
+                if not self.azure_client.is_available():
+                    return False, "Azure Speech API key is not configured.", 0.0
+                v = voice_name or "ja-JP-NanamiNeural"
+                wav = await self.azure_client.synthesize(test_text, v)
+            elif prov == "google":
+                if not self.google_client.is_available():
+                    return False, "Google Cloud credentials are not configured.", 0.0
+                v = voice_name or "ja-JP-Neural2-B"
+                wav = await self.google_client.synthesize(test_text, v)
+            elif prov == "edge":
+                v = voice_name or "ja-JP-NanamiNeural"
+                wav = await self.edge_client.synthesize(test_text, v)
+            elif prov == "openjtalk":
+                v = voice_name or "ojt_mei_normal"
+                wav = await self.openjtalk_client.synthesize(test_text, v)
+            else:
+                return False, f"Unsupported provider for testing: {prov}", 0.0
+
+            elapsed_ms = round((time.time() - start_ts) * 1000, 1)
+            if wav and len(wav) > 44:
+                return True, f"Success ({len(wav)} bytes generated)", elapsed_ms
+            else:
+                return False, "Empty or invalid WAV returned", elapsed_ms
+        except Exception as e:
+            elapsed_ms = round((time.time() - start_ts) * 1000, 1)
+            logger.warning(f"Test synthesis failed for {prov}: {e}")
+            return False, str(e), elapsed_ms
+
     def load_cached_voices(self) -> int:
         """保存された voices_cache.json からローカルエンジンモデルを config.voices に復元"""
         if not os.path.exists(self.VOICES_CACHE_FILE):

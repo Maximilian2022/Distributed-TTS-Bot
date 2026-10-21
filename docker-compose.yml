@@ -1,3 +1,15 @@
+# ==============================================================================
+# TTSBot OSS Docker Compose 設定ファイル
+#
+# クイックスタート (スタンドアロン):
+#   docker compose up -d
+#
+# オプション機能付き起動:
+#   - ローカル VOICEVOX エンジン同梱: docker compose --profile voicevox up -d
+#   - Cloudflare Tunnel 同梱:      docker compose --profile tunnel up -d
+#   - 全て同梱:                    docker compose --profile voicevox --profile tunnel up -d
+# ==============================================================================
+
 x-bot-base: &bot-base
   build:
     context: .
@@ -11,20 +23,18 @@ x-bot-base: &bot-base
       reservations:
         memory: 512M
   healthcheck:
-    test: ["CMD-SHELL", "python -c 'import os, sys, urllib.request; sys.exit(0 if os.path.exists(\"/tmp/ttsbot_ready\") or (lambda: urllib.request.urlopen(\"http://127.0.0.1:8080/health\", timeout=3).status == 200)() else 1)' 2>/dev/null || exit 1"]
+    test: ["CMD-SHELL", "python -c 'import urllib.request, os, sys; p = os.getenv(\"WEB_PORT\", \"8080\"); sys.exit(0 if urllib.request.urlopen(f\"http://127.0.0.1:{p}/health\", timeout=3).status == 200 else 1)' 2>/dev/null || exit 1"]
     interval: 30s
     timeout: 5s
     retries: 3
     start_period: 30s
   volumes:
+    - ./src:/app/src
+    - ./data:/app/data
+    - ./logs:/app/logs
     - tts_cache:/app/cache
     - voicevox_cache:/app/cache_voicevox
-    - coeiroink_models:/app/coeiroink_models:ro
-    - bot_data:/app/data
-    - ./src:/app/src
-    - ./logs:/app/logs
-    - ./config.yaml:/app/config.yaml
-    - ./gcp-key.json:/app/gcp-key.json:ro
+    - coeiroink_models:/app/coeiroink_models
     - ./openjtalk_voices:/app/openjtalk_voices:ro
     - /var/run/docker.sock:/var/run/docker.sock
   env_file:
@@ -34,7 +44,6 @@ x-bot-base: &bot-base
     - PYTHONPATH=/app
     - TZ=Asia/Tokyo
     - COEIROINK_MODEL_DIR=/app/coeiroink_models
-    - TTSBOT_STANDBY=${TTSBOT_STANDBY:-0}
   logging:
     driver: "json-file"
     options:
@@ -42,88 +51,51 @@ x-bot-base: &bot-base
       max-file: "3"
 
 services:
-  router:
-    image: nginx:alpine
-    container_name: ttsbot-router
+  # ----------------------------------------------------------------------------
+  # 1. メインアプリケーション (デフォルト: スタンドアロン起動)
+  # ----------------------------------------------------------------------------
+  app:
+    <<: *bot-base
     restart: unless-stopped
     ports:
-      - "8088:8080"
-    volumes:
-      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      - "${WEB_PORT:-8080}:${WEB_PORT:-8080}"
+
+  # ----------------------------------------------------------------------------
+  # 2. ローカル VOICEVOX エンジン (オプション: --profile voicevox)
+  # ----------------------------------------------------------------------------
+  voicevox:
+    image: voicevox/voicevox_engine:cpu-ubuntu20.04-latest
+    restart: unless-stopped
+    profiles:
+      - voicevox
+    ports:
+      - "50021:50021"
     deploy:
       resources:
         limits:
-          cpus: '0.5'
-          memory: 128M
-    networks:
-      default:
-        aliases:
-          - ttsbot
+          cpus: '2.0'
+          memory: 2048M
 
-  ttsbot-blue:
-    <<: *bot-base
-    container_name: ttsbot-blue
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app
-      - TZ=Asia/Tokyo
-      - COEIROINK_MODEL_DIR=/app/coeiroink_models
-      - TTSBOT_STANDBY=${TTSBOT_STANDBY:-0}
-      - TTSBOT_NODE=${TTSBOT_NODE:-ubuntu}
-      - TTSBOT_SLOT=blue
-
-  ttsbot-green:
-    <<: *bot-base
-    container_name: ttsbot-green
-    restart: unless-stopped
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PYTHONPATH=/app
-      - TZ=Asia/Tokyo
-      - COEIROINK_MODEL_DIR=/app/coeiroink_models
-      - TTSBOT_STANDBY=${TTSBOT_STANDBY:-0}
-      - TTSBOT_NODE=${TTSBOT_NODE:-ubuntu}
-      - TTSBOT_SLOT=green
-
+  # ----------------------------------------------------------------------------
+  # 3. Cloudflare Tunnel (オプション: --profile tunnel)
+  # ----------------------------------------------------------------------------
   tunnel:
     image: cloudflare/cloudflared:latest
-    container_name: ttsbot-tunnel
     restart: unless-stopped
+    profiles:
+      - tunnel
     command: tunnel --no-autoupdate run
     environment:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
-      - router
-    healthcheck:
-      test: ["CMD", "cloudflared", "--version"]
-      interval: 60s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      - app
     deploy:
       resources:
         limits:
           cpus: '0.5'
           memory: 256M
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 volumes:
   tts_cache:
-    name: tts_cache
   voicevox_cache:
-    name: voicevox_cache
-  bot_data:
-    name: bot_data
   coeiroink_models:
-    name: coeiroink_models

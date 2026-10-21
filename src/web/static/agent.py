@@ -19,6 +19,7 @@ import platform
 import subprocess
 import shutil
 import io
+import base64
 import tarfile
 import zipfile
 import hashlib
@@ -107,7 +108,18 @@ AGENT_PORT = int(os.getenv("AGENT_PORT", "50030"))
 RSYNC_PORT = int(os.getenv("RSYNC_PORT", "8730"))
 IDLE_TIMEOUT_SECONDS = int(os.getenv("IDLE_TIMEOUT_SECONDS", "900"))  # 15分
 NODE_ID = os.getenv("NODE_ID", f"worker_{socket.gethostname()}")
-WORKER_TOKEN = os.getenv("WORKER_SHARED_SECRET", os.getenv("WORKER_SECRET", "")).strip()
+
+# CLI引数と環境変数のパース (WAN/NAT越え WebSocket 対応)
+_cli_master_ws = None
+_cli_secret = None
+for i, arg in enumerate(sys.argv):
+    if arg == "--master-ws" and i + 1 < len(sys.argv):
+        _cli_master_ws = sys.argv[i + 1]
+    elif arg == "--secret" and i + 1 < len(sys.argv):
+        _cli_secret = sys.argv[i + 1]
+
+MASTER_WS_URL = (_cli_master_ws or os.getenv("MASTER_WS_URL", "")).strip()
+WORKER_TOKEN = (_cli_secret or os.getenv("WORKER_SHARED_SECRET", os.getenv("WORKER_SECRET", ""))).strip()
 
 def resolve_work_dir() -> str:
     """ホストの作業ディレクトリ（Composeファイルやdockerディレクトリが存在する場所）を特定"""
@@ -462,6 +474,171 @@ ENGINES = {
         "health_path": "/docs",
     }
 }
+
+async def synthesize_local(
+    engine: str,
+    speaker_id: int,
+    text: str,
+    speed: float = 1.0,
+    pitch: float = 0.0,
+    intonation: float = 1.0,
+    volume: float = 1.0,
+    speaker_uuid: str = "",
+    style_id: int = 0
+) -> bytes:
+    """ローカル稼働エンジン (VOICEVOX / SHAREVOX / COEIROINK) を呼び出してWAV音声バイナリを生成"""
+    engine_lower = engine.lower()
+    async with aiohttp.ClientSession() as session:
+        if engine_lower in ("voicevox", "sharevox"):
+            port = 50021 if engine_lower == "voicevox" else 50025
+            base_url = f"http://127.0.0.1:{port}"
+
+            # 1. audio_query
+            query_url = f"{base_url}/audio_query"
+            params = {"text": text, "speaker": speaker_id}
+            async with session.post(query_url, params=params, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    raise RuntimeError(f"{engine} audio_query failed ({resp.status}): {err}")
+                query_data = await resp.json()
+
+            # パラメータ適用
+            query_data["speedScale"] = speed
+            query_data["pitchScale"] = pitch
+            query_data["intonationScale"] = intonation
+            query_data["volumeScale"] = volume
+
+            # 2. synthesis
+            synth_url = f"{base_url}/synthesis"
+            async with session.post(synth_url, params={"speaker": speaker_id}, json=query_data, timeout=aiohttp.ClientTimeout(total=10.0)) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    raise RuntimeError(f"{engine} synthesis failed ({resp.status}): {err}")
+                return await resp.read()
+
+        elif engine_lower == "coeiroink":
+            # COEIROINK v2 (port 50032)
+            base_url = "http://127.0.0.1:50032"
+            synth_url = f"{base_url}/v1/synthesis"
+            payload = {
+                "speakerUuid": speaker_uuid or "3cda4742-1cb1-433d-9ce6-209fa0952c0e",
+                "styleId": style_id or speaker_id or 0,
+                "text": text,
+                "speedScale": speed,
+                "volumeScale": volume,
+                "pitchScale": pitch,
+                "intonationScale": intonation
+            }
+            async with session.post(synth_url, json=payload, timeout=aiohttp.ClientTimeout(total=10.0)) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    raise RuntimeError(f"COEIROINK synthesis failed ({resp.status}): {err}")
+                return await resp.read()
+
+        else:
+            raise ValueError(f"Unsupported engine: {engine}")
+
+async def _handle_ws_synth_request(ws, req_id: str, data: dict):
+    """WebSocket経由で受信したMasterからの音声合成要求をローカルエンジンで処理し返信"""
+    try:
+        engine = data.get("engine", "voicevox")
+        speaker_id = data.get("speaker_id", 1)
+        text = data.get("text", "")
+        speed = float(data.get("speed", 1.0))
+        pitch = float(data.get("pitch", 0.0))
+        intonation = float(data.get("intonation", 1.0))
+        volume = float(data.get("volume", 1.0))
+        speaker_uuid = data.get("speaker_uuid", "")
+        style_id = int(data.get("style_id", 0))
+
+        audio_bytes = await synthesize_local(
+            engine=engine,
+            speaker_id=speaker_id,
+            text=text,
+            speed=speed,
+            pitch=pitch,
+            intonation=intonation,
+            volume=volume,
+            speaker_uuid=speaker_uuid,
+            style_id=style_id
+        )
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        await ws.send_json({
+            "type": "synthesize_response",
+            "req_id": req_id,
+            "audio_b64": audio_b64,
+            "error": None
+        })
+    except Exception as e:
+        logger.error(f"❌ [WS-Client] Synthesis error for req {req_id}: {e}")
+        await ws.send_json({
+            "type": "synthesize_response",
+            "req_id": req_id,
+            "audio_b64": None,
+            "error": str(e)
+        })
+
+async def ws_client_loop(master_ws_url: str, secret: str, node_id: str):
+    """Master との双方向常時接続 WebSocket クライアントループ (NAT/WAN越え用)"""
+    logger.info(f"🚀 [WS-Client] Starting WebSocket client loop to {master_ws_url}")
+    reconnect_delay = 3.0
+
+    while True:
+        try:
+            ws_target = master_ws_url
+            sep = "&" if "?" in ws_target else "?"
+            if secret:
+                ws_target = f"{ws_target}{sep}token={secret}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(ws_target, heartbeat=20.0, max_msg_size=32 * 1024 * 1024) as ws:
+                    logger.info(f"🔌 [WS-Client] Connected to Master WebSocket: {master_ws_url}")
+                    reconnect_delay = 3.0
+
+                    reg_payload = {
+                        "type": "register",
+                        "node_id": node_id,
+                        "node_name": f"Worker ({socket.gethostname()})",
+                        "engines": list(ENGINES.keys())
+                    }
+                    await ws.send_json(reg_payload)
+
+                    async def send_heartbeats():
+                        while not ws.closed:
+                            await asyncio.sleep(20.0)
+                            try:
+                                await ws.send_json({"type": "heartbeat"})
+                            except Exception:
+                                break
+
+                    hb_task = asyncio.create_task(send_heartbeats())
+
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                except Exception:
+                                    continue
+
+                                m_type = data.get("type")
+                                if m_type == "registered":
+                                    logger.info(f"✅ [WS-Client] Registered to Master as {data.get('node_id')}")
+
+                                elif m_type == "synthesize_request":
+                                    req_id = data.get("req_id")
+                                    asyncio.create_task(_handle_ws_synth_request(ws, req_id, data))
+
+                            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                                break
+                    finally:
+                        hb_task.cancel()
+
+        except Exception as e:
+            logger.warning(f"⚠️ [WS-Client] Connection error ({master_ws_url}): {e}. Reconnecting in {reconnect_delay:.1f}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 1.5, 30.0)
+
 
 
 def get_resource_usage() -> Dict[str, Any]:
@@ -2002,7 +2179,7 @@ hosts allow = *
             os.makedirs(staging_dir, exist_ok=True)
 
             logger.info(f"📥 [{idx}/{total_models}] モデル '{spk_name}' ({folder_name}, {size_mb}MB) をステージング領域へダウンロード・展開中...")
-            dl_url = f"{MASTER_URL}/api/worker/models/download/{folder_name}"
+            dl_url = f"{get_master_url()}/api/worker/models/download/{folder_name}"
             stream_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30.0, sock_read=120.0)
 
             try:
@@ -3076,6 +3253,11 @@ async def main():
     asyncio.create_task(agent.ensure_coeiroink_mount_healthy())
     # 起動時スタック保証 (欠落コンテナがあればComposeから自動復元)
     asyncio.create_task(agent.ensure_engine_stack_exists())
+
+    # WAN/NAT越え WebSocket トンネルクライアント (MASTER_WS_URL 設定時)
+    if MASTER_WS_URL:
+        logger.info(f"🌐 [WS-Tunnel] Remote WAN/NAT-traversal mode enabled -> {MASTER_WS_URL}")
+        asyncio.create_task(ws_client_loop(MASTER_WS_URL, WORKER_TOKEN, NODE_ID))
 
     # 永続待機
     while True:

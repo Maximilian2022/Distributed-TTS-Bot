@@ -128,6 +128,7 @@ class AppConfig:
     google_credentials_json: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    admin_password: str = ""
 
     def get_discord_tokens(self) -> List[Tuple[int, str]]:
         """有効な全Botトークンを (bot_index, token) の昇順リストで取得 (最大10台対応)"""
@@ -141,6 +142,8 @@ class AppConfig:
 
     def apply_db_credentials(self, credentials: Dict[str, str], bot_tokens: List[Dict[str, Any]]) -> None:
         """データベースに保存された最新の認証情報・トークンを AppConfig に適用"""
+        if credentials.get("admin_password"):
+            self.admin_password = credentials["admin_password"]
         if credentials.get("azure_speech_key"):
             self.azure_speech_key = credentials["azure_speech_key"]
         if credentials.get("azure_speech_region"):
@@ -330,6 +333,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.speculative_timeout_seconds = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", cfg.speculative_timeout_seconds))
 
     # Web UI & OAuth2 環境変数 (汎用WEB_BASE_URL対応)
+    cfg.admin_password = os.getenv("ADMIN_PASSWORD", cfg.admin_password).strip()
     cfg.web_port = int(os.getenv("WEB_PORT", cfg.web_port))
     cfg.web_host = os.getenv("WEB_HOST", cfg.web_host)
     cfg.discord_client_id = os.getenv("DISCORD_CLIENT_ID", cfg.discord_client_id).strip()

@@ -93,6 +93,15 @@
               <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.893.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
               Discordでログインして利用する
             </a>
+
+            <div style="margin:28px 0 16px;border-top:1px solid rgba(255,255,255,0.1);position:relative;text-align:center;">
+              <span style="background:var(--bg-card, #1a1a2e);padding:0 12px;font-size:12px;color:var(--text-muted, #888);position:relative;top:-9px;">または管理者パスワードでログイン</span>
+            </div>
+            <form onsubmit="handlePasswordLogin(event)" style="display:flex;gap:8px;max-width:380px;margin:0 auto;flex-wrap:wrap;">
+              <input type="password" id="admin-login-pwd" class="form-input" placeholder="管理者パスワード (ADMIN_PASSWORD)" style="flex:1;min-width:200px;" required>
+              <button type="submit" id="admin-login-btn" class="btn btn-secondary">ログイン 🔑</button>
+            </form>
+            <div id="admin-login-err" style="color:#f04747;font-size:12px;margin-top:8px;display:none;"></div>
           </div>
         `);
       } else {
@@ -103,6 +112,8 @@
             <button class="tab-btn" data-tab="dict">📖 単語辞書</button>
             <button class="tab-btn" id="tab-btn-member-voices" data-tab="member-voices" style="display:none;">👥 メンバー音声設定</button>
             <button class="tab-btn" id="tab-btn-config" data-tab="config">⚙️ ボット設定</button>
+            <button class="tab-btn" id="tab-btn-bots" data-tab="bots">🤖 Bot管理</button>
+            <button class="tab-btn" id="tab-btn-credentials" data-tab="credentials">🔑 API・連携設定</button>
             <button class="tab-btn" id="tab-btn-system" data-tab="system">📊 システム & ワーカー状況</button>
             <button class="tab-btn" id="tab-btn-help" data-tab="help">ℹ️ ヘルプ・利用規約</button>
           </nav>
@@ -636,6 +647,136 @@
                 </div>
               </form>
             </div>
+          </section>
+
+          <!-- 5. Discord Bot 管理タブ (最大10台プール) -->
+          <section id="tab-bots" class="tab-pane">
+            <div class="section-title">🤖 Discord Bot プール管理 (動的スケール)</div>
+            <div class="section-desc">最大10台のDiscord Botアカウントを一元管理します。同一サーバー内で複数のVC通話が同時に行われても、空き号機が自動的に参加して並行読み上げを行います。</div>
+
+            <div class="card" style="margin-bottom:20px;padding:20px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+                <div>
+                  <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+                    <span>登録済みBotスロット一覧 (1〜10号機)</span>
+                    <span id="bots-summary-badge" class="badge" style="background:var(--primary);color:#fff;">取得中...</span>
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    1号機はWebUI・管理代表ノードとして動作します。2〜10号機は通話多重化用のワーカーBotです。
+                  </div>
+                </div>
+                <button type="button" class="btn btn-primary btn-sm" onclick="openAddBotModal()">
+                  ＋ Botトークンを追加・編集
+                </button>
+              </div>
+
+              <div id="bot-slots-grid" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(320px, 1fr));gap:14px;">
+                <div style="color:var(--text-muted);font-size:13px;padding:20px;">読み込み中...</div>
+              </div>
+            </div>
+
+            <!-- Bot招待リンク生成カード -->
+            <div class="card" style="padding:20px;">
+              <h3 style="margin:0 0 8px;font-size:15px;">🔗 Discord Bot 招待URL生成</h3>
+              <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
+                作成したBotアカウントをDiscordサーバーへ招待するための公式OAuth2リンクを生成します。必要な権限（ボイス接続・発言・メッセージ読み取り・スラッシュコマンド）が自動付与されます。
+              </p>
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <input type="text" id="invite-client-id-input" class="form-input" placeholder="Application Client ID (Discord Developer Portalより取得)" style="flex:1;min-width:240px;">
+                <button type="button" class="btn btn-secondary" onclick="generateBotInviteLink()">招待リンクを開く ↗</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 6. API・クレデンシャル設定タブ -->
+          <section id="tab-credentials" class="tab-pane">
+            <div class="section-title">🔑 API・外部サービス連携設定</div>
+            <div class="section-desc">クラウド音声合成API（Azure / Google）のAPIキー設定や、自宅PC（Workerノード）との通信用秘密鍵、公開URLを設定します。保存すると再起動なしで即座に反映されます。</div>
+
+            <form id="credentials-form" onsubmit="saveCredentials(event)">
+              <!-- Azure Speech 設定 -->
+              <div class="card" style="margin-bottom:16px;padding:20px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                  <h3 style="margin:0;font-size:15px;display:flex;align-items:center;gap:6px;">
+                    <span>☁️ Azure AI Speech</span>
+                    <span id="azure-status-badge" class="badge">未設定</span>
+                  </h3>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="testCredential('azure')">疎通テスト ⚡</button>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 200px;gap:12px;">
+                  <div>
+                    <label class="form-label" style="font-size:12px;">サブスクリプションキー (Subscription Key)</label>
+                    <input type="password" id="cred-azure-key" class="form-input" placeholder="未設定 (入力すると更新されます)">
+                  </div>
+                  <div>
+                    <label class="form-label" style="font-size:12px;">リージョン (Region)</label>
+                    <input type="text" id="cred-azure-region" class="form-input" placeholder="japaneast" value="japaneast">
+                  </div>
+                </div>
+              </div>
+
+              <!-- Google Cloud TTS 設定 -->
+              <div class="card" style="margin-bottom:16px;padding:20px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                  <h3 style="margin:0;font-size:15px;display:flex;align-items:center;gap:6px;">
+                    <span>🌐 Google Cloud Text-to-Speech</span>
+                    <span id="google-status-badge" class="badge">未設定</span>
+                  </h3>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="testCredential('google')">疎通テスト ⚡</button>
+                </div>
+                <div style="margin-bottom:12px;">
+                  <label class="form-label" style="font-size:12px;">サービスアカウント JSON (Service Account Key JSON)</label>
+                  <textarea id="cred-google-json" class="form-input" rows="3" placeholder='{"type": "service_account", ...} のJSON全文を貼り付け (入力すると更新されます)' style="font-family:monospace;font-size:11px;"></textarea>
+                </div>
+                <div>
+                  <label class="form-label" style="font-size:12px;">または Google APIキー (REST簡易認証用)</label>
+                  <input type="password" id="cred-google-key" class="form-input" placeholder="AIzaSy...">
+                </div>
+              </div>
+
+              <!-- GPU Worker ノード連携設定 -->
+              <div class="card" style="margin-bottom:16px;padding:20px;">
+                <h3 style="margin:0 0 12px;font-size:15px;">🖥️ 分散GPU Worker 認証・接続設定</h3>
+                <div style="margin-bottom:14px;">
+                  <label class="form-label" style="font-size:12px;">Worker 共通共有秘密鍵 (WORKER_SHARED_SECRET)</label>
+                  <div style="display:flex;gap:8px;">
+                    <input type="text" id="cred-worker-secret" class="form-input" style="font-family:monospace;" readonly>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="generateNewWorkerSecret()">再生成 🎲</button>
+                  </div>
+                  <small style="color:var(--text-muted);font-size:11px;margin-top:4px;display:block;">
+                    リモートWorker（自宅GPUマシン等）がこのMasterへWebSocket接続・登録する際の認証トークンです。
+                  </small>
+                </div>
+
+                <div style="background:rgba(0,0,0,0.25);border-radius:8px;padding:14px;border:1px solid rgba(255,255,255,0.08);">
+                  <div style="font-size:12px;font-weight:600;margin-bottom:6px;">⚡ リモートノード接続ワンライナー (自宅PC・別サーバー用)</div>
+                  <div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">自宅のGPU PC（Windows WSL2 / Linux）で以下を実行するだけで、ポート開放不要でMasterへ外向きWebSocket接続されます：</div>
+                  <pre id="worker-oneliner-code" style="background:#111;padding:10px;border-radius:6px;font-size:11px;overflow-x:auto;color:#10b981;margin:0;"></pre>
+                  <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyWorkerOneliner()">コマンドをコピー 📋</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- システム基本公開設定 -->
+              <div class="card" style="margin-bottom:20px;padding:20px;">
+                <h3 style="margin:0 0 12px;font-size:15px;">🌐 公開URL・管理者パスワード設定</h3>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                  <div>
+                    <label class="form-label" style="font-size:12px;">外部公開ベースURL (WEB_BASE_URL)</label>
+                    <input type="text" id="cred-web-base-url" class="form-input" placeholder="https://tts.example.com または http://192.168.11.xxx:8080">
+                  </div>
+                  <div>
+                    <label class="form-label" style="font-size:12px;">新管理者パスワード (変更時のみ入力)</label>
+                    <input type="password" id="cred-admin-password" class="form-input" placeholder="変更しない場合は空欄">
+                  </div>
+                </div>
+              </div>
+
+              <div style="display:flex;justify-content:flex-end;">
+                <button type="submit" class="btn btn-primary" style="padding:12px 32px;">設定を保存してホットリロード 💾</button>
+              </div>
+            </form>
           </section>
 
           <!-- 4. システム & キャッシュ状況タブ -->
@@ -1901,6 +2042,54 @@
       }, 250);
     }
   </script>
+
+  <!-- Botトークン追加・編集モーダル -->
+  <div id="bot-token-modal" class="modal-backdrop" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;">
+    <div class="modal-card card" style="max-width:480px;width:90%;background:var(--bg-card, #1a1a2e);border:1px solid rgba(255,255,255,0.15);border-radius:12px;padding:0;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+      <div style="padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;">
+        <h3 id="bot-modal-title" style="margin:0;font-size:16px;">Botトークンの設定</h3>
+        <button type="button" onclick="closeBotModal()" style="background:none;border:none;color:#aaa;font-size:20px;cursor:pointer;">×</button>
+      </div>
+      <form onsubmit="submitBotTokenForm(event)">
+        <div style="padding:20px;">
+          <div style="margin-bottom:14px;">
+            <label class="form-label" style="font-size:12px;">号機スロット (1〜10号機)</label>
+            <select id="bot-modal-index" class="form-input" required>
+              <option value="1">1号機 (メイン代表Bot / WebUI)</option>
+              <option value="2">2号機 (ワーカーBot)</option>
+              <option value="3">3号機 (ワーカーBot)</option>
+              <option value="4">4号機 (ワーカーBot)</option>
+              <option value="5">5号機 (ワーカーBot)</option>
+              <option value="6">6号機 (ワーカーBot)</option>
+              <option value="7">7号機 (ワーカーBot)</option>
+              <option value="8">8号機 (ワーカーBot)</option>
+              <option value="9">9号機 (ワーカーBot)</option>
+              <option value="10">10号機 (ワーカーBot)</option>
+            </select>
+          </div>
+          <div style="margin-bottom:14px;">
+            <label class="form-label" style="font-size:12px;">メモ・識別ラベル (任意)</label>
+            <input type="text" id="bot-modal-label" class="form-input" placeholder="例: メイン読み上げBot">
+          </div>
+          <div style="margin-bottom:14px;">
+            <label class="form-label" style="font-size:12px;">Discord Bot Token</label>
+            <input type="password" id="bot-modal-token" class="form-input" placeholder="Botトークンを貼り付け" required>
+            <small style="color:var(--text-muted);font-size:11px;display:block;margin-top:4px;">
+              Discord Developer Portal の「Bot」タブで「Reset Token」から取得できます。
+            </small>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <input type="checkbox" id="bot-modal-enabled" checked>
+            <label for="bot-modal-enabled" style="font-size:13px;cursor:pointer;">保存後に即座にGatewayへ接続起動する</label>
+          </div>
+        </div>
+        <div style="padding:14px 20px;background:rgba(0,0,0,0.2);display:flex;justify-content:flex-end;gap:10px;border-top:1px solid rgba(255,255,255,0.08);">
+          <button type="button" class="btn btn-secondary btn-sm" onclick="closeBotModal()">キャンセル</button>
+          <button type="submit" id="bot-modal-submit-btn" class="btn btn-primary btn-sm">保存して接続 🚀</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <div id="toast-container" class="toast-container"></div>
   <script src="/static/app.js?v={{ASSET_V}}"></script>

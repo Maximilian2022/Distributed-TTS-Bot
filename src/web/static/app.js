@@ -54,8 +54,8 @@ function setupTabs() {
       const tabId = btn.dataset.tab;
 
       // 権限チェック
-      const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin;
-      if ((tabId === "config" || tabId === "system" || tabId === "member-voices") && !hasAccess) {
+      const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin || (window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+      if ((tabId === "config" || tabId === "system" || tabId === "member-voices" || tabId === "bots" || tabId === "credentials") && !hasAccess) {
         showToast("このタブを閲覧する権限がありません（管理者または指定ロールのみ）", "error");
         return;
       }
@@ -75,7 +75,13 @@ function setupTabs() {
         }
       } catch (e) {}
 
-      // ログ・統計タブが開かれたときの更新
+      // タブごとのロード
+      if (tabId === "bots") {
+        loadBotSlots();
+      }
+      if (tabId === "credentials") {
+        loadCredentials();
+      }
       if (tabId === "system") {
         loadStats(currentGuildId);
         if (currentGuildId) {
@@ -225,7 +231,17 @@ function updatePermissionsUI() {
   const cardMemberVoicesForbidden = document.getElementById("member-voices-forbidden-card");
   const areaMemberVoicesContent = document.getElementById("member-voices-content-area");
 
-  const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin;
+  const btnBots = document.getElementById("tab-btn-bots");
+  const btnCreds = document.getElementById("tab-btn-credentials");
+
+  const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin || (window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+
+  if (btnBots) {
+    btnBots.style.display = hasAccess ? "inline-block" : "none";
+  }
+  if (btnCreds) {
+    btnCreds.style.display = hasAccess ? "inline-block" : "none";
+  }
 
   if (btnMemberVoices) {
     btnMemberVoices.style.display = hasAccess ? "inline-block" : "none";
@@ -6423,3 +6439,466 @@ window.loadLatencyIncidents = loadLatencyIncidents;
 
 
 
+
+// ==========================================
+// 1. 管理者パスワードログイン処理
+// ==========================================
+async function handlePasswordLogin(event) {
+  event.preventDefault();
+  const pwdInput = document.getElementById("admin-login-pwd");
+  const errDiv = document.getElementById("admin-login-err");
+  const btn = document.getElementById("admin-login-btn");
+  if (!pwdInput) return;
+
+  const password = pwdInput.value.trim();
+  if (!password) return;
+
+  if (btn) btn.disabled = true;
+  if (errDiv) errDiv.style.display = "none";
+
+  try {
+    const res = await fetch("/api/auth/login_password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: password })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      showToast("管理者としてログインしました 🔑", "success");
+      setTimeout(() => {
+        window.location.reload();
+      }, 500);
+    } else {
+      if (errDiv) {
+        errDiv.textContent = `❌ ${data.error || "パスワードが正しくありません"}`;
+        errDiv.style.display = "block";
+      }
+      showToast(data.error || "ログインに失敗しました", "error");
+    }
+  } catch (err) {
+    if (errDiv) {
+      errDiv.textContent = `❌ 通信エラー: ${err.message}`;
+      errDiv.style.display = "block";
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+window.handlePasswordLogin = handlePasswordLogin;
+
+// ==========================================
+// 2. Discord Bot プール管理 (1〜10号機)
+// ==========================================
+async function loadBotSlots() {
+  const grid = document.getElementById("bot-slots-grid");
+  const badge = document.getElementById("bots-summary-badge");
+  if (!grid) return;
+
+  try {
+    const res = await fetch("/api/system/bots");
+    if (!res.ok) {
+      const err = await res.json();
+      grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Bot情報の取得に失敗しました: ${escapeHtml(err.error || res.statusText)}</div>`;
+      return;
+    }
+    const data = await res.json();
+    const slots = data.slots || [];
+
+    if (badge) {
+      badge.textContent = `稼働中: ${data.running_count} / ${data.enabled_count} 台 (全${data.total_slots}スロット)`;
+      badge.style.background = data.running_count > 0 ? "var(--primary, #5865f2)" : "rgba(255,255,255,0.15)";
+    }
+
+    grid.innerHTML = slots.map(slot => {
+      const isConfigured = slot.is_configured;
+      const isRunning = slot.is_running;
+      const isEnabled = slot.is_enabled;
+      const isPrimary = slot.index === 1;
+
+      let statusBadge = "";
+      let borderColor = "rgba(255,255,255,0.08)";
+      if (!isConfigured) {
+        statusBadge = `<span class="badge" style="background:rgba(255,255,255,0.06);color:var(--text-dim, #72767d);">未登録</span>`;
+      } else if (isRunning) {
+        statusBadge = `<span class="badge" style="background:rgba(46,204,113,0.2);color:#2ecc71;border:1px solid rgba(46,204,113,0.4);">🟢 接続中 (${Math.round(slot.ping_ms || 0)}ms)</span>`;
+        borderColor = "rgba(46,204,113,0.3)";
+      } else if (isEnabled) {
+        statusBadge = `<span class="badge" style="background:rgba(241,196,15,0.2);color:#f1c40f;border:1px solid rgba(241,196,15,0.4);">🟡 接続準備中...</span>`;
+        borderColor = "rgba(241,196,15,0.3)";
+      } else {
+        statusBadge = `<span class="badge" style="background:rgba(231,76,60,0.15);color:#ff6b6b;border:1px solid rgba(231,76,60,0.3);">⚪ 停止中</span>`;
+      }
+
+      const roleBadge = isPrimary
+        ? `<span class="badge" style="background:rgba(88,101,242,0.25);color:#7289da;border:1px solid rgba(88,101,242,0.4);">👑 代表Bot / WebUI</span>`
+        : `<span class="badge" style="background:rgba(255,255,255,0.06);color:var(--text-muted, #999);">⚡ 多重化ワーカー</span>`;
+
+      let guildsListHtml = "";
+      if (slot.guilds && slot.guilds.length > 0) {
+        guildsListHtml = `
+          <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.05);font-size:11px;color:var(--text-muted);">
+            参加サーバー (${slot.guilds_count}件):
+            <div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px;">
+              ${slot.guilds.map(g => `<span style="background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:4px;color:var(--text-light);">${escapeHtml(g.name)}</span>`).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      return `
+        <div class="card" style="margin:0;padding:16px;background:rgba(0,0,0,0.2);border:1px solid ${borderColor};border-radius:8px;display:flex;flex-direction:column;justify-content:space-between;">
+          <div>
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;">
+              <div>
+                <div style="font-weight:700;font-size:14px;color:var(--text-light);display:flex;align-items:center;gap:6px;">
+                  <span>${slot.index}号機</span>
+                  ${roleBadge}
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
+                  ${slot.label ? escapeHtml(slot.label) : '<span style="color:var(--text-dim);font-style:italic;">ラベルなし</span>'}
+                </div>
+              </div>
+              <div>${statusBadge}</div>
+            </div>
+
+            <div style="font-size:11px;font-family:monospace;color:var(--text-dim);background:rgba(0,0,0,0.25);padding:4px 8px;border-radius:4px;margin:8px 0;word-break:break-all;">
+              ${slot.token_masked || 'トークン未設定'}
+            </div>
+
+            ${guildsListHtml}
+          </div>
+
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px;padding-top:10px;border-top:1px solid rgba(255,255,255,0.08);">
+            <div>
+              ${isConfigured ? `
+                <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--text-light);">
+                  <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleBotSlot(${slot.index}, this.checked)">
+                  <span>${isEnabled ? '有効' : '無効'}</span>
+                </label>
+              ` : `
+                <span style="font-size:12px;color:var(--text-dim);">未設定</span>
+              `}
+            </div>
+            <div style="display:flex;gap:6px;">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="openAddBotModal(${slot.index}, '${escapeHtml(slot.label || '')}')" style="padding:4px 8px;font-size:11px;">
+                ${isConfigured ? '編集' : '＋ 設定'}
+              </button>
+              ${isConfigured ? `
+                <button type="button" class="btn btn-danger btn-sm" onclick="deleteBotSlot(${slot.index})" style="padding:4px 8px;font-size:11px;" title="トークンを削除">
+                  🗑️
+                </button>
+              ` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+    }).join("");
+  } catch (err) {
+    console.error("loadBotSlots error:", err);
+    grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Bot情報の取得中にエラーが発生しました: ${escapeHtml(err.message)}</div>`;
+  }
+}
+window.loadBotSlots = loadBotSlots;
+
+function openAddBotModal(idx = 1, label = "") {
+  const modal = document.getElementById("bot-token-modal");
+  const idxSelect = document.getElementById("bot-modal-index");
+  const labelInput = document.getElementById("bot-modal-label");
+  const tokenInput = document.getElementById("bot-modal-token");
+  const enabledInput = document.getElementById("bot-modal-enabled");
+  const title = document.getElementById("bot-modal-title");
+
+  if (!modal) return;
+  if (idxSelect) idxSelect.value = String(idx);
+  if (labelInput) labelInput.value = label;
+  if (tokenInput) tokenInput.value = "";
+  if (enabledInput) enabledInput.checked = true;
+  if (title) title.textContent = `Botトークンの設定 (${idx}号機)`;
+
+  modal.style.display = "flex";
+}
+window.openAddBotModal = openAddBotModal;
+
+function closeBotModal() {
+  const modal = document.getElementById("bot-token-modal");
+  if (modal) modal.style.display = "none";
+}
+window.closeBotModal = closeBotModal;
+
+async function submitBotTokenForm(event) {
+  event.preventDefault();
+  const idx = parseInt(document.getElementById("bot-modal-index").value, 10);
+  const label = document.getElementById("bot-modal-label").value.trim();
+  const token = document.getElementById("bot-modal-token").value.trim();
+  const enabled = document.getElementById("bot-modal-enabled").checked;
+  const submitBtn = document.getElementById("bot-modal-submit-btn");
+
+  if (!token) {
+    showToast("Discord Bot Token を入力してください", "error");
+    return;
+  }
+
+  if (submitBtn) submitBtn.disabled = true;
+
+  try {
+    const res = await fetch("/api/system/bots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        bot_index: idx,
+        token: token,
+        label: label,
+        is_enabled: enabled
+      })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      showToast(`${idx}号機トークンを設定しました 🚀`, "success");
+      closeBotModal();
+      loadBotSlots();
+    } else {
+      showToast(data.error || "Bot設定の保存に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+}
+window.submitBotTokenForm = submitBotTokenForm;
+
+async function toggleBotSlot(idx, enabled) {
+  try {
+    const res = await fetch(`/api/system/bots/${idx}/toggle`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ is_enabled: enabled })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      showToast(enabled ? `${idx}号機の起動を開始しました` : `${idx}号機を停止しました`, "success");
+      loadBotSlots();
+    } else {
+      showToast(data.error || "状態変更に失敗しました", "error");
+      loadBotSlots();
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+    loadBotSlots();
+  }
+}
+window.toggleBotSlot = toggleBotSlot;
+
+async function deleteBotSlot(idx) {
+  if (!confirm(`${idx}号機の登録トークンを削除し、Botを切断・停止しますか？`)) {
+    return;
+  }
+  try {
+    const res = await fetch(`/api/system/bots/${idx}`, {
+      method: "DELETE"
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      showToast(`${idx}号機を削除しました 🗑️`, "success");
+      loadBotSlots();
+    } else {
+      showToast(data.error || "削除に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  }
+}
+window.deleteBotSlot = deleteBotSlot;
+
+function generateBotInviteLink() {
+  const input = document.getElementById("invite-client-id-input");
+  if (!input) return;
+  const clientId = input.value.trim();
+  if (!clientId) {
+    showToast("Application Client ID を入力してください", "error");
+    input.focus();
+    return;
+  }
+  const url = `https://discord.com/api/oauth2/authorize?client_id=${encodeURIComponent(clientId)}&permissions=3148800&scope=bot%20applications.commands`;
+  window.open(url, "_blank");
+}
+window.generateBotInviteLink = generateBotInviteLink;
+
+// ==========================================
+// 3. API・クレデンシャル設定 & Worker連携
+// ==========================================
+function updateWorkerOneliner(webBaseUrl, secret) {
+  const pre = document.getElementById("worker-oneliner-code");
+  if (!pre) return;
+
+  const baseUrl = (webBaseUrl || window.location.origin).replace(/\/$/, "");
+  let wsUrl = baseUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  if (!wsUrl.includes("/api/worker/ws")) {
+    wsUrl = `${wsUrl}/api/worker/ws`;
+  }
+  const sec = secret || "your_worker_secret_here";
+  const cmd = `curl -sSL "${baseUrl}/static/setup-worker.sh" | bash -s -- --master-ws "${wsUrl}" --secret "${sec}"`;
+  pre.textContent = cmd;
+}
+
+async function loadCredentials() {
+  const azureBadge = document.getElementById("azure-status-badge");
+  const googleBadge = document.getElementById("google-status-badge");
+  const azureRegionInput = document.getElementById("cred-azure-region");
+  const workerSecretInput = document.getElementById("cred-worker-secret");
+  const webBaseUrlInput = document.getElementById("cred-web-base-url");
+
+  try {
+    const res = await fetch("/api/system/credentials");
+    if (!res.ok) {
+      const err = await res.json();
+      showToast(`クレデンシャル取得エラー: ${err.error || res.statusText}`, "error");
+      return;
+    }
+    const data = await res.json();
+
+    if (azureBadge) {
+      azureBadge.textContent = data.azure_speech_configured ? "🟢 設定済み" : "⚪ 未設定";
+      azureBadge.style.background = data.azure_speech_configured ? "rgba(46,204,113,0.2)" : "rgba(255,255,255,0.06)";
+      azureBadge.style.color = data.azure_speech_configured ? "#2ecc71" : "var(--text-dim)";
+    }
+    if (azureRegionInput) {
+      azureRegionInput.value = data.azure_speech_region || "japaneast";
+    }
+
+    if (googleBadge) {
+      const gOk = data.google_tts_configured;
+      googleBadge.textContent = gOk ? (data.has_google_json ? "🟢 JSONキー設定済" : "🟢 APIキー設定済") : "⚪ 未設定";
+      googleBadge.style.background = gOk ? "rgba(46,204,113,0.2)" : "rgba(255,255,255,0.06)";
+      googleBadge.style.color = gOk ? "#2ecc71" : "var(--text-dim)";
+    }
+
+    if (workerSecretInput) {
+      workerSecretInput.value = data.worker_shared_secret || "";
+    }
+    if (webBaseUrlInput) {
+      webBaseUrlInput.value = data.web_base_url || window.location.origin;
+    }
+
+    updateWorkerOneliner(data.web_base_url, data.worker_shared_secret);
+  } catch (err) {
+    console.error("loadCredentials error:", err);
+    showToast(`クレデンシャル読み込み失敗: ${err.message}`, "error");
+  }
+}
+window.loadCredentials = loadCredentials;
+
+function generateNewWorkerSecret() {
+  const chars = "abcdef0123456789";
+  let secret = "";
+  const cryptoObj = window.crypto || window.msCrypto;
+  if (cryptoObj && cryptoObj.getRandomValues) {
+    const arr = new Uint8Array(32);
+    cryptoObj.getRandomValues(arr);
+    secret = Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
+  } else {
+    for (let i = 0; i < 64; i++) {
+      secret += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+  }
+
+  const input = document.getElementById("cred-worker-secret");
+  const webBaseUrlInput = document.getElementById("cred-web-base-url");
+  if (input) input.value = secret;
+  updateWorkerOneliner(webBaseUrlInput ? webBaseUrlInput.value : "", secret);
+  showToast("新しい秘密鍵を生成しました（保存するまで反映されません）", "success");
+}
+window.generateNewWorkerSecret = generateNewWorkerSecret;
+
+function copyWorkerOneliner() {
+  const pre = document.getElementById("worker-oneliner-code");
+  if (!pre) return;
+  const text = pre.textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => {
+      showToast("ワンライナーコマンドをコピーしました 📋", "success");
+    }).catch(err => {
+      showToast("コピーに失敗しました", "error");
+    });
+  } else {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand("copy");
+    document.body.removeChild(textarea);
+    showToast("ワンライナーコマンドをコピーしました 📋", "success");
+  }
+}
+window.copyWorkerOneliner = copyWorkerOneliner;
+
+async function saveCredentials(event) {
+  event.preventDefault();
+  const azureKey = document.getElementById("cred-azure-key")?.value?.trim() || "";
+  const azureRegion = document.getElementById("cred-azure-region")?.value?.trim() || "japaneast";
+  const googleJson = document.getElementById("cred-google-json")?.value?.trim() || "";
+  const googleKey = document.getElementById("cred-google-key")?.value?.trim() || "";
+  const workerSecret = document.getElementById("cred-worker-secret")?.value?.trim() || "";
+  const webBaseUrl = document.getElementById("cred-web-base-url")?.value?.trim() || "";
+  const adminPassword = document.getElementById("cred-admin-password")?.value?.trim() || "";
+
+  const payload = {
+    azure_speech_region: azureRegion,
+    worker_shared_secret: workerSecret,
+    web_base_url: webBaseUrl
+  };
+  if (azureKey) payload.azure_speech_key = azureKey;
+  if (googleJson) payload.google_service_account_json = googleJson;
+  if (googleKey) payload.google_api_key = googleKey;
+  if (adminPassword) payload.admin_password = adminPassword;
+
+  try {
+    const res = await fetch("/api/system/credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      showToast("設定を保存し、ホットリロードを完了しました 💾", "success");
+      const k1 = document.getElementById("cred-azure-key");
+      const k2 = document.getElementById("cred-google-json");
+      const k3 = document.getElementById("cred-google-key");
+      const k4 = document.getElementById("cred-admin-password");
+      if (k1) k1.value = "";
+      if (k2) k2.value = "";
+      if (k3) k3.value = "";
+      if (k4) k4.value = "";
+      loadCredentials();
+    } else {
+      showToast(data.error || "設定保存に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  }
+}
+window.saveCredentials = saveCredentials;
+
+async function testCredential(provider) {
+  showToast(`⚡ ${provider.toUpperCase()} のテスト音声合成を実行中...`, "success");
+  try {
+    const res = await fetch("/api/system/credentials/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: provider })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      showToast(`✅ ${provider.toUpperCase()} 疎通成功！ (遅延: ${data.latency_ms}ms, 形式: ${data.format})`, "success");
+      if (data.audio_base64) {
+        const audio = new Audio(`data:audio/${data.format};base64,${data.audio_base64}`);
+        audio.play().catch(e => console.warn("Audio play prevented:", e));
+      }
+    } else {
+      showToast(`❌ ${provider.toUpperCase()} テスト失敗: ${data.error || res.statusText}`, "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  }
+}
+window.testCredential = testCredential;

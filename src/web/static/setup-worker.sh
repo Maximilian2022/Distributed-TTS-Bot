@@ -24,13 +24,51 @@ C_RED="\033[31m"
 C_CYAN="\033[36m"
 
 MASTER_URL="${TTSBOT_MASTER_URL:-http://192.168.11.245:8088}"
+MASTER_WS_URL="${TTSBOT_MASTER_WS_URL:-}"
+WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"
 WORK_DIR="${TTSBOT_WORK_DIR:-${HOME}/ttsbot-worker}"
 AGENT_IMAGE="${TTSBOT_AGENT_IMAGE:-python:3.14-slim}"
+
+# コマンドライン引数のパース (ワンライナー対応)
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --master)
+            MASTER_URL="$2"
+            shift 2
+            ;;
+        --master-ws)
+            MASTER_WS_URL="$2"
+            shift 2
+            ;;
+        --secret)
+            WORKER_SECRET="$2"
+            shift 2
+            ;;
+        --work-dir)
+            WORK_DIR="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# MASTER_WS_URL が渡された場合、未指定の MASTER_URL を自動補完
+if [ -n "${MASTER_WS_URL}" ] && [ "${MASTER_URL}" = "http://192.168.11.245:8088" ]; then
+    DERIVED_HTTP=$(echo "${MASTER_WS_URL}" | sed -E 's|^ws://|http://|' | sed -E 's|^wss://|https://|' | sed -E 's|/api/worker/ws.*||')
+    if [ -n "${DERIVED_HTTP}" ]; then
+        MASTER_URL="${DERIVED_HTTP}"
+    fi
+fi
 
 echo -e "${C_BOLD}${C_CYAN}"
 echo "=============================================================================="
 echo "   🚀 TTSBot Compute Worker 自動セットアップ (Debian/Linux) v2              "
 echo "   Master: ${MASTER_URL}"
+if [ -n "${MASTER_WS_URL}" ]; then
+echo "   Master WS: ${MASTER_WS_URL} (WAN/NAT越えモード)"
+fi
 echo "=============================================================================="
 echo -e "${C_RESET}"
 echo -e "${C_BLUE}ℹ️  作業ディレクトリ: ${WORK_DIR}${C_RESET}"
@@ -334,6 +372,8 @@ services:
     environment:
       - TZ=Asia/Tokyo
       - MASTER_URL=${MASTER_URL}
+      - MASTER_WS_URL=${MASTER_WS_URL}
+      - WORKER_SHARED_SECRET=${WORKER_SECRET}
       - WORKER_IP=${LOCAL_IP}
       - HAS_GPU=${HAS_GPU}
       - GPU_NAME=${GPU_NAME}
