@@ -520,6 +520,27 @@ class Database:
                 )
             """)
 
+            # 11. システム認証情報・APIキー・設定 (WebUIで管理可能)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS system_credentials (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # 12. Discord Botトークンプール (最大10台動的スケーリング)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_tokens (
+                    bot_index INTEGER PRIMARY KEY,
+                    token TEXT NOT NULL,
+                    label TEXT DEFAULT '',
+                    is_enabled INTEGER DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             # マイグレーション: 全ユーザーの話者を Azure / GCP クラウドプールから再選定
             async with db.execute("SELECT 1 FROM schema_migrations WHERE version = '20261002_reassign_cloud_speakers'") as cur:
                 if not await cur.fetchone():
@@ -2470,6 +2491,70 @@ class Database:
         except Exception as e:
             logger.warning(f"Error during SQLite maintenance: {e}")
         return result
+
+    # --- システム認証情報 & 動的Botトークン管理 ---
+
+    async def get_credential(self, key: str, default: str = "") -> str:
+        """システム設定・認証情報値を取得"""
+        async with self.get_connection() as db:
+            async with db.execute("SELECT value FROM system_credentials WHERE key = ?", (key,)) as cur:
+                row = await cur.fetchone()
+                return str(row[0]) if row else default
+
+    async def set_credential(self, key: str, value: str) -> None:
+        """システム設定・認証情報値を保存・更新"""
+        async with self.get_connection() as db:
+            await db.execute("""
+                INSERT INTO system_credentials (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
+            """, (key, str(value)))
+            await db.commit()
+
+    async def get_all_credentials(self) -> Dict[str, str]:
+        """全システム認証情報・キー設定を取得"""
+        async with self.get_connection() as db:
+            async with db.execute("SELECT key, value FROM system_credentials") as cur:
+                rows = await cur.fetchall()
+                return {r[0]: r[1] for r in rows}
+
+    async def get_bot_tokens(self) -> List[Dict[str, Any]]:
+        """登録済みの全Botトークン一覧を取得 (1〜10号機昇順)"""
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM bot_tokens ORDER BY bot_index ASC") as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+
+    async def save_bot_token(self, bot_index: int, token: str, label: str = "", is_enabled: bool = True) -> None:
+        """Botトークンを保存・更新 (1〜10号機)"""
+        if not (1 <= bot_index <= 10):
+            raise ValueError("bot_index must be between 1 and 10")
+        async with self.get_connection() as db:
+            await db.execute("""
+                INSERT INTO bot_tokens (bot_index, token, label, is_enabled, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(bot_index) DO UPDATE SET
+                    token=excluded.token,
+                    label=excluded.label,
+                    is_enabled=excluded.is_enabled,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (bot_index, str(token).strip(), label, 1 if is_enabled else 0))
+            await db.commit()
+
+    async def delete_bot_token(self, bot_index: int) -> bool:
+        """Botトークンを削除"""
+        async with self.get_connection() as db:
+            cur = await db.execute("DELETE FROM bot_tokens WHERE bot_index = ?", (bot_index,))
+            await db.commit()
+            return cur.rowcount > 0
+
+    async def toggle_bot_token(self, bot_index: int, is_enabled: bool) -> bool:
+        """Botトークンの有効/無効を切り替え"""
+        async with self.get_connection() as db:
+            cur = await db.execute("UPDATE bot_tokens SET is_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE bot_index = ?", (1 if is_enabled else 0, bot_index))
+            await db.commit()
+            return cur.rowcount > 0
 
 
 

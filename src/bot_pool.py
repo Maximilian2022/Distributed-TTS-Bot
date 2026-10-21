@@ -29,6 +29,8 @@ class BotPoolManager:
         self.tts_manager = tts_manager
         self.bots: Dict[int, commands.Bot] = {}
         self.tokens: List[Tuple[int, str]] = config.get_discord_tokens()
+        self.bot_tasks: Dict[int, asyncio.Task] = {}
+        self.bot_factory = None  # main.py から注入されるBotインスタンス生成ファクトリ
         self._connecting_vcs: Dict[Tuple[int, int], int] = {}  # (guild_id, vc_id) -> bot_index
         self._vc_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         self._pool_lock = asyncio.Lock()
@@ -152,6 +154,105 @@ class BotPoolManager:
         """号機番号とBotインスタンスをプールに登録"""
         self.bots[bot_index] = bot
         logger.info(f"Registered Bot #{bot_index} into BotPoolManager.")
+
+    def set_bot_factory(self, factory) -> None:
+        """Botインスタンス動的生成用のファクトリ関数をセット"""
+        self.bot_factory = factory
+
+    async def start_bot(self, bot_index: int, token: str) -> bool:
+        """指定号機のBotを動的生成・Gateway接続起動 (最大10台対応)"""
+        if not (1 <= bot_index <= 10):
+            logger.warning(f"[BotPool] Invalid bot_index {bot_index}. Must be 1-10.")
+            return False
+        if not self.bot_factory:
+            logger.error("[BotPool] Cannot start bot: bot_factory is not set.")
+            return False
+
+        async with self._pool_lock:
+            # 既に稼働中なら一度停止
+            if bot_index in self.bots:
+                await self._stop_bot_internal(bot_index)
+
+            logger.info(f"[BotPool] Starting Bot #{bot_index} dynamically...")
+            bot = self.bot_factory(bot_index)
+            self.register_bot(bot_index, bot)
+
+            loop = asyncio.get_running_loop()
+            async def _bot_runner():
+                try:
+                    await bot.start(token.strip())
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"[BotPool] Bot #{bot_index} fatal runtime error: {e}", exc_info=True)
+                finally:
+                    if not bot.is_closed():
+                        try:
+                            await bot.close()
+                        except Exception:
+                            pass
+                    logger.info(f"[BotPool] Bot #{bot_index} stopped.")
+
+            task = loop.create_task(_bot_runner(), name=f"bot_runner_{bot_index}")
+            self.bot_tasks[bot_index] = task
+            return True
+
+    async def _stop_bot_internal(self, bot_index: int) -> bool:
+        """内部停止処理 (ロック保持下で呼び出し)"""
+        bot = self.bots.pop(bot_index, None)
+        task = self.bot_tasks.pop(bot_index, None)
+
+        if bot:
+            logger.info(f"[BotPool] Stopping Bot #{bot_index}...")
+            # 接続中VCから安全退出
+            for vc in getattr(bot, "voice_clients", []):
+                try:
+                    if vc and vc.is_connected():
+                        await vc.disconnect(force=True)
+                except Exception:
+                    pass
+            if not bot.is_closed():
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
+
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+            except Exception:
+                pass
+        return True
+
+    async def stop_bot(self, bot_index: int) -> bool:
+        """指定号機のBotを切断・停止"""
+        async with self._pool_lock:
+            return await self._stop_bot_internal(bot_index)
+
+    async def add_or_update_token(
+        self, bot_index: int, token: str, label: str = "", is_enabled: bool = True
+    ) -> bool:
+        """WebUIからトークンを追加・更新し、DB保存および即時起動/停止を反映"""
+        clean_token = token.strip()
+        await self.db.save_bot_token(bot_index, clean_token, label=label, is_enabled=is_enabled)
+        self.config.discord_tokens_map[bot_index] = clean_token
+        if bot_index == 1:
+            self.config.discord_token = clean_token
+
+        if is_enabled and clean_token:
+            return await self.start_bot(bot_index, clean_token)
+        else:
+            return await self.stop_bot(bot_index)
+
+    async def delete_token(self, bot_index: int) -> bool:
+        """WebUIからトークンを削除し、Botを停止"""
+        await self.stop_bot(bot_index)
+        await self.db.delete_bot_token(bot_index)
+        self.config.discord_tokens_map.pop(bot_index, None)
+        if bot_index == 1:
+            self.config.discord_token = ""
+        return True
 
     def get_main_bot(self) -> Optional[commands.Bot]:
         """メインBot (1号機) を取得"""

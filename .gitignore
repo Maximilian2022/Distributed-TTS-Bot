@@ -60,6 +60,7 @@ logs/*
 # Temporary / Scratch files
 scratch/*
 !scratch/memo.md
+!scratch/remaining.md
 
 # IDE / Editor
 .idea/

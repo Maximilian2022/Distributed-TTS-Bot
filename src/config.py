@@ -105,8 +105,8 @@ class AppConfig:
     web_port: int = 8080
     discord_client_id: str = ""
     discord_client_secret: str = ""
-    discord_redirect_uri: str = "https://ttsbot.kenko.land/callback"
-    web_dashboard_url: str = "https://ttsbot.kenko.land"
+    discord_redirect_uri: str = "http://localhost:8080/callback"
+    web_dashboard_url: str = "http://localhost:8080"
     web_session_secret: str = ""
     worker_shared_secret: str = ""
 
@@ -118,12 +118,9 @@ class AppConfig:
     # Voices map
     voices: Dict[str, VoiceConfig] = field(default_factory=dict)
 
-    # API Keys / Credentials
+    # API Keys / Credentials (1〜10号機Botトークン辞書)
     discord_token: str = ""
-    discord_token_2: str = ""
-    discord_token_3: str = ""
-    discord_token_4: str = ""
-    discord_token_5: str = ""
+    discord_tokens_map: Dict[int, str] = field(default_factory=dict)
     azure_speech_key: str = ""
     azure_speech_region: str = "japaneast"
     google_application_credentials: str = ""
@@ -133,18 +130,43 @@ class AppConfig:
     gemini_model: str = "gemini-2.5-flash"
 
     def get_discord_tokens(self) -> List[Tuple[int, str]]:
-        """有効な全Botトークンを (bot_index, token) のリストで取得 (1〜5号機)"""
+        """有効な全Botトークンを (bot_index, token) の昇順リストで取得 (最大10台対応)"""
         tokens = []
-        for idx, tok in [
-            (1, self.discord_token),
-            (2, self.discord_token_2),
-            (3, self.discord_token_3),
-            (4, self.discord_token_4),
-            (5, self.discord_token_5),
-        ]:
+        # 1. 辞書から取得
+        for idx in range(1, 11):
+            tok = self.discord_tokens_map.get(idx) or (self.discord_token if idx == 1 else "")
             if tok and tok.strip():
                 tokens.append((idx, tok.strip()))
         return tokens
+
+    def apply_db_credentials(self, credentials: Dict[str, str], bot_tokens: List[Dict[str, Any]]) -> None:
+        """データベースに保存された最新の認証情報・トークンを AppConfig に適用"""
+        if credentials.get("azure_speech_key"):
+            self.azure_speech_key = credentials["azure_speech_key"]
+        if credentials.get("azure_speech_region"):
+            self.azure_speech_region = credentials["azure_speech_region"]
+        if credentials.get("google_api_key"):
+            self.google_api_key = credentials["google_api_key"]
+        if credentials.get("google_credentials_json"):
+            self.google_credentials_json = credentials["google_credentials_json"]
+        if credentials.get("worker_shared_secret"):
+            self.worker_shared_secret = credentials["worker_shared_secret"]
+        if credentials.get("web_base_url"):
+            base = credentials["web_base_url"].strip().rstrip("/")
+            self.web_dashboard_url = base
+            self.discord_redirect_uri = f"{base}/callback"
+
+        # トークン辞書の更新
+        for bt in bot_tokens:
+            idx = int(bt.get("bot_index", 1))
+            if bt.get("is_enabled", 1) and bt.get("token"):
+                self.discord_tokens_map[idx] = bt["token"].strip()
+                if idx == 1:
+                    self.discord_token = bt["token"].strip()
+            elif not bt.get("is_enabled", 1):
+                self.discord_tokens_map.pop(idx, None)
+                if idx == 1:
+                    self.discord_token = ""
 
     def reload(self, config_path: str = "config.yaml") -> None:
         """YAMLファイルおよび.envから最新の設定をロードして現在のインスタンスに反映"""
@@ -286,12 +308,15 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
                 fallback_voice=v_data.get("fallback_voice", "")
             )
 
-    # 環境変数からの上書き
-    cfg.discord_token = os.getenv("DISCORD_TOKEN", cfg.discord_token)
-    cfg.discord_token_2 = os.getenv("DISCORD_TOKEN_2", "")
-    cfg.discord_token_3 = os.getenv("DISCORD_TOKEN_3", "")
-    cfg.discord_token_4 = os.getenv("DISCORD_TOKEN_4", "")
-    cfg.discord_token_5 = os.getenv("DISCORD_TOKEN_5", "")
+    # 環境変数からの上書き (1〜10号機Botトークン)
+    cfg.discord_token = os.getenv("DISCORD_TOKEN", cfg.discord_token).strip()
+    if cfg.discord_token:
+        cfg.discord_tokens_map[1] = cfg.discord_token
+    for i in range(2, 11):
+        tok = os.getenv(f"DISCORD_TOKEN_{i}", "").strip()
+        if tok:
+            cfg.discord_tokens_map[i] = tok
+
     cfg.azure_speech_key = os.getenv("AZURE_SPEECH_KEY", cfg.azure_speech_key)
     cfg.azure_speech_region = os.getenv("AZURE_SPEECH_REGION", cfg.azure_region)
     cfg.google_application_credentials = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", cfg.google_application_credentials)
@@ -304,20 +329,28 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
     cfg.speculative_timeout_seconds = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", cfg.speculative_timeout_seconds))
 
-    # Web UI & OAuth2 環境変数
+    # Web UI & OAuth2 環境変数 (汎用WEB_BASE_URL対応)
     cfg.web_port = int(os.getenv("WEB_PORT", cfg.web_port))
     cfg.web_host = os.getenv("WEB_HOST", cfg.web_host)
-    cfg.discord_client_id = os.getenv("DISCORD_CLIENT_ID", cfg.discord_client_id)
-    cfg.discord_client_secret = os.getenv("DISCORD_CLIENT_SECRET", cfg.discord_client_secret)
-    cfg.discord_redirect_uri = os.getenv("DISCORD_REDIRECT_URI", cfg.discord_redirect_uri)
-    cfg.web_dashboard_url = os.getenv("WEB_DASHBOARD_URL", cfg.web_dashboard_url)
-    if not os.getenv("WEB_DASHBOARD_URL") and cfg.discord_redirect_uri:
-        from urllib.parse import urlparse
-        parsed = urlparse(cfg.discord_redirect_uri)
-        if parsed.scheme and parsed.netloc:
-            cfg.web_dashboard_url = f"{parsed.scheme}://{parsed.netloc}"
-    cfg.web_session_secret = os.getenv("WEB_SESSION_SECRET", cfg.web_session_secret) or os.getenv("SESSION_SECRET", "ttsbot_default_secret_key_change_me")
+    cfg.discord_client_id = os.getenv("DISCORD_CLIENT_ID", cfg.discord_client_id).strip()
+    cfg.discord_client_secret = os.getenv("DISCORD_CLIENT_SECRET", cfg.discord_client_secret).strip()
+
+    base_url = os.getenv("WEB_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        base_url = os.getenv("WEB_DASHBOARD_URL", "").strip().rstrip("/")
+    if not base_url:
+        base_url = f"http://localhost:{cfg.web_port}"
+    cfg.web_dashboard_url = base_url
+    cfg.discord_redirect_uri = os.getenv("DISCORD_REDIRECT_URI", f"{base_url}/callback").strip()
+
+    import secrets
+    cfg.web_session_secret = os.getenv("WEB_SESSION_SECRET", cfg.web_session_secret) or os.getenv("SESSION_SECRET", "")
+    if not cfg.web_session_secret:
+        cfg.web_session_secret = secrets.token_hex(32)
+
     cfg.worker_shared_secret = os.getenv("WORKER_SHARED_SECRET", "").strip()
+    if not cfg.worker_shared_secret:
+        cfg.worker_shared_secret = secrets.token_hex(16)
 
     # ホスト直接実行時にもローカルディレクトリが存在するように作成
     for directory in [Path(cfg.cache_dir), Path(cfg.db_path).parent, Path(cfg.log_file).parent]:
