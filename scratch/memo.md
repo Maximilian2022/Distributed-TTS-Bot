@@ -108,3 +108,30 @@
      - 異常時は即座に新環境停止: `cd /root/ttsbot/ttsbot-oss && docker compose --profile tunnel down`
      - 旧本番再開: `cd /root/ttsbot && docker compose start ttsbot-green ttsbot-router ttsbot-tunnel`
 
+---
+
+# CodeQL Code Scanning 脆弱性全46件 修正・安全化作業メモ (2026-10-22)
+
+## 目的
+GitHub Code Scanning（CodeQL）で検知された全46件（Critical 3件、High 43件）の脆弱性を安全に解消し、OSSとしての堅牢性を確保する。本番稼働（/root/ttsbot）には一切影響を与えないSide-by-Side構成で作業・検証を行う。
+
+## タスク進捗
+- [x] Phase 1: Critical (SSRF 3件) ＋ XSS (2件)
+  - [x] 1. SSRF防御: `ipaddress` バリデーション関数の実装と、`worker_log_collector.py`, `server.py` への適用
+  - [x] 2. XSS防御: `server.py` の `{{USER_DATA}}` JSONシリアライズ時のUnicodeエスケープ
+  - [x] 3. DOM XSS防御: `app.js` の `showToast` での `textContent` 適用
+- [x] Phase 2: サニタイズ修正・ReDoS解消・URL判定厳格化 (8件)
+  - [x] 4. `app.js`: `.replaceAll("%", "")` および属性値の安全化
+  - [x] 5. `text_cleaner.py`: ReDoS正規表現を廃止し、組み込み `rstrip` で高速・完全O(N)化
+  - [x] 6. `mycoeiroink.py`: `urllib.parse.urlparse` によるホスト名厳格判定
+- [x] Phase 3: Path Injection 一括安全化 (33件)
+  - [x] 7. `cache_manager.py`: `Path.resolve().is_relative_to(base.resolve())` による安全なファイルパス解決
+  - [x] 8. `agent.py`: `clean_model` の英数字チェックとベースディレクトリ検証
+  - [x] 9. `worker_log_collector.py`: `LOG_DIR_BASE` に対するトラバーサル検証共通化
+  - [x] 10. `server.py`: `COEIROINK_MODEL_DIR` 配下のモデルディレクトリ・ファイル検証
+- [x] Phase 4: サンドボックス動作検証 & 反映
+  - [x] 11. 一時コンテナ（ポート8095）でのWebUI・API・TTS合成検証
+  - [x] 12. テストコンテナ破棄
+  - [x] 13. `logs/remediation_history.md` 追記
+  - [ ] 14. Git コミット & プッシュ
+  - [ ] 15. GitHub Code Scanning のアラート解消確認

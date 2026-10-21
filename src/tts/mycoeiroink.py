@@ -15,6 +15,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Set
+import urllib.parse
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -524,9 +525,12 @@ class MyCoeiroinkManager:
                 "message": "BOOTHまたは外部配布ページからの手動ダウンロードが必要です。"
             }
 
+        parsed_url = urllib.parse.urlparse(raw_url)
+        hostname = (parsed_url.hostname or "").lower()
+
         # Google Drive の共有リンクをダイレクトダウンロードURLに変換試行
         dl_url = raw_url
-        if "drive.google.com" in lower_url:
+        if hostname == "drive.google.com" or hostname.endswith(".drive.google.com"):
             m = re.search(r"/d/([a-zA-Z0-9_-]+)", raw_url)
             if not m:
                 m = re.search(r"id=([a-zA-Z0-9_-]+)", raw_url)
@@ -535,7 +539,7 @@ class MyCoeiroinkManager:
                 dl_url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
         # Dropbox の共有リンクを直リンク化
-        if "dropbox.com" in lower_url:
+        if hostname == "dropbox.com" or hostname.endswith(".dropbox.com"):
             if "dl=0" in dl_url:
                 dl_url = dl_url.replace("dl=0", "dl=1")
             elif "?" not in dl_url:

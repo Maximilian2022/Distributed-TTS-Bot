@@ -33,7 +33,15 @@ function showToast(message, type = "success") {
 
   const toast = document.createElement("div");
   toast.className = `toast ${type}`;
-  toast.innerHTML = `<span>${type === 'success' ? '✅' : '❌'}</span><span>${message}</span>`;
+  
+  const iconSpan = document.createElement("span");
+  iconSpan.textContent = type === 'success' ? '✅' : '❌';
+  
+  const msgSpan = document.createElement("span");
+  msgSpan.textContent = message || '';
+  
+  toast.appendChild(iconSpan);
+  toast.appendChild(msgSpan);
   container.appendChild(toast);
 
   setTimeout(() => {
@@ -499,7 +507,7 @@ function selectVoiceDetail(speakerId, scroll=false) {
   // (現在保存中のモデルであれば、本人が設定・保存したピッチ・速度・音量を復元)
   if (isChanged) {
     if (isSaved && currentVoiceSettings) {
-      currentDetailPitch = parseInt(currentVoiceSettings.pitch ? currentVoiceSettings.pitch.replace("%", "").replace("+", "") : "0") || 0;
+      currentDetailPitch = parseInt(currentVoiceSettings.pitch ? currentVoiceSettings.pitch.replace(/[%+]/g, "") : "0") || 0;
       currentDetailSpeed = parseFloat(currentVoiceSettings.speed) || 1.0;
       currentDetailVolume = (currentVoiceSettings.volume !== undefined && currentVoiceSettings.volume !== null) ? Math.round(parseFloat(currentVoiceSettings.volume) * 100) : 80;
     } else {
@@ -677,7 +685,7 @@ function initVoiceControls(settings) {
 
   // 設定値を内部状態変数に同期
   if (settings.pitch) {
-    currentDetailPitch = parseInt(settings.pitch.replace("%", "").replace("+", "")) || 0;
+    currentDetailPitch = parseInt(settings.pitch.replace(/[%+]/g, "")) || 0;
   }
   if (settings.speed) {
     currentDetailSpeed = parseFloat(settings.speed) || 1.0;
@@ -1651,7 +1659,8 @@ function onDictBatchInputChanged(clearSelections = true) {
         const overwrite = dictConflictSelections.has(item.word) ? dictConflictSelections.get(item.word) : true;
         statusHtml = `
           <select class="input-field" style="font-size:11px;padding:2px 4px;width:auto;background:${overwrite ? 'rgba(235, 100, 52, 0.2)' : 'rgba(255, 255, 255, 0.08)'};border-color:${overwrite ? '#eb6434' : 'var(--border-color)'};"
-            onchange="onDictConflictChange('${escapeHtml(item.word).replace(/'/g, "\\'")}', this.value === 'overwrite')">
+            data-word="${escapeHtml(item.word)}"
+            onchange="onDictConflictChange(this.getAttribute('data-word'), this.value === 'overwrite')">
             <option value="overwrite" ${overwrite ? 'selected' : ''}>⚠️ 上書き</option>
             <option value="skip" ${!overwrite ? 'selected' : ''}>⏭️ スキップ</option>
           </select>

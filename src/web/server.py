@@ -24,6 +24,7 @@ from src.version import BUILD_VERSION, BUILD_DATE, AGENT_VERSION
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
 from src.utils.avatar_manager import get_avatar_path, has_avatar
+from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script
 from .auth import DiscordAuth
 
 logger = logging.getLogger(__name__)
@@ -610,7 +611,7 @@ class WebServer:
         # テンプレート内の簡易変数置換
         is_logged_in = "true" if user else "false"
         client_configured = "true" if self.auth.is_configured() else "false"
-        user_json = json.dumps(user) if user else "null"
+        user_json = safe_json_for_html_script(user)
 
         # 静的アセットキャッシュバスター (ファイルのmtimeを付与してCloudflare等のエッジキャッシュを強制バイパス)
         app_js_path = Path(__file__).resolve().parent / "static" / "app.js"
@@ -1979,10 +1980,16 @@ class WebServer:
         user = self._require_auth(request)
         target = request.match_info.get("target", "cloud")
         filename = request.match_info.get("filename", "")
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            return web.Response(text="Invalid filename", status=400)
 
         file_path = self.cache_manager.get_explorer_file_path(target, filename)
         if not file_path:
             return web.Response(text="Cache file not found", status=404)
+
+        base_cache_dir = (self.cache_manager.voicevox_cache_dir if target in ("voicevox", "local") else self.cache_manager.cache_dir).resolve()
+        if not file_path.resolve().is_relative_to(base_cache_dir):
+            return web.Response(text="Access denied (path traversal)", status=403)
 
         download = request.query.get("download", "0") == "1"
         disposition = f'attachment; filename="{filename}"' if download else f'inline; filename="{filename}"'
@@ -3173,6 +3180,8 @@ class WebServer:
             agent_port = data.get("agent_port", 50030)
             if not target_ip:
                 return web.json_response({"error": "ip is required when target_all is false"}, status=400)
+            if not validate_safe_worker_ip(target_ip):
+                return web.json_response({"error": "Invalid or disallowed worker IP address (SSRF guard)"}, status=400)
             targets.append({"ip": target_ip, "agent_port": agent_port, "node_id": "single"})
 
         if not targets:
@@ -3181,7 +3190,11 @@ class WebServer:
         import aiohttp
         async def _notify_worker(t: Dict[str, Any]) -> Dict[str, Any]:
             ip = t["ip"]
-            port = t["agent_port"]
+            if not validate_safe_worker_ip(ip):
+                return {"ip": ip, "success": False, "error": "Disallowed or invalid worker IP address"}
+            port = int(t.get("agent_port", 50030))
+            if not (1 <= port <= 65535):
+                return {"ip": ip, "success": False, "error": "Invalid port number"}
             update_url = f"http://{ip}:{port}/update"
             try:
                 async with aiohttp.ClientSession() as session:
@@ -3467,10 +3480,12 @@ class WebServer:
             return web.json_response(content)
 
         # ファイルが未生成の場合は、直接ワーカーへHTTPフェッチを試みる (フォールバック)
-        if target_ip:
+        if target_ip and validate_safe_worker_ip(target_ip):
             try:
                 import aiohttp
-                url = f"http://{target_ip}:50030/logs?target={target}&lines={lines}"
+                safe_target = re.sub(r'[^a-zA-Z0-9_\-]', '', str(target))
+                safe_lines = max(1, min(int(lines), 1000))
+                url = f"http://{target_ip}:50030/logs?target={safe_target}&lines={safe_lines}"
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.5)) as session:
                     async with session.get(url) as resp:
                         if resp.status == 200:
@@ -3682,12 +3697,12 @@ class WebServer:
     async def api_worker_models_manifest(self, request: web.Request) -> web.Response:
         """指定モデルの詳細ファイルマニフェスト（ファイル一覧・各SHA256ハッシュ・サイズ・ツリーハッシュ）を返却"""
         model_name = request.match_info.get("model_name", "")
-        if not model_name or "/" in model_name or "\\" in model_name or model_name.startswith("."):
+        if not is_safe_identifier(model_name):
             return web.Response(text="Invalid model name", status=400)
 
-        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models"))
-        target_path = model_dir / model_name
-        if not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
+        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        target_path = validate_safe_path(model_dir, model_name)
+        if not target_path or not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
             return web.Response(text="Model not found", status=404)
 
         from src.utils.model_manifest import build_model_manifest
@@ -3701,19 +3716,18 @@ class WebServer:
         model_name = request.match_info.get("model_name", "")
         file_path_str = request.match_info.get("file_path", "")
 
-        if not model_name or "/" in model_name or "\\" in model_name or model_name.startswith("."):
+        if not is_safe_identifier(model_name):
             return web.Response(text="Invalid model name", status=400)
 
-        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models"))
-        target_model_dir = (model_dir / model_name).resolve()
+        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        target_model_dir = validate_safe_path(model_dir, model_name)
+        if not target_model_dir or not target_model_dir.exists() or not target_model_dir.is_dir():
+            return web.Response(text="Model not found", status=404)
 
         # パストラバーサル防止 (CWE-22)
-        try:
-            target_file = (target_model_dir / file_path_str).resolve()
-            if not target_file.is_relative_to(target_model_dir):
-                return web.Response(text="Access denied (path traversal)", status=403)
-        except Exception:
-            return web.Response(text="Invalid file path", status=400)
+        target_file = validate_safe_path(target_model_dir, file_path_str)
+        if not target_file or not target_file.is_relative_to(model_dir):
+            return web.Response(text="Access denied (path traversal)", status=403)
 
         if not target_file.exists() or not target_file.is_file():
             return web.Response(text="File not found", status=404)
@@ -3778,13 +3792,13 @@ class WebServer:
     async def api_worker_models_download(self, request: web.Request) -> web.StreamResponse:
         """指定された COEIROINK モデルフォルダを tar ストリームで高速配信"""
         model_name = request.match_info.get("model_name", "")
-        # 安全性チェック: パストラバーサル防止
-        if not model_name or "/" in model_name or "\\" in model_name or model_name.startswith("."):
+        # 安全性チェック: パストラバーサル防止 (CWE-22)
+        if not is_safe_identifier(model_name):
             return web.Response(text="Invalid model name", status=400)
 
-        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models"))
-        target_path = model_dir / model_name
-        if not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
+        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        target_path = validate_safe_path(model_dir, model_name)
+        if not target_path or not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
             return web.Response(text="Model not found", status=404)
 
         response = web.StreamResponse(

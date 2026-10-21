@@ -16,6 +16,8 @@ import re
 from pathlib import Path
 import aiohttp
 
+from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier
+
 logger = logging.getLogger(__name__)
 
 # ホスト/コンテナ内のワーカーログ保存ルートディレクトリ
@@ -100,6 +102,11 @@ class WorkerLogCollector:
 
     async def collect_single_worker(self, node_id: str, ip: str, tail: int = 300) -> bool:
         """単一ワーカーノードから全ログ（Agent＋各エンジン）を取得しファイルへ書き出し"""
+        # SSRF ガード (CWE-918): 不正・予約済みIPアドレスへのリクエストを遮断
+        if not validate_safe_worker_ip(ip):
+            logger.warning(f"SSRF guard blocked request to worker IP: {ip} (node_id={node_id})")
+            return False
+
         url = f"http://{ip}:50030/logs?target=all&tail={tail}"
         session = self._session or aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4.0))
         own_session = self._session is None
@@ -115,49 +122,62 @@ class WorkerLogCollector:
             if own_session and not session.closed:
                 await session.close()
 
-        # 出力ディレクトリ作成: logs/workers/<node_id>/
+        # 出力ディレクトリ安全検証: logs/workers/<safe_node_name>/ (CWE-22)
         safe_node_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', node_id)
-        node_dir = os.path.join(LOG_DIR_BASE, safe_node_name)
-        os.makedirs(node_dir, exist_ok=True)
+        node_dir = validate_safe_path(LOG_DIR_BASE, safe_node_name)
+        if not node_dir:
+            logger.warning(f"Path injection guard blocked worker directory: {safe_node_name}")
+            return False
+        node_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Agent ログの保存
         agent_logs = data.get("agent_logs") or data.get("logs") or []
         if agent_logs:
-            agent_log_path = os.path.join(node_dir, "agent.log")
-            self._write_logs_file(agent_log_path, agent_logs)
+            agent_log_path = validate_safe_path(node_dir, "agent.log")
+            if agent_log_path:
+                self._write_logs_file(str(agent_log_path), agent_logs)
 
         # 2. 各エンジンコンテナログの保存
         engines = data.get("engines", {})
         for eng_name, eng_info in engines.items():
+            safe_eng_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', eng_name)
             eng_logs = eng_info.get("logs", [])
             if eng_logs:
-                eng_log_path = os.path.join(node_dir, f"{eng_name}.log")
-                self._write_logs_file(eng_log_path, eng_logs)
+                eng_log_path = validate_safe_path(node_dir, f"{safe_eng_name}.log")
+                if eng_log_path:
+                    self._write_logs_file(str(eng_log_path), eng_logs)
 
         # メタデータ (最終同期時刻・稼働ステータス)
-        meta_path = os.path.join(node_dir, "status.json")
-        try:
-            with open(meta_path, "w", encoding="utf-8") as f:
-                import json
-                json.dump({
-                    "node_id": node_id,
-                    "ip": ip,
-                    "agent_version": data.get("agent_version", "unknown"),
-                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                    "engines_status": {k: v.get("running", False) for k, v in engines.items()}
-                }, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        meta_path = validate_safe_path(node_dir, "status.json")
+        if meta_path:
+            try:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    import json
+                    json.dump({
+                        "node_id": node_id,
+                        "ip": ip,
+                        "agent_version": data.get("agent_version", "unknown"),
+                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        "engines_status": {k: v.get("running", False) for k, v in engines.items()}
+                    }, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
         return True
 
     def _write_logs_file(self, filepath: str, lines: List[str]) -> None:
         """ログファイルに書き出し（行数上限時に *-archive.log へ退避し直近100行保持する2段階ハイブリッドローテーション）"""
+        target_path = Path(filepath).resolve()
+        base_dir = Path(LOG_DIR_BASE).resolve()
+        if not target_path.is_relative_to(base_dir):
+            logger.warning(f"Path traversal blocked in _write_logs_file: {filepath}")
+            return
+
         try:
             # 既存ファイルがある場合は読み込み
             existing_lines: List[str] = []
-            if os.path.exists(filepath):
-                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            if target_path.exists() and target_path.is_file():
+                with open(target_path, "r", encoding="utf-8", errors="replace") as f:
                     existing_lines = [l.rstrip("\r\n") for l in f.readlines()]
 
             # 既存末尾と新規先頭の重複を排除してマージ
@@ -177,15 +197,16 @@ class WorkerLogCollector:
                 recent_lines = merged[-KEEP_LINES_ON_ROTATE:]
 
                 # アーカイブファイルパス: 例 logs/workers/<node_id>/agent-archive.log
-                p = Path(filepath)
-                archive_path = p.parent / f"{p.stem}-archive.log"
+                archive_path = target_path.parent / f"{target_path.stem}-archive.log"
+                if not archive_path.resolve().is_relative_to(base_dir):
+                    return
 
                 # 古い行をアーカイブファイルへ追記退避
                 with open(archive_path, "a", encoding="utf-8", errors="replace") as af:
                     af.write("\n".join(older_lines) + "\n")
 
                 # 直近100行をアクティブファイルに上書き
-                with open(filepath, "w", encoding="utf-8") as f:
+                with open(target_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(recent_lines) + "\n")
 
                 # アーカイブが 100MB を超過した場合は別スレッドで zstd 圧縮を実行 (bot.log と同一)
@@ -197,14 +218,14 @@ class WorkerLogCollector:
                             target=compress_archive_worker,
                             args=(archive_path,),
                             daemon=True,
-                            name=f"zstd-worker-{p.stem}"
+                            name=f"zstd-worker-{target_path.stem}"
                         )
                         t.start()
                     except Exception as ce:
                         logger.debug(f"Failed to trigger zstd compression for {archive_path}: {ce}")
             else:
                 # 3000行未満の場合はそのまま上書き保存
-                with open(filepath, "w", encoding="utf-8") as f:
+                with open(target_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(merged) + "\n")
         except Exception as e:
             logger.debug(f"Failed to write log file {filepath}: {e}")
@@ -212,32 +233,32 @@ class WorkerLogCollector:
     def get_log_content(self, node_id: str, target: str = "agent", tail: int = 100) -> Dict[str, Any]:
         """保存されているログファイルを読み取って返却 (WebUI / AI用)"""
         safe_node_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', node_id)
-        target_clean = re.sub(r'[^a-zA-Z0-9_\-]', '', target.lower())
-        node_dir = os.path.join(LOG_DIR_BASE, safe_node_name)
-        log_file = os.path.join(node_dir, f"{target_clean}.log")
-
-        if not os.path.exists(log_file):
+        safe_target_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', target.lower())
+        
+        # 安全なパス検証 (CWE-22)
+        log_file_path = validate_safe_path(LOG_DIR_BASE, f"{safe_node_name}/{safe_target_name}.log")
+        if not log_file_path or not log_file_path.exists() or not log_file_path.is_file():
             return {
                 "success": False,
                 "node_id": node_id,
                 "target": target,
                 "lines": [],
-                "error": f"Log file not found: {log_file}"
+                "error": f"Log file not found: {safe_target_name}.log"
             }
 
         try:
             _ctrl_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            with open(log_file_path, "r", encoding="utf-8", errors="replace") as f:
                 all_lines = [_ctrl_re.sub('', l).rstrip("\r\n") for l in f.readlines()]
             recent = [l for l in (all_lines[-tail:] if tail > 0 else all_lines) if l.strip()]
             return {
                 "success": True,
                 "node_id": node_id,
                 "target": target,
-                "file_path": log_file,
+                "file_path": str(log_file_path),
                 "total_lines": len(all_lines),
                 "lines": recent,
-                "mtime": os.path.getmtime(log_file)
+                "mtime": log_file_path.stat().st_mtime
             }
         except Exception as e:
             return {

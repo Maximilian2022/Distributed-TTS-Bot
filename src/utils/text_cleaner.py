@@ -33,9 +33,9 @@ _RE_SLANG_EXCL_REPEAT = re.compile(r'[!！]{2,}')
 _RE_SLANG_QUES_REPEAT = re.compile(r'[\?？]{2,}')
 _RE_SLANG_DASH_REPEAT = re.compile(r'[~〜ー]{2,}')
 _RE_SLANG_KUSA_REPEAT = re.compile(r'草{2,}')
-_RE_TRAILING_MARKS_ALL = re.compile(r'[!！?？~〜ーwｗ\s。、]+$')
-_RE_TRAILING_MARKS_EXCEPT_QUES = re.compile(r'[!！~〜ーwｗ\s。、]+$')
-_RE_TRAILING_QUES = re.compile(r'[?？]+$')
+_TRAILING_MARKS_ALL_CHARS = "!！?？~〜ーwｗ \t\r\n\u3000。、"
+_TRAILING_MARKS_EXCEPT_QUES_CHARS = "!！~〜ーwｗ \t\r\n\u3000。、"
+_TRAILING_QUES_CHARS = "?？ \t\r\n\u3000"
 _RE_HAS_QUES = re.compile(r'[?？]')
 _RE_BEEP_TAG = re.compile(r'<<ピー音(?::(\d+))?>>')
 _RE_BEEP_SPLIT = re.compile(r'(<<ピー音(?::\d+)?>>)')
@@ -694,7 +694,7 @@ class TextCleaner:
             "りょうかいです": "了解です",
             "りょうかい": "了解",
         }
-        base_no_marks = _RE_TRAILING_MARKS_ALL.sub('', t)
+        base_no_marks = t.rstrip(_TRAILING_MARKS_ALL_CHARS)
         if base_no_marks in greeting_map:
             t = greeting_map[base_no_marks] + t[len(base_no_marks):]
 
@@ -702,10 +702,10 @@ class TextCleaner:
         has_question = bool(_RE_HAS_QUES.search(t[-3:] if len(t) >= 3 else t))
 
         # 3. 文末の連続する装飾記号（！、ー、〜、w、ｗ、。、空白、読点）を除去
-        t = _RE_TRAILING_MARKS_EXCEPT_QUES.sub('', t).strip()
+        t = t.rstrip(_TRAILING_MARKS_EXCEPT_QUES_CHARS).strip()
 
         # 疑問符があった場合は「？」を1つだけ末尾に統一付与
         if has_question:
-            t = _RE_TRAILING_QUES.sub('', t).strip() + "？"
+            t = t.rstrip(_TRAILING_QUES_CHARS).strip() + "？"
 
         return t

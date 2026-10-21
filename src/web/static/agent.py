@@ -3126,8 +3126,12 @@ async def handle_sync_models(request: web.Request) -> web.Response:
     work_dir = resolve_work_dir()
     clean_model = request.query.get("clean_model")
     if clean_model:
-        target_dir = os.path.join(work_dir, "coeiroink_models", clean_model)
-        if os.path.exists(target_dir):
+        # パストラバーサル防止 (CWE-22): 英数字識別子チェックおよびベースディレクトリ検証
+        if not re.match(r'^[a-zA-Z0-9_\-]+$', clean_model):
+            return web.Response(text="Invalid clean_model identifier", status=400)
+        models_base = (Path(work_dir) / "coeiroink_models").resolve()
+        target_dir = (models_base / clean_model).resolve()
+        if target_dir.is_relative_to(models_base) and target_dir.exists() and target_dir.is_dir():
             shutil.rmtree(target_dir, ignore_errors=True)
             logger.info(f"🗑️ 指定モデル '{clean_model}' をクリーン削除しました: {target_dir}")
     asyncio.create_task(agent.sync_coeiroink_models(work_dir))
