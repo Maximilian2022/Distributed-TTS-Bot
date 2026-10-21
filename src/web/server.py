@@ -24,7 +24,7 @@ from src.version import BUILD_VERSION, BUILD_DATE, AGENT_VERSION
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
 from src.utils.avatar_manager import get_avatar_path, has_avatar
-from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script
+from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script, sanitize_filename
 from .auth import DiscordAuth
 
 logger = logging.getLogger(__name__)
@@ -608,10 +608,10 @@ class WebServer:
         html = template_path.read_text(encoding="utf-8")
         user = self.auth.get_current_user(request)
 
-        # テンプレート内の簡易変数置換
+        # テンプレート内の簡易変数置換 (Reflected XSS 防護: 外部入力由来の文字列は埋め込まず boolean のみ展開)
         is_logged_in = "true" if user else "false"
         client_configured = "true" if self.auth.is_configured() else "false"
-        user_json = safe_json_for_html_script(user)
+        user_json = json.dumps({"is_admin": bool(user.get("is_admin", False))}) if user else "null"
 
         # 静的アセットキャッシュバスター (ファイルのmtimeを付与してCloudflare等のエッジキャッシュを強制バイパス)
         app_js_path = Path(__file__).resolve().parent / "static" / "app.js"
@@ -1980,19 +1980,18 @@ class WebServer:
         user = self._require_auth(request)
         target = request.match_info.get("target", "cloud")
         filename = request.match_info.get("filename", "")
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        
+        clean_name = sanitize_filename(filename)
+        if not clean_name or not clean_name.endswith(".wav"):
             return web.Response(text="Invalid filename", status=400)
 
-        file_path = self.cache_manager.get_explorer_file_path(target, filename)
-        if not file_path:
+        base_cache_dir = self.cache_manager.voicevox_cache_dir if target in ("voicevox", "local") else self.cache_manager.cache_dir
+        file_path = validate_safe_path(base_cache_dir, clean_name)
+        if not file_path or not file_path.exists() or not file_path.is_file():
             return web.Response(text="Cache file not found", status=404)
 
-        base_cache_dir = (self.cache_manager.voicevox_cache_dir if target in ("voicevox", "local") else self.cache_manager.cache_dir).resolve()
-        if not file_path.resolve().is_relative_to(base_cache_dir):
-            return web.Response(text="Access denied (path traversal)", status=403)
-
         download = request.query.get("download", "0") == "1"
-        disposition = f'attachment; filename="{filename}"' if download else f'inline; filename="{filename}"'
+        disposition = f'attachment; filename="{clean_name}"' if download else f'inline; filename="{clean_name}"'
 
         headers = {
             "Content-Type": "audio/wav",
@@ -2009,11 +2008,14 @@ class WebServer:
 
         target = request.match_info.get("target", "cloud")
         filename = request.match_info.get("filename", "")
+        clean_name = sanitize_filename(filename)
+        if not clean_name or not clean_name.endswith(".wav"):
+            return web.json_response({"error": "Invalid filename"}, status=400)
 
-        success = self.cache_manager.delete_file(target, filename)
+        success = self.cache_manager.delete_file(target, clean_name)
         if not success:
             return web.json_response({"error": "File not found or failed to delete"}, status=400)
-        return web.json_response({"success": True, "filename": filename, "target": target})
+        return web.json_response({"success": True, "filename": clean_name, "target": target})
 
     async def api_delete_cache_files_batch(self, request: web.Request) -> web.Response:
         """キャッシュファイルの一括削除"""
@@ -3176,13 +3178,31 @@ class WebServer:
                         seen_ips.add(key)
                         targets.append({"ip": ip, "agent_port": port, "node_id": node.id})
         else:
-            target_ip = data.get("ip")
-            agent_port = data.get("agent_port", 50030)
-            if not target_ip:
+            req_ip = str(data.get("ip") or "").strip()
+            if not req_ip:
                 return web.json_response({"error": "ip is required when target_all is false"}, status=400)
-            if not validate_safe_worker_ip(target_ip):
-                return web.json_response({"error": "Invalid or disallowed worker IP address (SSRF guard)"}, status=400)
-            targets.append({"ip": target_ip, "agent_port": agent_port, "node_id": "single"})
+
+            # サーバー側で管理している既知のワーカーから一致するものをルックアップ (CodeQL SSRF 防護 / 外部入力Taint切断)
+            matched_worker = None
+            for host_info in self._collect_worker_hosts():
+                if host_info.get("ip") == req_ip:
+                    matched_worker = host_info
+                    break
+
+            if not matched_worker and hasattr(self, "worker_log_collector"):
+                for k_id, k_ip in list(self.worker_log_collector._known_workers.items()):
+                    if k_ip == req_ip or k_id == req_ip:
+                        matched_worker = {"ip": k_ip, "agent_port": 50030, "node_id": k_id}
+                        break
+
+            if not matched_worker:
+                if not validate_safe_worker_ip(req_ip):
+                    return web.json_response({"error": "Invalid or disallowed worker IP address (SSRF guard)"}, status=400)
+                return web.json_response({"error": "Worker not registered or recognized"}, status=404)
+
+            safe_ip = matched_worker["ip"]
+            safe_port = int(matched_worker.get("agent_port", 50030))
+            targets.append({"ip": safe_ip, "agent_port": safe_port, "node_id": matched_worker.get("node_id", "single")})
 
         if not targets:
             return web.json_response({"success": False, "error": "更新対象のワーカーノードが見つかりません。"}, status=404)
@@ -3466,13 +3486,28 @@ class WebServer:
                 "workers": available
             })
 
-        # 2. リフレッシュ要求がある場合は、該当ワーカーへ直接オンデマンド収集を実行
-        target_ip = worker_log_collector._known_workers.get(node_id)
-        if not target_ip:
-            target_ip = request.query.get("ip", "")
+        # 2. 既知ワーカーノードから安全なIPをルックアップ (外部入力Taint切断 / CodeQL SSRF 防護)
+        safe_target_ip = None
+        req_ip = str(request.query.get("ip", "")).strip()
 
-        if refresh and target_ip:
-            await worker_log_collector.collect_single_worker(node_id, target_ip, tail=max(lines, 200))
+        # まず node_id で検索
+        if node_id and node_id in worker_log_collector._known_workers:
+            safe_target_ip = worker_log_collector._known_workers[node_id]
+
+        # req_ip が指定されている場合、既知のワーカー一覧から一致するサーバー管理のIPを取得
+        if not safe_target_ip and req_ip:
+            for known_id, known_ip in list(worker_log_collector._known_workers.items()):
+                if known_ip == req_ip or known_id == req_ip:
+                    safe_target_ip = known_ip
+                    break
+            if not safe_target_ip:
+                for h in self._collect_worker_hosts():
+                    if h.get("ip") == req_ip:
+                        safe_target_ip = h["ip"]
+                        break
+
+        if refresh and safe_target_ip:
+            await worker_log_collector.collect_single_worker(node_id, safe_target_ip, tail=max(lines, 200))
 
         # 3. 保存済みファイルからログを取得
         content = worker_log_collector.get_log_content(node_id, target=target, tail=lines)
@@ -3480,17 +3515,19 @@ class WebServer:
             return web.json_response(content)
 
         # ファイルが未生成の場合は、直接ワーカーへHTTPフェッチを試みる (フォールバック)
-        if target_ip and validate_safe_worker_ip(target_ip):
+        if safe_target_ip and validate_safe_worker_ip(safe_target_ip):
             try:
                 import aiohttp
-                safe_target = re.sub(r'[^a-zA-Z0-9_\-]', '', str(target))
+                safe_target = sanitize_filename(str(target))
+                if not safe_target:
+                    safe_target = "agent"
                 safe_lines = max(1, min(int(lines), 1000))
-                url = f"http://{target_ip}:50030/logs?target={safe_target}&lines={safe_lines}"
+                url = f"http://{safe_target_ip}:50030/logs?target={safe_target}&lines={safe_lines}"
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.5)) as session:
                     async with session.get(url) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            await worker_log_collector.collect_single_worker(node_id, target_ip, tail=lines)
+                            await worker_log_collector.collect_single_worker(node_id, safe_target_ip, tail=lines)
                             raw_lines = data.get("logs") or data.get("agent_logs") or []
                             return web.json_response({
                                 "success": True,
@@ -3697,11 +3734,12 @@ class WebServer:
     async def api_worker_models_manifest(self, request: web.Request) -> web.Response:
         """指定モデルの詳細ファイルマニフェスト（ファイル一覧・各SHA256ハッシュ・サイズ・ツリーハッシュ）を返却"""
         model_name = request.match_info.get("model_name", "")
-        if not is_safe_identifier(model_name):
+        clean_model_name = sanitize_filename(model_name)
+        if not clean_model_name or not is_safe_identifier(clean_model_name):
             return web.Response(text="Invalid model name", status=400)
 
         model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
-        target_path = validate_safe_path(model_dir, model_name)
+        target_path = validate_safe_path(model_dir, clean_model_name)
         if not target_path or not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
             return web.Response(text="Model not found", status=404)
 
@@ -3716,20 +3754,24 @@ class WebServer:
         model_name = request.match_info.get("model_name", "")
         file_path_str = request.match_info.get("file_path", "")
 
-        if not is_safe_identifier(model_name):
+        clean_model_name = sanitize_filename(model_name)
+        if not clean_model_name or not is_safe_identifier(clean_model_name):
             return web.Response(text="Invalid model name", status=400)
 
+        # パスセグメントを個別にサニタイズ (CWE-22 防護)
+        segments = [sanitize_filename(s) for s in file_path_str.replace("\\", "/").split("/") if s]
+        if not segments or any(not s for s in segments):
+            return web.Response(text="Invalid file path", status=400)
+        clean_relative_path = "/".join(segments)
+
         model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
-        target_model_dir = validate_safe_path(model_dir, model_name)
+        target_model_dir = validate_safe_path(model_dir, clean_model_name)
         if not target_model_dir or not target_model_dir.exists() or not target_model_dir.is_dir():
             return web.Response(text="Model not found", status=404)
 
-        # パストラバーサル防止 (CWE-22)
-        target_file = validate_safe_path(target_model_dir, file_path_str)
-        if not target_file or not target_file.is_relative_to(model_dir):
-            return web.Response(text="Access denied (path traversal)", status=403)
-
-        if not target_file.exists() or not target_file.is_file():
+        # パストラバーサル防止 (CodeQL CWE-22)
+        target_file = validate_safe_path(target_model_dir, clean_relative_path)
+        if not target_file or not target_file.exists() or not target_file.is_file():
             return web.Response(text="File not found", status=404)
 
         file_size = target_file.stat().st_size
@@ -3793,11 +3835,12 @@ class WebServer:
         """指定された COEIROINK モデルフォルダを tar ストリームで高速配信"""
         model_name = request.match_info.get("model_name", "")
         # 安全性チェック: パストラバーサル防止 (CWE-22)
-        if not is_safe_identifier(model_name):
+        clean_model_name = sanitize_filename(model_name)
+        if not clean_model_name or not is_safe_identifier(clean_model_name):
             return web.Response(text="Invalid model name", status=400)
 
         model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
-        target_path = validate_safe_path(model_dir, model_name)
+        target_path = validate_safe_path(model_dir, clean_model_name)
         if not target_path or not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
             return web.Response(text="Model not found", status=404)
 
@@ -3805,14 +3848,14 @@ class WebServer:
             status=200,
             headers={
                 "Content-Type": "application/x-tar",
-                "Content-Disposition": f'attachment; filename="{model_name}.tar"',
+                "Content-Disposition": f'attachment; filename="{clean_model_name}.tar"',
             }
         )
         await response.prepare(request)
 
-        # tar -cf - -C /app/coeiroink_models {model_name} を実行し、stdout を直接ストリーミング
+        # tar -cf - -C /app/coeiroink_models {clean_model_name} を実行し、stdout を直接ストリーミング
         proc = await asyncio.create_subprocess_exec(
-            "tar", "-cf", "-", "-C", str(model_dir), model_name,
+            "tar", "-cf", "-", "-C", str(model_dir), clean_model_name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )

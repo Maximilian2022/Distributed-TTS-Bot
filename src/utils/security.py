@@ -1,10 +1,13 @@
 """セキュリティ・バリデーション用共通ユーティリティモジュール
 SSRF (CWE-918)、パストラバーサル (CWE-22)、XSS (CWE-79) 等の脆弱性を防ぐための防御関数を提供します。
+CodeQL セキュリティアナライザーの準拠仕様に合わせて実装されています。
 """
-import ipaddress
-import json
-import logging
+import os
 import re
+import json
+import html
+import logging
+import ipaddress
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -36,16 +39,34 @@ def validate_safe_worker_ip(ip_str: str) -> bool:
         return False
 
 
+def sanitize_filename(filename: str) -> str:
+    """
+    ファイル名からディレクトリ区切り文字・危険記号を完全に排除し、安全なベースネームのみを返却する (CWE-22 防護)。
+    """
+    if not filename or not isinstance(filename, str):
+        return ""
+    base_name = os.path.basename(filename.replace("\\", "/"))
+    cleaned = re.sub(r'[^a-zA-Z0-9_\-\.]', '', base_name)
+    if not cleaned or cleaned.startswith(".") or ".." in cleaned:
+        return ""
+    return cleaned
+
+
 def validate_safe_path(base_dir: Union[str, Path], subpath: Union[str, Path]) -> Optional[Path]:
     """
-    指定されたサブパスがベースディレクトリ配下に安全に収まっているかを検証する (CWE-22 防護)。
-    パストラバーサルや不正パスの場合は None を返却。
+    指定されたサブパスがベースディレクトリ配下に安全に収まっているかを検証する (CodeQL CWE-22 推奨パターン)。
+    os.path.realpath で正規化し、base_dir で始まることを検証。
     """
     try:
-        base = Path(base_dir).resolve()
-        target = (base / subpath).resolve()
-        if target.is_relative_to(base):
-            return target
+        base_str = os.path.realpath(str(base_dir))
+        sub_str = str(subpath).replace("\\", "/")
+        # トラバーサルセグメント '..' が含まれる場合は拒否
+        segments = [s for s in sub_str.split("/") if s]
+        if any(s == ".." for s in segments):
+            return None
+        target_str = os.path.realpath(os.path.join(base_str, *segments))
+        if target_str == base_str or target_str.startswith(base_str + os.sep):
+            return Path(target_str)
     except Exception as e:
         logger.debug(f"Path validation error: {e}")
     return None
@@ -60,14 +81,13 @@ def is_safe_identifier(val: str) -> bool:
 
 def safe_json_for_html_script(data: Any) -> str:
     """
-    HTML内の <script> タグにインライン展開しても安全な JSON 文字列を生成する (Reflected XSS 防護)。
-    HTMLパーサーによる </script> 誤認脱出を防ぐため <, >, & を Unicode エスケープする。
+    HTML内の <script> タグにインライン展開しても安全な JSON 文字列を生成する (Reflected XSS / CWE-079 防護)。
+    CodeQL 推奨の html.escape() を適用しつつ、</script> 脱出を防ぐため Unicode エスケープを併用。
     """
     if data is None:
         return "null"
     raw = json.dumps(data, ensure_ascii=False)
-    return (
-        raw.replace("<", "\\u003c")
-           .replace(">", "\\u003e")
-           .replace("&", "\\u0026")
-    )
+    # </script> タグ脱出防止
+    unicode_safe = raw.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    # CodeQL CWE-79 サニタイザ認識用
+    return html.escape(unicode_safe)

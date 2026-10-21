@@ -11,12 +11,12 @@ import os
 import time
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 import re
 from pathlib import Path
 import aiohttp
 
-from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier
+from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, sanitize_filename
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +102,19 @@ class WorkerLogCollector:
 
     async def collect_single_worker(self, node_id: str, ip: str, tail: int = 300) -> bool:
         """単一ワーカーノードから全ログ（Agent＋各エンジン）を取得しファイルへ書き出し"""
-        # SSRF ガード (CWE-918): 不正・予約済みIPアドレスへのリクエストを遮断
-        if not validate_safe_worker_ip(ip):
-            logger.warning(f"SSRF guard blocked request to worker IP: {ip} (node_id={node_id})")
+        # SSRF ガード (CWE-918): サーバー承認済みIPリストからルックアップ (外部入力Taintの完全切断)
+        target_ip = None
+        for known_id, known_ip in list(self._known_workers.items()):
+            if (node_id and known_id == node_id) or (ip and known_ip == ip):
+                target_ip = known_ip
+                break
+
+        if not target_ip:
+            logger.warning(f"SSRF guard blocked request to unregistered worker: {ip} (node_id={node_id})")
             return False
 
-        url = f"http://{ip}:50030/logs?target=all&tail={tail}"
+        safe_tail = max(1, min(int(tail), 1000))
+        url = f"http://{target_ip}:50030/logs?target=all&tail={safe_tail}"
         session = self._session or aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4.0))
         own_session = self._session is None
 
@@ -123,7 +130,9 @@ class WorkerLogCollector:
                 await session.close()
 
         # 出力ディレクトリ安全検証: logs/workers/<safe_node_name>/ (CWE-22)
-        safe_node_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', node_id)
+        safe_node_name = sanitize_filename(node_id)
+        if not safe_node_name:
+            return False
         node_dir = validate_safe_path(LOG_DIR_BASE, safe_node_name)
         if not node_dir:
             logger.warning(f"Path injection guard blocked worker directory: {safe_node_name}")
@@ -135,17 +144,19 @@ class WorkerLogCollector:
         if agent_logs:
             agent_log_path = validate_safe_path(node_dir, "agent.log")
             if agent_log_path:
-                self._write_logs_file(str(agent_log_path), agent_logs)
+                self._write_logs_file(agent_log_path, agent_logs)
 
         # 2. 各エンジンコンテナログの保存
         engines = data.get("engines", {})
         for eng_name, eng_info in engines.items():
-            safe_eng_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', eng_name)
+            safe_eng_name = sanitize_filename(eng_name)
+            if not safe_eng_name:
+                continue
             eng_logs = eng_info.get("logs", [])
             if eng_logs:
                 eng_log_path = validate_safe_path(node_dir, f"{safe_eng_name}.log")
                 if eng_log_path:
-                    self._write_logs_file(str(eng_log_path), eng_logs)
+                    self._write_logs_file(eng_log_path, eng_logs)
 
         # メタデータ (最終同期時刻・稼働ステータス)
         meta_path = validate_safe_path(node_dir, "status.json")
@@ -155,7 +166,7 @@ class WorkerLogCollector:
                     import json
                     json.dump({
                         "node_id": node_id,
-                        "ip": ip,
+                        "ip": target_ip,
                         "agent_version": data.get("agent_version", "unknown"),
                         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                         "engines_status": {k: v.get("running", False) for k, v in engines.items()}
@@ -165,13 +176,14 @@ class WorkerLogCollector:
 
         return True
 
-    def _write_logs_file(self, filepath: str, lines: List[str]) -> None:
+    def _write_logs_file(self, filepath: Union[str, Path], lines: List[str]) -> None:
         """ログファイルに書き出し（行数上限時に *-archive.log へ退避し直近100行保持する2段階ハイブリッドローテーション）"""
-        target_path = Path(filepath).resolve()
-        base_dir = Path(LOG_DIR_BASE).resolve()
-        if not target_path.is_relative_to(base_dir):
+        base_str = os.path.realpath(str(LOG_DIR_BASE))
+        target_str = os.path.realpath(str(filepath))
+        if not (target_str == base_str or target_str.startswith(base_str + os.sep)):
             logger.warning(f"Path traversal blocked in _write_logs_file: {filepath}")
             return
+        target_path = Path(target_str)
 
         try:
             # 既存ファイルがある場合は読み込み
@@ -197,8 +209,11 @@ class WorkerLogCollector:
                 recent_lines = merged[-KEEP_LINES_ON_ROTATE:]
 
                 # アーカイブファイルパス: 例 logs/workers/<node_id>/agent-archive.log
-                archive_path = target_path.parent / f"{target_path.stem}-archive.log"
-                if not archive_path.resolve().is_relative_to(base_dir):
+                archive_filename = sanitize_filename(f"{target_path.stem}-archive.log")
+                if not archive_filename:
+                    return
+                archive_path = validate_safe_path(target_path.parent, archive_filename)
+                if not archive_path:
                     return
 
                 # 古い行をアーカイブファイルへ追記退避
@@ -232,18 +247,35 @@ class WorkerLogCollector:
 
     def get_log_content(self, node_id: str, target: str = "agent", tail: int = 100) -> Dict[str, Any]:
         """保存されているログファイルを読み取って返却 (WebUI / AI用)"""
-        safe_node_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', node_id)
-        safe_target_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', target.lower())
+        safe_node_name = sanitize_filename(node_id)
+        safe_target_base = sanitize_filename(target.lower())
+        if not safe_node_name or not safe_target_base:
+            return {
+                "success": False,
+                "node_id": node_id,
+                "target": target,
+                "lines": [],
+                "error": "Invalid node_id or target"
+            }
         
-        # 安全なパス検証 (CWE-22)
-        log_file_path = validate_safe_path(LOG_DIR_BASE, f"{safe_node_name}/{safe_target_name}.log")
+        # 安全なパス検証 (CodeQL CWE-22)
+        node_dir = validate_safe_path(LOG_DIR_BASE, safe_node_name)
+        if not node_dir:
+            return {
+                "success": False,
+                "node_id": node_id,
+                "target": target,
+                "lines": [],
+                "error": "Invalid worker directory"
+            }
+        log_file_path = validate_safe_path(node_dir, f"{safe_target_base}.log")
         if not log_file_path or not log_file_path.exists() or not log_file_path.is_file():
             return {
                 "success": False,
                 "node_id": node_id,
                 "target": target,
                 "lines": [],
-                "error": f"Log file not found: {safe_target_name}.log"
+                "error": f"Log file not found: {safe_target_base}.log"
             }
 
         try:

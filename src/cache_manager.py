@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any, Union
 from src.utils.text_cleaner import TextCleaner
 from src.utils.async_task import safe_create_task
+from src.utils.security import sanitize_filename, validate_safe_path
 
 logger = logging.getLogger(__name__)
 
@@ -639,24 +640,15 @@ class CacheManager:
 
     def get_explorer_file_path(self, target: str, filename: str) -> Optional[Path]:
         """
-        パストラバーサルを防ぎつつ安全にキャッシュファイルのパスを取得 (CWE-22)。
+        パストラバーサルを防ぎつつ安全にキャッシュファイルのパスを取得 (CodeQL CWE-22 準拠)。
         """
-        if not filename or not isinstance(filename, str) or not filename.endswith(".wav"):
-            return None
-
-        clean_name = Path(filename).name
-        if clean_name != filename or "/" in filename or "\\" in filename or ".." in filename:
+        clean_name = sanitize_filename(filename)
+        if not clean_name or not clean_name.endswith(".wav"):
             return None
 
         target_dir = self.voicevox_cache_dir if target in ("voicevox", "local") else self.cache_dir
-        base_resolved = target_dir.resolve()
-        file_path = (base_resolved / clean_name).resolve()
-
-        # パストラバーサル防止 (CWE-22): 解決後パスがベースディレクトリ配下であることを保証
-        if not file_path.is_relative_to(base_resolved):
-            return None
-
-        if file_path.exists() and file_path.is_file():
+        file_path = validate_safe_path(target_dir, clean_name)
+        if file_path and file_path.exists() and file_path.is_file():
             return file_path
         return None
 
