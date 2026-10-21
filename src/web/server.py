@@ -178,6 +178,10 @@ class WebServer:
         self.app.router.add_post("/api/dict", self.api_add_dict)
         self.app.router.add_put("/api/dict", self.api_update_dict)
         self.app.router.add_delete("/api/dict/{word}", self.api_delete_dict)
+        self.app.router.add_get("/api/ng", self.api_get_ng)
+        self.app.router.add_post("/api/ng", self.api_add_ng)
+        self.app.router.add_delete("/api/ng/{word}", self.api_delete_ng)
+        self.app.router.add_post("/api/ng/import_preset", self.api_import_ng_preset)
         self.app.router.add_post("/api/dict/import_users", self.api_import_users)
         self.app.router.add_post("/api/dict/import_batch", self.api_import_dict_batch)
         self.app.router.add_get("/api/dict/ai/suggestions", self.api_get_ai_suggestions)
@@ -1104,6 +1108,49 @@ class WebServer:
         if updated:
             purged = await self.cache_manager.purge_by_words([old_word, new_word])
             return web.json_response({"success": True, "purged_cache_count": purged})
+        return web.json_response({"error": "Word not found"}, status=404)
+
+    # --- NGワード API ---
+
+    async def api_get_ng(self, request: web.Request) -> web.Response:
+        guild, _ = await self._get_guild_and_perms(request, request.query.get("guild_id"))
+        words = await self.db.get_ng_words(guild.id)
+        return web.json_response({
+            "guild_id": str(guild.id),
+            "ng_words": words
+        })
+
+    async def api_add_ng(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        word = data.get("word", "").strip()
+        if not word:
+            return web.json_response({"error": "Word is required"}, status=400)
+
+        await self.db.add_ng_word(guild.id, word)
+        purged = await self.cache_manager.purge_by_word(word)
+        return web.json_response({"success": True, "purged_cache_count": purged})
+
+    async def api_delete_ng(self, request: web.Request) -> web.Response:
+        word = request.match_info.get("word", "").strip()
+        guild, _ = await self._get_guild_and_perms(request, request.query.get("guild_id"))
+
+        if not word:
+            return web.json_response({"error": "Word is required"}, status=400)
+
+        deleted = await self.db.delete_ng_word(guild.id, word)
+        if deleted:
+            purged = await self.cache_manager.purge_by_word(word)
+            return web.json_response({"success": True, "purged_cache_count": purged})
+        return web.json_response({"error": "Word not found"}, status=404)
+
+    async def api_import_ng_preset(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+        count = await self.db.import_default_ng_words(guild.id)
+        return web.json_response({"success": True, "imported_count": count})
+
     async def api_get_ai_suggestions(self, request: web.Request) -> web.Response:
         """AI提案単語リストを取得"""
         guild, _ = await self._get_guild_and_perms(request, request.query.get("guild_id"))

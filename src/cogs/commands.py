@@ -550,6 +550,124 @@ class CommandsCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed)
 
+    # --- NGワードコマンド (/ng) ---
+
+    ng_group = app_commands.Group(name="ng", description="NGワードの登録・削除・一覧表示を行います。")
+
+    @ng_group.command(name="add", description="NGワードをサーバーに登録します。発言時にピー音に置き換えられます。")
+    @app_commands.describe(word="登録するNGワード")
+    async def ng_add(self, interaction: discord.Interaction, word: str):
+        if not interaction.guild_id:
+            await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+            return
+
+        w = word.strip()
+        if not w:
+            await interaction.response.send_message("❌ NGワードを正しく入力してください。", ephemeral=True)
+            return
+
+        await self.db.add_ng_word(interaction.guild_id, w)
+        # NGワード登録時も当該単語を含むキャッシュを選択的パージ
+        purged = await self.cache_manager.purge_by_word(w)
+        dashboard_url = getattr(self.config, "web_dashboard_url", "https://ttsbot.kenko.land")
+
+        embed = discord.Embed(
+            title="🚫 NGワード登録完了",
+            description=(
+                f"単語 **「{w}」** をNGワードに登録しました。\n"
+                f"今後この単語が使われた発言は、該当部分が自主規制ピー音に置き換えられ、🤫リアクションが付与されます。\n\n"
+                f"💡 [Webダッシュボード]({dashboard_url}) からもNGワード管理が可能です。"
+            ),
+            color=discord.Color.red()
+        )
+        if purged > 0:
+            embed.set_footer(text=f"登録に伴い、該当キャッシュ {purged} 件を選択的パージしました。")
+
+        await interaction.response.send_message(embed=embed)
+
+    @ng_group.command(name="delete", description="NGワードをサーバーから削除します。")
+    @app_commands.describe(word="削除するNGワード")
+    async def ng_delete(self, interaction: discord.Interaction, word: str):
+        if not interaction.guild_id:
+            await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+            return
+
+        w = word.strip()
+        if not w:
+            await interaction.response.send_message("❌ 削除するNGワードを指定してください。", ephemeral=True)
+            return
+
+        dashboard_url = getattr(self.config, "web_dashboard_url", "https://ttsbot.kenko.land")
+        deleted = await self.db.delete_ng_word(interaction.guild_id, w)
+        if deleted:
+            purged = await self.cache_manager.purge_by_word(w)
+            embed = discord.Embed(
+                title="🗑️ NGワード削除完了",
+                description=(
+                    f"NGワード **「{w}」** をサーバーから削除しました。\n\n"
+                    f"💡 [Webダッシュボード]({dashboard_url}) からも管理が可能です。"
+                ),
+                color=discord.Color.orange()
+            )
+            if purged > 0:
+                embed.set_footer(text=f"該当キャッシュ {purged} 件を選択的パージしました。")
+            await interaction.response.send_message(embed=embed)
+        else:
+            await interaction.response.send_message(
+                f"⚠️ 単語 **「{w}」** はNGワードに登録されていません。\n"
+                f"💡 [Webダッシュボード]({dashboard_url}) で登録状況を確認できます。",
+                ephemeral=True
+            )
+
+    @ng_group.command(name="list", description="サーバーに登録されているNGワード一覧を表示します。")
+    async def ng_list(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+            return
+
+        dashboard_url = getattr(self.config, "web_dashboard_url", "https://ttsbot.kenko.land")
+        words = await self.db.get_ng_words(interaction.guild_id)
+        if not words:
+            await interaction.response.send_message(
+                f"🚫 NGワードは現在何も登録されていません。\n"
+                f"💡 [Webダッシュボード]({dashboard_url}) からもNGワードの登録・管理が可能です。",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"🚫 NGワード一覧 ({len(words)}件)",
+            color=discord.Color.red()
+        )
+
+        lines = [f"• **{w}**" for w in words[:30]]
+        desc = "\n".join(lines)
+        desc += f"\n\n💡 [Webダッシュボード]({dashboard_url}) からもNGワード確認・追加が可能です。"
+        embed.description = desc
+
+        if len(words) > 30:
+            embed.set_footer(text=f"他 {len(words) - 30} 件（表示上限により省略）")
+
+        await interaction.response.send_message(embed=embed)
+
+    @ng_group.command(name="preset", description="一般的な標準NGワードプリセット（差別用語・露骨な性的語句等）を一括登録します。")
+    async def ng_preset(self, interaction: discord.Interaction):
+        if not interaction.guild_id:
+            await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+            return
+
+        dashboard_url = getattr(self.config, "web_dashboard_url", "https://ttsbot.kenko.land")
+        count = await self.db.import_default_ng_words(interaction.guild_id)
+        embed = discord.Embed(
+            title="📋 標準NGワードプリセット適用完了",
+            description=(
+                f"標準NGワード {count} 件をサーバーに一括登録しました。\n"
+                f"登録された単語は `/ng list` または [Webダッシュボード]({dashboard_url}) から確認・個別削除が可能です。"
+            ),
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed)
+
     @app_commands.command(name="info", description="Botの情報、搭載エンジン、各音声モデルの利用規約・クレジット表記を表示します。")
     async def info(self, interaction: discord.Interaction):
         """Bot情報および各TTSモデルのライセンス・規約・クレジット表記を表示"""

@@ -110,6 +110,7 @@
           <nav class="tabs-nav">
             <button class="tab-btn active" data-tab="voice">🎙️ マイ音声設定 (個人設定)</button>
             <button class="tab-btn" data-tab="dict">📖 単語辞書</button>
+            <button class="tab-btn" data-tab="ng">🚫 NGワード</button>
             <button class="tab-btn" id="tab-btn-member-voices" data-tab="member-voices" style="display:none;">👥 メンバー音声設定</button>
             <button class="tab-btn" id="tab-btn-config" data-tab="config">⚙️ ボット設定</button>
             <button class="tab-btn" id="tab-btn-bots" data-tab="bots">🤖 Bot管理</button>
@@ -258,6 +259,47 @@
                     </tr>
                   </thead>
                   <tbody id="dict-table-body">
+                    <!-- 動的にレンダリング -->
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- 2-2. NGワードタブ -->
+          <section id="tab-ng" class="tab-pane">
+            <div class="section-title">🚫 NGワード管理 (自主規制・ピー音)</div>
+            <div class="section-desc">
+              登録されたNGワードが使われた際、音声を電子的な自主規制ピー音（1000Hz）に置き換えて読み上げ、Discord発言に🤫リアクションを付与します。
+            </div>
+
+            <div class="card">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+                <h3 style="font-size:15px;margin:0;">➕ 新規NGワード登録</h3>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="importDefaultNgWords()">📋 標準NGプリセットを一括適用</button>
+              </div>
+
+              <form onsubmit="addNgWord(event)" style="display:flex;gap:12px;flex-wrap:wrap;">
+                <input type="text" id="ng-new-word" class="form-input" style="flex:1;min-width:200px;" placeholder="登録するNGワード (例: 禁止用語)" required>
+                <button type="submit" class="btn btn-primary">NGワードに追加 🚫</button>
+              </form>
+            </div>
+
+            <div class="card">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <h3 style="font-size:15px;">登録済みNGワード一覧 (<span id="ng-count">0件</span>)</h3>
+                <input type="text" id="ng-search-input" class="form-input" style="width:220px;" placeholder="NGワードで検索..." oninput="filterNgWords()">
+              </div>
+
+              <div class="dict-table-container">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th style="width:70%;">NGワード</th>
+                      <th style="width:30%;text-align:right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ng-table-body">
                     <!-- 動的にレンダリング -->
                   </tbody>
                 </table>

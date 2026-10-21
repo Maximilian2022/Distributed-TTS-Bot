@@ -102,6 +102,9 @@ function setupTabs() {
           if (chk) chk.checked = false;
         }
       }
+      if (tabId === "ng") {
+        if (currentGuildId) loadNgWords(currentGuildId);
+      }
       if (tabId === "config") {
         if (currentGuildId) loadBotConfig(currentGuildId);
       }
@@ -198,6 +201,7 @@ async function switchGuild(guildId) {
 
   // サーバー別データの読み込み
   loadDictionary(currentGuildId);
+  loadNgWords(currentGuildId);
   loadUserProfile(currentGuildId);
   loadSyncSourceGuilds();
   await Promise.all([
@@ -922,6 +926,130 @@ async function testPreviewAudio() {
     showToast("音声試聴中に通信エラーが発生しました", "error");
     btn.disabled = false;
     btn.textContent = "試聴する 🔊";
+  }
+}
+
+// --- NGワード管理 ---
+
+let allNgWords = [];
+let currentFilteredNgWords = [];
+
+async function loadNgWords(guildId) {
+  if (!guildId) return;
+  try {
+    const res = await fetch(`/api/ng?guild_id=${guildId}`);
+    const data = await res.json();
+    allNgWords = data.ng_words || [];
+    filterNgWords();
+  } catch (e) {
+    console.error("Failed to load NG words:", e);
+  }
+}
+
+function filterNgWords() {
+  const query = (document.getElementById("ng-search-input")?.value || "").trim().toLowerCase();
+  if (!query) {
+    currentFilteredNgWords = [...allNgWords];
+  } else {
+    currentFilteredNgWords = allNgWords.filter(w => w.toLowerCase().includes(query));
+  }
+  renderNgTable(currentFilteredNgWords);
+}
+
+function renderNgTable(words) {
+  const tbody = document.getElementById("ng-table-body");
+  const countSpan = document.getElementById("ng-count");
+  if (!tbody) return;
+
+  if (countSpan) countSpan.textContent = `${words.length}件`;
+  tbody.innerHTML = "";
+
+  if (words.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="2" style="text-align:center;color:var(--text-muted);padding:24px;">登録されているNGワードはありません</td></tr>`;
+    return;
+  }
+
+  words.forEach(word => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="font-weight:600;color:#ff4757;">🚫 ${escapeHtml(word)}</td>
+      <td style="text-align:right;white-space:nowrap;">
+        <button type="button" class="btn btn-danger btn-sm" onclick="deleteNgWord('${encodeURIComponent(word)}')">削除</button>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+async function addNgWord(e) {
+  if (e) e.preventDefault();
+  const input = document.getElementById("ng-new-word");
+  const word = input?.value.trim();
+  if (!word || !currentGuildId) return;
+
+  try {
+    const res = await fetch("/api/ng", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ guild_id: currentGuildId, word })
+    });
+    if (res.ok) {
+      showToast(`NGワード「${word}」を追加しました 🚫`, "success");
+      input.value = "";
+      loadNgWords(currentGuildId);
+    } else {
+      const err = await res.json();
+      showToast(err.error || "NGワードの追加に失敗しました", "error");
+    }
+  } catch (err) {
+    console.error("Failed to add NG word:", err);
+    showToast("通信エラーが発生しました", "error");
+  }
+}
+
+async function deleteNgWord(encodedWord) {
+  const word = decodeURIComponent(encodedWord);
+  if (!confirm(`NGワード「${word}」を削除しますか？`)) return;
+  if (!currentGuildId) return;
+
+  try {
+    const res = await fetch(`/api/ng/${encodeURIComponent(word)}?guild_id=${currentGuildId}`, {
+      method: "DELETE"
+    });
+    if (res.ok) {
+      showToast(`NGワード「${word}」を削除しました`, "success");
+      loadNgWords(currentGuildId);
+    } else {
+      showToast("NGワードの削除に失敗しました", "error");
+    }
+  } catch (err) {
+    console.error("Failed to delete NG word:", err);
+    showToast("通信エラーが発生しました", "error");
+  }
+}
+
+async function importDefaultNgWords() {
+  if (!currentGuildId) return;
+  if (!confirm("一般的な標準NGワードプリセット（差別用語・露骨な性的語句等）を一括登録しますか？\n（既に登録済みの単語は重複登録されません）")) {
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/ng/import_preset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ guild_id: currentGuildId })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      showToast(`標準NGワード ${data.imported_count} 件を一括登録しました 📋`, "success");
+      loadNgWords(currentGuildId);
+    } else {
+      showToast("プリセットの登録に失敗しました", "error");
+    }
+  } catch (err) {
+    console.error("Failed to import default NG words:", err);
+    showToast("通信エラーが発生しました", "error");
   }
 }
 

@@ -871,6 +871,8 @@ class VCHandlerCog(commands.Cog):
             longest_idx = max(range(len(chunks)), key=lambda i: len(chunks[i].text))
 
             async def _synth_one(idx: int, ch):
+                if getattr(ch, "is_beep", False):
+                    return
                 is_long = (idx == longest_idx and len(ch.text) >= 15)
                 try:
                     await self.tts_manager.get_chunk_audio(
@@ -889,6 +891,13 @@ class VCHandlerCog(commands.Cog):
             await asyncio.gather(*[_synth_one(i, ch) for i, ch in enumerate(chunks)], return_exceptions=True)
         except Exception as e:
             logger.debug(f"Prefetch chunks task encountered error: {e}")
+
+    async def _add_reaction_safe(self, message: discord.Message, emoji_char: str) -> None:
+        """メッセージに安全にリアクションを付与（権限不足やメッセージ削除済みエラーを吸収）"""
+        try:
+            await message.add_reaction(emoji_char)
+        except Exception as e:
+            logger.debug(f"Failed to add reaction '{emoji_char}' to message {message.id}: {e}")
 
     async def _prefetch_audio(self, item: QueueItem):
         """メッセージがキューに入った瞬間にバックグラウンドでTTS合成を開始し、推論時間を再生と並行して隠蔽 (フォールバック用)"""
@@ -1115,6 +1124,12 @@ class VCHandlerCog(commands.Cog):
 
         async def _synth_chunk(ch, is_longest: bool):
             t_s = time.time()
+            if getattr(ch, "is_beep", False):
+                from src.utils.streaming_audio import get_beep_pcm
+                beep_pcm = get_beep_pcm(getattr(ch, "beep_duration_sec", 0.4))
+                t_e = time.time()
+                return ch, beep_pcm, "beep", "local", True, t_s, t_e
+
             b, p, w, c = await self.tts_manager.get_chunk_audio(
                 text=ch.text,
                 speaker_id=item.speaker_id,
@@ -1149,7 +1164,10 @@ class VCHandlerCog(commands.Cog):
             )
 
             # 第1チャンクをストリームに投入
-            dur0 = stream_source.feed_wav_bytes(c0_bytes, pause_after_ms=first_chunk.pause_after_ms)
+            if getattr(first_chunk, "is_beep", False):
+                dur0 = stream_source.feed_raw_pcm(c0_bytes, pause_after_ms=first_chunk.pause_after_ms)
+            else:
+                dur0 = stream_source.feed_wav_bytes(c0_bytes, pause_after_ms=first_chunk.pause_after_ms)
             total_audio_duration += dur0
 
             c0_synth_duration = round((c0_synth_end - c0_synth_start) * 1000, 1)
@@ -1240,7 +1258,10 @@ class VCHandlerCog(commands.Cog):
                             asyncio.shield(remaining_tasks[0]),
                             timeout=dynamic_wait_timeout
                         )
-                        dur1 = stream_source.feed_wav_bytes(b1, pause_after_ms=ch1.pause_after_ms)
+                        if getattr(ch1, "is_beep", False):
+                            dur1 = stream_source.feed_raw_pcm(b1, pause_after_ms=ch1.pause_after_ms)
+                        else:
+                            dur1 = stream_source.feed_wav_bytes(b1, pause_after_ms=ch1.pause_after_ms)
                         total_audio_duration += dur1
                         ch1_synth_dur = round((te1 - ts1) * 1000, 1)
                         ch1_audio_dur = round(dur1 * 1000, 1)
@@ -1275,7 +1296,10 @@ class VCHandlerCog(commands.Cog):
                     if remaining_tasks[0].done():
                         try:
                             ch1, b1, p1, w1, c1, ts1, te1 = remaining_tasks[0].result()
-                            dur1 = stream_source.feed_wav_bytes(b1, pause_after_ms=ch1.pause_after_ms)
+                            if getattr(ch1, "is_beep", False):
+                                dur1 = stream_source.feed_raw_pcm(b1, pause_after_ms=ch1.pause_after_ms)
+                            else:
+                                dur1 = stream_source.feed_wav_bytes(b1, pause_after_ms=ch1.pause_after_ms)
                             total_audio_duration += dur1
                             ch1_synth_dur = round((te1 - ts1) * 1000, 1)
                             ch1_audio_dur = round(dur1 * 1000, 1)
@@ -1317,7 +1341,10 @@ class VCHandlerCog(commands.Cog):
                 buffer_remaining_ms = buffer_remaining_s * 1000
                 min_buffer_remaining_ms = min(min_buffer_remaining_ms, buffer_remaining_ms)
 
-                dur = stream_source.feed_wav_bytes(b, pause_after_ms=ch.pause_after_ms)
+                if getattr(ch, "is_beep", False):
+                    dur = stream_source.feed_raw_pcm(b, pause_after_ms=ch.pause_after_ms)
+                else:
+                    dur = stream_source.feed_wav_bytes(b, pause_after_ms=ch.pause_after_ms)
                 total_audio_duration += dur
 
                 task_synth_dur = round((t_e - t_s) * 1000, 1)
@@ -1514,18 +1541,25 @@ class VCHandlerCog(commands.Cog):
 
         max_length = guild_settings.get("max_text_length", self.config.max_text_length)
         dict_words = await self.db.get_dictionary_words(message.guild.id)
+        ng_words = await self.db.get_ng_words(message.guild.id)
         read_username = bool(guild_settings.get("read_username", 0))
 
-        # 本文のサニタイズ
+        # 本文のサニタイズ (NGワードはピー音プレースホルダー <<ピー音>> に置換)
         cleaned_body = self.text_cleaner.clean(
             raw_text=message.content,
             guild=message.guild,
             dictionary_entries=dict_words,
+            ng_words=ng_words,
             max_length=max_length
         )
 
         if not cleaned_body:
             return
+
+        # NGワードが検知された場合、メッセージに🤫リアクションを付与＆last_used_at更新
+        if self.text_cleaner.last_detected_ng_words:
+            safe_create_task(self._add_reaction_safe(message, "🤫"), name=f"ng_react_{message.id}")
+            safe_create_task(self.db.touch_ng_words(message.guild.id, self.text_cleaner.last_detected_ng_words), name="touch_ng_words")
 
         # 辞書が使用された場合、非同期で last_used_at を更新 (LRU管理用)
         if dict_words:

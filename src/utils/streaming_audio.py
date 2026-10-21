@@ -9,7 +9,10 @@ Discord.py の vc.play() に対し、パーツ単位で生成された音声を�
 import io
 import wave
 import array
+import math
+import struct
 import asyncio
+import functools
 import logging
 from typing import Optional, List, Dict, Any
 
@@ -18,6 +21,65 @@ import discord
 logger = logging.getLogger(__name__)
 
 FRAME_SIZE = 3840  # 48kHz, 16bit, Stereo の 20ms 分のバイト数 (48000 * 2 * 2 * 0.02)
+
+
+def generate_beep_pcm(duration_sec: float = 0.4, freq: float = 1000.0, sample_rate: int = 48000, volume: float = 0.25) -> bytes:
+    """
+    1000Hzサイン波の48kHz 16-bit Stereo PCM（自主規制ピー音）を生成。
+    ポップノイズ防止のため先頭・末尾に5msのエンベロープ（フェード）を適用。
+    """
+    num_samples = int(sample_rate * duration_sec)
+    max_amp = int(32767 * volume)
+    fade_len = int(sample_rate * 0.005)  # 5ms
+
+    pcm_bytes = bytearray(num_samples * 4)  # 2ch * 2bytes
+    for i in range(num_samples):
+        val = math.sin(2.0 * math.pi * freq * (i / sample_rate))
+        if i < fade_len:
+            gain = i / fade_len
+        elif i > num_samples - fade_len:
+            gain = (num_samples - i) / fade_len
+        else:
+            gain = 1.0
+        sample_val = int(val * max_amp * gain)
+        s_bytes = struct.pack("<hh", sample_val, sample_val)
+        pcm_bytes[i * 4 : (i + 1) * 4] = s_bytes
+    return bytes(pcm_bytes)
+
+
+def calc_beep_duration(char_count: int) -> float:
+    """
+    NGワードの文字数に応じたピー音の長さ（秒）を算出。
+    1文字あたり約120ms。最小200ms〜最大1.5秒で自然な発話長に調整。
+    例:
+      1文字: 0.22秒 (220ms)
+      2文字: 0.34秒 (340ms)
+      3文字: 0.46秒 (460ms)
+      4文字: 0.58秒 (580ms)
+      5文字: 0.70秒 (700ms)
+      8文字: 1.06秒 (1060ms)
+      12文字以上: 1.50秒 (1500ms上限)
+    """
+    c = max(1, char_count)
+    sec = 0.10 + 0.12 * c
+    return min(1.50, max(0.20, sec))
+
+
+@functools.lru_cache(maxsize=64)
+def get_beep_pcm(duration_sec: float) -> bytes:
+    """
+    指定秒数の1000Hzサイン波48kHz Stereo PCMを取得（LRUキャッシュ）。
+    Discordの20msフレーム（960サンプル = 3840バイト）境界にアライン。
+    """
+    frame_samples = 960  # 48000 * 0.02
+    target_samples = int(48000 * duration_sec)
+    num_frames = max(1, round(target_samples / frame_samples))
+    actual_duration = (num_frames * frame_samples) / 48000.0
+    return generate_beep_pcm(duration_sec=actual_duration, freq=1000.0, sample_rate=48000, volume=0.25)
+
+
+# 事前生成された自主規制ピー音 (1000Hz, 400ms, 48kHz Stereo PCM: 互換性維持用)
+BEEP_PCM_48K_STEREO: bytes = get_beep_pcm(0.4)
 
 
 class StreamingAudioSource(discord.AudioSource):
@@ -160,6 +222,23 @@ class StreamingAudioSource(discord.AudioSource):
         except Exception as e:
             logger.warning(f"Error parsing/feeding WAV bytes to stream: {e}")
             return 0.0
+
+    def feed_raw_pcm(self, pcm_48k_stereo: bytes, pause_after_ms: int = 0) -> float:
+        """
+        48kHz 16-bit Stereo PCM 生データを直接ストリームバッファに追加 (WAVパース不要のO(1)即時投入)
+        戻り値: 追加された音声の長さ (秒)
+        """
+        if self._finished or self._is_closed or not pcm_48k_stereo:
+            return 0.0
+
+        duration = len(pcm_48k_stereo) / 192000.0  # 48000 samples/sec * 2ch * 2bytes = 192000 bytes/sec
+        if pause_after_ms > 0:
+            pause_bytes = b'\x00' * int(192 * pause_after_ms)
+            pcm_48k_stereo = pcm_48k_stereo + pause_bytes
+            duration += (pause_after_ms / 1000.0)
+
+        self._buffer.extend(pcm_48k_stereo)
+        return duration
 
     def finish(self):
         """これ以上のパーツ追加がないことを通知 (終端マーク)"""

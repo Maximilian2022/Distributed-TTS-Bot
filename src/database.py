@@ -134,6 +134,7 @@ class Database:
         self.pool = SQLitePool(db_path, max_connections=max_connections)
         self._guild_settings_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
         self._dict_cache: Dict[int, Tuple[float, List[Tuple[str, str]]]] = {}
+        self._ng_words_cache: Dict[int, Tuple[float, List[str]]] = {}
         self._user_settings_cache: Dict[Tuple[int, int], Tuple[float, Optional[Dict[str, Any]]]] = {}
         self._cache_ttl: float = 300.0  # 5分間キャッシュ
         self._metric_delete_counter: int = 0
@@ -160,13 +161,15 @@ class Database:
 
 
     def invalidate_guild_cache(self, guild_id: Optional[int] = None) -> None:
-        """ギルド設定および辞書キャッシュを無効化"""
+        """ギルド設定、辞書、NGワードキャッシュを無効化"""
         if guild_id is None:
             self._guild_settings_cache.clear()
             self._dict_cache.clear()
+            self._ng_words_cache.clear()
         else:
             self._guild_settings_cache.pop(guild_id, None)
             self._dict_cache.pop(guild_id, None)
+            self._ng_words_cache.pop(guild_id, None)
             if guild_id == 0:
                 self._dict_cache.clear()
 
@@ -320,6 +323,17 @@ class Database:
                 )
             """)
             await db.execute("CREATE INDEX IF NOT EXISTS idx_ai_suggested_status ON ai_suggested_words (guild_id, status);")
+
+            # 2-3. ギルド別NGワードテーブル
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS guild_ng_words (
+                    guild_id INTEGER NOT NULL,
+                    word TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, word)
+                )
+            """)
 
             # 3. ギルド個別設定
             await db.execute("""
@@ -1407,6 +1421,111 @@ class Database:
             self.invalidate_guild_cache(guild_id)
             logger.info(f"Pruned {deleted} LRU dictionary entries for guild {guild_id} (max: {max_entries})")
         return deleted
+
+    # --- ギルド別 NGワード管理 ---
+
+    async def get_ng_words(self, guild_id: int) -> List[str]:
+        """指定ギルドのNGワード一覧を取得（文字数降順）"""
+        now = time.time()
+        if guild_id in self._ng_words_cache:
+            ts, cached = self._ng_words_cache[guild_id]
+            if now - ts < self._cache_ttl:
+                return list(cached)
+
+        async with self.get_connection() as db:
+            async with db.execute(
+                """
+                SELECT word FROM guild_ng_words
+                WHERE guild_id = ?
+                ORDER BY LENGTH(word) DESC, word ASC
+                """,
+                (guild_id,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                result = [row[0] for row in rows]
+                self._ng_words_cache[guild_id] = (now, list(result))
+                return result
+
+    async def add_ng_word(self, guild_id: int, word: str) -> None:
+        """ギルドにNGワードを追加"""
+        w = word.strip()
+        if not w:
+            return
+        async with self.get_connection() as db:
+            await db.execute(
+                """
+                INSERT INTO guild_ng_words (guild_id, word, created_at, last_used_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(guild_id, word) DO UPDATE SET last_used_at = CURRENT_TIMESTAMP
+                """,
+                (guild_id, w)
+            )
+            await db.commit()
+        self.invalidate_guild_cache(guild_id)
+
+    async def delete_ng_word(self, guild_id: int, word: str) -> bool:
+        """ギルドからNGワードを削除"""
+        w = word.strip()
+        if not w:
+            return False
+        async with self.get_connection() as db:
+            cursor = await db.execute(
+                "DELETE FROM guild_ng_words WHERE guild_id = ? AND word = ?",
+                (guild_id, w)
+            )
+            await db.commit()
+            deleted = cursor.rowcount > 0
+        if deleted:
+            self.invalidate_guild_cache(guild_id)
+        return deleted
+
+    async def touch_ng_words(self, guild_id: int, words: List[str]) -> None:
+        """検知されたNGワードの last_used_at を非同期更新 (LRU管理用)"""
+        if not words:
+            return
+        clean_words = [w.strip() for w in words if w.strip()]
+        if not clean_words:
+            return
+        try:
+            async with self.get_connection() as db:
+                placeholders = ",".join("?" for _ in clean_words)
+                query = f"""
+                    UPDATE guild_ng_words
+                    SET last_used_at = CURRENT_TIMESTAMP
+                    WHERE guild_id = ? AND word IN ({placeholders})
+                """
+                await db.execute(query, [guild_id] + clean_words)
+                await db.commit()
+        except Exception as e:
+            logger.debug(f"[Database] touch_ng_words error: {e}")
+
+    async def import_default_ng_words(self, guild_id: int) -> int:
+        """標準NGワードプリセットをギルドに一括インポート"""
+        from src.utils.default_ng_words import DEFAULT_NG_WORDS
+        imported_count = 0
+        async with self.get_connection() as db:
+            for w in DEFAULT_NG_WORDS:
+                clean_w = w.strip()
+                if not clean_w:
+                    continue
+                async with db.execute(
+                    "SELECT 1 FROM guild_ng_words WHERE guild_id = ? AND word = ?",
+                    (guild_id, clean_w)
+                ) as cur:
+                    if await cur.fetchone() is None:
+                        await db.execute(
+                            """
+                            INSERT INTO guild_ng_words (guild_id, word, created_at, last_used_at)
+                            VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """,
+                            (guild_id, clean_w)
+                        )
+                        imported_count += 1
+            await db.commit()
+        if imported_count > 0:
+            self.invalidate_guild_cache(guild_id)
+        logger.info(f"Imported {imported_count} default NG words for guild {guild_id}")
+        return imported_count
 
     # --- AI学習提案辞書 (自己学習・辞書汚染防止) ---
 

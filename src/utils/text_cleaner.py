@@ -37,6 +37,8 @@ _RE_TRAILING_MARKS_ALL = re.compile(r'[!！?？~〜ーwｗ\s。、]+$')
 _RE_TRAILING_MARKS_EXCEPT_QUES = re.compile(r'[!！~〜ーwｗ\s。、]+$')
 _RE_TRAILING_QUES = re.compile(r'[?？]+$')
 _RE_HAS_QUES = re.compile(r'[?？]')
+_RE_BEEP_TAG = re.compile(r'<<ピー音(?::(\d+))?>>')
+_RE_BEEP_SPLIT = re.compile(r'(<<ピー音(?::\d+)?>>)')
 
 _janome_tokenizer = None
 _janome_failed = False
@@ -91,6 +93,8 @@ class TextChunk:
     pause_after_ms: int = 0
     split_ms: float = 0.0
     is_name_prefix: bool = False
+    is_beep: bool = False
+    beep_duration_sec: float = 0.4
 
 class TextCleaner:
     def __init__(self, max_length: int = 50):
@@ -103,6 +107,7 @@ class TextCleaner:
         self._newline_pattern = re.compile(r'[\r\n]+')
         self._space_pattern = re.compile(r'\s+')
         self.last_detected_unknown_words: List[str] = []
+        self.last_detected_ng_words: List[str] = []
 
     def should_ignore(self, message: discord.Message, ignore_prefixes: Optional[List[str]] = None) -> bool:
         """無視すべきメッセージ（Botの発言、コマンド行、除外プレフィックス等）かを判定"""
@@ -141,6 +146,7 @@ class TextCleaner:
         raw_text: str,
         guild: Optional[discord.Guild] = None,
         dictionary_entries: Optional[List[Tuple[str, str]]] = None,
+        ng_words: Optional[List[str]] = None,
         max_length: Optional[int] = None
     ) -> str:
         """
@@ -199,6 +205,13 @@ class TextCleaner:
         except Exception as e:
             logger.debug(f"Demojize skipped: {e}")
 
+        # 4.5. NGワード置換 (ピー音プレースホルダー <<BEEP>> への変換 & 最長一致 & 誤爆防止)
+        if ng_words:
+            text, detected_ng = self.apply_ng_words(text, ng_words)
+            self.last_detected_ng_words = detected_ng
+        else:
+            self.last_detected_ng_words = []
+
         # 5. 単語辞書置換 (最長一致 & 誤爆防止ガード)
         if dictionary_entries:
             text = self.apply_dictionary(text, dictionary_entries)
@@ -226,6 +239,7 @@ class TextCleaner:
         raw_text: str,
         guild: Optional[discord.Guild] = None,
         dictionary_entries: Optional[List[Tuple[str, str]]] = None,
+        ng_words: Optional[List[str]] = None,
         max_length: Optional[int] = None
     ) -> Tuple[str, List[str]]:
         """サニタイズされたテキストと、検出された未知語リストを返却"""
@@ -233,9 +247,58 @@ class TextCleaner:
             raw_text=raw_text,
             guild=guild,
             dictionary_entries=dictionary_entries,
+            ng_words=ng_words,
             max_length=max_length
         )
         return cleaned, list(self.last_detected_unknown_words)
+
+    @classmethod
+    def apply_ng_words(cls, text: str, ng_words: Optional[List[str]]) -> Tuple[str, List[str]]:
+        """
+        NGワード置換 (最長一致 & 誤爆防止ガード)
+        NGワードを検知してピー音トークン ' <<BEEP>> ' に置換し、検出されたNGワード一覧を返却
+        """
+        if not ng_words:
+            return text, []
+
+        detected: List[str] = []
+        sorted_words = sorted([w.strip() for w in ng_words if w.strip()], key=len, reverse=True)
+
+        for w in sorted_words:
+            if not w or w not in text:
+                continue
+
+            matched = False
+            # 1. 漢字のみで構成された単語（例: 「表」）: 前後に漢字がない場合のみ置換
+            if _RE_KANJI_ONLY.match(w):
+                cache_key = ("ng_kanji", w)
+                pat = _DICT_REGEX_CACHE.get(cache_key)
+                if pat is None:
+                    pat = re.compile(rf'(?<![\u4e00-\u9faf]){re.escape(w)}(?![\u4e00-\u9faf])')
+                    _DICT_REGEX_CACHE[cache_key] = pat
+                if pat.search(text):
+                    text = pat.sub(f" <<ピー音:{len(w)}>> ", text)
+                    matched = True
+            # 2. 英数字のみで構成された単語（例: 「ng」）: 前後に英数字がない場合のみ置換
+            elif _RE_ALNUM_ONLY.match(w):
+                cache_key = ("ng_alnum", w.lower())
+                pat = _DICT_REGEX_CACHE.get(cache_key)
+                if pat is None:
+                    pat = re.compile(rf'(?<![a-zA-Z0-9]){re.escape(w)}(?![a-zA-Z0-9])', re.IGNORECASE)
+                    _DICT_REGEX_CACHE[cache_key] = pat
+                if pat.search(text):
+                    text = pat.sub(f" <<ピー音:{len(w)}>> ", text)
+                    matched = True
+            # 3. ひらがな・カタカナ・記号・混在語
+            else:
+                if w in text:
+                    text = text.replace(w, f" <<ピー音:{len(w)}>> ")
+                    matched = True
+
+            if matched:
+                detected.append(w)
+
+        return text, detected
 
     @classmethod
     def apply_dictionary(cls, text: str, dictionary_entries: Optional[List[Tuple[str, str]]]) -> str:
@@ -554,20 +617,37 @@ class TextCleaner:
             else:
                 pause_ms = 100
 
-            chunks.append(TextChunk(text=sentence, pause_after_ms=pause_ms))
+            # NGワードピー音プレースホルダー <<ピー音...>> を含む場合は前後でチャンク分割
+            if '<<ピー音' in sentence:
+                parts = _RE_BEEP_SPLIT.split(sentence)
+                for p_idx, p in enumerate(parts):
+                    p_clean = p.strip()
+                    if not p_clean:
+                        continue
+                    m = _RE_BEEP_TAG.match(p_clean)
+                    if m:
+                        char_count = int(m.group(1)) if m.group(1) else 3
+                        from src.utils.streaming_audio import calc_beep_duration
+                        beep_sec = calc_beep_duration(char_count)
+                        chunks.append(TextChunk(text="", pause_after_ms=60, is_beep=True, beep_duration_sec=beep_sec))
+                    else:
+                        sub_pause = pause_ms if (is_last and p_idx == len(parts) - 1) else 60
+                        chunks.append(TextChunk(text=p_clean, pause_after_ms=sub_pause))
+            else:
+                chunks.append(TextChunk(text=sentence, pause_after_ms=pause_ms))
 
         # 5. 記号のみチャンクの安全統合 (Azure/Edge-TTSの44byte空音声・発音不能エラー完全防止)
         cleaned_chunks: List[TextChunk] = []
         for c in chunks:
-            if c.is_name_prefix:
+            if c.is_name_prefix or c.is_beep:
                 cleaned_chunks.append(c)
                 continue
             
             if _RE_HAS_READABLE.search(c.text):
                 cleaned_chunks.append(c)
             else:
-                # 記号のみチャンクの場合: 直前の本文チャンクがあれば結合
-                if cleaned_chunks and not cleaned_chunks[-1].is_name_prefix:
+                # 記号のみチャンクの場合: 直前の本文チャンクがあれば結合 (直前がis_name_prefixまたはis_beepの場合は除外)
+                if cleaned_chunks and not cleaned_chunks[-1].is_name_prefix and not cleaned_chunks[-1].is_beep:
                     cleaned_chunks[-1].text += c.text
                     cleaned_chunks[-1].pause_after_ms = max(cleaned_chunks[-1].pause_after_ms, c.pause_after_ms)
                 elif not cleaned_chunks or (len(cleaned_chunks) == 1 and cleaned_chunks[0].is_name_prefix):
@@ -578,7 +658,10 @@ class TextCleaner:
 
         # 分割結果が空なら全文を1パーツとして扱う
         if not chunks and text.strip():
-            chunks.append(TextChunk(text=text.strip(), pause_after_ms=0))
+            if '<<ピー音>>' in text:
+                chunks.append(TextChunk(text="", pause_after_ms=0, is_beep=True))
+            else:
+                chunks.append(TextChunk(text=text.strip(), pause_after_ms=0))
 
         split_ms = round((time.time() - t_start) * 1000, 2)
         for c in chunks:
