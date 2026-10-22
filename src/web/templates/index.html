@@ -3,7 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Discord 超低遅延 TTS Bot - 設定ダッシュボード</title>
+  <title>Distributed TTS Discord Bot - 設定ダッシュボード</title>
+  <link rel="icon" type="image/png" sizes="64x64" href="/static/favicon.png?v={{ASSET_V}}">
+  <link rel="shortcut icon" href="/static/favicon.ico?v={{ASSET_V}}">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -36,9 +38,11 @@
   <header>
     <div class="nav-container">
       <div class="logo-area">
-        <div class="bot-avatar">柴</div>
+        <div class="bot-avatar">
+          <img src="/static/logo.png?v={{ASSET_V}}" alt="Distributed TTS" class="bot-logo-img">
+        </div>
         <div class="logo-text">
-          <h1>柴ヴォ TTS <span class="badge">Online</span> <span class="build-tag" style="font-size:10px;font-weight:500;opacity:0.65;background:rgba(255,255,255,0.1);padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:6px;" title="ビルド: {{BUILD_ID}} ({{BUILD_DATE}})">{{BUILD_ID}}</span></h1>
+          <h1>Distributed TTS <span class="badge">Online</span> <span class="build-tag" style="font-size:10px;font-weight:500;opacity:0.65;background:rgba(255,255,255,0.1);padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:6px;" title="ビルド: {{BUILD_ID}} ({{BUILD_DATE}})">{{BUILD_ID}}</span></h1>
         </div>
       </div>
 
@@ -77,8 +81,8 @@
       if (!window.APP_IS_LOGGED_IN) {
         document.write(`
           <div class="login-hero">
-            <div class="login-hero-icon">🎙️</div>
-            <h2>Discord TTS ダッシュボード</h2>
+            <div class="login-hero-icon"><img src="/static/logo.png?v={{ASSET_V}}" alt="Distributed TTS" style="width:72px;height:72px;border-radius:50%;box-shadow:0 8px 24px rgba(88,101,242,0.4);display:block;margin:0 auto 16px;"></div>
+            <h2>Distributed TTS ダッシュボード</h2>
             <p>
               このBotが導入されているDiscordサーバーのメンバー向け設定画面です。<br>
               Discordアカウントでログインして、あなたの専用声質や単語辞書、ボットの動作設定をカスタマイズできます。

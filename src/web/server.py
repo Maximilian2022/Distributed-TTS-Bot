@@ -728,7 +728,7 @@ class WebServer:
             guild_list_str = "、".join(guild_names) if guild_names else "なし"
             error_html = (
                 "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
-                "<title>アクセス制限 - TTS Bot</title>"
+                "<title>アクセス制限 - Distributed TTS</title>"
                 "<style>body{background:#121316;color:#e1e2e6;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}"
                 ".card{background:#1e1f22;padding:40px;border-radius:12px;max-width:500px;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,0.4);border:1px solid #ff4757;}"
                 "h2{color:#ff4757;margin-top:0;}p{line-height:1.6;color:#a0a4ab;}.btn{display:inline-block;margin-top:20px;padding:10px 24px;background:#5865F2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;}"

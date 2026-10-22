@@ -674,7 +674,7 @@ class CommandsCog(commands.Cog):
         dashboard_url = getattr(self.config, "web_dashboard_url", "https://ttsbot.kenko.land")
 
         embed = discord.Embed(
-            title="ℹ️ Discord TTS Bot 情報 & 利用規約・クレジット",
+            title="ℹ️ Distributed TTS Discord Bot 情報 & 利用規約・クレジット",
             description=(
                 "本Botは複数の高度な音声合成エンジンを統合した超低遅延読み上げBotです。\n"
                 "生成された音声をご利用・配信・公開される際は、各エンジンの**利用規約およびクレジット表記**を必ず遵守してください。"

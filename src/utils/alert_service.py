@@ -194,7 +194,7 @@ class AlertService:
                     inline=False
                 )
 
-            embed.set_footer(text="柴ヴォ TTS Bot 監視サブシステム (JST)")
+            embed.set_footer(text="Distributed TTS 監視サブシステム (JST)")
 
             # DM送信
             await admin_user.send(embed=embed)
