@@ -1556,10 +1556,8 @@ class VCHandlerCog(commands.Cog):
         if not cleaned_body:
             return
 
-        # NGワードが検知された場合、メッセージに🤫リアクションを付与＆last_used_at更新
-        if self.text_cleaner.last_detected_ng_words:
-            safe_create_task(self._add_reaction_safe(message, "🤫"), name=f"ng_react_{message.id}")
-            safe_create_task(self.db.touch_ng_words(message.guild.id, self.text_cleaner.last_detected_ng_words), name="touch_ng_words")
+        # NGワード検知リストの収集（本文）
+        detected_ng_words: List[str] = list(self.text_cleaner.last_detected_ng_words)
 
         # 辞書が使用された場合、非同期で last_used_at を更新 (LRU管理用)
         if dict_words:
@@ -1604,12 +1602,23 @@ class VCHandlerCog(commands.Cog):
                 raw_text=raw_display_name,
                 guild=message.guild,
                 dictionary_entries=dict_words,
+                ng_words=ng_words,
                 max_length=20
             )
+            if self.text_cleaner.last_detected_ng_words:
+                for w in self.text_cleaner.last_detected_ng_words:
+                    if w not in detected_ng_words:
+                        detected_ng_words.append(w)
+
             # 「以下略」がついた場合は取り除く
             cleaned_author = cleaned_author.replace(" 以下略", "").strip()
             if cleaned_author:
                 author_prefix = f"{cleaned_author}、"
+
+        # NGワードが検知された場合（本文または発言者名）、メッセージに🤫リアクションを付与＆last_used_at更新
+        if detected_ng_words:
+            safe_create_task(self._add_reaction_safe(message, "🤫"), name=f"ng_react_{message.id}")
+            safe_create_task(self.db.touch_ng_words(message.guild.id, detected_ng_words), name="touch_ng_words")
 
         # 5. 再生キューに追加 (本文と名前プレフィックスをスマート分離)
         item = QueueItem(
@@ -1734,14 +1743,19 @@ class VCHandlerCog(commands.Cog):
                     stripped = re.sub(r"[（\(【\[〔〈《「『][^）\)】\]〕〉》」』]*[）\)】\]〕〉》」』]", "", raw_display_name).strip()
                     if stripped:
                         raw_display_name = stripped
+                ng_words = await self.db.get_ng_words(guild.id)
                 cleaned_author = self.text_cleaner.clean(
                     raw_text=raw_display_name,
                     guild=guild,
                     dictionary_entries=[],
+                    ng_words=ng_words,
                     max_length=20
                 ).replace(" 以下略", "").strip()
 
                 if cleaned_author:
+                    # NGワードピー音プレースホルダーが含まれる場合は事前キャッシュを行わない（発言時に動的PCMフィードするため）
+                    if '<<ピー音' in cleaned_author:
+                        return
                     name_prefix = f"{cleaned_author}、"
                     # 全文キャッシュの有無を事前チェック（存在すれば合成不要）
                     cache_key = CacheManager.generate_cache_key(

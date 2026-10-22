@@ -548,10 +548,27 @@ class TextCleaner:
         chunks: List[TextChunk] = []
 
         # 1. 発言者名プレフィックスがあれば先頭パーツとして追加 (間: 80ms)
+        # NGワードピー音プレースホルダー <<ピー音...>> を含む場合は前後でチャンク分割
         if author_prefix:
             prefix = author_prefix.strip()
             if prefix:
-                chunks.append(TextChunk(text=prefix, pause_after_ms=80, is_name_prefix=True))
+                if '<<ピー音' in prefix:
+                    parts = _RE_BEEP_SPLIT.split(prefix)
+                    for p in parts:
+                        p_clean = p.strip()
+                        if not p_clean:
+                            continue
+                        m = _RE_BEEP_TAG.match(p_clean)
+                        if m:
+                            char_count = int(m.group(1)) if m.group(1) else 3
+                            from src.utils.streaming_audio import calc_beep_duration
+                            beep_sec = calc_beep_duration(char_count)
+                            chunks.append(TextChunk(text="", pause_after_ms=60, is_beep=True, beep_duration_sec=beep_sec, is_name_prefix=True))
+                        else:
+                            if _RE_HAS_READABLE.search(p_clean):
+                                chunks.append(TextChunk(text=p_clean, pause_after_ms=80, is_name_prefix=True))
+                else:
+                    chunks.append(TextChunk(text=prefix, pause_after_ms=80, is_name_prefix=True))
 
         if not text or not text.strip():
             split_ms = round((time.time() - t_start) * 1000, 2)
