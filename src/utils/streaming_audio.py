@@ -82,6 +82,67 @@ def get_beep_pcm(duration_sec: float) -> bytes:
 BEEP_PCM_48K_STEREO: bytes = get_beep_pcm(0.4)
 
 
+def trim_trailing_silence(
+    pcm_48k_stereo: bytes,
+    margin_ms: int = 25,
+    fade_ms: int = 5,
+    threshold: int = 200
+) -> bytes:
+    """
+    48kHz 16-bit Stereo PCMデータの末尾に存在するTTSエンジンの無音余韻（200ms〜800ms）を高速トリミング。
+    ブツ切りノイズ（ポップノイズ）を防ぐため、音声末尾から margin_ms のマージンを残し、
+    終端 fade_ms に滑らかな線形フェードアウトを適用する。
+    """
+    if not pcm_48k_stereo or len(pcm_48k_stereo) < FRAME_SIZE:
+        return pcm_48k_stereo
+
+    samples = array.array('h')
+    samples.frombytes(pcm_48k_stereo)
+    n = len(samples)
+
+    # 20msチャンク（960サンプル = 1920 shorts）単位で末尾からスキャン
+    chunk_shorts = 1920
+    last_voice_idx = -1
+
+    for pos in range(n, 0, -chunk_shorts):
+        sub = samples[max(0, pos - chunk_shorts):pos]
+        if any(abs(s) > threshold for s in sub):
+            # このブロック内に音声信号が存在する
+            for i in range(pos - 1, max(0, pos - chunk_shorts) - 1, -2):
+                if abs(samples[i]) > threshold or abs(samples[i - 1]) > threshold:
+                    last_voice_idx = i + 1
+                    break
+            break
+
+    # 全編無音の場合はそのまま返す
+    if last_voice_idx < 0:
+        return pcm_48k_stereo
+
+    # マージン（余韻）を加算
+    margin_shorts = int(48000 * (margin_ms / 1000.0) * 2)
+    cutoff = min(n, last_voice_idx + margin_shorts)
+    # 48kHz Stereo フレーム境界（4 shorts = 8 bytes）にアライン
+    cutoff = (cutoff + 3) & ~3
+
+    # 末尾無音がほぼない（切り詰める長さが20ms未満）ならそのまま返す
+    if cutoff >= n - (960 * 2):
+        return pcm_48k_stereo
+
+    # ポップノイズ防止の線形フェードアウト
+    fade_shorts = max(4, int(48000 * (fade_ms / 1000.0) * 2))
+    fade_start = max(0, cutoff - fade_shorts)
+    num_pairs = (cutoff - fade_start) // 2
+
+    if num_pairs > 0:
+        for idx in range(num_pairs):
+            pos = fade_start + idx * 2
+            gain = 1.0 - (idx / float(num_pairs))
+            samples[pos] = int(samples[pos] * gain)
+            samples[pos + 1] = int(samples[pos + 1] * gain)
+
+    return samples[:cutoff].tobytes()
+
+
 class StreamingAudioSource(discord.AudioSource):
     """
     非同期キューからPCMデータを逐次読み出すパイプ型 Discord AudioSource
@@ -158,7 +219,13 @@ class StreamingAudioSource(discord.AudioSource):
 
         return out.tobytes()
 
-    def feed_wav_bytes(self, wav_bytes: bytes, pause_after_ms: int = 0) -> float:
+    def feed_wav_bytes(
+        self,
+        wav_bytes: bytes,
+        pause_after_ms: int = 0,
+        trim_tail: bool = True,
+        is_followed_by_beep: bool = False
+    ) -> float:
         """
         WAVバイト列を受け取り、PCM生データを48kHz Stereoに変換してストリームに追加
         戻り値: 追加された音声の長さ (秒)
@@ -181,7 +248,6 @@ class StreamingAudioSource(discord.AudioSource):
                 import struct
                 data_size = struct.unpack("<I", wav_bytes[40:44])[0]
                 raw_pcm = wav_bytes[44:44 + data_size] if data_size > 0 else wav_bytes[44:]
-                duration = len(raw_pcm) / 48000.0  # 24000 samples/sec * 2 bytes/sample
                 pcm_48k_stereo = self._pcm_24k_mono_to_48k_stereo(raw_pcm)
             else:
                 # 汎用 wave.open による解析
@@ -191,7 +257,6 @@ class StreamingAudioSource(discord.AudioSource):
                     sampwidth = wf.getsampwidth()
                     frames = wf.getnframes()
                     raw_pcm = wf.readframes(frames)
-                    duration = frames / float(framerate) if framerate > 0 else 0.0
 
                 # 48kHz Stereo PCMへの変換
                 if framerate == 24000 and nchannels == 1:
@@ -209,6 +274,13 @@ class StreamingAudioSource(discord.AudioSource):
                     )
                     pcm_48k_stereo = self._pcm_24k_mono_to_48k_stereo(raw_pcm)
 
+            # 末尾無音トリミング (特にピー音直前はマージン12ms、通常は25msでキレ良くカット)
+            if trim_tail:
+                margin_ms = 12 if is_followed_by_beep else 25
+                pcm_48k_stereo = trim_trailing_silence(pcm_48k_stereo, margin_ms=margin_ms, fade_ms=5)
+
+            duration = len(pcm_48k_stereo) / 192000.0  # 48000 samples/sec * 2ch * 2bytes = 192000 bytes/sec
+
             # ポーズ（無音）の追加
             if pause_after_ms > 0:
                 # 48kHz 16-bit Stereo の 1ms あたり 192 バイト (48000 * 4 / 1000)
@@ -223,7 +295,13 @@ class StreamingAudioSource(discord.AudioSource):
             logger.warning(f"Error parsing/feeding WAV bytes to stream: {e}")
             return 0.0
 
-    def feed_raw_pcm(self, pcm_48k_stereo: bytes, pause_after_ms: int = 0) -> float:
+    def feed_raw_pcm(
+        self,
+        pcm_48k_stereo: bytes,
+        pause_after_ms: int = 0,
+        trim_tail: bool = False,
+        is_followed_by_beep: bool = False
+    ) -> float:
         """
         48kHz 16-bit Stereo PCM 生データを直接ストリームバッファに追加 (WAVパース不要のO(1)即時投入)
         戻り値: 追加された音声の長さ (秒)

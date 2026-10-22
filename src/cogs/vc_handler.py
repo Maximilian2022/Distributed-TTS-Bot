@@ -1167,7 +1167,11 @@ class VCHandlerCog(commands.Cog):
             if getattr(first_chunk, "is_beep", False):
                 dur0 = stream_source.feed_raw_pcm(c0_bytes, pause_after_ms=first_chunk.pause_after_ms)
             else:
-                dur0 = stream_source.feed_wav_bytes(c0_bytes, pause_after_ms=first_chunk.pause_after_ms)
+                dur0 = stream_source.feed_wav_bytes(
+                    c0_bytes,
+                    pause_after_ms=first_chunk.pause_after_ms,
+                    is_followed_by_beep=getattr(first_chunk, "is_followed_by_beep", False)
+                )
             total_audio_duration += dur0
 
             c0_synth_duration = round((c0_synth_end - c0_synth_start) * 1000, 1)
@@ -1261,7 +1265,11 @@ class VCHandlerCog(commands.Cog):
                         if getattr(ch1, "is_beep", False):
                             dur1 = stream_source.feed_raw_pcm(b1, pause_after_ms=ch1.pause_after_ms)
                         else:
-                            dur1 = stream_source.feed_wav_bytes(b1, pause_after_ms=ch1.pause_after_ms)
+                            dur1 = stream_source.feed_wav_bytes(
+                                b1,
+                                pause_after_ms=ch1.pause_after_ms,
+                                is_followed_by_beep=getattr(ch1, "is_followed_by_beep", False)
+                            )
                         total_audio_duration += dur1
                         ch1_synth_dur = round((te1 - ts1) * 1000, 1)
                         ch1_audio_dur = round(dur1 * 1000, 1)
@@ -1299,7 +1307,11 @@ class VCHandlerCog(commands.Cog):
                             if getattr(ch1, "is_beep", False):
                                 dur1 = stream_source.feed_raw_pcm(b1, pause_after_ms=ch1.pause_after_ms)
                             else:
-                                dur1 = stream_source.feed_wav_bytes(b1, pause_after_ms=ch1.pause_after_ms)
+                                dur1 = stream_source.feed_wav_bytes(
+                                    b1,
+                                    pause_after_ms=ch1.pause_after_ms,
+                                    is_followed_by_beep=getattr(ch1, "is_followed_by_beep", False)
+                                )
                             total_audio_duration += dur1
                             ch1_synth_dur = round((te1 - ts1) * 1000, 1)
                             ch1_audio_dur = round(dur1 * 1000, 1)
@@ -1344,7 +1356,11 @@ class VCHandlerCog(commands.Cog):
                 if getattr(ch, "is_beep", False):
                     dur = stream_source.feed_raw_pcm(b, pause_after_ms=ch.pause_after_ms)
                 else:
-                    dur = stream_source.feed_wav_bytes(b, pause_after_ms=ch.pause_after_ms)
+                    dur = stream_source.feed_wav_bytes(
+                        b,
+                        pause_after_ms=ch.pause_after_ms,
+                        is_followed_by_beep=getattr(ch, "is_followed_by_beep", False)
+                    )
                 total_audio_duration += dur
 
                 task_synth_dur = round((t_e - t_s) * 1000, 1)
@@ -1544,7 +1560,7 @@ class VCHandlerCog(commands.Cog):
         ng_words = await self.db.get_ng_words(message.guild.id)
         read_username = bool(guild_settings.get("read_username", 0))
 
-        # 本文のサニタイズ (NGワードはピー音プレースホルダー <<ピー音>> に置換)
+        # 本文のサニタイズ (NGワードはピー音プレースホルダー <<BEEP>> に置換)
         cleaned_body = self.text_cleaner.clean(
             raw_text=message.content,
             guild=message.guild,
