@@ -1770,7 +1770,7 @@ class VCHandlerCog(commands.Cog):
 
                 if cleaned_author:
                     # NGワードピー音プレースホルダーが含まれる場合は事前キャッシュを行わない（発言時に動的PCMフィードするため）
-                    if '<<ピー音' in cleaned_author:
+                    if '<<__BEEP' in cleaned_author or '<<ピー音' in cleaned_author:
                         return
                     name_prefix = f"{cleaned_author}、"
                     # 全文キャッシュの有無を事前チェック（存在すれば合成不要）

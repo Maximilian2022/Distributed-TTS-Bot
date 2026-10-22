@@ -37,8 +37,8 @@ _RE_TRAILING_MARKS_ALL = re.compile(r'[!！?？~〜ーwｗ\s。、]+$')
 _RE_TRAILING_MARKS_EXCEPT_QUES = re.compile(r'[!！~〜ーwｗ\s。、]+$')
 _RE_TRAILING_QUES = re.compile(r'[?？]+$')
 _RE_HAS_QUES = re.compile(r'[?？]')
-_RE_BEEP_TAG = re.compile(r'<<ピー音(?::(\d+))?>>')
-_RE_BEEP_SPLIT = re.compile(r'(<<ピー音(?::\d+)?>>)')
+_RE_BEEP_TAG = re.compile(r'<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::(\d+))?(?:__)?>>')
+_RE_BEEP_SPLIT = re.compile(r'(<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::\d+)?(?:__)?>>)')
 
 _janome_tokenizer = None
 _janome_failed = False
@@ -278,7 +278,7 @@ class TextCleaner:
                     pat = re.compile(rf'(?<![\u4e00-\u9faf]){re.escape(w)}(?![\u4e00-\u9faf])')
                     _DICT_REGEX_CACHE[cache_key] = pat
                 if pat.search(text):
-                    text = pat.sub(f" <<ピー音:{len(w)}>> ", text)
+                    text = pat.sub(f" <<__BEEP:{len(w)}__>> ", text)
                     matched = True
             # 2. 英数字のみで構成された単語（例: 「ng」）: 前後に英数字がない場合のみ置換
             elif _RE_ALNUM_ONLY.match(w):
@@ -288,12 +288,12 @@ class TextCleaner:
                     pat = re.compile(rf'(?<![a-zA-Z0-9]){re.escape(w)}(?![a-zA-Z0-9])', re.IGNORECASE)
                     _DICT_REGEX_CACHE[cache_key] = pat
                 if pat.search(text):
-                    text = pat.sub(f" <<ピー音:{len(w)}>> ", text)
+                    text = pat.sub(f" <<__BEEP:{len(w)}__>> ", text)
                     matched = True
             # 3. ひらがな・カタカナ・記号・混在語
             else:
                 if w in text:
-                    text = text.replace(w, f" <<ピー音:{len(w)}>> ")
+                    text = text.replace(w, f" <<__BEEP:{len(w)}__>> ")
                     matched = True
 
             if matched:
@@ -549,11 +549,11 @@ class TextCleaner:
         chunks: List[TextChunk] = []
 
         # 1. 発言者名プレフィックスがあれば先頭パーツとして追加 (間: 80ms)
-        # NGワードピー音プレースホルダー <<ピー音...>> を含む場合は前後でチャンク分割
+        # NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) を含む場合は前後でチャンク分割
         if author_prefix:
             prefix = author_prefix.strip()
             if prefix:
-                if '<<ピー音' in prefix:
+                if '<<__BEEP' in prefix or '<<ピー音' in prefix:
                     parts = _RE_BEEP_SPLIT.split(prefix)
                     for p_idx, p in enumerate(parts):
                         p_clean = p.strip()
@@ -637,8 +637,8 @@ class TextCleaner:
             else:
                 pause_ms = 100
 
-            # NGワードピー音プレースホルダー <<ピー音...>> を含む場合は前後でチャンク分割
-            if '<<ピー音' in sentence:
+            # NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) を含む場合は前後でチャンク分割
+            if '<<__BEEP' in sentence or '<<ピー音' in sentence:
                 parts = _RE_BEEP_SPLIT.split(sentence)
                 for p_idx, p in enumerate(parts):
                     p_clean = p.strip()
@@ -680,7 +680,7 @@ class TextCleaner:
 
         # 分割結果が空なら全文を1パーツとして扱う
         if not chunks and text.strip():
-            if '<<ピー音>>' in text:
+            if '<<__BEEP' in text or '<<ピー音' in text:
                 chunks.append(TextChunk(text="", pause_after_ms=0, is_beep=True))
             else:
                 chunks.append(TextChunk(text=text.strip(), pause_after_ms=0))
