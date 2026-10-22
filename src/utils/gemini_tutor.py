@@ -158,7 +158,7 @@ class GeminiTutorClient:
 
     async def analyze_misread_text(self, sentence: str) -> List[Dict[str, str]]:
         """
-        ユーザーからリアクション指摘（🤔や❌）された文を分析し、
+        ユーザーからリアクション指摘（❌）された文を分析し、
         TTSが誤読した可能性が高い難読語や固有名詞と、その正しいカタカナ読みのペアを抽出。
         """
         s = sentence.strip()

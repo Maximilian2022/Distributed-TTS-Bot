@@ -1110,7 +1110,7 @@ function renderAiSuggestions(suggestions) {
   if (suggestions.length === 0) {
     container.innerHTML = `
       <div style="font-size:13px;color:var(--text-muted);padding:10px 0;text-align:center;">
-        現在、未承認のAI学習候補はありません。ユーザーの未知語発言や 🤔 ❌ リアクションから自動提案されます。
+        現在、未承認のAI学習候補はありません。ユーザーの未知語発言や ❌ リアクションから自動提案されます。
       </div>
     `;
     return;
@@ -1122,7 +1122,7 @@ function renderAiSuggestions(suggestions) {
     card.style.cssText = "display:flex;align-items:center;justify-content:space-between;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:10px 14px;gap:12px;flex-wrap:wrap;";
 
     const sourceBadge = item.source === "reaction"
-      ? `<span class="badge" style="background:#e67e22;color:white;font-size:10px;">🤔 リアクション指摘</span>`
+      ? `<span class="badge" style="background:#e67e22;color:white;font-size:10px;">❌ リアクション指摘</span>`
       : `<span class="badge" style="background:#3498db;color:white;font-size:10px;">💡 未知語検知</span>`;
 
     const reasonHtml = item.reason

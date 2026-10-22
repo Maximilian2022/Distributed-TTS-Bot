@@ -2282,7 +2282,7 @@ class VCHandlerCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
-        """ユーザーが 🤔 ❌ ❓ で誤読指摘リアクションをした場合にAI自己学習を発火"""
+        """ユーザーが ❌ (✕印) で誤読指摘リアクションをした場合にAI自己学習を発火"""
         if not self.config.gemini_api_key:
             return
 
@@ -2291,7 +2291,7 @@ class VCHandlerCog(commands.Cog):
             return
 
         emoji_name = str(payload.emoji.name)
-        if emoji_name not in ("🤔", "❌", "❓", "👎"):
+        if emoji_name not in ("❌", "✖️", "✖", "❎", "✕"):
             return
 
         if not payload.guild_id:
