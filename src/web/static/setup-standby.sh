@@ -153,8 +153,8 @@ if [ ! -f "Dockerfile" ]; then
     fi
 fi
 
-if [ ! -f "Dockerfile" ]; then
-    echo -e "${RED}エラー: Dockerfile を取得できませんでした。ネットワーク接続または GitHub へのアクセスを確認してください。${RESET}"
+if [ ! -f "Dockerfile" ] && [ ! -f "docker-compose.yml" ]; then
+    echo -e "${RED}エラー: 設定ファイルを取得できませんでした。ネットワーク接続または GitHub へのアクセスを確認してください。${RESET}"
     exit 1
 fi
 
@@ -181,6 +181,9 @@ TTSBOT_CHECK_INTERVAL=5
 TTSBOT_FAIL_THRESHOLD=6
 TTSBOT_SYNC_INTERVAL=60
 
+# Docker Hub イメージ指定 (未指定時は madpiero/ttsbot:latest)
+TTSBOT_IMAGE=madpiero/ttsbot:latest
+
 # Web & ポート設定
 HOST_WEB_PORT=8088
 WEB_PORT=8080
@@ -194,6 +197,11 @@ echo -e "  ✓ .env ファイル作成完了: ${GREEN}${ENV_FILE}${RESET}"
 
 # 6. Standby Watchdog コンテナの起動 (--profile standby 指定)
 echo -e "\n${BOLD}[4/4] Slave Standby Watchdog を起動中...${RESET}"
+
+# Docker Hub から最新ビルド済みイメージを高速プル
+echo "  Docker Hub から最新イメージを確認・取得中..."
+${DOCKER_COMPOSE_CMD} --profile standby pull standby-watchdog 2>/dev/null || true
+
 ${DOCKER_COMPOSE_CMD} --profile standby up -d standby-watchdog
 
 echo -e "\n${BOLD}${GREEN}======================================================${RESET}"

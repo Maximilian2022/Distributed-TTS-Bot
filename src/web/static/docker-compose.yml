@@ -16,6 +16,7 @@
 # ==============================================================================
 
 x-bot-base: &bot-base
+  image: ${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
   build:
     context: .
     dockerfile: Dockerfile
@@ -108,10 +109,16 @@ services:
       - TTSBOT_HA_ROLE=slave
       - TTSBOT_MASTER_URL=${TTSBOT_MASTER_URL:-}
       - TTSBOT_HA_SECRET=${TTSBOT_HA_SECRET:-}
+      - TTSBOT_HA_PRIORITY=${TTSBOT_HA_PRIORITY:-1}
+      - TTSBOT_PEER_URLS=${TTSBOT_PEER_URLS:-}
       - TTSBOT_CHECK_INTERVAL=${TTSBOT_CHECK_INTERVAL:-5}
       - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-6}
       - TTSBOT_SYNC_INTERVAL=${TTSBOT_SYNC_INTERVAL:-60}
       - TTSBOT_LOCAL_DB_PATH=/app/data/bot.db
+      - TTSBOT_IMAGE=${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
+      - HOST_WEB_PORT=${HOST_WEB_PORT:-8088}
+      - WEB_PORT=${WEB_PORT:-8080}
+      - CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
     deploy:
       resources:
         limits:

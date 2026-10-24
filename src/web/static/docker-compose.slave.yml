@@ -1,0 +1,110 @@
+# ==============================================================================
+# TTSBot OSS Standby Slave (待機系ノード) Docker Compose 設定ファイル
+#
+# クイックスタート (Slave 待機エージェント起動):
+#   docker compose -f docker-compose.slave.yml up -d
+#
+# 状態・ログ確認:
+#   docker compose -f docker-compose.slave.yml logs -f standby-watchdog
+#
+# 停止:
+#   docker compose -f docker-compose.slave.yml stop
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. HA Standby Watchdog (常駐待機・同期監視エージェント: デフォルト起動)
+  # ----------------------------------------------------------------------------
+  standby-watchdog:
+    image: ${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
+    container_name: ttsbot-slave-watchdog
+    restart: unless-stopped
+    command: ["python", "-m", "src.ha_watchdog"]
+    init: true
+    environment:
+      - TTSBOT_HA_ROLE=slave
+      - TTSBOT_MASTER_URL=${TTSBOT_MASTER_URL}
+      - TTSBOT_HA_SECRET=${TTSBOT_HA_SECRET}
+      - TTSBOT_HA_PRIORITY=${TTSBOT_HA_PRIORITY:-1}
+      - TTSBOT_PEER_URLS=${TTSBOT_PEER_URLS:-}
+      - TTSBOT_CHECK_INTERVAL=${TTSBOT_CHECK_INTERVAL:-5}
+      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-6}
+      - TTSBOT_SYNC_INTERVAL=${TTSBOT_SYNC_INTERVAL:-60}
+      - TTSBOT_LOCAL_DB_PATH=/app/data/bot.db
+      - TTSBOT_IMAGE=${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
+      - HOST_WEB_PORT=${HOST_WEB_PORT:-8088}
+      - WEB_PORT=${WEB_PORT:-8080}
+      - CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - TZ=Asia/Tokyo
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ----------------------------------------------------------------------------
+  # 2. フェイルオーバー昇格用 メインアプリケーション (Master障害時に自動起動)
+  # ----------------------------------------------------------------------------
+  app:
+    image: ${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
+    container_name: ttsbot-app
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${HOST_WEB_PORT:-8088}:${WEB_PORT:-8080}"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+      - TZ=Asia/Tokyo
+      - WEB_PORT=${WEB_PORT:-8080}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - TTSBOT_HA_SECRET=${TTSBOT_HA_SECRET:-}
+      - CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+      - COEIROINK_MODEL_DIR=/app/coeiroink_models
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - tts_cache:/app/cache
+      - voicevox_cache:/app/cache_voicevox
+      - coeiroink_models:/app/coeiroink_models
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./.env:/app/.env
+    profiles:
+      - active
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request, os, sys; p = os.getenv(\"WEB_PORT\", \"8080\"); sys.exit(0 if urllib.request.urlopen(f\"http://127.0.0.1:{p}/health\", timeout=3).status == 200 else 1)' 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  tts_cache:
+  voicevox_cache:
+  coeiroink_models:

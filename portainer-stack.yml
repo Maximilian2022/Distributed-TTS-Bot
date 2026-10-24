@@ -1,0 +1,85 @@
+# ==============================================================================
+# TTSBot OSS - Portainer Stack Deployment Template
+# ==============================================================================
+# Portainer の "Stacks" -> "Add stack" から
+# 1. Web editor に本ファイルの内容を貼り付ける
+# 2. または "Repository" を選択し、本リポジトリ URL を指定して即座にデプロイできます。
+#
+# 【主要な環境変数の指定 (Portainer の Environment variables 欄)】
+# - DISCORD_BOT_TOKEN: Discord Bot Token (Master運用時 / 必須)
+# - DISCORD_CLIENT_ID: Discord OAuth Client ID (WebUIログイン用 / 任意)
+# - DISCORD_CLIENT_SECRET: Discord OAuth Client Secret (WebUIログイン用 / 任意)
+# - TTSBOT_HA_ROLE: "master" または "slave" (デフォルト: master)
+# - TTSBOT_MASTER_URL: 接続先Master URL (Slave運用時のみ必須)
+# - TTSBOT_HA_SECRET: HA共有シークレットキー (自動認証・DB暗号化同期用)
+# - CLOUDFLARE_TUNNEL_TOKEN: Cloudflare Tunnel トークン (任意)
+# ==============================================================================
+
+version: '3.8'
+
+services:
+  ttsbot:
+    image: ${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
+    container_name: ttsbot-app
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${HOST_WEB_PORT:-8088}:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Tokyo
+      - WEB_PORT=8080
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}
+      - DISCORD_CLIENT_SECRET=${DISCORD_CLIENT_SECRET:-}
+      - TTSBOT_HA_ROLE=${TTSBOT_HA_ROLE:-master}
+      - TTSBOT_MASTER_URL=${TTSBOT_MASTER_URL:-}
+      - TTSBOT_HA_SECRET=${TTSBOT_HA_SECRET:-}
+      - TTSBOT_HA_PRIORITY=${TTSBOT_HA_PRIORITY:-1}
+      - TTSBOT_PEER_URLS=${TTSBOT_PEER_URLS:-}
+      - TTSBOT_CHECK_INTERVAL=${TTSBOT_CHECK_INTERVAL:-5}
+      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-6}
+      - TTSBOT_SYNC_INTERVAL=${TTSBOT_SYNC_INTERVAL:-60}
+      - COEIROINK_MODEL_DIR=/app/coeiroink_models
+    volumes:
+      - ttsbot_data:/app/data
+      - ttsbot_logs:/app/logs
+      - tts_cache:/app/cache
+      - voicevox_cache:/app/cache_voicevox
+      - coeiroink_models:/app/coeiroink_models
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request, os, sys; p = os.getenv(\"WEB_PORT\", \"8080\"); sys.exit(0 if urllib.request.urlopen(f\"http://127.0.0.1:{p}/health\", timeout=3).status == 200 else 1)' 2>/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: ttsbot-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - ttsbot
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  ttsbot_data:
+  ttsbot_logs:
+  tts_cache:
+  voicevox_cache:
+  coeiroink_models:

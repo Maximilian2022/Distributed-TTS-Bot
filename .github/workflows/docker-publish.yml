@@ -1,0 +1,92 @@
+name: Build, Push Docker Image & Create Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+    paths-ignore:
+      - 'docs/**'
+      - 'logs/**'
+      - 'scratch/**'
+      - '.agents/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  docker-build-push-release:
+    name: Build, Push to Docker Hub & Create GitHub Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version Tag
+        id: version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG_NAME="${{ github.ref_name }}"
+          else
+            # main push または workflow_dispatch の場合: 日付 + 実行番号 (例: v2026.10.24.1)
+            DATE=$(date +'%Y.%m.%d')
+            TAG_NAME="v${DATE}.${{ github.run_number }}"
+          fi
+          echo "tag=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "Determined release tag: ${TAG_NAME}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: madpiero/ttsbot
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=sha,format=short,prefix=sha-
+
+      - name: Build and Push Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "TTSBot ${{ steps.version.outputs.tag }}"
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            docker-compose.yml
+            docker-compose.slave.yml
+            portainer-stack.yml
+            src/web/static/setup-standby.sh
+            src/web/static/setup-standby.ps1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

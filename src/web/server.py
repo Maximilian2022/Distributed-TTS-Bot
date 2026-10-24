@@ -262,6 +262,8 @@ class WebServer:
         self.app.router.add_get("/setup-standby.sh", self.handle_setup_standby_sh)
         self.app.router.add_get("/setup-standby.ps1", self.handle_setup_standby_ps1)
         self.app.router.add_get("/docker-compose.yml", self.handle_docker_compose_yml)
+        self.app.router.add_get("/docker-compose.slave.yml", self.handle_docker_compose_slave_yml)
+        self.app.router.add_get("/portainer-stack.yml", self.handle_portainer_stack_yml)
         self.app.router.add_get("/static/agent.py", self.handle_worker_agent_script)
 
         # ボランティアWorkerツール配信 (全ユーザー向け)
@@ -853,6 +855,32 @@ class WebServer:
             if p.exists():
                 return web.Response(text=p.read_text(encoding="utf-8"), content_type="text/yaml", charset="utf-8")
         return web.Response(text="# docker-compose.yml not found\n", status=404, content_type="text/plain")
+
+    async def handle_docker_compose_slave_yml(self, request: web.Request) -> web.Response:
+        """Slave (Standby) 専用 docker-compose.slave.yml を配信"""
+        candidates = [
+            Path(__file__).resolve().parent / "static" / "docker-compose.slave.yml",
+            Path("/app/docker-compose.slave.yml"),
+            Path("docker-compose.slave.yml"),
+            Path(__file__).resolve().parent.parent.parent / "docker-compose.slave.yml"
+        ]
+        for p in candidates:
+            if p.exists():
+                return web.Response(text=p.read_text(encoding="utf-8"), content_type="text/yaml", charset="utf-8")
+        return web.Response(text="# docker-compose.slave.yml not found\n", status=404, content_type="text/plain")
+
+    async def handle_portainer_stack_yml(self, request: web.Request) -> web.Response:
+        """Portainer 用 portainer-stack.yml を配信"""
+        candidates = [
+            Path(__file__).resolve().parent / "static" / "portainer-stack.yml",
+            Path("/app/portainer-stack.yml"),
+            Path("portainer-stack.yml"),
+            Path(__file__).resolve().parent.parent.parent / "portainer-stack.yml"
+        ]
+        for p in candidates:
+            if p.exists():
+                return web.Response(text=p.read_text(encoding="utf-8"), content_type="text/yaml", charset="utf-8")
+        return web.Response(text="# portainer-stack.yml not found\n", status=404, content_type="text/plain")
 
     async def handle_volunteer_file(self, request: web.Request) -> web.Response:
         """ボランティアツールの個別スクリプトファイルを配信"""

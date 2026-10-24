@@ -1,5 +1,46 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] GitHub Actions による Docker Hub 自動 Push ＆ GitHub Release 連動、および Master/Slave 両対応 Docker Compose の整備
+- **ユーザーフィードバック & 課題**:
+  1. GitHub Actions で Docker Hub イメージをビルド・Push する際、同時に GitHub Release（リリース発行・タグ付け）も自動で行う要求。
+  2. イメージビルドに伴い、Master および Slave の双方でスムーズに運用できるよう Docker Compose 設定を更新・最適化する要求。
+  3. NAT/FW 越しで Cloudflare Tunnel 経由のみアクセス可能な実運用環境を考慮した、フェイルオーバー待機間隔の拡大（Priority 2: 約3分、Priority 3: 約5分）および安全なヘルスチェック調停の要求。
+- **実施内容**:
+  1. **GitHub Actions ワークフロー新設 & 自動リリース連動 (`.github/workflows/docker-publish.yml`)**:
+     - `docker/setup-buildx-action@v3` および `docker/build-push-action@v6` を採用。
+     - GitHub Secrets (`DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`) を使用したセキュアな自動認証。
+     - 自動タグ判定: 手動Gitタグ発行時はそのタグ名、`main` push 時は日付＋実行番号（`vYYYY.MM.DD.run_number`）で自動タグ付け。
+     - `softprops/action-gh-release@v2` により、イメージビルド成功時に GitHub Release を自動作成・公開。自動チェンジログ生成（`generate_release_notes: true`）および Compose・セットアップスクリプトを自動添付。
+  2. **Master / Slave 両対応 Docker Compose の整備**:
+     - **統合/Master 向け (`docker-compose.yml`)**:
+       - `image: ${TTSBOT_IMAGE:-madpiero/ttsbot:latest}` を共通化。
+       - `standby-watchdog` サービスに `TTSBOT_HA_PRIORITY`, `TTSBOT_PEER_URLS`, `HOST_WEB_PORT`, `WEB_PORT`, `CLOUDFLARE_TUNNEL_TOKEN` を完全反映。
+     - **Slave 専用スタンドアロン Compose 新設 (`docker-compose.slave.yml`)**:
+       - `docker compose -f docker-compose.slave.yml up -d` だけで profile 不要で Standby Watchdog が起動。
+       - 障害昇格時の本体起動用 `app` サービス（`profiles: [active]`）を同梱し、ソースコード clone 不要で Docker Hub イメージから即時昇格可能。
+     - **Portainer スタック最適化 (`portainer-stack.yml`)**:
+       - Master / Slave の切り替えや昇格用設定を整理し、名前付きボリュームで完全永続化。
+  3. **Master からのファイル直接配信エンドポイント拡充 (`src/web/server.py`)**:
+     - `/docker-compose.slave.yml` および `/portainer-stack.yml` の HTTP 配信ルートを追加し、外部から curl で直接取得可能に。
+  4. **Portainer 運用ガイドの作成 (`docs/PORTAINER.md`)**:
+     - Master (主系) および Slave (待機系) のデプロイ手順、環境変数一覧、ワンクリック更新手順（Re-pull image and redeploy）、データ永続化について体系的にドキュメント化。
+  5. **NAT/FW & Cloudflare Tunnel を考慮した HA カスケード間隔の最適化 (`src/ha_watchdog.py`)**:
+     - Priority に応じた待機時間を拡大:
+       - Priority 1 (第1待機系): 約30秒 (6回チェック) で最速昇格。
+       - Priority 2 (第2待機系): 約3分 (36回チェック) 待機昇格。
+       - Priority 3 (第3待機系): 約5分 (60回チェック) 待機昇格。
+     - Cloudflare Tunnel の切り替え遅延（30秒〜90秒）を確実に吸収し、先行ノードのトンネル接続完了を待ってから判定するため、無駄な二重昇格を完全回避。
+     - P2P 相互ヘルスチェックの安全化: タイムアウトを 2 秒に短縮。NAT/FW 越しで直接 IP 疎通ができない場合でも、相手ダウンと誤認せず安全にスルーし、明示的な 200 OK 応答時のみ「相手生存」と判定。
+     - 上位優先自律プリエンプト降格（Higher Priority Preemption）: 万が一重複起動した場合も、劣後ノード（Priority 2）が稼働中ループで上位ノードの Active 稼働を検知した瞬間に、自らを即座に `docker compose stop app` して Standby へ自動復帰。
+  6. **Slave セットアップスクリプトの Docker Hub Pull 高速化 (`setup-standby.sh`, `setup-standby.ps1`)**:
+     - `.env` に `TTSBOT_IMAGE=madpiero/ttsbot:latest` を自動定義。
+     - 起動前に `docker compose --profile standby pull standby-watchdog` を実行し、Docker Hub から最新イメージを高速取得してローカルビルドをスキップ。
+  7. **WebUI のフェイルオーバー時間表記同期 (`src/web/static/app.js`)**:
+     - 優先度設定セレクトボックスおよびバッジ表示を「Priority 1 (約30秒 最速昇格)」「Priority 2 (約3分 待機昇格)」「Priority 3 (約5分 待機昇格)」に完全同期。
+- **検証**:
+  - 全関連ファイルの構文・Lint エラー 0 件を確認。
+  - 本番コンテナのリロードおよびヘルスチェック（200 OK）を確認。
+
 ## [2026-10-24] Slave セットアップの Dockerfile 不在エラー解消 & 複数台待機 (推奨2台) カスケード Priority 制御の実装
 - **ユーザーフィードバック & 課題**:
   1. `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` 実行時に `open Dockerfile: no such file or directory` が発生し、セットアップが途中で停止する不具合の報告。

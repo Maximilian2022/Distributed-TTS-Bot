@@ -6785,10 +6785,10 @@ async function loadManagerNodes() {
         }
 
         const prio = slave.priority || 1;
-        const failoverSec = 30 + (prio - 1) * 15;
+        const failoverLabel = prio === 1 ? '最速昇格 約30秒' : (prio === 2 ? '待機昇格 約3分' : (prio === 3 ? '待機昇格 約5分' : `待機昇格 約${5 + (prio - 3) * 2}分`));
         const priorityBadge = `
           <span class="badge" style="background:${prio === 1 ? 'rgba(88,101,242,0.25)' : 'rgba(155,89,182,0.25)'};color:${prio === 1 ? '#7289da' : '#bb86fc'};border:1px solid ${prio === 1 ? 'rgba(88,101,242,0.5)' : 'rgba(155,89,182,0.5)'};font-weight:700;">
-            ★ Priority ${prio} (${prio === 1 ? '最速昇格 約30秒' : `待機昇格 約${failoverSec}秒`})
+            ★ Priority ${prio} (${failoverLabel})
           </span>
         `;
 
@@ -6839,7 +6839,11 @@ async function loadManagerNodes() {
               <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
                 <span style="color:var(--text-muted);">昇格優先度:</span>
                 <select onchange="setManagerSlavePriority('${escapeHtml(slave.node_id)}', parseInt(this.value, 10))" style="background:#2b2d31;color:#fff;border:1px solid rgba(255,255,255,0.2);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer;">
-                  ${[1, 2, 3, 4, 5].map(p => `<option value="${p}" ${p === prio ? 'selected' : ''}>Priority ${p} (${30 + (p-1)*15}s昇格)</option>`).join('')}
+                  <option value="1" ${prio === 1 ? 'selected' : ''}>Priority 1 (約30秒 最速昇格)</option>
+                  <option value="2" ${prio === 2 ? 'selected' : ''}>Priority 2 (約3分 待機昇格)</option>
+                  <option value="3" ${prio === 3 ? 'selected' : ''}>Priority 3 (約5分 待機昇格)</option>
+                  <option value="4" ${prio === 4 ? 'selected' : ''}>Priority 4 (約7分 待機昇格)</option>
+                  <option value="5" ${prio === 5 ? 'selected' : ''}>Priority 5 (約9分 待機昇格)</option>
                 </select>
               </div>
               <div>${actionBtnHtml}</div>

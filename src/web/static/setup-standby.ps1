@@ -169,6 +169,9 @@ TTSBOT_CHECK_INTERVAL=5
 TTSBOT_FAIL_THRESHOLD=6
 TTSBOT_SYNC_INTERVAL=60
 
+# Docker Hub イメージ指定 (未指定時は madpiero/ttsbot:latest)
+TTSBOT_IMAGE=madpiero/ttsbot:latest
+
 # Web & ポート設定
 HOST_WEB_PORT=8088
 WEB_PORT=8080
@@ -183,6 +186,11 @@ Write-Host "  ✓ .env ファイル作成完了: $EnvFile" -ForegroundColor Gree
 
 # 5. Standby Watchdog コンテナの起動 (--profile standby 指定)
 Write-Host "`n[4/4] Slave Standby Watchdog を起動中..." -ForegroundColor Yellow
+
+# Docker Hub から最新ビルド済みイメージを高速プル
+Write-Host "  Docker Hub から最新イメージを確認・取得中..."
+docker compose --profile standby pull standby-watchdog 2>$null
+
 docker compose --profile standby up -d standby-watchdog
 
 Write-Host "`n======================================================" -ForegroundColor Green

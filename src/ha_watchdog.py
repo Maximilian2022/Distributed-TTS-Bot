@@ -115,8 +115,9 @@ class HAWatchdog:
         self.check_interval = float(os.getenv("TTSBOT_CHECK_INTERVAL", "5.0"))
         self.base_fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "6"))  # 基本: 6回 (約30秒)
         self.priority = int(os.getenv("TTSBOT_HA_PRIORITY", "1"))  # 優先度 (1=最速昇格、2=待機昇格)
-        # 猶予時間を +30秒（6回チェック分）に拡大し、先行ノードの起動完了時間を確実に確保
-        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 6
+        # 待機時間を十分確保 (Priority 1: 30秒, Priority 2: 3分, Priority 3: 5分)
+        # Cloudflare Tunnel の切り替えや先行ノードの起動完了を待つため
+        self.fail_threshold = self._calc_fail_threshold(self.priority)
         self.sync_interval = float(os.getenv("TTSBOT_SYNC_INTERVAL", "60.0"))  # 1分周期でDB同期
         self.db_path = Path(os.getenv("TTSBOT_LOCAL_DB_PATH", "/app/data/bot.db"))
         self.docker = DockerSocketClient(os.getenv("TTSBOT_DOCKER_SOCKET", "/var/run/docker.sock"))
@@ -145,6 +146,21 @@ class HAWatchdog:
             f"Priority: {self.priority}, Failover threshold: {self.fail_threshold} checks = {self.fail_threshold * self.check_interval:.0f}s)"
         )
 
+    def _calc_fail_threshold(self, priority: int) -> int:
+        """
+        Priority ごとのフェイルオーバー無応答回数 (5秒/回) を算出。
+        - Priority 1: 6 回 = 30秒 (最速フェイルオーバー)
+        - Priority 2: 36 回 = 180秒 (約3分: 先行ノードの起動・Cloudflare Tunnel 切り替え完了を十分待機)
+        - Priority 3: 60 回 = 300秒 (約5分)
+        - Priority N: 36 + (priority - 2) * 24 回 (約5分 + 2分刻み)
+        """
+        if priority <= 1:
+            return self.base_fail_threshold
+        elif priority == 2:
+            return 36  # 3分 (180秒)
+        else:
+            return 36 + (priority - 2) * 24  # Priority 3 は 60回 = 5分 (300秒)
+
     def _load_cluster_nodes(self) -> List[Dict[str, Any]]:
         """他ノード情報をキャッシュから読込"""
         try:
@@ -163,7 +179,11 @@ class HAWatchdog:
             logger.debug(f"Failed to save cluster nodes cache: {e}")
 
     def is_higher_priority_active(self) -> bool:
-        """自分より優先度の高いノード (Priority 1 など) が Active 稼働しているかを直接相互確認"""
+        """
+        自分より優先度の高いノード (Priority 1 など) が Active 稼働しているかを直接相互確認。
+        ※ NAT/FW 越しで直接疎通できない環境も多いため、200 OK 応答時のみ「生存」と判定し、
+        タイムアウト等は相手ダウンと決めつけず安全にスルーします。
+        """
         higher_nodes = [
             n for n in self.cluster_nodes
             if n.get("priority", 999) < self.priority and n.get("ip")
@@ -176,17 +196,19 @@ class HAWatchdog:
             port = node.get("port", 8088)
             url = f"http://{ip}:{port}/health"
             try:
+                # FW 越え不可を考慮して短時間 (2.0s) でタイムアウト
                 req = urllib.request.Request(url, headers={"User-Agent": f"TTSBot-HA-PeerCheck/{self.node_id}"})
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
                     if resp.status == 200:
                         data = json.loads(resp.read().decode("utf-8"))
                         if data.get("status") == "ok":
                             logger.info(
-                                f"🛡️ [Cluster Peer Check] Higher-priority node '{node.get('hostname')}' "
-                                f"({ip}:{port}, Priority {node.get('priority')}) is ACTIVE!"
+                                f"🛡️ [Cluster Peer Check] Higher-priority peer '{node.get('hostname')}' "
+                                f"({ip}:{port}, Priority {node.get('priority')}) is verified ACTIVE via LAN/Direct connection!"
                             )
                             return True
             except Exception:
+                # FW の向こう側で直接アクセスできない環境では正常な挙動のため無視
                 pass
         return False
 
@@ -271,7 +293,7 @@ class HAWatchdog:
                     if assigned_p and isinstance(assigned_p, int) and assigned_p != self.priority:
                         logger.info(f"🔄 [Priority] Master assigned new Priority: {self.priority} -> {assigned_p}")
                         self.priority = assigned_p
-                        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 6
+                        self.fail_threshold = self._calc_fail_threshold(self.priority)
                         logger.info(f"⏱️ [Failover] New failover threshold: {self.fail_threshold} checks ({self.fail_threshold * self.check_interval:.0f}s)")
 
                     # 他ノード (Peer Standbys) の最新情報をキャッシュ更新
