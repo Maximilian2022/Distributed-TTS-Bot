@@ -17,11 +17,13 @@
      - Master へのハートビート時に `X-HA-Priority`, `X-HA-Cpu-Cores`, `X-HA-Memory-Gb`, `X-HA-Os` を自動送信。
      - Master から返される `assigned_priority` を動的に反映。
      - カスケードフェイルオーバー閾値計算:
-       - `fail_threshold = 6 + (priority - 1) * 3`
+       - `fail_threshold = 6 + (priority - 1) * 6`
        - Priority 1 (第1待機系): 約30秒で最速自律昇格。
-       - Priority 2 (第2待機系): 約45秒で待機昇格。
-     - **二重昇格・多重スプリットブレイン防止ガード**:
-       - Priority > 1 のノードは、閾値（45秒等）到達時に昇格する直前、再度 Master URL（または上位ノードの昇格状況）を確認。上位ノードが無事昇格または Master が復旧していれば自律昇格を安全に抑制し、Standby を維持。
+       - Priority 2 (第2待機系): 約60秒で待機昇格（先行ノードの起動完了に十分な30秒の猶予を確保）。
+       - チェック周期に 0.1〜0.8 秒のランダムジッターを付与し、完全同一秒での衝突を物理的に排除。
+     - **多重防御による完全な二重昇格・スプリットブレイン防止調停**:
+       1. **P2P 相互直接ヘルスチェック (`is_higher_priority_active`)**: Master URL の切り替え（DNS/Tunnel）を待たずに、Master から共有されたクラスタトポロジーに基づき、上位ノード（Priority 1 の IP:Port）へ直接 `/health` 疎通を確認。上位ノードの Active 稼働を直接検知して昇格を抑制。
+       2. **上位優先自律プリエンプト降格 (Higher Priority Preemption)**: 万が一ネットワーク遅延やタイミングの微小なズレで一瞬 2 台が Active になった場合でも、劣後ノード（Priority 2）側が稼働中ループで上位ノード（Priority 1）の Active 稼働を検知した瞬間に、即座に自らを `docker compose stop app` して Standby へ自動降格。数秒以内に確実に 1 台へ収束するフェイルセーフを完備。
   3. **Master 側オーケストレーション & Priority API (`src/web/server.py`)**:
      - `_record_ha_slave_heartbeat`: 新規 Slave の初回接続時に参加順（1, 2...）で空いている最小 Priority を自動採番。スペック情報を永続化。
      - `/api/ha/status`: レスポンスに `assigned_priority`, `total_standbys`, `recommended_standbys: 2` を含め Slave へネゴシエーション。

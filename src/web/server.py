@@ -961,6 +961,18 @@ class WebServer:
         assigned_p = slave_entry.get("priority", 1)
         online_standbys = len([s for s in self.ha_slaves.values() if s.get("status") == "online"])
 
+        now_ts = time.time()
+        cluster_nodes = []
+        for nid, s in self.ha_slaves.items():
+            if nid != node_id and (now_ts - s.get("last_seen", 0)) < 120.0 and nid not in self.ha_revoked_nodes and s.get("status") != "revoked":
+                cluster_nodes.append({
+                    "node_id": nid,
+                    "hostname": s.get("hostname", "unknown"),
+                    "ip": s.get("ip", "unknown"),
+                    "port": 8088,
+                    "priority": s.get("priority", 1)
+                })
+
         return web.json_response({
             "status": "ok",
             "role": "master",
@@ -970,6 +982,7 @@ class WebServer:
             "priority": assigned_p,
             "total_standbys": online_standbys,
             "recommended_standbys": 2,
+            "cluster_nodes": cluster_nodes,
             "db_size_bytes": db_size,
             "db_mtime": db_mtime,
             "timestamp": time.time(),

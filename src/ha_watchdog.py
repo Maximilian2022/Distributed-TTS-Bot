@@ -22,8 +22,9 @@ import urllib.error
 import http.client
 import socket
 import uuid
+import random
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,13 +115,18 @@ class HAWatchdog:
         self.check_interval = float(os.getenv("TTSBOT_CHECK_INTERVAL", "5.0"))
         self.base_fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "6"))  # 基本: 6回 (約30秒)
         self.priority = int(os.getenv("TTSBOT_HA_PRIORITY", "1"))  # 優先度 (1=最速昇格、2=待機昇格)
-        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 3
+        # 猶予時間を +30秒（6回チェック分）に拡大し、先行ノードの起動完了時間を確実に確保
+        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 6
         self.sync_interval = float(os.getenv("TTSBOT_SYNC_INTERVAL", "60.0"))  # 1分周期でDB同期
         self.db_path = Path(os.getenv("TTSBOT_LOCAL_DB_PATH", "/app/data/bot.db"))
         self.docker = DockerSocketClient(os.getenv("TTSBOT_DOCKER_SOCKET", "/var/run/docker.sock"))
 
         self.hostname = socket.gethostname()
         self.node_id = self._init_node_id()
+
+        # クラスタトポロジー (他ノード情報) の保持
+        self.cluster_nodes_file = self.db_path.parent / "ha_cluster_nodes.json"
+        self.cluster_nodes: List[Dict[str, Any]] = self._load_cluster_nodes()
 
         # システムスペックの自動検出 (Master での Priority 自動提案・表示用)
         self.cpu_cores = os.cpu_count() or 1
@@ -138,6 +144,51 @@ class HAWatchdog:
             f"Spec: {self.cpu_cores} cores / {self.memory_gb} GB RAM / {self.os_name}, "
             f"Priority: {self.priority}, Failover threshold: {self.fail_threshold} checks = {self.fail_threshold * self.check_interval:.0f}s)"
         )
+
+    def _load_cluster_nodes(self) -> List[Dict[str, Any]]:
+        """他ノード情報をキャッシュから読込"""
+        try:
+            if self.cluster_nodes_file.exists():
+                return json.loads(self.cluster_nodes_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return []
+
+    def _save_cluster_nodes(self):
+        """他ノード情報をキャッシュへ保存"""
+        try:
+            self.cluster_nodes_file.parent.mkdir(parents=True, exist_ok=True)
+            self.cluster_nodes_file.write_text(json.dumps(self.cluster_nodes, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.debug(f"Failed to save cluster nodes cache: {e}")
+
+    def is_higher_priority_active(self) -> bool:
+        """自分より優先度の高いノード (Priority 1 など) が Active 稼働しているかを直接相互確認"""
+        higher_nodes = [
+            n for n in self.cluster_nodes
+            if n.get("priority", 999) < self.priority and n.get("ip")
+        ]
+        if not higher_nodes:
+            return False
+
+        for node in higher_nodes:
+            ip = node.get("ip")
+            port = node.get("port", 8088)
+            url = f"http://{ip}:{port}/health"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": f"TTSBot-HA-PeerCheck/{self.node_id}"})
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data.get("status") == "ok":
+                            logger.info(
+                                f"🛡️ [Cluster Peer Check] Higher-priority node '{node.get('hostname')}' "
+                                f"({ip}:{port}, Priority {node.get('priority')}) is ACTIVE!"
+                            )
+                            return True
+            except Exception:
+                pass
+        return False
 
     def _detect_memory_gb(self) -> float:
         """システム物理メモリ (GB) の検出"""
@@ -220,8 +271,15 @@ class HAWatchdog:
                     if assigned_p and isinstance(assigned_p, int) and assigned_p != self.priority:
                         logger.info(f"🔄 [Priority] Master assigned new Priority: {self.priority} -> {assigned_p}")
                         self.priority = assigned_p
-                        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 3
+                        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 6
                         logger.info(f"⏱️ [Failover] New failover threshold: {self.fail_threshold} checks ({self.fail_threshold * self.check_interval:.0f}s)")
+
+                    # 他ノード (Peer Standbys) の最新情報をキャッシュ更新
+                    peers = data.get("cluster_nodes", [])
+                    if isinstance(peers, list):
+                        self.cluster_nodes = peers
+                        self._save_cluster_nodes()
+
                     return data.get("is_active", True)
                 elif resp.status == 410:
                     self._handle_revocation()
@@ -422,7 +480,7 @@ class HAWatchdog:
                 if is_healthy:
                     self.fail_count = 0
 
-                    # Master が健全なのに Slave が Active の場合は即座に降格 (Preempt Demote)
+                    # Master が健全なのに Slave が Active の場合は即座に降格 (Preempt Demote to Master)
                     if self.current_state == "active":
                         await self.demote_to_standby()
 
@@ -437,9 +495,22 @@ class HAWatchdog:
                         f"⚠️ Master health check failed ({self.fail_count}/{self.fail_threshold})"
                     )
 
+                    # 【多重昇格調停フェイルセーフ】
+                    # 万が一、自身が Active の状態で、より優先度の高い上位ノード (Priority 1 など) も Active になっている場合、
+                    # 劣後ノード (Priority 2) である自身を直ちに Standby へ自動降格 (Preempt Demote) してスプリットブレインを解消
+                    if self.current_state == "active" and self.priority > 1:
+                        is_higher_active = await loop.run_in_executor(None, self.is_higher_priority_active)
+                        if is_higher_active:
+                            logger.warning(
+                                f"🛑 [Split-Brain Resolver] Higher-priority peer is ACTIVE! "
+                                f"Demoting this node (Priority {self.priority}) to STANDBY immediately to resolve conflict."
+                            )
+                            await self.demote_to_standby()
+                            continue
+
                     # 閾値到達 & 現在 Standby ならば昇格判定
                     if self.fail_count >= self.fail_threshold and self.current_state == "standby":
-                        # 外向きインターネット疎通の二重確認
+                        # 1. 外向きインターネット疎通の確認
                         has_net = await loop.run_in_executor(None, self.check_internet_connectivity)
                         if not has_net:
                             logger.error(
@@ -448,16 +519,17 @@ class HAWatchdog:
                             )
                             continue
 
-                        # Priority > 1 (第2待機系以降) の場合、昇格直前に上位ノードや Master が稼働・復旧していないか最終確認
+                        # 2. Priority > 1 (第2待機系以降) の場合、昇格直前に上位ノード (Priority 1) や Master を直接相互検証
                         if self.priority > 1:
                             logger.info(
                                 f"🔍 [Priority {self.priority} Standby] Pre-promotion verification: "
-                                "Checking if higher-priority node or Master is active..."
+                                "Checking if higher-priority peer (Priority 1) or Master is active..."
                             )
-                            is_active_somewhere = await loop.run_in_executor(None, self.is_master_healthy)
-                            if is_active_somewhere:
+                            is_master_ok = await loop.run_in_executor(None, self.is_master_healthy)
+                            is_higher_ok = await loop.run_in_executor(None, self.is_higher_priority_active)
+                            if is_master_ok or is_higher_ok:
                                 logger.info(
-                                    "🛡️ [Split-Brain Guard] Master or higher-priority node is active! "
+                                    "🛡️ [Split-Brain Guard] Active peer/Master detected! "
                                     "Suppressing promotion to keep this node in standby."
                                 )
                                 self.fail_count = 0
@@ -468,7 +540,9 @@ class HAWatchdog:
             except Exception as e:
                 logger.error(f"Unexpected error in Watchdog loop: {e}", exc_info=True)
 
-            await asyncio.sleep(self.check_interval)
+            # ジッター (0.1〜0.8s の揺らぎ) を付与して複数ノードのチェックタイミング同期・衝突を分散
+            jitter = random.uniform(0.1, 0.8)
+            await asyncio.sleep(self.check_interval + jitter)
 
 
 def main():
