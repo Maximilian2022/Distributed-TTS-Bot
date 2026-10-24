@@ -13,6 +13,7 @@
 # ==============================================================================
 
 $MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8080" }
+$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) { $env:TTSBOT_WORKER_SECRET } else { "" }
 $WorkDir    = if ($env:TTSBOT_WORK_DIR)   { $env:TTSBOT_WORK_DIR   } else { "$HOME\ttsbot-worker" }
 $WorkDirUnix = $WorkDir.Replace('\', '/')
 
@@ -415,6 +416,7 @@ services:
     environment:
       - TZ=Asia/Tokyo
       - MASTER_URL=$MasterUrl
+      - WORKER_SHARED_SECRET=$WorkerSecret
       - WORKER_IP=$LocalIp
       - HAS_GPU=$($HasGpu.ToString().ToLower())
       - GPU_NAME=$GpuName
@@ -470,7 +472,9 @@ if (-not (Test-Path $ModelsDir)) {
 $ModelsListUrl = "$MasterUrl/api/worker/models/list"
 try {
     # Invoke-RestMethod で Master から JSON を直接取得 (PowerShell ネイティブ)
-    $ModelsData = Invoke-RestMethod -Uri $ModelsListUrl -TimeoutSec 15 -UseBasicParsing
+    $ReqHeaders = @{}
+    if ($WorkerSecret) { $ReqHeaders["X-Worker-Token"] = $WorkerSecret }
+    $ModelsData = Invoke-RestMethod -Uri $ModelsListUrl -Headers $ReqHeaders -TimeoutSec 15 -UseBasicParsing
     if ($ModelsData -and $ModelsData.models) {
         $ModelList = $ModelsData.models
         $TotalModels = $ModelList.Count
@@ -520,9 +524,12 @@ try {
             # バイナリ破損防止のため、ファイルに直接保存してから tar 展開
             try {
                 if ($CurlExe) {
-                    & $CurlExe -sSL "$DownloadUrl" -o "$TempTar"
+                    $curlArgs = @("-sSL")
+                    if ($WorkerSecret) { $curlArgs += @("-H", "X-Worker-Token: $WorkerSecret") }
+                    $curlArgs += @("$DownloadUrl", "-o", "$TempTar")
+                    & $CurlExe @curlArgs
                 } else {
-                    Invoke-WebRequest -Uri "$DownloadUrl" -OutFile "$TempTar" -UseBasicParsing
+                    Invoke-WebRequest -Uri "$DownloadUrl" -Headers $ReqHeaders -OutFile "$TempTar" -UseBasicParsing
                 }
 
                 if (Test-Path "$TempTar") {

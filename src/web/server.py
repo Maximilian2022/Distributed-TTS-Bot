@@ -444,12 +444,9 @@ class WebServer:
         path = request.path
         is_wan = self._is_wan_request(request)
 
-        # 1. WAN境界セキュリティ防御: Worker API / Workerセットアップファイルのインターネット直接アクセス遮断
+        # 1. WAN境界セキュリティ防御: Worker 内部通信APIのインターネット直接アクセス遮断
         worker_sensitive_prefixes = (
             "/api/worker/",
-            "/setup-worker.sh",
-            "/setup-worker.ps1",
-            "/static/agent.py",
         )
         if is_wan and any(path == p or path.startswith(p) for p in worker_sensitive_prefixes):
             # 例外1: WebUIダッシュボードの管理用API (/api/worker/nodes, /api/worker/logs, /api/worker/update等) は認証済み管理者なら許可
@@ -458,9 +455,9 @@ class WebServer:
                 user = self.auth.get_current_user(request)
                 if not user:
                     return web.json_response({"error": "Forbidden: WAN access requires authentication"}, status=403)
-            # 例外2: リモートボランティア Worker 接続エンドポイント (/api/worker/ws, /api/worker/register, /api/worker/models/)
+            # 例外2: リモート Worker / クラスタ Worker 接続エンドポイント (/api/worker/ws, /api/worker/register, /api/worker/heartbeat, /api/worker/models/)
             # 外部 (Cloudflare Tunnel / インターネット) からの安全な接続のため、正当な共有トークン (WORKER_SHARED_SECRET) が【必須】
-            elif path in ("/api/worker/ws", "/api/worker/register") or path.startswith("/api/worker/models/"):
+            elif path in ("/api/worker/ws", "/api/worker/register", "/api/worker/heartbeat") or path.startswith("/api/worker/models/"):
                 if not self._verify_worker_auth(request):
                     client_ip = request.headers.get("CF-Connecting-IP") or request.remote or "unknown"
                     logger.warning(f"🚫 [Security] Blocked WAN worker request (missing or invalid shared token) to '{path}' from {client_ip}")
@@ -781,18 +778,30 @@ class WebServer:
         return response
 
     async def handle_setup_worker_sh(self, request: web.Request) -> web.Response:
-        """Debian/Linux 用ワンライナー自動セットアップスクリプトを配信"""
+        """Debian/Linux 用ワンライナー自動セットアップスクリプトを配信 (URL & トークン動的注入)"""
         script_path = Path(__file__).resolve().parent / "static" / "setup-worker.sh"
         if not script_path.exists():
             return web.Response(text="#!/bin/bash\necho 'Error: setup-worker.sh not found'\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
-        return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+        content = script_path.read_text(encoding="utf-8").lstrip("\ufeff")
+        master_url = self._get_master_base_url(request)
+        token = getattr(self.config, "worker_shared_secret", "").strip()
+        content = content.replace('MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"', f'MASTER_URL="${{TTSBOT_MASTER_URL:-{master_url}}}"')
+        content = content.replace('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"', f'WORKER_SECRET="${{TTSBOT_WORKER_SECRET:-{token}}}"')
+        return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
     async def handle_setup_worker_ps1(self, request: web.Request) -> web.Response:
-        """Windows GPU 用ワンライナー自動セットアップスクリプトを配信"""
+        """Windows GPU 用ワンライナー自動セットアップスクリプトを配信 (URL & トークン動的注入)"""
         script_path = Path(__file__).resolve().parent / "static" / "setup-worker.ps1"
         if not script_path.exists():
             return web.Response(text="Write-Host 'Error: setup-worker.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
-        return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+        content = script_path.read_text(encoding="utf-8").lstrip("\ufeff")
+        master_url = self._get_master_base_url(request)
+        token = getattr(self.config, "worker_shared_secret", "").strip()
+        content = content.replace('$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8080" }',
+                                  f'$MasterUrl  = if ($env:TTSBOT_MASTER_URL) {{ $env:TTSBOT_MASTER_URL }} else {{ "{master_url}" }}')
+        content = content.replace('$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) { $env:TTSBOT_WORKER_SECRET } else { "" }',
+                                  f'$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) {{ $env:TTSBOT_WORKER_SECRET }} else {{ "{token}" }}')
+        return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
     def _get_master_base_url(self, request: web.Request) -> str:
         """アクセス元リクエストおよび設定から Master サーバーのベースURLを自動特定"""

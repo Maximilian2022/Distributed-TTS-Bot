@@ -472,7 +472,12 @@ echo -e "\n${C_BLUE}📥 [3.5/5] Master サーバーから COEIROINK 話者モ�
 MODELS_DIR="${WORK_DIR}/coeiroink_models"
 mkdir -p "${MODELS_DIR}"
 
-MODELS_LIST_JSON=$(curl -sSL --max-time 15 "${MASTER_URL}/api/worker/models/list" 2>/dev/null || echo "")
+AUTH_HEADER=()
+if [ -n "${WORKER_SECRET}" ]; then
+    AUTH_HEADER=(-H "X-Worker-Token: ${WORKER_SECRET}")
+fi
+
+MODELS_LIST_JSON=$(curl -sSL --max-time 15 "${AUTH_HEADER[@]}" "${MASTER_URL}/api/worker/models/list" 2>/dev/null || echo "")
 if [ -n "$MODELS_LIST_JSON" ] && command -v python3 >/dev/null 2>&1; then
     MODEL_NAMES=$(python3 -c "
 import json, sys
@@ -520,7 +525,7 @@ except Exception:
 
         echo -e "  [${IDX}/${TOTAL_M}] ${SNAME} (${SIZE_MB}MB) をダウンロード・展開中..."
         DOWNLOAD_URL="${MASTER_URL}/api/worker/models/download/${FNAME}"
-        curl -sSL "${DOWNLOAD_URL}" | tar -xf - -C "${MODELS_DIR}"
+        curl -sSL "${AUTH_HEADER[@]}" "${DOWNLOAD_URL}" | tar -xf - -C "${MODELS_DIR}"
 
         if [ -f "${TARGET_FOLDER}/metas.json" ] && [ -d "${TARGET_FOLDER}/model" ]; then
             echo -e "  [${IDX}/${TOTAL_M}] ✅ ${SNAME} の配置完了"

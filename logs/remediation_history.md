@@ -1,5 +1,24 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] クラスタ用 Worker セットアップスクリプト (`setup-worker.ps1` / `setup-worker.sh`) の WAN 403 解消 & URL・共有トークン自動注入
+- **ユーザーフィードバック & 課題**:
+  - インターネット経由（Cloudflare Tunnel `https://ttsbot.kenko.land/`）からクラスタ用 Worker のセットアップワンライナー（`irm "https://ttsbot.kenko.land/setup-worker.ps1" | iex`）を実行したところ、`{"error": "Forbidden: This endpoint is restricted to local LAN access only."}` が返りブロックされた。
+- **真因の究明**:
+  - `src/web/server.py` の WAN 境界セキュリティミドルウェアにおいて、`worker_sensitive_prefixes` に `/setup-worker.sh`, `/setup-worker.ps1`, `/static/agent.py` が登録されていた。
+  - これらは単なるオープンソースの環境構築スクリプト・エージェントコードであり機密情報は含まないが、WAN からの直接アクセスが一律 403 Forbidden で遮断されていた。
+  - さらに、配信ハンドラが素のテキストをそのまま返していたため、ワンライナー実行時に `$MasterUrl` が `http://localhost:8080` とみなされ、共有トークンも未設定になる潜在課題があった。
+- **抜本的改善内容**:
+  1. **WAN 境界セキュリティミドルウェアの修正 (`server.py`)**:
+     - `worker_sensitive_prefixes` を `/api/worker/` のみに限定し、セットアップスクリプト（`setup-worker.ps1`, `setup-worker.sh`）およびエージェントコード（`/static/agent.py`）の WAN 経由ダウンロードを安全に許可。
+     - WAN からの定期ハートビート（`/api/worker/heartbeat`）についても、正当な共有トークン（`WORKER_SHARED_SECRET`）がある場合は例外として許可するようにポリシーを拡張。
+  2. **セットアップスクリプトへの動的 URL & 共有トークン自動注入 (`server.py`, `setup-worker.ps1`, `setup-worker.sh`)**:
+     - `handle_setup_worker_sh` / `handle_setup_worker_ps1` において、アクセスされたリクエストの URL（`_get_master_base_url`）およびサーバーの `worker_shared_secret` をスクリプト内のデフォルト値として動的置換して配信。
+     - PowerShell 向け配信では UTF-8 BOM を付与せず純粋な UTF-8（`Content-Type: text/plain; charset=utf-8`）で返すことで、`| iex` パイプラインでの不可視文字構文エラーを防止。
+     - `setup-worker.ps1` および `setup-worker.sh` での COEIROINK モデル同期時（`/api/worker/models/list` および `/api/worker/models/download/...`）に、`X-Worker-Token` 認証ヘッダーを付与するように改修。WAN 経由でのモデル取得も 403 にならずスムーズに自動同期可能に。
+- **検証**:
+  - `curl -H "CF-Connecting-IP: 203.0.113.1"` による擬似 WAN リクエストで、`/setup-worker.ps1`, `/setup-worker.sh`, `/static/agent.py` の全エンドポイントが 200 OK を返すことを確認。
+  - スクリプト本文内に `https://ttsbot.kenko.land` および `cf94f2cae9006ef84981affa1da0dd0d` が正しく自動展開されていることを実機検証。
+
 ## [2026-10-24] COEIROINK等保有モデル差異のピンポイント・ルーティング & エンジンDL進捗プログレスバー実装
 - **ユーザーフィードバック & 課題**:
   1. ボランティア機の参入により、PCごとの保有モデル（特にCOEIROINKのMYCOEIROINK/公式キャラ）に差異が生じるため、持っているモデルに応じて的確にリクエストを振り分けたい。
