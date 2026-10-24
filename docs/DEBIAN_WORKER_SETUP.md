@@ -1,6 +1,6 @@
 # Debian / Linux コンピュートノード (ワーカー) セットアップ手順書
 
-本手順書は、共用サーバー等の Debian / Linux マシンを **音声合成専用のコンピュートワーカー（Compute Node）** として参加させ、Master（Ubuntu）と自動連携させるためのセットアップガイドです。
+本手順書は、共用サーバー等の Debian / Linux マシンを **音声合成専用のコンピュートワーカー（Compute Node）** として参加させ、Master サーバーと自動連携させるためのセットアップガイドです。
 
 現在、セットアップは**ワンライナーで完全自動化**されており、手動でのファイル転送（scp）やモデル同期（rsync）、設定ファイル編集は一切不要です。
 
@@ -33,9 +33,14 @@ sudo usermod -aG docker $USER
 ## ステップ 2: ワンライナーで自動セットアップ
 
 Debian 上で以下のコマンドを 1 行実行するだけで、すべてのセットアップが完了します。
+（`<MASTER_HOST>:<PORT>` には Master サーバーの IP またはドメインを指定してください）
 
 ```bash
-curl -sSL http://192.168.11.245:8088/setup-worker.sh | bash
+# LAN 内直接接続の例:
+curl -sSL http://<MASTER_HOST>:8080/setup-worker.sh | bash
+
+# ドメイン経由の例:
+curl -sSL https://<YOUR_TTSBOT_DOMAIN>/setup-worker.sh | bash
 ```
 
 ### スクリプトが自動で行う処理
@@ -44,7 +49,7 @@ curl -sSL http://192.168.11.245:8088/setup-worker.sh | bash
 3. Worker Agent (`ttsworker-agent`) コンテナの起動
 4. Master からの話者モデル自動同期（すでに同期済みのモデルは **0秒でスキップ**）
 5. 各種 TTS エンジンコンテナ（VOICEVOX, SHAREVOX, COEIROINK）の自動ビルド・起動
-6. Master (Ubuntu) への自動登録（Auto-Discovery）
+6. Master への自動登録（Auto-Discovery）
 
 > **※ 状態の確認**:
 > Debian 上で `docker ps` を実行し、`ttsworker-agent`, `ttsworker-voicevox`, `ttsworker-sharevox`, `ttsworker-coeiroink` の 4 コンテナが起動していれば完了です。
@@ -54,23 +59,24 @@ curl -sSL http://192.168.11.245:8088/setup-worker.sh | bash
 
 ## ステップ 3: Master 側からのリモート管理・診断
 
-Master サーバー（Ubuntu）には、Debian Worker を遠隔管理するための SSH 共通鍵と診断 CLI が用意されています。
+Master サーバーには、Debian Worker を遠隔管理するための SSH 共通鍵と診断 CLI が用意されています。
 
 ### 1. 診断 CLI で全ワーカーの生存確認
 Master 側からいつでも一括状況確認が可能です：
 ```bash
-/root/ttsbot/scripts/check_workers.sh
+/path/to/ttsbot/scripts/check_workers.sh
 ```
 
 ### 2. SSH 経由での直接リモート操作
-Master サーバーの `WorkerAccess/id_rsa` を使ってログインやワンライナー確認ができます：
+[`WorkerAccess/README.md`](file:///root/ttsbot/WorkerAccess/README.md) に従って生成した SSH 秘密鍵を使ってログインやワンライナー確認ができます：
 ```bash
 # ログイン
-ssh -i /root/ttsbot/WorkerAccess/id_rsa root@192.168.11.248
+ssh -i /path/to/WorkerAccess/id_rsa <USER>@<WORKER_IP>
 
 # コンテナ状態確認
-ssh -i /root/ttsbot/WorkerAccess/id_rsa root@192.168.11.248 "docker ps"
+ssh -i /path/to/WorkerAccess/id_rsa <USER>@<WORKER_IP> "docker ps"
 
 # ワーカーエージェントのログ確認
-ssh -i /root/ttsbot/WorkerAccess/id_rsa root@192.168.11.248 "docker logs --tail 50 ttsworker-agent"
+ssh -i /path/to/WorkerAccess/id_rsa <USER>@<WORKER_IP> "docker logs --tail 50 ttsworker-agent"
 ```
+

@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-DEBIAN_IP="192.168.11.248"
+DEBIAN_IP="${TTSBOT_STANDBY_IP:-192.168.11.248}"
 DEBIAN_HEALTH_URL="http://${DEBIAN_IP}:8088/health"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

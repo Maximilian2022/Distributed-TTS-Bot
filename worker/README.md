@@ -22,12 +22,33 @@ TTSBot の音声合成ネットワークに、あなたの PC (GPU / CPU) の処
 
 ## 🚀 クイックスタート
 
-### 1. 依存ライブラリのインストール
+### 方法 A: ワンクリック起動ツール（おすすめ）
+
+#### Windows の場合:
+[`run_volunteer.bat`](file:///root/ttsbot/worker/run_volunteer.bat) をダブルクリックするだけで起動できます。
+初回起動時に対話プロンプトで接続先サーバー URL とトークンを入力すれば、依存ライブラリ（`aiohttp`）も自動インストールされます。
+
+```cmd
+# 引数を直接渡して起動することも可能です
+run_volunteer.bat wss://<あなたのTTSBotドメイン>/api/worker/ws <共有トークン> "My-PC"
+```
+
+#### Linux / macOS の場合:
+```bash
+chmod +x run_volunteer.sh
+./run_volunteer.sh wss://<あなたのTTSBotドメイン>/api/worker/ws <共有トークン> "My-PC"
+```
+
+---
+
+### 方法 B: 手動実行
+
+#### 1. 依存ライブラリのインストール
 ```bash
 pip install aiohttp
 ```
 
-### 2. 実行
+#### 2. 実行
 ```bash
 python volunteer_worker.py \
   --server-url wss://<あなたのTTSBotドメイン>/api/worker/ws \

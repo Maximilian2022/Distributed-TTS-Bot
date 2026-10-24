@@ -2,17 +2,17 @@
 # TTSBot Compute Worker (Windows / Docker Desktop) 自動セットアップスクリプト v3
 #
 # 実行方法 (Windows PowerShell 管理者権限):
-#   irm https://ttsbot.kenko.land/setup-worker.ps1 | iex
+#   irm http://<MASTER_HOST>:8080/setup-worker.ps1 | iex
 #
 # 機能:
 #   - 3大TTSエンジン (VOICEVOX / SHAREVOX / COEIROINK) の自動ビルド・起動
 #   - GPU (NVIDIA) / CPU / RAM の自動検出 → リソース制限・並列数を動的最適化
-#   - 192.168.11.0/24 サブネット優先の正確な物理LAN IP自動検出 (仮想NIC除外)
+#   - プライベートLAN IPの自動検出 (仮想NIC除外)
 #   - Worker Agent コンテナを起動し Master に自動登録 & ハートビート
 #   - 自己アップデート機能（WebUI から /update エンドポイント経由）
 # ==============================================================================
 
-$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://192.168.11.245:8088" }
+$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8080" }
 $WorkDir    = if ($env:TTSBOT_WORK_DIR)   { $env:TTSBOT_WORK_DIR   } else { "$HOME\ttsbot-worker" }
 $WorkDirUnix = $WorkDir.Replace('\', '/')
 
@@ -116,31 +116,35 @@ Write-Host "  RAM: $TotalRamGb GB → 割り当て上限計: $AllocRamGb GB (VV:
 Write-Host "  GPU: $(if ($HasGpu) { 'あり (' + $GpuName + ')' } else { 'なし (CPU モード)' })" -ForegroundColor Blue
 Write-Host "  推奨並列数: $MaxConcurrent / 優先度: $Priority" -ForegroundColor Blue
 
-# IP アドレスの正確な検出 (192.168.11.0/24 優先、VMware/VirtualBox/WSL等の仮想NICを除外)
+# IP アドレスの正確な検出 (デフォルトルート物理NIC優先、VMware/VirtualBox/WSL等の仮想NICを除外)
 $LocalIp = ""
-# 1. 192.168.11.* を最優先で検索
-$MatchedIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
-    $_.IPAddress -like "192.168.11.*"
-}
-if ($MatchedIps) {
-    $LocalIp = ($MatchedIps | Select-Object -First 1).IPAddress
+# 1. デフォルトゲートウェイ（0.0.0.0/0）を持つ物理インターフェースから取得
+$DefaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+    Sort-Object RouteMetric | Select-Object -First 1
+if ($DefaultRoute) {
+    $IpObj = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $DefaultRoute.InterfaceIndex -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.IPAddress -notlike "127.*" -and
+            $_.IPAddress -notlike "169.254.*" -and
+            $_.InterfaceAlias -notlike "*VMware*" -and
+            $_.InterfaceAlias -notlike "*VirtualBox*" -and
+            $_.InterfaceAlias -notlike "*WSL*" -and
+            $_.InterfaceAlias -notlike "*vEthernet*"
+        } | Select-Object -First 1
+    if ($IpObj) { $LocalIp = $IpObj.IPAddress }
 }
 
-# 2. デフォルトゲートウェイ（0.0.0.0/0）を持つ物理インターフェースから取得
+# 2. プライベートIP (192.168.*, 10.*, 172.16-31.*) からのフォールバック取得
 if (-not $LocalIp) {
-    $DefaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
-        Sort-Object RouteMetric | Select-Object -First 1
-    if ($DefaultRoute) {
-        $IpObj = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $DefaultRoute.InterfaceIndex -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.IPAddress -notlike "127.*" -and
-                $_.IPAddress -notlike "169.254.*" -and
-                $_.InterfaceAlias -notlike "*VMware*" -and
-                $_.InterfaceAlias -notlike "*VirtualBox*" -and
-                $_.InterfaceAlias -notlike "*WSL*" -and
-                $_.InterfaceAlias -notlike "*vEthernet*"
-            } | Select-Object -First 1
-        if ($IpObj) { $LocalIp = $IpObj.IPAddress }
+    $MatchedIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        ($_.IPAddress -like "192.168.*" -or $_.IPAddress -like "10.*" -or $_.IPAddress -like "172.*") -and
+        $_.InterfaceAlias -notlike "*VMware*" -and
+        $_.InterfaceAlias -notlike "*VirtualBox*" -and
+        $_.InterfaceAlias -notlike "*WSL*" -and
+        $_.InterfaceAlias -notlike "*vEthernet*"
+    }
+    if ($MatchedIps) {
+        $LocalIp = ($MatchedIps | Select-Object -First 1).IPAddress
     }
 }
 

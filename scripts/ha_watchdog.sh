@@ -4,7 +4,7 @@
 # MasterUbuntu (192.168.11.245) の死活監視と自動フェイルオーバー
 # ==============================================================================
 
-UBUNTU_HEALTH_URL="http://192.168.11.245:8088/health"
+UBUNTU_HEALTH_URL="${TTSBOT_PRIMARY_HEALTH_URL:-http://192.168.11.245:8088/health}"
 FAIL_COUNT=0
 FAIL_THRESHOLD=6  # 6回連続失敗 (約30秒) でフェイルオーバー (一時スパイクによる誤昇格防止)
 CHECK_INTERVAL=5

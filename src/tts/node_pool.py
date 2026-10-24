@@ -157,33 +157,23 @@ class TTSNode:
         if explicit_host:
             clean = str(explicit_host).strip()
 
-        if clean.upper() == "MASTERSOMEN2022":
-            clean = "OMEN2022"
-        elif clean.upper() == "MASTEROMEN2017":
-            clean = "OMEN2017"
-        elif clean.upper() == "MASTERDEBIAN":
-            clean = "MasterDebian"
-        elif clean.upper() == "MASTERUBUNTU":
-            clean = "MasterUbuntu"
-        elif clean == "local_master":
+        if clean == "local_master":
             return "Master (CPU)"
 
-        # コンテナID (12文字Hex) の場合は specs または IP / GPU 名から動的解決
+        # コンテナID (12文字Hex) の場合は specs または GPU / OS 名から動的解決
         if _HEX12_RE.match(clean):
             if explicit_host:
                 clean = explicit_host
             else:
-                gpu_str = str(self.specs.get("gpu_name", ""))
-                KNOWN_NODE_MAPPINGS = [
-                    (["192.168.11.200", "3090"], "OMEN2022"),
-                    (["192.168.11.207", "1060", "1080"], "OMEN2017"),
-                    (["192.168.11.248"], "MasterDebian"),
-                    (["192.168.11.245"], "MasterUbuntu"),
-                ]
-                for keys, target_name in KNOWN_NODE_MAPPINGS:
-                    if any(k in self.url or k in gpu_str for k in keys):
-                        clean = target_name
-                        break
+                gpu_name = str(self.specs.get("gpu_name", "")).strip()
+                os_name = str(self.specs.get("os", "")).strip()
+                if gpu_name:
+                    clean_gpu = gpu_name.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
+                    clean = f"Worker ({clean_gpu})"
+                elif os_name:
+                    clean = f"Worker ({os_name})"
+                else:
+                    clean = f"Worker ({clean[:6]})"
 
         if self.specs.get("gpu"):
             gpu_name = self.specs.get("gpu_name", "GPU")

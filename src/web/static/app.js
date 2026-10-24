@@ -2547,23 +2547,16 @@ function renderWorkerNodes(nodesData) {
     const isHexContainerId = /^[0-9a-f]{12}$/i.test(cleanId);
 
     if (isHexContainerId || cleanId.length === 12) {
-      if (nodeIp === '192.168.11.200' || (specs.gpu_name && specs.gpu_name.includes('3090'))) {
-        resolvedHostname = 'OMEN2022';
-      } else if (nodeIp === '192.168.11.207' || (specs.gpu_name && (specs.gpu_name.includes('1060') || specs.gpu_name.includes('1080')))) {
-        resolvedHostname = 'OMEN2017';
-      } else if (nodeIp === '192.168.11.248') {
-        resolvedHostname = 'MasterDebian';
-      } else if (nodeIp === '192.168.11.245') {
-        resolvedHostname = 'MasterUbuntu';
+      if (specs.gpu_name) {
+        const cleanGpu = String(specs.gpu_name).replace(/NVIDIA (GeForce )?/i, '').trim();
+        resolvedHostname = `Worker (${cleanGpu})`;
+      } else if (specs.os) {
+        resolvedHostname = `Worker (${specs.os})`;
+      } else {
+        resolvedHostname = `Worker (${cleanId.substring(0, 6)})`;
       }
-    } else if (cleanId.toUpperCase() === 'MASTERSOMEN2022') {
-      resolvedHostname = 'OMEN2022';
-    } else if (cleanId.toUpperCase() === 'MASTEROMEN2017') {
-      resolvedHostname = 'OMEN2017';
-    } else if (cleanId.toUpperCase() === 'MASTERDEBIAN') {
-      resolvedHostname = 'MasterDebian';
-    } else if (cleanId.toUpperCase() === 'MASTERUBUNTU') {
-      resolvedHostname = 'MasterUbuntu';
+    } else if (cleanId) {
+      resolvedHostname = cleanId;
     }
 
     const isVolunteer = Boolean(node.is_volunteer || (node.engines || []).some(e => e.is_volunteer) || cleanId.startsWith('volunteer_') || (node.url && node.url.startsWith('ws://')));
@@ -2908,14 +2901,7 @@ window.switchMetricsNode = function(nodeKey) {
   // タイトル表示の更新
   const cpuTitle = document.getElementById("metrics-cpu-title");
   const memTitle = document.getElementById("metrics-mem-title");
-  const nodeNames = {
-    'master': 'MasterDebian (i7-7700K)',
-    'masterdebian': 'MasterDebian (i7-7700K)',
-    'masterubuntu': 'MasterUbuntu (8 Core)',
-    'omen2022': 'OMEN2022 (RTX 3090)',
-    'omen2017': 'OMEN2017 (GTX 1060)'
-  };
-  const targetName = nodeNames[nodeKey] || nodeKey;
+  const targetName = nodeKey === 'master' ? 'Primary Node (Master)' : (window._workerNodeLabels?.[nodeKey] || nodeKey);
   if (cpuTitle) cpuTitle.textContent = `🔥 ${targetName} CPU使用率推移 (%)`;
   if (memTitle) memTitle.textContent = `💾 ${targetName} 実質メモリ / VRAM推移`;
 
@@ -3533,15 +3519,9 @@ function formatSmartWorker(rawLabel, provider) {
     const parts = str.split(" / ");
     return { machine: parts[0].trim(), engine: parts[1].trim() };
   }
-  let machine = "MasterDebian";
-  if (str.includes("2022") || str.includes("192.168.11.200")) {
-    machine = "OMEN2022";
-  } else if (str.includes("2017") || str.includes("192.168.11.207") || str.includes("192.168.11.201")) {
-    machine = "OMEN2017";
-  } else if (str.toLowerCase().includes("ubuntu") || str.includes("192.168.11.245")) {
-    machine = "MasterUbuntu";
-  } else if (str.toLowerCase().includes("debian") || str.toLowerCase().includes("master") || str.includes("192.168.11.248") || str.includes("127.0.0.1")) {
-    machine = "MasterDebian";
+  let machine = str || "Primary Node";
+  if (str.includes("127.0.0.1") || str.toLowerCase().includes("master") || str.toLowerCase().includes("local")) {
+    machine = "Primary Node";
   }
 
   let engine = (provider || "").toUpperCase();
@@ -5696,17 +5676,11 @@ async function syncWorkerLogNodes() {
     if (data.success && Array.isArray(data.workers)) {
       _workerLogNodesSynced = true;
       const existing = new Set(Array.from(selNode.options).map(o => o.value));
-      const nodeLabels = {
-        "worker_MASTERSOMEN2022": "OMEN2022 (RTX 3090)",
-        "worker_MASTEROMEN2017": "OMEN2017 (GTX 1080 Ti)",
-        "worker_MasterDebian": "MasterDebian (CPU)",
-        "worker_MasterUbuntu": "MasterUbuntu (8 Core)",
-      };
       for (const w of data.workers) {
         if (w.node_id && !existing.has(w.node_id)) {
           const opt = document.createElement("option");
           opt.value = w.node_id;
-          opt.textContent = nodeLabels[w.node_id] || w.node_id.replace(/^worker_/, "");
+          opt.textContent = w.label || w.hostname || w.node_id.replace(/^worker_/, "");
           selNode.appendChild(opt);
           existing.add(w.node_id);
         }

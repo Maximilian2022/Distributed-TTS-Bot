@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 DOCKER_SOCKET_PATH = "/var/run/docker.sock"
 
-# 現在のホストIP解決 (Debian昇格フェイルオーバー時にも耐性を持つ動的解決)
-_CURRENT_NODE = os.getenv("TTSBOT_NODE", "ubuntu").lower()
-LOCAL_HOST_IP = os.getenv("LOCAL_HOST_IP", "192.168.11.248" if "debian" in _CURRENT_NODE else "192.168.11.245")
+# 現在のホストIP解決 (未指定時は 127.0.0.1)
+_CURRENT_NODE = os.getenv("TTSBOT_NODE", "master").lower()
+LOCAL_HOST_IP = os.getenv("LOCAL_HOST_IP", "127.0.0.1")
 
 # 対象ローカルエンジン定義
 LOCAL_ENGINES: Dict[str, Dict[str, Any]] = {

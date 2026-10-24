@@ -5897,7 +5897,57 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - `submitBotTokenForm`, `toggleBotSlot`, `deleteBotSlot` において、`res.text()` 経由で JSON パースを行い、成否判定を `(data.status === "ok" || data.success)` に柔軟化。
    - `loadBotSlots` において、プロパティの安全フォールバック参照を実装。
 
+### 3. 検証と本番反映
+- サンドボックス検証 (`test_bot_pool_api.py`) にて全APIが完全動作（`status: ok` & `success: true`）することを確認。
+- 本番瞬時再起動 (`docker compose restart app`) により反映。全5台Bot健全稼働を確認。
 
+---
 
+## [2026-10-24 10:45] プロジェクト全体の汎用OSS化・旧開発環境固有情報の徹底クリーンアップ
 
+### 1. 課題と背景
+- 新規OSSプロジェクト（`ttsbot-oss`）として公開・運用するにあたり、旧個人開発環境の固有情報（固定IP `192.168.11.x`、個人所有PC名 `OMEN2022/OMEN2017/MasterUbuntu/MasterDebian`、個人ドメイン `ttsbot.kenko.land`、特定サブネット決め打ち）がコードベース各所に残存していた。
+- 誰でも自前環境（ローカル、自前サーバー、クラウド等）でそのままセットアップ・運用できるよう、プロジェクト全体を点検・汎用化を実施。
+
+### 2. 実施した修正
+1. **Worker リモートアクセス管理 (`WorkerAccess/`)**:
+   - `WorkerAccess/README.md`: 環境依存IPや特定ドメインを撤廃し、汎用プレースホルダー（`<WORKER_IP>`, `<USER>`）によるリモートアクセスガイド・鍵生成マニュアルへ刷新。
+   - `WorkerAccess/setup-windows-ssh.ps1` & `src/web/static/setup-windows-ssh.ps1`: 管理者公開鍵の引数・対話入力化（`param([string]$PublicKeyParam = "")`）および、`192.168.11.*` 固定サブネット依存を排除し、プライベートIP全般（`192.168.*`, `10.*`, `172.*`）の自動検出に対応。
+2. **Worker 起動ツール & ドキュメント (`worker/`, `docs/`)**:
+   - `worker/run_volunteer.bat` & `worker/run_volunteer.sh`: `SERVER_URL` の旧ドメインハードコードを撤廃し、引数・環境変数・対話入力に対応。
+   - `worker/README.md`: ワンクリック起動ツールの詳細手順を追記。
+   - `docs/DEBIAN_WORKER_SETUP.md`: `192.168.11.245:8088` や `root@192.168.11.248` 等の旧環境記述を汎用プレースホルダー（`http://<MASTER_HOST>:<PORT>`, `<USER>@<WORKER_IP>`）に全面置換。
+3. **設定ファイル (`config.yaml`)**:
+   - `192.168.11.245/248/200` などの固定IPを `127.0.0.1` およびコメント付きサンプルURLへ変更。
+4. **Python バックエンドコード**:
+   - `src/cogs/commands.py` (全11箇所) & `src/cogs/vc_handler.py` (全2箇所): `"https://ttsbot.kenko.land"` のハードコードフォールバックを `self.config.web_dashboard_url or "http://localhost:8080"` に統一。
+   - `src/web/server.py`:
+     - CSRF 防御の `allowed_hosts` を固定値から動的抽出（`localhost`, `127.0.0.1`, `request.host`, `web_dashboard_url`）に変更。
+     - ノード名解決ロジック（Line 2831〜, Line 2971〜）において、固定IP・旧PC名の決め打ちを全廃し、GPU名（`Worker (RTX 3090)` 等）やOS名からのスペックベース動的解決に刷新。
+     - メトリクス履歴キー（Line 3003〜）を固定名からノード名・ノードIDに基づく安全な識別子動的生成に変更。
+   - `src/tts/node_pool.py`: `KNOWN_NODE_MAPPINGS` の固定IP決め打ちをスペックベース動的解決に刷新。
+   - `src/resource_manager.py`: `LOCAL_HOST_IP` デフォルトを `127.0.0.1` に変更。
+   - `src/utils/worker_log_collector.py`: `_known_workers` の初期固定IP辞書を空辞書 `{}` に変更し、完全動的学習化。
+   - `src/utils/latency_tracker.py`: マシン名推定の固定IP・旧PC名判定を汎用動的解決に改善。
+   - `scripts/migrate_from_prod.py`: `web_base_url` を環境変数からの動的取得に汎用化。
+5. **Web フロントエンド (HTML / JS / スクリプト)**:
+   - `src/web/templates/index.html`:
+     - 外部公開URLの placeholder を `http://192.168.11.xxx:8080` から `http://localhost:8080` に変更。
+     - メトリクスタブの固定PC名タブ（MasterDebian, OMEN等）を「🏢 Primary Node (Master)」デフォルトおよび動的コンテナ化。
+     - 運用案内文の主系/副系固定IP表示を削除。
+     - ログビューアの `<select>` 内の固定ノード option を汎用プレースホルダーに変更。
+   - `src/web/static/app.js`:
+     - ノード名解決、メトリクスノード名表示、ログノード一覧同期における固定PC名辞書を動的解決へ移行。
+     - `parseEngineLabel` の固定PC名・IP判定を汎用化。
+   - `src/web/static/setup-worker.sh` & `setup-worker.ps1`:
+     - デフォルトの `MASTER_URL` を `http://localhost:8080` に汎用化。
+     - LAN IP 検出を `192.168.11.0/24` 固定サブネット最優先から、物理NIC優先および全プライベートIP（`192.168.*`, `10.*`, `172.*`）対応の汎用ロジックへ改善。
+6. **運用スクリプト (`scripts/`)**:
+   - `scripts/check_workers.sh`: コマンドライン引数および環境変数 `TTSBOT_WORKER_NODES` をサポート。
+   - `scripts/ha_watchdog.sh`, `scripts/sync_db.sh`, `scripts/preempt_guard.sh`: 環境変数 `TTSBOT_PRIMARY_HEALTH_URL` / `TTSBOT_STANDBY_IP` でオーバーライド可能に改善。
+
+### 3. 検証と本番反映
+- サンドボックス環境にて全改修 Python ファイルの AST 構文チェックおよび `config.yaml` のロード検証を実行し完全合格。
+- 本番コンテナ瞬断再起動 (`docker compose restart app`) により反映。
+- `/health` エンドポイントにて `status: "ok"`, `bot.is_ready: true`, 全9ノード健全接続を確認。
 

@@ -9,6 +9,10 @@
 #   - 厳格なアクセス権限 (ACL) の自動設定 (Bad ownership or permissions エラー防止)
 # ==============================================================================
 
+param(
+    [string]$PublicKeyParam = ""
+)
+
 # 1. 管理者権限チェック
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
@@ -21,8 +25,21 @@ Write-Host "====================================================================
 Write-Host "   🚀 TTSBot Worker (Windows) OpenSSH サーバー自動セットアップ" -ForegroundColor Cyan
 Write-Host "==============================================================================" -ForegroundColor Cyan
 
-# 登録する公開鍵 (OpenSSH 形式 - Linux 側と共通)
-$PublicKey = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDokomo/DAu+9g3gB+zIEinh7ew4T9mWUMi6RB5NhLbflPNqPlCcXXXurqRCJGdcd15JGzPafPSKanW/cKrl3jzIoslcJ4DcnVVbpEhBjbDS7AcB37tn0/La3VmbJQGlRryb5u07HAuYY5HbWgdNFozLagLPlcYGi7P1k3HT0KOVlq2SznmXnnEwgvgjgV/Tm9rMHQwqQdghHlYUaNxswcRSnN/1onppVoe3t7t4xVgdDlwIaTIwZX2dG+gwYtbv1PVB8BKvRsOeCvartKevlr7kkFItbD3oOmgyHU3uRpNSxre8u3KwrSazIKyQmBQRYxhgM536M7u5OGrG1Mvtm4Z rsa-key-20210606"
+# 登録する公開鍵 (引数指定を最優先、なければ対話入力またはデフォルト)
+$PublicKey = $PublicKeyParam.Trim()
+if ([string]::IsNullOrWhiteSpace($PublicKey)) {
+    if (Test-Path "id_rsa.pub") {
+        $PublicKey = (Get-Content "id_rsa.pub" -Raw).Trim()
+    }
+}
+if ([string]::IsNullOrWhiteSpace($PublicKey)) {
+    Write-Host "登録する SSH 公開鍵 (OpenSSH 形式: ssh-rsa AAAAB3NzaC1...) を入力してください:" -ForegroundColor Yellow
+    $PublicKey = (Read-Host "Public Key").Trim()
+}
+if ([string]::IsNullOrWhiteSpace($PublicKey)) {
+    Write-Host "❌ エラー: 公開鍵が入力されませんでした。セットアップを中止します。" -ForegroundColor Red
+    exit 1
+}
 
 # 2. OpenSSH Server 機能のインストール確認 & 追加
 Write-Host "`n📦 [1/5] OpenSSH Server 機能を確認中..." -ForegroundColor Blue
@@ -113,7 +130,12 @@ Restart-Service sshd
 # 7. 接続情報の表示
 $ComputerName = $env:COMPUTERNAME
 $CurrentUser = [Environment]::UserName
-$LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like "192.168.11.*" } | Select-Object -ExpandProperty IPAddress -First 1)
+$LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+    ($_.IPAddress -like "192.168.*" -or $_.IPAddress -like "10.*" -or $_.IPAddress -like "172.*") -and
+    $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and
+    $_.InterfaceAlias -notlike "*VMware*" -and $_.InterfaceAlias -notlike "*VirtualBox*" -and
+    $_.InterfaceAlias -notlike "*WSL*" -and $_.InterfaceAlias -notlike "*vEthernet*"
+} | Select-Object -ExpandProperty IPAddress -First 1)
 if (-not $LocalIP) {
     $LocalIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } | Select-Object -ExpandProperty IPAddress -First 1)
 }

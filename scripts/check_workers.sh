@@ -17,13 +17,18 @@ echo -e "${BOLD}${CYAN}======================================================${R
 echo -e "${BOLD}${CYAN}  TTSBot Compute Worker 診断 & ログビューア${RESET}"
 echo -e "${BOLD}${CYAN}======================================================${RESET}"
 
-# 既知のワーカーノード一覧 (IP:PORT:LABEL)
-NODES=(
-  "192.168.11.245:50030:MasterUbuntu (Linux)"
-  "192.168.11.248:50030:MasterDebian (Linux)"
-  "192.168.11.200:50030:MASTERSOMEN2022 (Windows/GPU)"
-  "192.168.11.207:50030:MASTEROMEN2017 (Windows/GPU)"
-)
+# 検査対象ノード一覧 (引数または環境変数 TTSBOT_WORKER_NODES から指定可能: IP:PORT:LABEL)
+NODES=()
+if [ $# -gt 0 ]; then
+  NODES=("$@")
+elif [ -n "${TTSBOT_WORKER_NODES:-}" ]; then
+  IFS="," read -ra NODES <<< "$TTSBOT_WORKER_NODES"
+else
+  # デフォルトのサンプルノード
+  NODES=(
+    "127.0.0.1:50030:Local Worker (Docker)"
+  )
+fi
 
 for item in "${NODES[@]}"; do
   IFS=":" read -r IP PORT LABEL <<< "$item"

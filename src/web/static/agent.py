@@ -69,11 +69,11 @@ _buf_handler = BufferLogHandler()
 _buf_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s]: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(_buf_handler)
 
-# Multi-Master URL候補リスト (カンマ区切り対応。未指定時は Ubuntu を第1候補、Debian を第2候補として自動フォールバック)
-_raw_master_urls = os.getenv("MASTER_URLS", os.getenv("MASTER_URL", "http://192.168.11.245:8088,http://192.168.11.248:8088"))
+# Multi-Master URL候補リスト (カンマ区切り対応。未指定時は localhost:8080)
+_raw_master_urls = os.getenv("MASTER_URLS", os.getenv("MASTER_URL", "http://localhost:8080"))
 MASTER_CANDIDATE_URLS: List[str] = [u.strip().rstrip("/") for u in _raw_master_urls.split(",") if u.strip()]
 if not MASTER_CANDIDATE_URLS:
-    MASTER_CANDIDATE_URLS = ["http://192.168.11.245:8088"]
+    MASTER_CANDIDATE_URLS = ["http://localhost:8080"]
 _current_master_idx: int = 0
 
 def get_master_url() -> str:

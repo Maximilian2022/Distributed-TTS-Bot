@@ -126,7 +126,7 @@ def main():
         "azure_speech_region": env_vars.get("AZURE_SPEECH_REGION", "japaneast"),
         "google_api_key": env_vars.get("GOOGLE_API_KEY", ""),
         "worker_shared_secret": env_vars.get("WORKER_SHARED_SECRET", ""),
-        "web_base_url": "https://ttsbot.kenko.land"
+        "web_base_url": env_vars.get("WEB_BASE_URL", env_vars.get("WEB_DASHBOARD_URL", "http://localhost:8080"))
     }
     registered_creds = 0
     for k, v in creds.items():

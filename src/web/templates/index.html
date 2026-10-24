@@ -810,7 +810,7 @@
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
                   <div>
                     <label class="form-label" style="font-size:12px;">外部公開ベースURL (WEB_BASE_URL)</label>
-                    <input type="text" id="cred-web-base-url" class="form-input" placeholder="https://tts.example.com または http://192.168.11.xxx:8080">
+                    <input type="text" id="cred-web-base-url" class="form-input" placeholder="https://tts.example.com または http://localhost:8080">
                   </div>
                   <div>
                     <label class="form-label" style="font-size:12px;">新管理者パスワード (変更時のみ入力)</label>
@@ -1050,19 +1050,10 @@
                   </div>
                 </div>
 
-                <!-- ノード選択タブ (MasterDebian / MasterUbuntu / OMEN2022 / OMEN2017) -->
-                <div style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:8px;flex-wrap:wrap;">
+                <!-- ノード選択タブ -->
+                <div id="metrics-nodes-tabs" style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:8px;flex-wrap:wrap;">
                   <button id="metrics-tab-master" class="btn btn-sm metrics-node-tab active" onclick="switchMetricsNode('master')" style="background:#5865f2;color:white;font-weight:600;padding:4px 12px;border-radius:6px;font-size:11px;border:none;cursor:pointer;">
-                    🏢 MasterDebian (i7-7700K)
-                  </button>
-                  <button id="metrics-tab-masterubuntu" class="btn btn-sm metrics-node-tab btn-secondary" onclick="switchMetricsNode('masterubuntu')" style="padding:4px 12px;border-radius:6px;font-size:11px;cursor:pointer;">
-                    🐧 MasterUbuntu (8 Core)
-                  </button>
-                  <button id="metrics-tab-omen2022" class="btn btn-sm metrics-node-tab btn-secondary" onclick="switchMetricsNode('omen2022')" style="padding:4px 12px;border-radius:6px;font-size:11px;cursor:pointer;">
-                    🎮 OMEN2022 (RTX 3090)
-                  </button>
-                  <button id="metrics-tab-omen2017" class="btn btn-sm metrics-node-tab btn-secondary" onclick="switchMetricsNode('omen2017')" style="padding:4px 12px;border-radius:6px;font-size:11px;cursor:pointer;">
-                    💻 OMEN2017 (GTX 1060)
+                    🏢 Primary Node (Master)
                   </button>
                 </div>
 
@@ -1162,7 +1153,7 @@
                   <div>
                     <span>💡 外部ワーカーの新規展開手順・ワンライナーコマンドは </span>
                     <strong style="color:var(--text-normal);">WorkerAccess/README.md</strong>
-                    <span> に集約されています（主系: <code style="color:#50e6ff;">http://192.168.11.245:8088</code> / 副系: <code style="color:#50e6ff;">http://192.168.11.248:8088</code>）。</span>
+                    <span> に集約されています。</span>
                   </div>
                   <span class="badge" style="background:rgba(255,255,255,0.08);color:#eee;font-size:10px;padding:2px 6px;">Auto-Managed</span>
                 </div>
@@ -1631,10 +1622,7 @@
                       <span>🖥️</span> <span>分散ワーカーノード リアルタイムログ</span>
                     </h3>
                     <select id="worker-log-node-select" class="form-input" style="padding:4px 10px;font-size:12px;width:auto;" onchange="onWorkerLogNodeChanged()">
-                      <option value="worker_MASTERSOMEN2022">OMEN2022 (RTX 3090)</option>
-                      <option value="worker_MASTEROMEN2017">OMEN2017 (GTX 1080 Ti)</option>
-                      <option value="worker_MasterDebian">MasterDebian (CPU)</option>
-                      <option value="worker_MasterUbuntu">MasterUbuntu (8 Core)</option>
+                      <option value="">-- ワーカーノードを選択 --</option>
                     </select>
                     <div style="display:flex;gap:4px;background:rgba(0,0,0,0.3);padding:2px;border-radius:6px;" id="worker-log-target-tabs">
                       <button type="button" class="btn btn-sm btn-primary" onclick="switchWorkerLogTarget('agent')" id="wlog-tab-agent" style="padding:3px 10px;font-size:11px;">Agent ログ</button>

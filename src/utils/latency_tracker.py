@@ -169,17 +169,9 @@ def parse_smart_worker_label(raw_label: str, provider: str = "") -> tuple[str, s
         return (parts[0].strip(), parts[1].strip().upper())
 
     # マシン名の推定
-    machine = "MasterDebian (i7-7700K)"
-    if "2022" in raw_clean or "192.168.11.200" in raw_clean:
-        machine = "OMEN2022 (RTX 3090)"
-    elif "2017" in raw_clean or "192.168.11.207" in raw_clean or "192.168.11.201" in raw_clean:
-        machine = "OMEN2017 (GTX 1080 Ti)"
-    elif "ubuntu" in raw_clean.lower() or "192.168.11.245" in raw_clean:
-        machine = "MasterUbuntu (8 Core)"
-    elif "debian" in raw_clean.lower() or "192.168.11.248" in raw_clean:
-        machine = "MasterDebian (i7-7700K)"
-    elif "local" in raw_clean.lower() or "127.0.0.1" in raw_clean:
-        machine = "Master (CPU)"
+    machine = raw_clean or "Primary Node"
+    if "local" in raw_clean.lower() or "127.0.0.1" in raw_clean or "master" in raw_clean.lower():
+        machine = "Primary Node"
 
     # エンジン名の推定
     engine = (provider or "").upper()

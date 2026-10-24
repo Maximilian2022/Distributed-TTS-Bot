@@ -1,6 +1,6 @@
 """
 Worker ログ自動収集・集約マネージャー (WorkerLogCollector)
-- 各分散ワーカー (OMEN2022, OMEN2017, MasterDebian) の agent.py (ポート 50030) から
+- 各分散ワーカーの agent.py (ポート 50030) から
   Agentログおよび各TTSエンジンコンテナログをHTTP経由で定期自動収集
 - Master側の /app/logs/workers/<node_id>/ 配下にファイルとして保存・更新
 - WebUI API および AI・管理者による即時調査（view_file / grep / tail）を完全サポート
@@ -34,13 +34,8 @@ class WorkerLogCollector:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._session: Optional[aiohttp.ClientSession] = None
-        # 登録ワーカーの既知IPリスト (node_id -> ip)
-        self._known_workers: Dict[str, str] = {
-            "worker_MASTERSOMEN2022": "192.168.11.200",
-            "worker_MASTEROMEN2017": "192.168.11.207",
-            "worker_MasterDebian": "192.168.11.248",
-            "worker_MasterUbuntu": "192.168.11.245",
-        }
+        # 登録ワーカーのIPマップ (node_id -> ip, register_worker で動的学習)
+        self._known_workers: Dict[str, str] = {}
         os.makedirs(LOG_DIR_BASE, exist_ok=True)
 
     def register_worker(self, node_id: str, ip: str) -> None:

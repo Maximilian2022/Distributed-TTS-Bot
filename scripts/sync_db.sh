@@ -10,7 +10,7 @@ set -euo pipefail
 # ==============================================================================
 
 MODE="${1:-push}"
-DEBIAN_IP="192.168.11.248"
+DEBIAN_IP="${TTSBOT_STANDBY_IP:-192.168.11.248}"
 LOCAL_DATA="/var/lib/docker/volumes/bot_data/_data"
 REMOTE_DATA="/var/lib/docker/volumes/bot_data/_data"
 TEMP_BACKUP="/tmp/bot_sync_atomic.db"

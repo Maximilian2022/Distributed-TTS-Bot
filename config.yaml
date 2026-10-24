@@ -42,55 +42,55 @@ tts:
     endpoint: "asia-northeast1-texttospeech.googleapis.com"
     timeout_seconds: 5.0
   voicevox:
-    base_url: "http://192.168.11.245:50021"
+    base_url: "http://127.0.0.1:50021"
     timeout_seconds: 10.0
     default_fallback_style_id: 3 # ずんだもん (ノーマル)
     nodes:
       - id: "local_master"
-        url: "http://192.168.11.245:50021"
+        url: "http://127.0.0.1:50021"
         priority: 2          # 優先度 (1=GPU, 2=通常CPU, 3=予備)
-        max_concurrent: 1    # 共用マシン配慮 (同時実行上限)
-        enabled: false       # 完全Worker分離に伴い、worker_MasterUbuntu から動的登録されるため無効化
-      - id: "debian_worker"
-        url: "http://192.168.11.248:50021" # DebianサーバーのIPとポート
+        max_concurrent: 1    # 同時実行上限
+        enabled: false       # 完全Worker分離に伴い、Worker Agent から動的登録されるため初期値は無効
+      - id: "worker_node_1"
+        url: "http://192.168.1.100:50021" # 外部WorkerサーバーのIPとポート例
         priority: 2
         max_concurrent: 1
-        enabled: false       # Worker Agent から動的登録されるため静的定義は無効
-      - id: "win_gpu_1"
-        url: "http://192.168.11.200:50021" # OMEN PC (GPU)
+        enabled: false       # Worker Agent から動的登録されるため初期値は無効
+      - id: "gpu_worker_1"
+        url: "http://192.168.1.200:50021" # GPU Worker PC のIPとポート例
         priority: 1          # GPU最優先
         max_concurrent: 2
-        enabled: false       # Worker Agent から動的登録されるため静的定義は無効
+        enabled: false       # Worker Agent から動的登録されるため初期値は無効
   sharevox:
-    base_url: "http://192.168.11.245:50025"
+    base_url: "http://127.0.0.1:50025"
     timeout_seconds: 10.0
     nodes:
       - id: "local_master"
-        url: "http://192.168.11.245:50025"
+        url: "http://127.0.0.1:50025"
         priority: 2
         max_concurrent: 1
-        enabled: false       # 完全Worker分離に伴い、worker_MasterUbuntu から動的登録されるため無効化
-      - id: "debian_worker"
-        url: "http://192.168.11.248:50025"
+        enabled: false       # Worker Agent から動的登録されるため初期値は無効
+      - id: "worker_node_1"
+        url: "http://192.168.1.100:50025"
         priority: 2
         max_concurrent: 1
         enabled: false
   coeiroink:
-    base_url: "http://192.168.11.245:50031"
+    base_url: "http://127.0.0.1:50031"
     timeout_seconds: 25.0
     nodes:
       - id: "local_master"
-        url: "http://192.168.11.245:50031"
+        url: "http://127.0.0.1:50031"
         priority: 2
         max_concurrent: 1
-        enabled: false       # 完全Worker分離に伴い、worker_MasterUbuntu から動的登録されるため無効化
-      - id: "debian_worker"
+        enabled: false       # Worker Agent から動的登録されるため初期値は無効
+      - id: "worker_node_1"
         url: "http://192.168.1.100:50031"
         priority: 2
         max_concurrent: 1
         enabled: false
-      - id: "win_gpu_1"
-        url: "http://192.168.1.101:50031"
+      - id: "gpu_worker_1"
+        url: "http://192.168.1.200:50031"
         priority: 1
         max_concurrent: 2
         enabled: false

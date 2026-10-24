@@ -351,7 +351,19 @@ class WebServer:
         if is_wan and request.method in ("POST", "PUT", "DELETE") and path.startswith("/api/") and not path.startswith("/api/worker/"):
             origin = request.headers.get("Origin") or ""
             referer = request.headers.get("Referer") or ""
-            allowed_hosts = ("ttsbot.kenko.land", "localhost", "127.0.0.1")
+            allowed_hosts = {"localhost", "127.0.0.1"}
+            req_host = (request.host.split(":")[0] if request.host else "").lower()
+            if req_host:
+                allowed_hosts.add(req_host)
+            dash_url = getattr(self.config, "web_dashboard_url", "")
+            if dash_url:
+                try:
+                    from urllib.parse import urlparse
+                    d_host = urlparse(dash_url).hostname
+                    if d_host:
+                        allowed_hosts.add(d_host.lower())
+                except Exception:
+                    pass
 
             valid_csrf = False
             for check_url in (origin, referer):
@@ -359,7 +371,7 @@ class WebServer:
                     try:
                         from urllib.parse import urlparse
                         p_host = urlparse(check_url).hostname
-                        if p_host and (p_host in allowed_hosts or p_host.startswith("192.168.")):
+                        if p_host and (p_host.lower() in allowed_hosts or p_host.startswith("192.168.") or p_host.startswith("10.") or p_host.startswith("172.")):
                             valid_csrf = True
                             break
                     except Exception:
@@ -2821,30 +2833,22 @@ class WebServer:
         if not node_id or not ip:
             return web.json_response({"error": "node_id and ip are required"}, status=400)
 
-        import re
-        hostname = specs.get("hostname", node_id)
-        # コンテナID (12文字Hex) の露出を防止し、物理ホスト名へ解決
+        hostname = specs.get("host_hostname") or specs.get("hostname", node_id)
+        # コンテナID (12文字Hex) の露出を防止し、物理ホスト名またはスペックベースへ解決
         clean_host = hostname
         for prefix in ("worker_", "worker-"):
             if clean_host.lower().startswith(prefix):
                 clean_host = clean_host[len(prefix):]
         if re.match(r"^[0-9a-fA-F]{12}$", clean_host):
-            if ip == "192.168.11.200" or "3090" in str(specs.get("gpu_name", "")):
-                hostname = "OMEN2022"
-            elif ip == "192.168.11.207" or "1060" in str(specs.get("gpu_name", "")) or "1080" in str(specs.get("gpu_name", "")):
-                hostname = "OMEN2017"
-            elif ip == "192.168.11.248":
-                hostname = "MasterDebian"
-            elif ip == "192.168.11.245":
-                hostname = "MasterUbuntu"
-        elif clean_host.upper() == "MASTERSOMEN2022":
-            hostname = "OMEN2022"
-        elif clean_host.upper() == "MASTEROMEN2017":
-            hostname = "OMEN2017"
-        elif clean_host.upper() == "MASTERDEBIAN":
-            hostname = "MasterDebian"
-        elif clean_host.upper() == "MASTERUBUNTU":
-            hostname = "MasterUbuntu"
+            gpu_name = str(specs.get("gpu_name", "")).strip()
+            os_name = str(specs.get("os", "")).strip()
+            if gpu_name:
+                clean_gpu = gpu_name.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
+                hostname = f"Worker ({clean_gpu})"
+            elif os_name:
+                hostname = f"Worker ({os_name})"
+            else:
+                hostname = f"Worker ({clean_host[:6]})"
         specs["hostname"] = hostname
 
         mac = specs.get("recommended_max_concurrent", 1)
@@ -2963,22 +2967,20 @@ class WebServer:
                         # RAMDisk 常駐モデル一覧
                         if "ram_models" in data:
                             node.specs["ram_models"] = data["ram_models"]
-                        # ホスト名スマート補正
                         clean_h = node.hostname or ""
                         for prefix in ("worker_", "worker-"):
                             if clean_h.lower().startswith(prefix):
                                 clean_h = clean_h[len(prefix):]
-                        if re.match(r"^[0-9a-fA-F]{12}$", clean_h) or clean_h.upper() in ("MASTERSOMEN2022", "MASTEROMEN2017", "MASTERDEBIAN", "MASTERUBUNTU"):
-                            from urllib.parse import urlparse
-                            p_ip = urlparse(node.url).hostname
-                            if p_ip == "192.168.11.200" or "3090" in str(node.specs.get("gpu_name", "")):
-                                node.hostname = "OMEN2022"
-                            elif p_ip == "192.168.11.207" or "1060" in str(node.specs.get("gpu_name", "")) or "1080" in str(node.specs.get("gpu_name", "")):
-                                node.hostname = "OMEN2017"
-                            elif p_ip == "192.168.11.248":
-                                node.hostname = "MasterDebian"
-                            elif p_ip == "192.168.11.245":
-                                node.hostname = "MasterUbuntu"
+                        if re.match(r"^[0-9a-fA-F]{12}$", clean_h):
+                            gpu_name = str(node.specs.get("gpu_name", "")).strip()
+                            os_name = str(node.specs.get("os", "")).strip()
+                            if gpu_name:
+                                clean_gpu = gpu_name.replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
+                                node.hostname = f"Worker ({clean_gpu})"
+                            elif os_name:
+                                node.hostname = f"Worker ({os_name})"
+                            else:
+                                node.hostname = f"Worker ({clean_h[:6]})"
                             node.specs["hostname"] = node.hostname
 
         if not found_any:
@@ -2998,18 +3000,10 @@ class WebServer:
             host_k = ""
             if target_node:
                 h_name = (target_node.hostname or "").lower()
-                from urllib.parse import urlparse
-                n_ip = urlparse(target_node.url).hostname or ""
-                if "2022" in h_name or n_ip == "192.168.11.200":
-                    host_k = "omen2022"
-                elif "2017" in h_name or n_ip == "192.168.11.207":
-                    host_k = "omen2017"
-                elif "debian" in h_name or n_ip == "192.168.11.248":
-                    host_k = "masterdebian"
-                elif "ubuntu" in h_name or n_ip == "192.168.11.245":
-                    host_k = "masterubuntu"
-                else:
-                    host_k = re.sub(r"[^a-zA-Z0-9_-]", "", h_name)
+                host_k = re.sub(r"[^a-zA-Z0-9_-]", "_", h_name).strip("_")
+                if not host_k:
+                    clean_nid = re.sub(r"[^a-zA-Z0-9_-]", "_", str(node_id)).strip("_")
+                    host_k = f"node_{clean_nid}"
 
             if host_k:
                 if host_k not in self.workers_metrics_history:

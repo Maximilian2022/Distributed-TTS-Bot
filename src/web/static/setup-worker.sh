@@ -3,7 +3,7 @@
 # TTSBot Compute Worker (Debian/Linux) ワンライナー自動セットアップスクリプト v2
 #
 # 実行方法 (Debian側でワンライナー):
-#   curl -fsSL https://ttsbot.kenko.land/setup-worker.sh | bash
+#   curl -fsSL http://<MASTER_HOST>:8080/setup-worker.sh | bash
 #
 # 機能:
 #   - Docker / docker compose の自動インストール
@@ -23,7 +23,7 @@ C_YELLOW="\033[33m"
 C_RED="\033[31m"
 C_CYAN="\033[36m"
 
-MASTER_URL="${TTSBOT_MASTER_URL:-http://192.168.11.245:8088}"
+MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"
 MASTER_WS_URL="${TTSBOT_MASTER_WS_URL:-}"
 WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"
 WORK_DIR="${TTSBOT_WORK_DIR:-${HOME}/ttsbot-worker}"
@@ -55,7 +55,7 @@ while [ $# -gt 0 ]; do
 done
 
 # MASTER_WS_URL が渡された場合、未指定の MASTER_URL を自動補完
-if [ -n "${MASTER_WS_URL}" ] && [ "${MASTER_URL}" = "http://192.168.11.245:8088" ]; then
+if [ -n "${MASTER_WS_URL}" ] && [ "${MASTER_URL}" = "http://localhost:8080" ]; then
     DERIVED_HTTP=$(echo "${MASTER_WS_URL}" | sed -E 's|^ws://|http://|' | sed -E 's|^wss://|https://|' | sed -E 's|/api/worker/ws.*||')
     if [ -n "${DERIVED_HTTP}" ]; then
         MASTER_URL="${DERIVED_HTTP}"
@@ -245,12 +245,15 @@ echo -e "  総CPU: ${TOTAL_CPUS}コア → 割り当て: ${ALLOC_CPUS}コア / $
 echo -e "  総RAM: ${TOTAL_RAM_GB}GB → 割り当て上限: ${ALLOC_RAM_GB}GB (エンジン計: VV=${RAM_VV}G, SV=${RAM_SV}G, CI=${RAM_CI}G)"
 echo -e "  VOICEVOX イメージ: ${VOICEVOX_IMAGE}"
 
-# LAN IP アドレス検出 (192.168.11.0/24 サブネット最優先)
-LOCAL_IP=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)192\.168\.11\.\d+' | head -n 1 || true)
+# LAN IP アドレス検出 (プライベートIP・デフォルトルート物理NIC優先)
+LOCAL_IP=$(ip route get 1 2>/dev/null | awk '{print $7;exit}' || true)
 if [ -z "$LOCAL_IP" ]; then
-    LOCAL_IP=$(ip route get 1 2>/dev/null | awk '{print $7;exit}' || hostname -I 2>/dev/null | awk '{print $1}')
+    LOCAL_IP=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+)' | head -n 1 || true)
 fi
-echo -e "  LAN IP アドレス: ${C_GREEN}${LOCAL_IP}${C_RESET} (サブネット: 192.168.11.0/24 優先)"
+if [ -z "$LOCAL_IP" ]; then
+    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
+fi
+echo -e "  LAN IP アドレス: ${C_GREEN}${LOCAL_IP}${C_RESET} (自動検出)"
 
 # 3. 構成ファイルの展開
 echo -e "\n${C_BLUE}📦 [3/5] コンテナ構成ファイルを展開中...${C_RESET}"
