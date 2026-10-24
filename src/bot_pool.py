@@ -370,6 +370,16 @@ class BotPoolManager:
             })
         return status_list
 
+    def get_active_bot_count(self) -> int:
+        """現在稼働中 (is_ready) のBot台数を取得 (最低1台、最大10台)"""
+        ready_count = sum(1 for b in self.bots.values() if b.is_ready())
+        if ready_count > 0:
+            return max(1, min(10, ready_count))
+        if self.bots:
+            return max(1, min(10, len(self.bots)))
+        tokens = self.config.get_discord_tokens()
+        return max(1, min(10, len(tokens) if tokens else 1))
+
     def is_bot_busy(self, bot: commands.Bot) -> bool:
         """
         BotがいずれかのサーバーのVCに接続中（または接続処理中）かどうかを判定。

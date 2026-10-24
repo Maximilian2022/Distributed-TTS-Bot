@@ -5972,4 +5972,30 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - ワーカー側ローカルでの `docker ps` / `docker logs` による確認、および Master WebUI（「ℹ️ システム状況」タブ）を通じた自律型ハートビート監視手順に刷新。
      - Master からワーカーへのインバウンド接続（SSH等）は不要で安全に運用できる旨を明記。
 
+---
+
+## 2026-10-24 11:00: 自動参加チャンネル・ペアリング設定の稼働Bot数連動・動的スケーリング化
+
+### 1. 課題と背景
+- Botプール管理により最大10台までのBotトークン拡張・動的起動に対応したが、自動参加チャンネル・ペアリング設定のUIやバックエンド処理において上限「最大5組」がハードコードされていた。
+- ユーザー要望に基づき、現在稼働しているBotの数（1〜10台）に合わせて、ペアリングスロット数およびUI表示（ラベル、バッジ、説明文）が動的にスケールするように改修。
+
+### 2. 実施した修正
+1. **Botプール管理 (`src/bot_pool.py`)**:
+   - `get_active_bot_count()` メソッドを追加し、現在稼働中（`is_ready`）のBot台数を動的に算出（1〜10）。
+2. **バックエンド API (`src/web/server.py`)**:
+   - `GET /api/config`: レスポンスに `max_auto_join_pairs` および `active_bot_count` を追加。
+   - `POST /api/config`: `auto_join_pairs` のスライス上限（固定5件）を、稼働中Bot数（最大10件）へ動的拡張。
+3. **データベース層 (`src/database.py`)**:
+   - `update_guild_settings`: `auto_join_pairs` の上限（`[:5]`）を最大10件（`[:10]`）へ拡張。
+4. **Web フロントエンド (`src/web/templates/index.html` & `src/web/static/app.js`)**:
+   - `index.html`: ペアリング設定の見出し（`#auto-join-max-label`）、バッジ（`#auto-join-max-badge`）、説明文（`#auto-join-bots-desc`）にIDを付与。
+   - `app.js`:
+     - `updateAutoJoinPairsHeader(count)` を新設し、稼働Bot数に合わせて「最大N組」「最大N VC同時」「1〜N号機」を動的に書き換え。
+     - `renderAutoJoinPairs(pairs, maxPairs)`: ループ回数を固定5回から `maxPairs`（稼働Bot数）へ動的化。
+     - `loadBotConfig`: APIレスポンスの `max_auto_join_pairs` を読み込んで描画。
+     - `saveBotConfig`: DOMに存在する行数（稼働Bot数分）を動的に走査して保存。
+     - `renderBotPool`: ボットプール一覧の定期ポーリング時にも、稼働Bot数（`readyCount`）の変化を即座にペアリング設定へ連動・再描画。
+
+
 

@@ -1990,10 +1990,25 @@ async function loadGuildRoles(guildId) {
   }
 }
 
-// --- ギルドチャンネル一覧 (VC / Text) & 自動参加ペアリング (最大5組) ---
+// --- ギルドチャンネル一覧 (VC / Text) & 自動参加ペアリング (稼働Bot数連動) ---
 
 let currentGuildChannels = { voice: [], text: [] };
 let cachedAutoJoinPairs = [];
+let currentMaxAutoJoinPairs = 5;
+
+function updateAutoJoinPairsHeader(maxPairs) {
+  const count = Math.max(1, Math.min(10, maxPairs || 5));
+  const labelEl = document.getElementById("auto-join-max-label");
+  if (labelEl) labelEl.textContent = `最大${count}組`;
+
+  const badgeEl = document.getElementById("auto-join-max-badge");
+  if (badgeEl) badgeEl.textContent = `最大${count}VC同時`;
+
+  const descEl = document.getElementById("auto-join-bots-desc");
+  if (descEl) {
+    descEl.textContent = count > 1 ? `1〜${count}号機` : `1号機`;
+  }
+}
 
 async function loadGuildChannels(guildId) {
   if (!guildId) return;
@@ -2004,25 +2019,30 @@ async function loadGuildChannels(guildId) {
     currentGuildChannels.voice = data.voice_channels || [];
     currentGuildChannels.text = data.text_channels || [];
 
-    // ペアリングUIの再描画
-    renderAutoJoinPairs(cachedAutoJoinPairs);
+    // ペアリングUIの再描画 (稼働Bot数連動)
+    renderAutoJoinPairs(cachedAutoJoinPairs, currentMaxAutoJoinPairs);
   } catch (e) {
     console.error("Failed to load guild channels:", e);
   }
 }
 
-function renderAutoJoinPairs(pairs) {
+function renderAutoJoinPairs(pairs, maxPairs) {
   const container = document.getElementById("auto-join-pairs-list");
   if (!container) return;
+
+  const count = typeof maxPairs === "number" ? Math.max(1, Math.min(10, maxPairs)) : (currentMaxAutoJoinPairs || 5);
+  currentMaxAutoJoinPairs = count;
+  updateAutoJoinPairsHeader(count);
 
   container.innerHTML = "";
   const voiceChannels = currentGuildChannels.voice || [];
   const textChannels = currentGuildChannels.text || [];
 
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < count; i++) {
     const pair = (pairs && pairs[i]) ? pairs[i] : { vc_id: "0", text_id: "0" };
     const row = document.createElement("div");
     row.className = "auto-pair-row";
+    row.dataset.index = i;
     row.style.cssText = "display:flex;align-items:center;gap:10px;background:rgba(0,0,0,0.25);padding:10px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);flex-wrap:wrap;";
 
     // ペア番号バッジ
@@ -2114,9 +2134,14 @@ async function loadBotConfig(guildId) {
     document.getElementById("cfg-dedup-sec").value = cfg.dedup_window_seconds || 5.0;
     document.getElementById("cfg-dedup-len").value = cfg.dedup_max_length || 10;
     
-    // 自動参加ペアリング (最大5組)
+    // 自動参加ペアリング (稼働Bot数連動)
+    if (typeof cfg.max_auto_join_pairs === "number") {
+      currentMaxAutoJoinPairs = cfg.max_auto_join_pairs;
+    } else if (typeof cfg.active_bot_count === "number") {
+      currentMaxAutoJoinPairs = cfg.active_bot_count;
+    }
     cachedAutoJoinPairs = cfg.auto_join_pairs || [];
-    renderAutoJoinPairs(cachedAutoJoinPairs);
+    renderAutoJoinPairs(cachedAutoJoinPairs, currentMaxAutoJoinPairs);
 
     // 読み上げ除外プレフィックス
     renderIgnorePrefixesUI(cfg.ignore_prefixes || [";", "；"]);
@@ -2244,9 +2269,11 @@ async function saveBotConfig(e) {
   const disasterVolumeVal = parseInt(document.getElementById("cfg-disaster-volume")?.value || "100");
   const disasterVolume = Math.max(0.0, Math.min(2.0, disasterVolumeVal / 100.0));
 
-  // 5組のペアリングを抽出
+  // 稼働Bot数連動のペアリングを抽出
   const pairs = [];
-  for (let i = 0; i < 5; i++) {
+  const pairRows = document.querySelectorAll(".auto-pair-row");
+  const countToExtract = pairRows.length > 0 ? pairRows.length : (currentMaxAutoJoinPairs || 5);
+  for (let i = 0; i < countToExtract; i++) {
     const vcSelect = document.querySelector(`.auto-pair-vc[data-index="${i}"]`);
     const textSelect = document.querySelector(`.auto-pair-text[data-index="${i}"]`);
     const vcId = vcSelect ? vcSelect.value : "0";
@@ -2440,6 +2467,17 @@ function renderBotPool(botPool) {
     const readyCount = botPool.filter(b => b.is_ready).length;
     countBadge.textContent = `${readyCount}/${botPool.length}台 稼働中`;
     countBadge.style.background = readyCount > 0 ? "#23a55a" : "#ed4245";
+
+    // 稼働Bot数の変化を自動参加ペア設定の上限に同期 (最低1、最大10)
+    if (readyCount > 0 && readyCount !== currentMaxAutoJoinPairs) {
+      currentMaxAutoJoinPairs = Math.max(1, Math.min(10, readyCount));
+      const autoJoinList = document.getElementById("auto-join-pairs-list");
+      if (autoJoinList && autoJoinList.children.length > 0) {
+        renderAutoJoinPairs(cachedAutoJoinPairs, currentMaxAutoJoinPairs);
+      } else {
+        updateAutoJoinPairsHeader(currentMaxAutoJoinPairs);
+      }
+    }
   }
 
   container.innerHTML = "";

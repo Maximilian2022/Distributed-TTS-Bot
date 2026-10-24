@@ -1759,7 +1759,7 @@ class Database:
             raw_pairs = kwargs["auto_join_pairs"]
             valid_pairs = []
             if isinstance(raw_pairs, list):
-                for p in raw_pairs[:5]:  # 最大5件
+                for p in raw_pairs[:10]:  # 最大10件対応 (動的Botプール上限)
                     try:
                         vc_id = int(p.get("vc_id", 0))
                         text_id = int(p.get("text_id", 0))

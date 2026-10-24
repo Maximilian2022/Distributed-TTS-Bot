@@ -1291,6 +1291,14 @@ class WebServer:
         raw_pairs = settings.get("auto_join_pairs", [])
         str_pairs = [{"vc_id": str(p["vc_id"]), "text_id": str(p["text_id"])} for p in raw_pairs]
 
+        # 稼働中のBot数を動的に取得 (最低1台、最大10台)
+        active_bots = 1
+        if self.bot_pool and hasattr(self.bot_pool, "get_active_bot_count"):
+            active_bots = self.bot_pool.get_active_bot_count()
+        elif self.bot_pool and hasattr(self.bot_pool, "bots"):
+            ready_c = sum(1 for b in self.bot_pool.bots.values() if b.is_ready())
+            active_bots = max(1, min(10, ready_c if ready_c > 0 else len(self.bot_pool.bots)))
+
         return web.json_response({
             "guild_id": str(guild.id),
             "command_prefix": settings.get("command_prefix", "!"),
@@ -1300,6 +1308,8 @@ class WebServer:
             "auto_join_vc_id": str(settings.get("auto_join_vc_id", 0)),
             "auto_join_text_channel_id": str(settings.get("auto_join_text_channel_id", 0)),
             "auto_join_pairs": str_pairs,
+            "max_auto_join_pairs": active_bots,
+            "active_bot_count": active_bots,
             "admin_role_id": str(settings.get("admin_role_id", 0)),
             "default_speaker": settings.get("default_speaker", self.config.default_speaker),
             "read_username": bool(settings.get("read_username", 0)),
@@ -1342,8 +1352,12 @@ class WebServer:
         if "auto_join_pairs" in data:
             raw_pairs = data["auto_join_pairs"]
             valid_pairs = []
+            max_limit = 10
+            if self.bot_pool and hasattr(self.bot_pool, "get_active_bot_count"):
+                max_limit = self.bot_pool.get_active_bot_count()
+            slice_limit = max(1, min(10, max_limit))
             if isinstance(raw_pairs, list):
-                for p in raw_pairs[:5]:
+                for p in raw_pairs[:slice_limit]:
                     try:
                         vc_id = int(p.get("vc_id", 0))
                         text_id = int(p.get("text_id", 0))
