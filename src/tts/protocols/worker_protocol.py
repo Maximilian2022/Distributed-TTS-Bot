@@ -29,6 +29,7 @@ class RegisterMessage:
     exclusive_guild_id: Optional[str] = None  # 特定サーバー専用枠 (Noneまたは空なら全体共有)
     client_version: str = PROTOCOL_VERSION
     specs: Dict[str, Any] = field(default_factory=dict) # CPU, GPU, OS等
+    supported_models: Dict[str, List[str]] = field(default_factory=dict) # エンジン別保有モデルUUID一覧
     type: str = "register"
 
 @dataclass
@@ -52,6 +53,7 @@ class HeartbeatMessage:
     engine_status: Dict[str, bool] = field(default_factory=dict)
     uptime_sec: float = 0.0
     timestamp: float = field(default_factory=time.time)
+    supported_models: Dict[str, List[str]] = field(default_factory=dict)
     type: str = "heartbeat"
 
 @dataclass

@@ -85,6 +85,7 @@ class VolunteerWorker:
         self.start_time = time.time()
         self.last_activity_time = time.time()
         self._bg_tasks: List[asyncio.Task] = []
+        self.supported_models: Dict[str, List[str]] = {}
 
         if self.game_priority:
             self._apply_low_process_priority()
@@ -246,6 +247,57 @@ class VolunteerWorker:
 
         return list(available)
 
+    async def collect_supported_models(self) -> Dict[str, List[str]]:
+        """各エンジンが保有しているモデル・話者UUID一覧を収集"""
+        models: Dict[str, List[str]] = {}
+        if not self.session or self.session.closed:
+            return models
+
+        # 1. COEIROINK (v1/speakers から speakerUuid 一覧を取得)
+        ci_url = self.engine_urls.get("coeiroink")
+        if ci_url:
+            try:
+                async with self.session.get(f"{ci_url}/v1/speakers", timeout=aiohttp.ClientTimeout(total=4.0)) as r:
+                    if r.status == 200:
+                        speakers = await r.json()
+                        uuids = []
+                        for spk in speakers:
+                            u = spk.get("speakerUuid")
+                            if u:
+                                uuids.append(str(u).lower())
+                        models["coeiroink"] = uuids
+                        logger.info(f"📦 [COEIROINK] 保有モデル検出: {len(uuids)} 話者 (例: {', '.join(uuids[:3])})")
+            except Exception as e:
+                logger.debug(f"COEIROINK models fetch error: {e}")
+
+        # 2. VOICEVOX (speakers から speaker_uuid 一覧を取得)
+        vv_url = self.engine_urls.get("voicevox")
+        if vv_url:
+            try:
+                async with self.session.get(f"{vv_url}/speakers", timeout=aiohttp.ClientTimeout(total=4.0)) as r:
+                    if r.status == 200:
+                        speakers = await r.json()
+                        uuids = [str(spk.get("speaker_uuid", "")).lower() for spk in speakers if spk.get("speaker_uuid")]
+                        models["voicevox"] = uuids
+                        logger.info(f"📦 [VOICEVOX] 保有話者検出: {len(uuids)} 話者")
+            except Exception as e:
+                logger.debug(f"VOICEVOX models fetch error: {e}")
+
+        # 3. SHAREVOX (speakers から speaker_uuid 一覧を取得)
+        sv_url = self.engine_urls.get("sharevox")
+        if sv_url:
+            try:
+                async with self.session.get(f"{sv_url}/speakers", timeout=aiohttp.ClientTimeout(total=4.0)) as r:
+                    if r.status == 200:
+                        speakers = await r.json()
+                        uuids = [str(spk.get("speaker_uuid", "")).lower() for spk in speakers if spk.get("speaker_uuid")]
+                        models["sharevox"] = uuids
+                        logger.info(f"📦 [SHAREVOX] 保有話者検出: {len(uuids)} 話者")
+            except Exception as e:
+                logger.debug(f"SHAREVOX models fetch error: {e}")
+
+        return models
+
     def collect_specs(self) -> Dict[str, Any]:
         """PC スペック情報を収集"""
         specs = {
@@ -390,6 +442,7 @@ class VolunteerWorker:
                 logger.info(f"✅ サーバーに接続しました: {self.server_url}")
 
                 self.supported_engines = await self.detect_local_engines()
+                self.supported_models = await self.collect_supported_models()
                 specs = self.collect_specs()
 
                 reg_payload = {
@@ -397,6 +450,7 @@ class VolunteerWorker:
                     "node_id": self.node_id,
                     "node_name": self.node_name,
                     "supported_engines": self.supported_engines,
+                    "supported_models": self.supported_models,
                     "capacity": self.capacity,
                     "priority": self.priority,
                     "exclusive_guild_id": self.exclusive_guild_id,
@@ -433,16 +487,25 @@ class VolunteerWorker:
 
     async def _heartbeat_loop(self, ws: aiohttp.ClientWebSocketResponse):
         """10 秒間隔の生存報告ループ"""
+        hb_count = 0
         while not ws.closed:
             try:
                 await asyncio.sleep(10.0)
+                hb_count += 1
+                if hb_count % 6 == 0:
+                    try:
+                        self.supported_models = await self.collect_supported_models()
+                    except Exception:
+                        pass
+
                 hb_data = {
                     "type": "heartbeat",
                     "node_id": self.node_id,
                     "active_tasks": self.active_tasks,
                     "cpu_percent": 0.0,
                     "memory_percent": 0.0,
-                    "uptime_sec": round(time.time() - self.start_time, 1)
+                    "uptime_sec": round(time.time() - self.start_time, 1),
+                    "supported_models": self.supported_models
                 }
                 await ws.send_json(hb_data)
             except asyncio.CancelledError:

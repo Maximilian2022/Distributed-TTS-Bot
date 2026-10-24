@@ -40,7 +40,8 @@ class WSWorkerNode(TTSNode):
         capacity: int = 2,
         specs: Optional[Dict[str, Any]] = None,
         priority: int = 50,
-        exclusive_guild_id: Optional[str] = None
+        exclusive_guild_id: Optional[str] = None,
+        supported_models: Optional[Dict[str, List[str]]] = None
     ):
         config = TTSNodeConfig(
             id=node_id,
@@ -54,6 +55,10 @@ class WSWorkerNode(TTSNode):
         self.ws: web.WebSocketResponse = ws
         self.supported_engines: List[str] = [e.lower() for e in supported_engines]
         self.exclusive_guild_id: Optional[str] = str(exclusive_guild_id).strip() if exclusive_guild_id else None
+        self.supported_models: Dict[str, List[str]] = {
+            str(k).lower(): [str(m).lower().strip() for m in v]
+            for k, v in (supported_models or {}).items()
+        }
         self.pending_requests: Dict[str, asyncio.Future] = {}
         self.last_heartbeat = time.time()
         self.is_healthy = True
@@ -99,7 +104,7 @@ class WSWorkerNode(TTSNode):
         return True
 
     def update_from_heartbeat(self, msg: HeartbeatMessage):
-        """ハートビート情報からスペック・負荷・死活を更新"""
+        """ハートビート情報からスペック・負荷・死活・保有モデルを更新"""
         self.last_heartbeat = time.time()
         self.is_healthy = True
         self.unhealthy_until = 0.0
@@ -109,6 +114,49 @@ class WSWorkerNode(TTSNode):
         self.specs["uptime_sec"] = msg.uptime_sec
         if msg.engine_status:
             self.specs["engine_status"] = msg.engine_status
+        if msg.supported_models:
+            self.update_supported_models(msg.supported_models)
+
+    def update_supported_models(self, models: Optional[Dict[str, List[str]]]) -> None:
+        """保有モデル・話者UUID一覧を更新"""
+        if models is not None:
+            self.supported_models = {
+                str(k).lower(): [str(m).lower().strip() for m in v]
+                for k, v in models.items()
+            }
+
+    def supports_model(self, engine: str, model_name: Optional[str]) -> bool:
+        """
+        指定されたエンジンおよびモデル（話者UUID等）をこのノードが保有しているか判定
+        - エンジン自体が非対応なら False
+        - model_name が指定されていない場合は、エンジンが対応していれば True
+        - COEIROINK 等でモデル一覧が申告されている場合は、UUIDが一致するか厳密判定
+        """
+        eng = engine.lower()
+        if eng not in self.supported_engines:
+            return False
+
+        if not model_name:
+            return True
+
+        models = self.supported_models.get(eng)
+        if models is None:
+            # モデル申告がない場合 (古いワーカーや未検出時): 後方互換のため True
+            return True
+
+        # 空リストが明示的に申告されている場合はモデルなしのため False
+        if len(models) == 0:
+            return False
+
+        req = str(model_name).lower().strip()
+        # UUID_StyleId (例: d312d0fb-d38d-434e-825d-cbcbfd105ad0_0) の場合は UUID 部分を抽出
+        uuid_part = req.split("_")[0]
+
+        for m in models:
+            if m == req or m == uuid_part:
+                return True
+
+        return False
 
     def to_dict(self) -> Dict[str, Any]:
         """WebUIステータス用辞書"""
@@ -116,6 +164,7 @@ class WSWorkerNode(TTSNode):
         d["is_volunteer"] = True
         d["connection_type"] = "websocket"
         d["supported_engines"] = self.supported_engines
+        d["supported_models"] = self.supported_models
         return d
 
     async def synthesize(

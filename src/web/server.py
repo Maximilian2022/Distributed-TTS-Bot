@@ -5320,6 +5320,7 @@ class WebServer:
                         worker_node_id = data.get("node_id", f"ws_worker_{int(time.time())}")
                         node_name = data.get("node_name", worker_node_id)
                         supported_engines = data.get("supported_engines", ["voicevox"])
+                        supported_models = data.get("supported_models", {})
                         capacity = int(data.get("capacity", 2))
                         specs = data.get("specs", {})
                         priority = int(data.get("priority", 50))
@@ -5334,7 +5335,8 @@ class WebServer:
                             capacity=capacity,
                             specs=specs,
                             priority=priority,
-                            exclusive_guild_id=exclusive_guild_id
+                            exclusive_guild_id=exclusive_guild_id,
+                            supported_models=supported_models
                         )
                         self.tts_manager.register_ws_worker_node(ws_node)
                         self.worker_ws_connections[worker_node_id] = ws
@@ -5347,7 +5349,8 @@ class WebServer:
                             "heartbeat_interval_sec": 10.0
                         })
                         scope_desc = f" (Dedicated to Guild {exclusive_guild_id})" if exclusive_guild_id else " (Global Shared)"
-                        logger.info(f"✅ [WorkerWS] Volunteer Worker successfully registered: {worker_node_id} ({node_name}){scope_desc} - Engines: {supported_engines}")
+                        models_desc = f" - Models: {list(supported_models.keys())}" if supported_models else ""
+                        logger.info(f"✅ [WorkerWS] Volunteer Worker successfully registered: {worker_node_id} ({node_name}){scope_desc} - Engines: {supported_engines}{models_desc}")
 
                     elif msg_type == "heartbeat":
                         if ws_node is not None:
@@ -5357,7 +5360,8 @@ class WebServer:
                                 cpu_percent=float(data.get("cpu_percent", 0.0)),
                                 memory_percent=float(data.get("memory_percent", 0.0)),
                                 engine_status=data.get("engine_status", {}),
-                                uptime_sec=float(data.get("uptime_sec", 0.0))
+                                uptime_sec=float(data.get("uptime_sec", 0.0)),
+                                supported_models=data.get("supported_models", {})
                             )
                             ws_node.update_from_heartbeat(hb)
                         await ws.send_json({"type": "heartbeat_ack", "server_time": time.time()})

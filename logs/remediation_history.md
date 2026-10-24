@@ -1,5 +1,27 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] COEIROINK等保有モデル差異のピンポイント・ルーティング & エンジンDL進捗プログレスバー実装
+- **ユーザーフィードバック & 課題**:
+  1. ボランティア機の参入により、PCごとの保有モデル（特にCOEIROINKのMYCOEIROINK/公式キャラ）に差異が生じるため、持っているモデルに応じて的確にリクエストを振り分けたい。
+  2. ローカルエンジン（VOICEVOX / SHAREVOX等）の自動インストーラーダウンロード時に、何％進んだか等の進捗を見えるようにしたい。
+- **抜本的改善内容**:
+  1. **ボランティア Worker 保有モデル自動収集 & 申告 (`volunteer_worker.py`)**:
+     - `collect_supported_models()` メソッドを新設。ローカル COEIROINK API (`/v1/speakers`) から `speakerUuid` 一覧を自動抽出し、VOICEVOX / SHAREVOX についても対応。
+     - WebSocket 登録（`register`）ペイロードに `supported_models` を含めてサーバーに通知。
+     - 生存報告ループ（`_heartbeat_loop`）内で 60秒に 1回モデル一覧を自動再スキャンし、ユーザーがボランティア稼働中に新規モデルを導入した場合も再起動なしでサーバーへ動的反映。
+  2. **サーバー側ピンポイント・モデルルーティング (`ws_node_adapter.py`, `server.py`, `node_pool.py`)**:
+     - `WSWorkerNode`: `supported_models` フィールドを保持し、`supports_model(engine, model_name) -> bool` メソッドを実装。要求されたキャラ・話者の UUID（`uuid_styleId` の UUID 部分）を所有しているか厳密照合。
+     - `server.py`: `api_worker_ws` で `register` および `heartbeat` 受信時に `supported_models` を受け取り、ノードアダプタに即座に反映。
+     - `node_pool.py`: `acquire_node` のノード抽出ループに `n.supports_model(self.engine_name, model_name)` によるフィルタリングを追加。ボランティア機が持っていないキャラのリクエストは候補から完全に除外され、そのキャラを保有しているクラスタノード（Master/Slave/OMEN等）にのみ割り当てられる安全なルーティングを確立。
+  3. **ダウンロード進捗モーダルダイアログ (`run_volunteer_gui.ps1`)**:
+     - `Install-EngineFromUrl` に専用のダウンロード進捗フォーム（`ProgressBar`, パーセンテージ表示, `XX MB / YY MB`, キャンセルボタン, `TopMost = $true`）を実装。
+     - `.NET WebClient.DownloadFileAsync` と `DownloadProgressChanged` イベントにより、UI をフリーズさせることなくリアルタイムに進捗バー・テキスト・ウィンドウタイトル（`[XX%] ...`）を更新。
+     - コンソール画面にも 25% 刻みでダウンロード進捗を出力し、ターミナル作業時にも進捗を可視化。
+- **検証**:
+  - `scratch/test_model_routing.py`（コンテナ内実行）により、保有モデルの一致・未保有モデルの除外・ハートビート動的更新・クラスタ通常ノード互換性の全テストをパス。
+  - Web 配信エンドポイント（`/volunteer/run_volunteer_gui.ps1`）の BOM なし UTF-8 配信と動的プレースホルダー注入を確認。
+  - 本番コンテナ `ttsbot-app-1` の健全性（healthy）およびログ（COEIROINK ルーティング）を確認。
+
 ## [2026-10-24] 各音声合成エンジンのインストール判定 & 手動DL vs 自動スクリプトインストールの選択肢ダイアログ実装
 - **ユーザーフィードバック & 課題**:
   - Windows ボランティア参加ツールにおいて、各エンジン（VOICEVOX / COEIROINK / SHAREVOX）がPCにインストールされているかどうかを判定し、未導入の場合に「インストーラーを手動でDLして自分でやるか、自動のScriptでインストールするか選択肢を出してほしい」という要求。

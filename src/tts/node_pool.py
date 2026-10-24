@@ -271,6 +271,10 @@ class TTSNode:
                     return True
         return False
 
+    def supports_model(self, engine: str, model_name: Optional[str]) -> bool:
+        """指定されたモデル（話者UUID等）をこのノードがサポートしているか"""
+        return True
+
     def mark_success(self, latency_ms: float = 0.0):
         """リクエスト成功時の状態更新"""
         self.is_healthy = True
@@ -565,11 +569,14 @@ class TTSNodePool:
 
         start = time.time()
         while time.time() - start < timeout:
-            # ギルド専用ノード (exclusive_guild_id) のフィルタリング
+            # ギルド専用ノード (exclusive_guild_id) および保有モデルのフィルタリング
             filtered_nodes = []
             target_gid_str = str(guild_id).strip() if guild_id is not None else None
             for n in self.nodes:
                 if not n.is_available:
+                    continue
+                # モデル保有判定（ボランティア機等の未保有モデルへのリクエスト送出を完全防止）
+                if not n.supports_model(self.engine_name, model_name):
                     continue
                 ex_gid = getattr(n, "exclusive_guild_id", None)
                 if ex_gid:

@@ -284,32 +284,138 @@ function Get-GitHubLatestReleaseTag([string]$repo, [string]$fallbackTag) {
     return $fallbackTag
 }
 
-function Install-EngineFromUrl([string]$engineName, [string]$downloadUrl, [string]$fileName, [System.Windows.Forms.Label]$statusLabel) {
+function Install-EngineFromUrl([string]$engineName, [string]$downloadUrl, [string]$fileName, [System.Windows.Forms.Label]$statusLabel, [System.Windows.Forms.Form]$parentForm) {
     $tempDir = [System.IO.Path]::GetTempPath()
     $destFile = Join-Path $tempDir $fileName
 
+    # ダウンロード進捗モーダルダイアログ
+    $pDlg = New-Object System.Windows.Forms.Form
+    $pDlg.Text = "$engineName のダウンロード"
+    $pDlg.Size = New-Object System.Drawing.Size(460, 200)
+    $pDlg.StartPosition = "CenterParent"
+    $pDlg.FormBorderStyle = "FixedDialog"
+    $pDlg.MaximizeBox = $false
+    $pDlg.MinimizeBox = $false
+    $pDlg.TopMost = $true
+    $pDlg.BackColor = [System.Drawing.Color]::FromArgb(47, 49, 54)
+    $pDlg.ForeColor = [System.Drawing.Color]::White
+
+    $pTitle = New-Object System.Windows.Forms.Label
+    $pTitle.Text = "$engineName 公式インストーラーをダウンロード中..."
+    $pTitle.Location = New-Object System.Drawing.Point(20, 18)
+    $pTitle.Size = New-Object System.Drawing.Size(410, 24)
+    $pTitle.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+    $pDlg.Controls.Add($pTitle)
+
+    # プログレスバー
+    $pBar = New-Object System.Windows.Forms.ProgressBar
+    $pBar.Location = New-Object System.Drawing.Point(20, 50)
+    $pBar.Size = New-Object System.Drawing.Size(405, 24)
+    $pBar.Minimum = 0
+    $pBar.Maximum = 100
+    $pBar.Value = 0
+    $pDlg.Controls.Add($pBar)
+
+    # 詳細ステータス (何% / 何MB)
+    $pDetail = New-Object System.Windows.Forms.Label
+    $pDetail.Text = "接続中..."
+    $pDetail.Location = New-Object System.Drawing.Point(20, 82)
+    $pDetail.Size = New-Object System.Drawing.Size(300, 20)
+    $pDetail.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $pDetail.ForeColor = [System.Drawing.Color]::FromArgb(185, 187, 190)
+    $pDlg.Controls.Add($pDetail)
+
+    # キャンセルボタン
+    $pCancel = New-Object System.Windows.Forms.Button
+    $pCancel.Text = "キャンセル"
+    $pCancel.Location = New-Object System.Drawing.Point(325, 115)
+    $pCancel.Size = New-Object System.Drawing.Size(100, 28)
+    $pCancel.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+    $pCancel.ForeColor = [System.Drawing.Color]::White
+    $pCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $pCancel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $pDlg.Controls.Add($pCancel)
+
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+    # 進捗更新イベント
+    $script:lastLoggedPct = 0
+    $wc.Add_DownloadProgressChanged({
+        param($s, $e)
+        try {
+            $pBar.Value = $e.ProgressPercentage
+            $pDlg.Text = "[$($e.ProgressPercentage)%] $engineName のダウンロード"
+            $recMb = [math]::Round($e.BytesReceived / 1MB, 2)
+            if ($e.TotalBytesToReceive -gt 0) {
+                $totMb = [math]::Round($e.TotalBytesToReceive / 1MB, 2)
+                $pDetail.Text = "$($e.ProgressPercentage)% ($recMb MB / $totMb MB)"
+            } else {
+                $pDetail.Text = "$recMb MB 受信中..."
+            }
+            if ($e.ProgressPercentage -ge ($script:lastLoggedPct + 25)) {
+                $script:lastLoggedPct = $e.ProgressPercentage
+                Write-Host "  ... ダウンロード進捗: $($e.ProgressPercentage)%" -ForegroundColor DarkGray
+            }
+        } catch { }
+    })
+
+    # 完了イベント
+    $script:dlSuccess = $false
+    $script:dlError = $null
+    $wc.Add_DownloadFileCompleted({
+        param($s, $e)
+        if ($e.Cancelled) {
+            $script:dlSuccess = $false
+        } elseif ($e.Error) {
+            $script:dlSuccess = $false
+            $script:dlError = $e.Error
+        } else {
+            $script:dlSuccess = $true
+        }
+        $pDlg.Close()
+    })
+
+    $pCancel.Add_Click({
+        $wc.CancelAsync()
+        $pDlg.Close()
+    })
+
     if ($statusLabel) { $statusLabel.Text = "[DL中] $engineName インストーラーをダウンロード中..." }
     Write-Host "▶ $engineName インストーラーをダウンロード中: $downloadUrl" -ForegroundColor Cyan
-    
+
     try {
-        if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
-            & curl.exe -fL "$downloadUrl" -o "$destFile"
+        # 非同期ダウンロード開始
+        $uri = New-Object System.Uri($downloadUrl)
+        $wc.DownloadFileAsync($uri, $destFile)
+        if ($parentForm) {
+            $pDlg.ShowDialog($parentForm) | Out-Null
         } else {
-            $wc = New-Object System.Net.WebClient
-            $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            $wc.DownloadFile($downloadUrl, $destFile)
-        }
-        
-        if (Test-Path $destFile) {
-            if ($statusLabel) { $statusLabel.Text = "[起動] インストーラーを起動しています..." }
-            Write-Host "✓ ダウンロード完了: $destFile" -ForegroundColor Green
-            Write-Host "▶ インストーラーを起動中 (画面の指示に従って完了してください)..." -ForegroundColor Cyan
-            Start-Process -FilePath $destFile
-            return $true
+            $pDlg.ShowDialog() | Out-Null
         }
     } catch {
-        Write-Warning "ダウンロードに失敗しました: $_"
+        $script:dlError = $_
+    } finally {
+        $wc.Dispose()
+    }
+
+    if ($script:dlSuccess -and (Test-Path $destFile)) {
+        if ($statusLabel) { $statusLabel.Text = "[起動] インストーラーを起動しています..." }
+        Write-Host "✓ ダウンロード完了: $destFile" -ForegroundColor Green
+        Write-Host "▶ インストーラーを起動中 (画面の指示に従って完了してください)..." -ForegroundColor Cyan
+        Start-Process -FilePath $destFile
+        return $true
+    } elseif ($script:dlError) {
+        Write-Warning "ダウンロードに失敗しました: $($script:dlError)"
         if ($statusLabel) { $statusLabel.Text = "[エラー] ダウンロード失敗。手動でお試しください" }
+        [System.Windows.Forms.MessageBox]::Show(
+            "インストーラーのダウンロードに失敗しました。`nエラー: $($script:dlError)`n`n手動で公式サイトからダウンロードしてください。",
+            "ダウンロードエラー",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } else {
+        if ($statusLabel) { $statusLabel.Text = "[情報] ダウンロードがキャンセルされました" }
     }
     return $false
 }
@@ -347,7 +453,7 @@ function Show-EngineInstallOptionsDialog([string]$engineName, [string]$websiteUr
     $btnAuto.Add_Click({
         $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $dlg.Close()
-        Install-EngineFromUrl $engineName $autoInstallerUrl $installerFileName $statusLabel
+        Install-EngineFromUrl $engineName $autoInstallerUrl $installerFileName $statusLabel $parentForm
     })
     $dlg.Controls.Add($btnAuto)
 
