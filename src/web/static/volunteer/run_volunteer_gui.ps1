@@ -340,7 +340,7 @@ $SavedRuntime = if ($Config.runtime) { $Config.runtime } else { "native" }
 $RadNative.Checked = ($SavedRuntime -ne "docker")
 
 $RadDocker = New-Object System.Windows.Forms.RadioButton
-$RadDocker.Text = "Docker Desktop (コンテナ展開) - 音声合成エンジンを一括起動"
+$RadDocker.Text = "Docker Desktop (コンテナ展開) - 選択したエンジンをコンテナで自動起動"
 $RadDocker.Location = New-Object System.Drawing.Point(15, 40)
 $RadDocker.Size = New-Object System.Drawing.Size(440, 20)
 $RadDocker.Checked = -not $RadNative.Checked
