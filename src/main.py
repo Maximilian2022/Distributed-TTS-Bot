@@ -456,6 +456,7 @@ async def main():
         resource_manager.start_idle_monitor()
         safe_create_task(broadcast_pinned_models_to_workers(), name="broadcast_pinned_models_to_workers")
         safe_create_task(delayed_precache_previews(), name="delayed_precache_previews")
+        safe_create_task(tts_manager.start_heartbeat_monitor(), name="tts_heartbeat_monitor")
 
     # ローカルTTSエンジン（VOICEVOX / SHAREVOX / COEIROINK）の話者・スタイルを動的取得して config.voices に登録
     for engine_name, init_fn in [

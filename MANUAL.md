@@ -298,3 +298,38 @@ docker compose --profile tunnel up -d
 2. **音声が途切れる・遅延する場合**:
    - `logs/bot.log` を確認し、`HighLoadFallbackException` や `SynthesisTimeoutException` が発生していないか確認します。
    - ローカルGPU Workerが接続されている場合、ネットワーク往復遅延（Ping）を確認します。
+
+---
+
+## 8. 分散ボランティア型コンピュートワーカー (Distributed Volunteer Network)
+
+コミュニティメンバーや外部拠点の余剰コンピュートリソース（GPU/CPU）を安全に結集し、大規模かつ超低遅延な音声合成パイプラインを形成する仕組みです。
+
+### 8.1 設計上の特徴
+- **ポート開放不要 (Outbound WSS)**:
+  - ワーカー側からMasterサーバーの `/api/worker/ws` へ向けて外向きに接続（WSS）するため、ルーター設定や固定IP、ポート開放が一切不要です。
+- **ゼロコピー・高速バイナリ通信 (Binary Streaming)**:
+  - `[32-byte req_id][4-byte chunk_idx][1-byte flags][raw audio]` のバイナリフレームを採用し、JSONパースやBase64デコードのオーバーヘッドを完全排除。
+- **句読点なし多段チャンキング & 30文字ハードキャップ**:
+  - スペース、スラング（`w`、`草`）、終助詞境界で自然に分割し、最長でも30文字以内で安全にスライス。複数ノードへの同時並列ディスパッチで初動ラグ（TTFS）をミリ秒単位で短縮。
+- **自律的フェイルオーバー & サーキットブレーカー**:
+  - ワーカーの切断やタイムアウト時は、Masterが自動的に直前ノードを隔離し、クラウドTTSまたはローカルエンジンへ瞬時に透過フォールバックします。
+
+### 8.2 ボランティアワーカーの起動方法
+
+1. **Windowsの場合**:
+   ```cmd
+   worker\run_volunteer.bat
+   ```
+   - 初回起動時に対話形式でサーバーURLと共有トークンを入力するだけで自動接続されます。
+
+2. **Linux / macOSの場合**:
+   ```bash
+   ./worker/run_volunteer.sh wss://<ドメイン>/api/worker/ws <共有トークン> <ノード名>
+   ```
+
+3. **Pythonから直接起動**:
+   ```bash
+   python worker/volunteer_worker.py --server-url wss://<ドメイン>/api/worker/ws --token <共有トークン> --name "MyPC"
+   ```
+

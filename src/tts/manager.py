@@ -474,6 +474,33 @@ class TTSManager:
                     self.sharevox_pool.remove_node(node_id)
             logger.info(f"🔌 [TTSManager] WS Worker '{node_id}' unregistered from pools.")
 
+    async def start_heartbeat_monitor(self, interval_sec: float = 30.0):
+        """全TTSノードプールおよびボランティアノードの定期ハートビート監視ループ"""
+        logger.info("🩺 [TTSManager] Node heartbeat monitor loop started.")
+        while True:
+            try:
+                await asyncio.sleep(interval_sec)
+                # 1. 各プールの定期タイムアウトチェック
+                self.voicevox_pool.check_heartbeat_timeout(timeout_seconds=60.0)
+                self.sharevox_pool.check_heartbeat_timeout(timeout_seconds=60.0)
+                self.coeiroink_pool.check_heartbeat_timeout(timeout_seconds=60.0)
+
+                # 2. WebSocket ボランティアノードのゾンビ接続・切断チェック
+                now = time.time()
+                dead_nodes = []
+                for n_id, ws_node in list(self.ws_worker_nodes.items()):
+                    if getattr(ws_node.ws, "closed", True) or (now - ws_node.last_heartbeat > 60.0):
+                        dead_nodes.append(n_id)
+
+                for dead_id in dead_nodes:
+                    logger.warning(f"⚠️ [TTSManager] WS Worker '{dead_id}' heartbeat timed out or WS closed. Auto-unregistering.")
+                    self.unregister_ws_worker_node(dead_id)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in TTSManager heartbeat monitor: {e}", exc_info=True)
+
     def _get_voice_config(self, speaker_id: str) -> VoiceConfig:
         """話者IDからボイス定義を取得"""
         if speaker_id in self.config.voices:

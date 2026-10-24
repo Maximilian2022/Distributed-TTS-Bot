@@ -1,5 +1,25 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] 分散ボランティアTTS運用強化・定期死活監視・WebUI統合・ワンクリック起動ツールの配備 (Phase 2〜4完遂)
+- **概要**:
+  - ボランティアノードのゾンビ接続・切断を自律検知するバックグラウンド監視ループ（Phase 3.1）、WebUIノードダッシュボードの表示強化（Phase 3.2）、Windows/Linux/Mac用ワンクリック起動スクリプトの作成（Phase 4.1）、およびドキュメント更新（Phase 4.2）を実施。
+- **実施内容**:
+  1. **定期ハートビート監視ループ & ゾンビ自動キック (`src/tts/manager.py`, `src/main.py`)**:
+     - `start_heartbeat_monitor` ループを実装し、30秒間隔で全プールおよびボランティアノードの死活を検査。
+     - 60秒以上ハートビートが途絶したノードやWebSocket切断ノードを自律検知し、プールから安全に自動除外（`unregister_ws_worker_node`）。
+     - `main.py` の `start_active_background_tasks` に統合。
+  2. **WebUI ノードダッシュボード表示強化 (`src/web/static/app.js`)**:
+     - ボランティアノードに `🤝 ボランティア` バッジおよび `⚡ WSS 常時接続` バッジを表示。
+     - 外部ボランティアノードに対する不要な内部再起動ボタンの表示を抑制・保護。
+  3. **配布用ワンクリック起動スクリプト (`worker/run_volunteer.bat`, `worker/run_volunteer.sh`)**:
+     - Windows用ダブルクリック起動バッチ（Python・aiohttp自動チェック、対話式トークン入力対応）。
+     - Linux / macOS用シェルスクリプト。
+  4. **技術仕様書 & README 更新 (`MANUAL.md`, `README.md`)**:
+     - `MANUAL.md` に「第8章 分散ボランティア型コンピュートワーカー」を新設。
+     - `README.md` にボランティアネットワークおよび多段チャンキングの特徴を追記。
+  5. **テスト & 本番反映**:
+     - サンドボックス検証通過後、`docker compose build app`（1.5秒）および `docker compose --profile tunnel up -d`（0.9秒）で本番反映。ヘルスチェック（200 OK）、全Botおよび6ノードWorker健全復旧を確認。
+
 ## [2026-10-24] 分散ボランティア型TTS通信基盤 (Phase 1) & 多段チャンキング・30文字ハードキャップ (Phase 2.1) の本番配備
 - **概要**:
   - `docs/DISTRIBUTED_VOLUNTEER_ARCHITECTURE_PLAN.md` に基づき、一般家庭PC等のNAT配下ノードがポート開放不要で参加できる「ボランティア型分散WebSocket通信基盤 (Phase 1)」および、句読点のない口語・長文を低遅延並列化する「多段チャンキング & 30文字ハードキャップ (Phase 2.1)」を本番環境へ無停止配備。

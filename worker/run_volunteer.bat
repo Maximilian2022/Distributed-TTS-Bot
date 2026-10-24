@@ -1,0 +1,51 @@
+@echo off
+chcp 65001 > nul
+setlocal enabledelayedexpansion
+
+echo ======================================================
+echo   🎙️ TTSBot Volunteer Worker (ボランティア参加ツール)
+echo ======================================================
+echo.
+
+REM Pythonの存在確認
+where python >nul 2>nul
+if %errorlevel% neq 0 (
+    echo [エラー] Python が見つかりませんでした。
+    echo Python 3.9 以上をインストールし、「PATHに追加する」にチェックを入れてください。
+    pause
+    exit /b 1
+)
+
+REM 設定の読み込みまたは対話入力
+set SERVER_URL=wss://ttsbot.kenko.land/api/worker/ws
+if not "%~1"=="" set SERVER_URL=%~1
+
+set TOKEN=
+if not "%~2"=="" set TOKEN=%~2
+
+set NODE_NAME=%COMPUTERNAME%
+if not "%~3"=="" set NODE_NAME=%~3
+
+if "%TOKEN%"=="" (
+    echo 管理者から受け取った共有トークンを入力してください:
+    set /p TOKEN="Token: "
+)
+
+echo.
+echo ▶ 接続先サーバー : %SERVER_URL%
+echo ▶ ノード名       : %NODE_NAME%
+echo.
+
+REM 依存ライブラリのチェック & インストール
+python -c "import aiohttp" >nul 2>nul
+if %errorlevel% neq 0 (
+    echo ▶ 必要なライブラリ (aiohttp) をインストール中...
+    pip install aiohttp
+)
+
+echo ▶ ボランティアエージェントを起動します...
+python "%~dp0volunteer_worker.py" --server-url "%SERVER_URL%" --token "%TOKEN%" --name "%NODE_NAME%"
+
+echo.
+echo エージェントが停止しました。
+pause

@@ -2566,16 +2566,23 @@ function renderWorkerNodes(nodesData) {
       resolvedHostname = 'MasterUbuntu';
     }
 
+    const isVolunteer = Boolean(node.is_volunteer || (node.engines || []).some(e => e.is_volunteer) || cleanId.startsWith('volunteer_') || (node.url && node.url.startsWith('ws://')));
+
     // アイコン
-    const icon = isMaster ? "🏢" : (hasGpu ? "🎮" : "🖥️");
-    const nodeName = isMaster ? "MasterDebian (自機)" : resolvedHostname;
+    const icon = isMaster ? "🏢" : (isVolunteer ? "🤝" : (hasGpu ? "🎮" : "🖥️"));
+    let nodeName = isMaster ? "MasterDebian (自機)" : resolvedHostname;
+    if (isVolunteer) {
+      nodeName = `${resolvedHostname} <span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">🤝 ボランティア</span>`;
+    }
 
     // 1. Agent のオンライン/オフライン判定 (ハートビート疎通)
     const hbAgo = node.last_heartbeat_ago;
     const isAgentOnline = isMaster || (node.agent_online !== undefined ? Boolean(node.agent_online) : (hbAgo != null && hbAgo < 60));
-    const agentBadge = isAgentOnline
-      ? '<span class="badge" style="background:rgba(35,165,90,0.18);color:#23a55a;border:1px solid rgba(35,165,90,0.35);font-size:10px;font-weight:700;">🟢 Agent 稼働</span>'
-      : `<span class="badge" style="background:rgba(240,71,71,0.18);color:#f04747;border:1px solid rgba(240,71,71,0.35);font-size:10px;font-weight:700;">🔴 Agent 不通 (${hbAgo != null ? Math.round(hbAgo)+'s前' : '不明'})</span>`;
+    const agentBadge = isVolunteer
+      ? '<span class="badge" style="background:rgba(88,101,242,0.2);color:#50e6ff;border:1px solid rgba(88,101,242,0.4);font-size:10px;font-weight:700;">⚡ WSS 常時接続</span>'
+      : (isAgentOnline
+        ? '<span class="badge" style="background:rgba(35,165,90,0.18);color:#23a55a;border:1px solid rgba(35,165,90,0.35);font-size:10px;font-weight:700;">🟢 Agent 稼働</span>'
+        : `<span class="badge" style="background:rgba(240,71,71,0.18);color:#f04747;border:1px solid rgba(240,71,71,0.35);font-size:10px;font-weight:700;">🔴 Agent 不通 (${hbAgo != null ? Math.round(hbAgo)+'s前' : '不明'})</span>`);
 
     // 2. エンジン全体の稼働状況判定
     const engines = node.engines || [];
@@ -2699,7 +2706,7 @@ function renderWorkerNodes(nodesData) {
     const lastLatency = node.last_latency_ms ? `${node.last_latency_ms}ms` : '--';
     const priorityLabel = node.priority === 1
       ? '<span style="color:#a8ff78;font-weight:600;">GPU 最優先</span>'
-      : '通常 CPU';
+      : (isVolunteer ? '<span style="color:#50e6ff;font-weight:600;">ボランティア</span>' : '通常 CPU');
 
     // セマフォ合計稼働スロット
     const totalActive = (node.engines || []).reduce((s, e) => s + (e.active_count || 0), 0);
@@ -2708,9 +2715,9 @@ function renderWorkerNodes(nodesData) {
       ? `<span style="background:rgba(80,230,255,0.2);color:#50e6ff;padding:1px 6px;border-radius:4px;font-weight:700;">実行中: ${totalActive} / ${maxConcurrent}並列</span>`
       : `<span>上限: ${maxConcurrent}並列</span>`;
 
-    // アクションボタン (再起動・完全再構成) (ローカル自機以外)
+    // アクションボタン (再起動・完全再構成) (ローカル自機およびボランティアノード以外)
     let actionButtons = '';
-    if (!isMaster && nodeIp) {
+    if (!isMaster && !isVolunteer && nodeIp) {
       const restartBtn = `<button onclick="triggerWorkerRestart('${escapeHtml(nodeIp)}', this)" 
            title="ワーカーの全TTSエンジンおよびAgentコンテナを再起動します (ドレイン・待機あり)"
            style="font-size:10px;padding:3px 8px;border-radius:5px;border:1px solid rgba(250,166,26,0.5);
