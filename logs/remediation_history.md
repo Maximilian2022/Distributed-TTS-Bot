@@ -1,5 +1,46 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] WAN 接続時 403 Forbidden の完全解消・共有トークン必須化・Windows ボランティア GUI ランチャーの全面機能強化
+- **ユーザーフィードバック & 課題**:
+  1. Linux で実行時、`403, message='Invalid response status', url='wss://ttsbot.kenko.land/api/worker/ws'` が発生して接続できない不具合。
+  2. Cloudflare Tunnel 経由（WAN）アクセス環境のため、共有トークンをオプションではなく「必須」にしてほしい要求。
+  3. Linux で破損した `config.json` 読み込み時に `JSONDecodeError: Expecting value: line 6 column 15` が発生する問題。
+  4. Windows 向け GUI ランチャーへの新機能要求：
+     - ① ネイティブ直接実行と Docker Desktop コンテナを GUI 上で選択可能にする。
+     - ② 次回起動をデスクトップからワンクリックで行えるショートカット（`.lnk`）の自動配置。
+     - ③ VOICEVOX だけでなく、SHAREVOX や COEIROINK も未導入時にセットアップ・入手支援する。
+     - ④ ネイティブ実行時、ローカルエンジンをバックグラウンド（最小化）で起動し、ゲーム画面の前面に出てこないようにする。
+     - ⑤ ネイティブ実行時、ローカルエンジン（VOICEVOX等）が古い場合に最新リリースを自動判定し、ユーザー承認付きでアップデート案内する。
+- **真因の究明**:
+  - 403 Forbidden の原因: `server.py` の WAN セキュリティ防御ミドルウェア（行 448）において、`/api/worker/` プレフィックスへのインターネット（Cloudflare Tunnel 経由含む）アクセスを一律ブロック（403）していたため、正当なトークンを持っていても WebSocket エンドポイント `/api/worker/ws` に到達できなかった。
+  - JSONDecodeError の原因: 前回の構文エラー発生時に不完全な `config.json` が生成され、起動スクリプトが破損を検知できずにそのままロードしようとして例外が発生した。
+- **抜本的改善内容**:
+  1. **WAN 防御ミドルウェアでの正当 Worker 認証許可 (`src/web/server.py`)**:
+     - `/api/worker/ws`, `/api/worker/register`, `/api/worker/models/` に対し、共有トークン（`worker_shared_secret`）の一致を検証する例外ルートを追加。
+     - 有効なトークンを持つ Worker は正常に通過させ、トークン未指定または不正なアクセスのみを厳格に 403 で遮断。
+  2. **共有トークンの必須化 & JSON 破損自動検知 (`worker/run_volunteer.sh` & `src/web/static/volunteer/run_volunteer.sh`)**:
+     - `config.json` のロード前に `python3` による構文検証を実施し、破損時は自動で再設定（`RECONFIGURE=1`）へ移行。
+     - トークンが空の場合は `while [ -z "${TOKEN}" ]` ループで入力を強制（必須化）。
+     - 設定書き込みを Python の `json.dump` に移行し、絶対に構文破壊が起きないアトミック安全生成を保証。
+  3. **Windows 向け GUI ランチャーの全面機能強化 (`worker/run_volunteer_gui.ps1` & `src/web/static/volunteer/run_volunteer_gui.ps1`)**:
+     - **実行環境 (ランタイム方式) 選択グループ**:
+       - 🔘 Windows ネイティブ (直接実行・推奨) / 🔘 Docker Desktop (コンテナ展開) をラジオボタンで切替可能に。
+     - **共有トークンの必須化**:
+       - トークン欄が空の状態で起動しようとした場合、警告ダイアログを表示して入力を強制。
+     - **デスクトップ & スタートアップ ショートカット配置**:
+       - 「🖥️ デスクトップにショートカットを作成」チェックボックスを追加。`[Desktop]\TTSBot Volunteer Worker.lnk` を自動生成。
+     - **各音声合成エンジンの入手・セットアップ支援**:
+       - VOICEVOX / COEIROINK / SHAREVOX の各行に「⬇️ 入手」ボタンを新設。ワンクリックで公式サイト・ダウンロードページを開く。
+       - Docker Desktop モード時は VOICEVOX / SHAREVOX コンテナをバックグラウンド自動起動。
+     - **エンジンの最小化・バックグラウンド起動**:
+       - `Start-Process -WindowStyle Minimized` を徹底し、ゲームや作業の前面にウィンドウが飛び出さないよう配慮。
+     - **ローカルエンジンの自動アップデート確認 (ユーザー承認付き)**:
+       - 起動時に `/version` と GitHub 最新リリースを比較。更新がある場合はダイアログで確認し、承認時に公式サイトを開く。
+- **検証**:
+  - `curl -sI -H "X-Forwarded-For: 203.0.113.1" -H "Authorization: Bearer <TOKEN>" http://localhost:8088/api/worker/ws` で 403 を通過し WebSocket ハンドラに正常到達することを確認。
+  - トークンなしの WAN リクエストが確実に 403 でブロックされることを確認。
+  - 本番サーバーコンテナの再起動・ヘルスチェック（200 OK）を確認。
+
 ## [2026-10-24] Linux 向けボランティアスクリプト (run_volunteer.sh) のパイプ実行構文エラー解消 & WebUI ワンライナーへの共有トークン自動組み込み
 - **ユーザーフィードバック & 課題**:
   1. Linux サーバー（Debian）で `curl -sSL "https://.../run_volunteer.sh" | bash -s -- "wss://..."` を実行した際、以下のエラーが発生して中断する不具合：

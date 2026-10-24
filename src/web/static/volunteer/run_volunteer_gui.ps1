@@ -3,9 +3,13 @@
 # ==============================================================================
 # 外部依存ゼロ: PowerShell 標準の .NET Windows Forms を使用
 # 特徴:
-#   - 稼働中エンジンのスマートAPI判定 (VOICEVOX / SHAREVOX / COEIROINK のデフォルトポート対応)
-#   - VOICEVOX の自動セットアップ & 自動バックグラウンド起動 (Docker / winget / 既存アプリ)
-#   - ゲーム優先モード (BelowNormal プロセス優先度設定)
+#   - 実行環境の選択 (Windows ネイティブ直接実行 vs Docker Desktop コンテナ)
+#   - 共有トークン必須化 & 認証保護 (Cloudflare Tunnel / インターネット経由)
+#   - VOICEVOX / SHAREVOX / COEIROINK の自動検出 & 自動セットアップ支援
+#   - ネイティブエンジンの最小化・バックグラウンド起動 (ゲーム画面の邪魔にならない)
+#   - ローカルエンジンの最新バージョン自動チェック & アップデート案内 (ユーザー承認)
+#   - デスクトップ & スタートアップへのワンクリックショートカット配置
+#   - ワンライナー (irm ... | iex) 完全対応 (自己完結エージェント自動展開)
 # ==============================================================================
 
 param(
@@ -40,7 +44,7 @@ if (Test-Path $ConfigPath) {
     } catch {}
 }
 
-# 1. ローカルエンジンの簡易死活検査 (ポートチェック)
+# 1. ローカルエンジンのポート死活検査
 function Test-PortOpen([string]$HostName, [int]$Port) {
     try {
         $client = New-Object System.Net.Sockets.TcpClient
@@ -58,7 +62,7 @@ function Test-PortOpen([string]$HostName, [int]$Port) {
     }
 }
 
-# 2. 各ポートで稼働しているエンジン種別のスマートAPI判定
+# 2. 各ポートのエンジン種別スマートAPI判定
 function Get-EngineInfoAtPort([int]$Port) {
     if (-not (Test-PortOpen "127.0.0.1" $Port)) { return $null }
 
@@ -78,24 +82,27 @@ function Get-EngineInfoAtPort([int]$Port) {
         }
     } catch {}
 
-    # B. COEIROINK v1/v2 確認 (/v1/speakers)
+    # B. COEIROINK 判定 (/v1/speakers)
     try {
         $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/v1/speakers")
         $req.Timeout = 800
         $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
         $resp.Close()
-        return @{ type = "coeiroink"; port = $Port; url = "http://127.0.0.1:$Port"; label = "COEIROINK (ポート $Port)" }
+        if ($code -eq 200) {
+            return @{ type = "coeiroink"; port = $Port; url = "http://127.0.0.1:$Port"; label = "COEIROINK (ポート $Port)" }
+        }
     } catch {}
 
-    # C. /speakers による話者判別フォールバック
+    # C. 話者名判定フォールバック (/speakers)
     try {
         $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$Port/speakers")
         $req.Timeout = 800
         $resp = $req.GetResponse()
         $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
-        $body = $sr.ReadToEnd()
+        $json = $sr.ReadToEnd()
         $resp.Close()
-        if ($body -match '(?i)小春音アミ|sharevox') {
+        if ($json -match '小春音アミ' -or $json -match 'SHAREVOX') {
             return @{ type = "sharevox"; port = $Port; url = "http://127.0.0.1:$Port"; label = "SHAREVOX (ポート $Port)" }
         }
         return @{ type = "voicevox"; port = $Port; url = "http://127.0.0.1:$Port"; label = "VOICEVOX (ポート $Port)" }
@@ -106,7 +113,6 @@ function Get-EngineInfoAtPort([int]$Port) {
 
 function Scan-AllLocalEngines {
     $found = @{}
-    # 探索対象ポート: 50021 (VOICEVOX/SHAREVOX公式デフォルト), 50025 (旧SHAREVOX), 50031 (COEIROINK公式デフォルト), 50032 (COEIROINK v2)
     $ports = @(50021, 50025, 50031, 50032)
     foreach ($p in $ports) {
         $info = Get-EngineInfoAtPort $p
@@ -120,18 +126,55 @@ function Scan-AllLocalEngines {
     return $found
 }
 
-# 3. VOICEVOX の自動セットアップ & 自動起動
-function Start-VoicevoxEngine([System.Windows.Forms.Label]$statusLabel = $null) {
+# 3. エンジンのアップデート確認 (VOICEVOX)
+function Check-VoicevoxUpdate([string]$currentUrl = "http://127.0.0.1:50021") {
+    try {
+        # 現在のローカルバージョン取得
+        $localVer = ""
+        try {
+            $req = [System.Net.HttpWebRequest]::Create("$currentUrl/version")
+            $req.Timeout = 800
+            $resp = $req.GetResponse()
+            $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $localVer = $sr.ReadToEnd().Trim('"').Trim()
+            $resp.Close()
+        } catch {}
+
+        if (-not $localVer) { return }
+
+        # GitHub Releases の最新タグ取得
+        $ghReq = [System.Net.HttpWebRequest]::Create("https://api.github.com/repos/VOICEVOX/voicevox/releases/latest")
+        $ghReq.UserAgent = "TTSBot-Volunteer-Worker"
+        $ghReq.Timeout = 1200
+        $ghResp = $ghReq.GetResponse()
+        $ghSr = New-Object System.IO.StreamReader($ghResp.GetResponseStream())
+        $ghJson = $ghSr.ReadToEnd() | ConvertFrom-Json
+        $ghResp.Close()
+
+        $latestVer = $ghJson.tag_name.TrimStart('v').Trim()
+
+        if ($latestVer -and $localVer -and ($latestVer -ne $localVer)) {
+            $msg = "VOICEVOX の新しいバージョンが利用可能です！`n`n現在利用中: v$localVer`n最新バージョン: v$latestVer`n`n公式配布サイトを開いてアップデートしますか？"
+            $ans = [System.Windows.Forms.MessageBox]::Show(
+                $msg,
+                "VOICEVOX アップデートの確認",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            )
+            if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
+                Start-Process "https://voicevox.hiroshiba.jp/"
+            }
+        }
+    } catch {}
+}
+
+# 4. エンジンの起動支援 (ネイティブ & 最小化起動)
+function Start-NativeVoicevox([System.Windows.Forms.Label]$statusLabel = $null) {
     if (Test-PortOpen "127.0.0.1" 50021) {
         if ($statusLabel) { $statusLabel.Text = "✅ VOICEVOX は既に起動しています (50021)" }
-        Write-Host "✅ VOICEVOX は既に起動しています (50021)" -ForegroundColor Green
         return $true
     }
 
-    if ($statusLabel) { $statusLabel.Text = "🔍 インストール済み VOICEVOX を探索中..." }
-    Write-Host "🔍 インストール済み VOICEVOX を探索中..." -ForegroundColor Cyan
-
-    # 1. 既存のインストール済みアプリを検索して起動
     $PossiblePaths = @(
         (Join-Path $env:LOCALAPPDATA "Programs\VOICEVOX\VOICEVOX.exe"),
         "C:\Program Files\VOICEVOX\VOICEVOX.exe",
@@ -139,82 +182,73 @@ function Start-VoicevoxEngine([System.Windows.Forms.Label]$statusLabel = $null) 
     )
     foreach ($p in $PossiblePaths) {
         if (Test-Path $p) {
-            if ($statusLabel) { $statusLabel.Text = "🚀 VOICEVOX をバックグラウンド起動中..." }
-            Write-Host "💡 インストール済みの VOICEVOX を発見: $p" -ForegroundColor Green
+            if ($statusLabel) { $statusLabel.Text = "🚀 VOICEVOX を最小化起動中..." }
             Start-Process -FilePath $p -WindowStyle Minimized
             for ($i = 0; $i -lt 15; $i++) {
                 Start-Sleep -Seconds 1
                 if (Test-PortOpen "127.0.0.1" 50021) {
                     if ($statusLabel) { $statusLabel.Text = "✅ VOICEVOX の起動を確認しました！" }
-                    Write-Host "✅ VOICEVOX の起動を確認しました (50021)" -ForegroundColor Green
                     return $true
                 }
             }
         }
     }
+    return $false
+}
 
-    # 2. Docker があればコンテナで起動
-    if ($statusLabel) { $statusLabel.Text = "🐳 Docker 環境を確認中..." }
-    $hasDocker = $false
-    try {
-        $res = docker ps 2>&1
-        if ($LASTEXITCODE -eq 0) { $hasDocker = $true }
-    } catch {}
-
-    if ($hasDocker) {
-        if ($statusLabel) { $statusLabel.Text = "🐳 Docker で VOICEVOX コンテナを起動中..." }
-        Write-Host "🐳 Docker を検出。VOICEVOX コンテナを起動します..." -ForegroundColor Cyan
-        docker run -d --name ttsbot-worker-voicevox --restart unless-stopped -p 50021:50021 voicevox/voicevox_engine:cpu-latest 2>&1 | Out-Null
-        for ($i = 0; $i -lt 20; $i++) {
-            Start-Sleep -Seconds 1
-            if (Test-PortOpen "127.0.0.1" 50021) {
-                if ($statusLabel) { $statusLabel.Text = "✅ Docker 版 VOICEVOX が起動しました！" }
-                Write-Host "✅ Docker 版 VOICEVOX が起動しました！" -ForegroundColor Green
-                return $true
-            }
-        }
+function Start-NativeSharevox([System.Windows.Forms.Label]$statusLabel = $null) {
+    if (Test-PortOpen "127.0.0.1" 50025 -or Test-PortOpen "127.0.0.1" 50021) {
+        return $true
     }
-
-    # 3. winget による自動インストール (Windows 10 / 11)
-    if ($statusLabel) { $statusLabel.Text = "📦 winget での公式 VOICEVOX 自動インストールを確認中..." }
-    $hasWinget = $false
-    try {
-        $w = winget --version 2>&1
-        if ($LASTEXITCODE -eq 0) { $hasWinget = $true }
-    } catch {}
-
-    if ($hasWinget) {
-        if ($statusLabel) { $statusLabel.Text = "📦 winget で VOICEVOX を自動インストール中 (初回のみ数分)..." }
-        Write-Host "📦 winget を使用して公式 VOICEVOX を自動インストール中..." -ForegroundColor Cyan
-        try {
-            winget install --id Hiroshiba.VOICEVOX --source winget --accept-source-agreements --accept-package-agreements --silent --disable-interactivity 2>&1 | Out-Null
-            Start-Sleep -Seconds 2
-            foreach ($p in $PossiblePaths) {
-                if (Test-Path $p) {
-                    Start-Process -FilePath $p -WindowStyle Minimized
-                    for ($i = 0; $i -lt 15; $i++) {
-                        Start-Sleep -Seconds 1
-                        if (Test-PortOpen "127.0.0.1" 50021) {
-                            if ($statusLabel) { $statusLabel.Text = "✅ インストール完了 & 起動を確認しました！" }
-                            Write-Host "✅ VOICEVOX の自動インストール & 起動に成功しました！" -ForegroundColor Green
-                            return $true
-                        }
-                    }
+    $PossiblePaths = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\SHAREVOX\SHAREVOX.exe"),
+        "C:\Program Files\SHAREVOX\SHAREVOX.exe"
+    )
+    foreach ($p in $PossiblePaths) {
+        if (Test-Path $p) {
+            if ($statusLabel) { $statusLabel.Text = "🚀 SHAREVOX を最小化起動中..." }
+            Start-Process -FilePath $p -WindowStyle Minimized
+            for ($i = 0; $i -lt 15; $i++) {
+                Start-Sleep -Seconds 1
+                if (Test-PortOpen "127.0.0.1" 50025 -or Test-PortOpen "127.0.0.1" 50021) {
+                    return $true
                 }
             }
-        } catch {
-            Write-Warning "winget での自動インストールに失敗: $_"
         }
     }
-
-    if ($statusLabel) { $statusLabel.Text = "⚠️ 自動セットアップ失敗: 公式サイトから起動してください" }
-    Write-Warning "⚠️ 自動起動できませんでした。公式サイト (https://voicevox.hiroshiba.jp/) から手動起動してください。"
     return $false
+}
+
+function Start-DockerEngines([bool]$enableVv, [bool]$enableSv, [System.Windows.Forms.Label]$statusLabel = $null) {
+    if ($statusLabel) { $statusLabel.Text = "🐳 Docker Desktop 環境を確認中..." }
+    try {
+        docker ps 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            if ($statusLabel) { $statusLabel.Text = "❌ Docker Desktop が起動していません" }
+            return $false
+        }
+    } catch {
+        if ($statusLabel) { $statusLabel.Text = "❌ Docker コマンドが見つかりません" }
+        return $false
+    }
+
+    if ($enableVv -and -not (Test-PortOpen "127.0.0.1" 50021)) {
+        if ($statusLabel) { $statusLabel.Text = "🐳 VOICEVOX コンテナを起動中..." }
+        docker run -d --name ttsbot-worker-voicevox --restart unless-stopped -p 50021:50021 voicevox/voicevox_engine:cpu-latest 2>&1 | Out-Null
+    }
+
+    if ($enableSv -and -not (Test-PortOpen "127.0.0.1" 50025)) {
+        if ($statusLabel) { $statusLabel.Text = "🐳 SHAREVOX コンテナを起動中 (ポート 50025)..." }
+        docker run -d --name ttsbot-worker-sharevox --restart unless-stopped -p 50025:50021 sharevox/sharevox_engine:cpu-latest 2>&1 | Out-Null
+    }
+
+    Start-Sleep -Seconds 2
+    return $true
 }
 
 # バッチ等のバックグラウンドからエンジン起動のみを要求された場合
 if ($AutoStartEngineOnly) {
-    $started = Start-VoicevoxEngine
+    $started = Start-NativeVoicevox
     exit $(if ($started) { 0 } else { 1 })
 }
 
@@ -222,10 +256,10 @@ if ($AutoStartEngineOnly) {
 $DetectedEngines = Scan-AllLocalEngines
 $HasAnyEngine = $DetectedEngines.Count -gt 0
 
-# 4. フォームの定義
+# 5. フォームの定義
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = "🎙️ TTSBot Volunteer Worker 設定ランチャー"
-$Form.Size = New-Object System.Drawing.Size(530, 730)
+$Form.Size = New-Object System.Drawing.Size(540, 780)
 $Form.StartPosition = "CenterScreen"
 $Form.FormBorderStyle = "FixedDialog"
 $Form.MaximizeBox = $false
@@ -242,29 +276,29 @@ $ColorInputBg = [System.Drawing.Color]::FromArgb(64, 68, 75)
 $Header = New-Object System.Windows.Forms.Label
 $Header.Text = "🎙️ TTSBot ボランティア参加設定"
 $Header.Font = $FontTitle
-$Header.Location = New-Object System.Drawing.Point(20, 15)
-$Header.Size = New-Object System.Drawing.Size(460, 24)
+$Header.Location = New-Object System.Drawing.Point(20, 12)
+$Header.Size = New-Object System.Drawing.Size(480, 24)
 $Form.Controls.Add($Header)
 
 $SubHeader = New-Object System.Windows.Forms.Label
-$SubHeader.Text = "PCの余剰パワーを提供してDiscord読み上げを高速化・支援します。"
+$SubHeader.Text = "PCの余剰パワーを提供してDiscord読み上げを高速化・冗長化します。"
 $SubHeader.Font = $FontSmall
 $SubHeader.ForeColor = [System.Drawing.Color]::LightGray
-$SubHeader.Location = New-Object System.Drawing.Point(22, 40)
-$SubHeader.Size = New-Object System.Drawing.Size(460, 18)
+$SubHeader.Location = New-Object System.Drawing.Point(22, 36)
+$SubHeader.Size = New-Object System.Drawing.Size(480, 18)
 $Form.Controls.Add($SubHeader)
 
 # --- 接続情報グループ ---
 $LblServer = New-Object System.Windows.Forms.Label
 $LblServer.Text = "接続先サーバー URL (WSS):"
 $LblServer.Font = $FontRegular
-$LblServer.Location = New-Object System.Drawing.Point(20, 65)
+$LblServer.Location = New-Object System.Drawing.Point(20, 58)
 $LblServer.Size = New-Object System.Drawing.Size(200, 18)
 $Form.Controls.Add($LblServer)
 
 $TxtServer = New-Object System.Windows.Forms.TextBox
-$TxtServer.Location = New-Object System.Drawing.Point(20, 85)
-$TxtServer.Size = New-Object System.Drawing.Size(470, 24)
+$TxtServer.Location = New-Object System.Drawing.Point(20, 76)
+$TxtServer.Size = New-Object System.Drawing.Size(480, 24)
 $TxtServer.BackColor = $ColorInputBg
 $TxtServer.ForeColor = [System.Drawing.Color]::White
 $TxtServer.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
@@ -274,50 +308,76 @@ $TxtServer.Text = if ($Config.server_url) { $Config.server_url } elseif ($Defaul
 $Form.Controls.Add($TxtServer)
 
 $LblToken = New-Object System.Windows.Forms.Label
-$LblToken.Text = "共有トークン (管理者から受領した場合のみ):"
+$LblToken.Text = "共有トークン [必須] (Cloudflare / インターネット経由):"
 $LblToken.Font = $FontRegular
-$LblToken.Location = New-Object System.Drawing.Point(20, 115)
-$LblToken.Size = New-Object System.Drawing.Size(300, 18)
+$LblToken.ForeColor = [System.Drawing.Color]::FromArgb(255, 180, 50)
+$LblToken.Location = New-Object System.Drawing.Point(20, 104)
+$LblToken.Size = New-Object System.Drawing.Size(400, 18)
 $Form.Controls.Add($LblToken)
 
 $TxtToken = New-Object System.Windows.Forms.TextBox
-$TxtToken.Location = New-Object System.Drawing.Point(20, 135)
-$TxtToken.Size = New-Object System.Drawing.Size(470, 24)
+$TxtToken.Location = New-Object System.Drawing.Point(20, 122)
+$TxtToken.Size = New-Object System.Drawing.Size(480, 24)
 $TxtToken.BackColor = $ColorInputBg
 $TxtToken.ForeColor = [System.Drawing.Color]::White
 $TxtToken.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $TxtToken.Text = if ($Config.token) { $Config.token } elseif ($DefaultToken) { $DefaultToken } else { $DefaultTokenEnv }
 $Form.Controls.Add($TxtToken)
 
+# --- 0. 実行ランタイム (実行環境) グループ ---
+$GrpRuntime = New-Object System.Windows.Forms.GroupBox
+$GrpRuntime.Text = "実行環境 (ランタイム方式)"
+$GrpRuntime.Font = $FontRegular
+$GrpRuntime.ForeColor = [System.Drawing.Color]::White
+$GrpRuntime.Location = New-Object System.Drawing.Point(20, 150)
+$GrpRuntime.Size = New-Object System.Drawing.Size(480, 68)
+
+$RadNative = New-Object System.Windows.Forms.RadioButton
+$RadNative.Text = "Windows ネイティブ (直接実行・推奨) - 最速・最小メモリ"
+$RadNative.Location = New-Object System.Drawing.Point(15, 18)
+$RadNative.Size = New-Object System.Drawing.Size(440, 20)
+$SavedRuntime = if ($Config.runtime) { $Config.runtime } else { "native" }
+$RadNative.Checked = ($SavedRuntime -ne "docker")
+
+$RadDocker = New-Object System.Windows.Forms.RadioButton
+$RadDocker.Text = "Docker Desktop (コンテナ展開) - 音声合成エンジンを一括起動"
+$RadDocker.Location = New-Object System.Drawing.Point(15, 40)
+$RadDocker.Size = New-Object System.Drawing.Size(440, 20)
+$RadDocker.Checked = -not $RadNative.Checked
+
+$GrpRuntime.Controls.Add($RadNative)
+$GrpRuntime.Controls.Add($RadDocker)
+$Form.Controls.Add($GrpRuntime)
+
 # --- 1. 提供範囲 (スコープ) グループ ---
 $GrpScope = New-Object System.Windows.Forms.GroupBox
 $GrpScope.Text = "1. 提供範囲 (スコープ)"
 $GrpScope.Font = $FontRegular
 $GrpScope.ForeColor = [System.Drawing.Color]::White
-$GrpScope.Location = New-Object System.Drawing.Point(20, 168)
-$GrpScope.Size = New-Object System.Drawing.Size(470, 100)
+$GrpScope.Location = New-Object System.Drawing.Point(20, 222)
+$GrpScope.Size = New-Object System.Drawing.Size(480, 94)
 
 $RadGlobal = New-Object System.Windows.Forms.RadioButton
 $RadGlobal.Text = "全体共有プールに参加 (全サーバーの読み上げを支援・推奨)"
-$RadGlobal.Location = New-Object System.Drawing.Point(15, 20)
-$RadGlobal.Size = New-Object System.Drawing.Size(430, 20)
+$RadGlobal.Location = New-Object System.Drawing.Point(15, 18)
+$RadGlobal.Size = New-Object System.Drawing.Size(440, 20)
 $RadGlobal.Checked = if ($Config.exclusive_guild_id) { $false } else { $true }
 
 $RadDedicated = New-Object System.Windows.Forms.RadioButton
 $RadDedicated.Text = "自サーバー専用枠 (自分が参加するサーバーの読み上げのみ処理)"
-$RadDedicated.Location = New-Object System.Drawing.Point(15, 42)
-$RadDedicated.Size = New-Object System.Drawing.Size(430, 20)
+$RadDedicated.Location = New-Object System.Drawing.Point(15, 38)
+$RadDedicated.Size = New-Object System.Drawing.Size(440, 20)
 $RadDedicated.Checked = -not $RadGlobal.Checked
 
 $LblGuild = New-Object System.Windows.Forms.Label
-$LblGuild.Text = "専用 Discord サーバーID:"
+$LblGuild.Text = "専用サーバーID:"
 $LblGuild.Font = $FontSmall
-$LblGuild.Location = New-Object System.Drawing.Point(35, 68)
-$LblGuild.Size = New-Object System.Drawing.Size(140, 18)
+$LblGuild.Location = New-Object System.Drawing.Point(35, 64)
+$LblGuild.Size = New-Object System.Drawing.Size(100, 18)
 
 $TxtGuild = New-Object System.Windows.Forms.TextBox
-$TxtGuild.Location = New-Object System.Drawing.Point(180, 66)
-$TxtGuild.Size = New-Object System.Drawing.Size(260, 22)
+$TxtGuild.Location = New-Object System.Drawing.Point(140, 62)
+$TxtGuild.Size = New-Object System.Drawing.Size(310, 22)
 $TxtGuild.BackColor = $ColorInputBg
 $TxtGuild.ForeColor = [System.Drawing.Color]::White
 $TxtGuild.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
@@ -337,93 +397,103 @@ $Form.Controls.Add($GrpScope)
 
 # --- 2. 提供エンジン グループ ---
 $GrpEngines = New-Object System.Windows.Forms.GroupBox
-$GrpEngines.Text = "2. 提供する音声合成エンジン (自動検出 & 自動セットアップ)"
+$GrpEngines.Text = "2. 提供する音声合成エンジン (自動検出 & セットアップ支援)"
 $GrpEngines.Font = $FontRegular
 $GrpEngines.ForeColor = [System.Drawing.Color]::White
-$GrpEngines.Location = New-Object System.Drawing.Point(20, 275)
-$GrpEngines.Size = New-Object System.Drawing.Size(470, 145)
+$GrpEngines.Location = New-Object System.Drawing.Point(20, 320)
+$GrpEngines.Size = New-Object System.Drawing.Size(480, 160)
 
-# エンジンチェックボックスのテキスト更新ヘルパー
 function Update-EngineCheckboxTexts {
     $vvInfo = $DetectedEngines["voicevox"]
     $ciInfo = $DetectedEngines["coeiroink"]
     $svInfo = $DetectedEngines["sharevox"]
 
-    $ChkVv.Text = "VOICEVOX (四国めたん・ずんだもん等) " + $(if($vvInfo){"🟢 稼働中 ($($vvInfo.port))"}else{"⚪ 未起動"})
-    $ChkCi.Text = "COEIROINK (つくよみちゃん・クロワ等) " + $(if($ciInfo){"🟢 稼働中 ($($ciInfo.port))"}else{"⚪ 未起動"})
-    
-    $svText = "SHAREVOX (小春音アミ等) " + $(if($svInfo){"🟢 稼働中 ($($svInfo.port))"}else{"⚪ 未起動"})
-    if ($ChkVv.Checked -and $ChkSv.Checked -and (-not $svInfo -or $svInfo.port -eq 50021)) {
-        $svText += " (同時提供: 50025自動分離)"
-    }
-    $ChkSv.Text = $svText
+    $ChkVv.Text = "VOICEVOX (四国めたん・ずんだもん等) " + $(if($vvInfo){"🟢 稼働中"}else{"⚪ 未起動"})
+    $ChkCi.Text = "COEIROINK (つくよみちゃん・クロワ等) " + $(if($ciInfo){"🟢 稼働中"}else{"⚪ 未起動"})
+    $ChkSv.Text = "SHAREVOX (小春音アミ・つくよみちゃん等) " + $(if($svInfo){"🟢 稼働中"}else{"⚪ 未起動"})
 }
 
 $ChkVv = New-Object System.Windows.Forms.CheckBox
-$ChkVv.Location = New-Object System.Drawing.Point(15, 22)
-$ChkVv.Size = New-Object System.Drawing.Size(430, 20)
+$ChkVv.Location = New-Object System.Drawing.Point(15, 20)
+$ChkVv.Size = New-Object System.Drawing.Size(350, 22)
 $ChkVv.Checked = if ($Config.engines) { $Config.engines -contains "voicevox" } else { $true }
 
+$BtnSetupVv = New-Object System.Windows.Forms.Button
+$BtnSetupVv.Text = "⬇️ 入手"
+$BtnSetupVv.Font = $FontSmall
+$BtnSetupVv.Location = New-Object System.Drawing.Point(380, 18)
+$BtnSetupVv.Size = New-Object System.Drawing.Size(85, 24)
+$BtnSetupVv.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+$BtnSetupVv.ForeColor = [System.Drawing.Color]::White
+$BtnSetupVv.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$BtnSetupVv.Add_Click({
+    if ($RadDocker.Checked) {
+        Start-DockerEngines $true $false $LblEngineStatus
+    } else {
+        Start-Process "https://voicevox.hiroshiba.jp/"
+    }
+})
+
 $ChkCi = New-Object System.Windows.Forms.CheckBox
-$ChkCi.Location = New-Object System.Drawing.Point(15, 43)
-$ChkCi.Size = New-Object System.Drawing.Size(430, 20)
-$ChkCi.Checked = if ($Config.engines) { $Config.engines -contains "coeiroink" } else { [bool]$DetectedEngines["coeiroink"] }
+$ChkCi.Location = New-Object System.Drawing.Point(15, 46)
+$ChkCi.Size = New-Object System.Drawing.Size(350, 22)
+$ChkCi.Checked = if ($Config.engines) { $Config.engines -contains "coeiroink" } else { $false }
+
+$BtnSetupCi = New-Object System.Windows.Forms.Button
+$BtnSetupCi.Text = "⬇️ 入手"
+$BtnSetupCi.Font = $FontSmall
+$BtnSetupCi.Location = New-Object System.Drawing.Point(380, 44)
+$BtnSetupCi.Size = New-Object System.Drawing.Size(85, 24)
+$BtnSetupCi.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+$BtnSetupCi.ForeColor = [System.Drawing.Color]::White
+$BtnSetupCi.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$BtnSetupCi.Add_Click({
+    Start-Process "https://coeiroink.com/download"
+})
 
 $ChkSv = New-Object System.Windows.Forms.CheckBox
-$ChkSv.Location = New-Object System.Drawing.Point(15, 64)
-$ChkSv.Size = New-Object System.Drawing.Size(430, 20)
-$ChkSv.Checked = if ($Config.engines) { $Config.engines -contains "sharevox" } else { [bool]$DetectedEngines["sharevox"] }
+$ChkSv.Location = New-Object System.Drawing.Point(15, 72)
+$ChkSv.Size = New-Object System.Drawing.Size(350, 22)
+$ChkSv.Checked = if ($Config.engines) { $Config.engines -contains "sharevox" } else { $false }
 
-$ChkVv.Add_CheckedChanged({ Update-EngineCheckboxTexts })
-$ChkSv.Add_CheckedChanged({ Update-EngineCheckboxTexts })
+$BtnSetupSv = New-Object System.Windows.Forms.Button
+$BtnSetupSv.Text = "⬇️ 入手"
+$BtnSetupSv.Font = $FontSmall
+$BtnSetupSv.Location = New-Object System.Drawing.Point(380, 70)
+$BtnSetupSv.Size = New-Object System.Drawing.Size(85, 24)
+$BtnSetupSv.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+$BtnSetupSv.ForeColor = [System.Drawing.Color]::White
+$BtnSetupSv.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$BtnSetupSv.Add_Click({
+    if ($RadDocker.Checked) {
+        Start-DockerEngines $false $true $LblEngineStatus
+    } else {
+        Start-Process "https://www.sharevox.net/"
+    }
+})
 
 Update-EngineCheckboxTexts
 
-# 自動セットアップ制御
 $ChkAutoEngine = New-Object System.Windows.Forms.CheckBox
-$ChkAutoEngine.Text = "🚀 未起動時は VOICEVOX を自動インストール・起動する (推奨)"
-$ChkAutoEngine.Font = $FontSmall
-$ChkAutoEngine.ForeColor = [System.Drawing.Color]::FromArgb(56, 189, 248)
-$ChkAutoEngine.Location = New-Object System.Drawing.Point(15, 88)
-$ChkAutoEngine.Size = New-Object System.Drawing.Size(320, 20)
-$ChkAutoEngine.Checked = if ($null -ne $Config.auto_setup_engine) { [bool]$Config.auto_setup_engine } else { -not $DetectedEngines["voicevox"] }
-
-$BtnInstallEngine = New-Object System.Windows.Forms.Button
-$BtnInstallEngine.Text = "⚡ 今すぐ自動起動"
-$BtnInstallEngine.Font = $FontSmall
-$BtnInstallEngine.Location = New-Object System.Drawing.Point(340, 86)
-$BtnInstallEngine.Size = New-Object System.Drawing.Size(120, 24)
-$BtnInstallEngine.BackColor = [System.Drawing.Color]::FromArgb(40, 167, 69)
-$BtnInstallEngine.ForeColor = [System.Drawing.Color]::White
-$BtnInstallEngine.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$ChkAutoEngine.Text = "⚡ 未起動のローカルエンジンを自動バックグラウンド起動 (最小化)"
+$ChkAutoEngine.Location = New-Object System.Drawing.Point(15, 102)
+$ChkAutoEngine.Size = New-Object System.Drawing.Size(440, 20)
+$ChkAutoEngine.Checked = if ($null -ne $Config.auto_setup_engine) { [bool]$Config.auto_setup_engine } else { $true }
 
 $LblEngineStatus = New-Object System.Windows.Forms.Label
-$LblEngineStatus.Text = if ($HasAnyEngine) { "✨ 検出完了: ボランティア参加準備が整っています" } else { "※ エンジンが未起動です。「今すぐ自動起動」または起動後にご参加ください" }
+$LblEngineStatus.Text = if ($HasAnyEngine) { "✨ 検出されたエンジンを自動認識しました" } else { "💡 エンジン未起動。入手ボタンまたは自動起動が利用できます" }
 $LblEngineStatus.Font = $FontSmall
-$LblEngineStatus.ForeColor = [System.Drawing.Color]::DarkGray
-$LblEngineStatus.Location = New-Object System.Drawing.Point(15, 115)
-$LblEngineStatus.Size = New-Object System.Drawing.Size(440, 18)
-
-$BtnInstallEngine.Add_Click({
-    $BtnInstallEngine.Enabled = $false
-    $LblEngineStatus.ForeColor = [System.Drawing.Color]::Yellow
-    Start-VoicevoxEngine $LblEngineStatus
-    Start-Sleep -Seconds 1
-    # 再スキャン
-    $script:DetectedEngines = Scan-AllLocalEngines
-    Update-EngineCheckboxTexts
-    if ($DetectedEngines["voicevox"]) {
-        $ChkVv.Checked = $true
-        $LblEngineStatus.ForeColor = [System.Drawing.Color]::LightGreen
-    }
-    $BtnInstallEngine.Enabled = $true
-})
+$LblEngineStatus.ForeColor = [System.Drawing.Color]::FromArgb(88, 101, 242)
+$LblEngineStatus.Location = New-Object System.Drawing.Point(15, 130)
+$LblEngineStatus.Size = New-Object System.Drawing.Size(450, 20)
 
 $GrpEngines.Controls.Add($ChkVv)
+$GrpEngines.Controls.Add($BtnSetupVv)
 $GrpEngines.Controls.Add($ChkCi)
+$GrpEngines.Controls.Add($BtnSetupCi)
 $GrpEngines.Controls.Add($ChkSv)
+$GrpEngines.Controls.Add($BtnSetupSv)
 $GrpEngines.Controls.Add($ChkAutoEngine)
-$GrpEngines.Controls.Add($BtnInstallEngine)
 $GrpEngines.Controls.Add($LblEngineStatus)
 $Form.Controls.Add($GrpEngines)
 
@@ -432,26 +502,26 @@ $GrpPerf = New-Object System.Windows.Forms.GroupBox
 $GrpPerf.Text = "3. PC負荷 & ゲーム配慮"
 $GrpPerf.Font = $FontRegular
 $GrpPerf.ForeColor = [System.Drawing.Color]::White
-$GrpPerf.Location = New-Object System.Drawing.Point(20, 428)
-$GrpPerf.Size = New-Object System.Drawing.Size(470, 110)
+$GrpPerf.Location = New-Object System.Drawing.Point(20, 484)
+$GrpPerf.Size = New-Object System.Drawing.Size(480, 94)
 
 $ChkGamePriority = New-Object System.Windows.Forms.CheckBox
 $ChkGamePriority.Text = "🎮 ゲーム優先モード (プロセス優先度: 通常以下) ※推奨"
-$ChkGamePriority.Location = New-Object System.Drawing.Point(15, 20)
-$ChkGamePriority.Size = New-Object System.Drawing.Size(430, 20)
+$ChkGamePriority.Location = New-Object System.Drawing.Point(15, 18)
+$ChkGamePriority.Size = New-Object System.Drawing.Size(440, 20)
 $ChkGamePriority.Checked = if ($null -ne $Config.game_priority) { [bool]$Config.game_priority } else { $true }
 
 $LblGameNote = New-Object System.Windows.Forms.Label
-$LblGameNote.Text = "ゲーム中もFPSを落とさず、余ったGPU/CPUパワーのみで安全に処理します。"
+$LblGameNote.Text = "ゲームプレイ中もFPSを落とさず、余ったGPU/CPUパワーのみで安全に処理します。"
 $LblGameNote.Font = $FontSmall
 $LblGameNote.ForeColor = [System.Drawing.Color]::DarkGray
-$LblGameNote.Location = New-Object System.Drawing.Point(35, 40)
-$LblGameNote.Size = New-Object System.Drawing.Size(410, 18)
+$LblGameNote.Location = New-Object System.Drawing.Point(35, 38)
+$LblGameNote.Size = New-Object System.Drawing.Size(430, 18)
 
 $LblCapacity = New-Object System.Windows.Forms.Label
-$LblCapacity.Text = "同時処理タスク数:"
-$LblCapacity.Location = New-Object System.Drawing.Point(15, 68)
-$LblCapacity.Size = New-Object System.Drawing.Size(120, 20)
+$LblCapacity.Text = "同時処理数:"
+$LblCapacity.Location = New-Object System.Drawing.Point(15, 62)
+$LblCapacity.Size = New-Object System.Drawing.Size(80, 20)
 
 $CmbCapacity = New-Object System.Windows.Forms.ComboBox
 $CmbCapacity.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
@@ -460,7 +530,7 @@ $CmbCapacity.Items.Add("2件 (標準・推奨)") | Out-Null
 $CmbCapacity.Items.Add("3件 (ハイパワーGPU向け)") | Out-Null
 $CmbCapacity.Items.Add("4件 (最強スペック向け)") | Out-Null
 $CmbCapacity.SelectedIndex = if ($Config.capacity) { [Math]::Max(0, [Math]::Min(3, $Config.capacity - 1)) } else { 1 }
-$CmbCapacity.Location = New-Object System.Drawing.Point(140, 66)
+$CmbCapacity.Location = New-Object System.Drawing.Point(100, 60)
 $CmbCapacity.Size = New-Object System.Drawing.Size(180, 22)
 
 $GrpPerf.Controls.Add($ChkGamePriority)
@@ -469,41 +539,48 @@ $GrpPerf.Controls.Add($LblCapacity)
 $GrpPerf.Controls.Add($CmbCapacity)
 $Form.Controls.Add($GrpPerf)
 
-# --- 4. 常駐 & 設定記憶 ---
+# --- 4. ショートカット & 設定記憶 ---
 $LblName = New-Object System.Windows.Forms.Label
-$LblName.Text = "表示ノード名 (ニックネーム):"
+$LblName.Text = "ノード名 (ニックネーム):"
 $LblName.Font = $FontSmall
-$LblName.Location = New-Object System.Drawing.Point(20, 548)
-$LblName.Size = New-Object System.Drawing.Size(180, 18)
+$LblName.Location = New-Object System.Drawing.Point(20, 588)
+$LblName.Size = New-Object System.Drawing.Size(140, 18)
 $Form.Controls.Add($LblName)
 
 $TxtName = New-Object System.Windows.Forms.TextBox
-$TxtName.Location = New-Object System.Drawing.Point(180, 546)
-$TxtName.Size = New-Object System.Drawing.Size(310, 22)
+$TxtName.Location = New-Object System.Drawing.Point(160, 586)
+$TxtName.Size = New-Object System.Drawing.Size(340, 22)
 $TxtName.BackColor = $ColorInputBg
 $TxtName.ForeColor = [System.Drawing.Color]::White
 $TxtName.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 $TxtName.Text = if ($Config.node_name) { $Config.node_name } else { $env:COMPUTERNAME }
 $Form.Controls.Add($TxtName)
 
+$ChkDesktop = New-Object System.Windows.Forms.CheckBox
+$ChkDesktop.Text = "🖥️ デスクトップにショートカットを作成 (次回からダブルクリックで即起動)"
+$ChkDesktop.Location = New-Object System.Drawing.Point(20, 614)
+$ChkDesktop.Size = New-Object System.Drawing.Size(480, 20)
+$ChkDesktop.Checked = $true
+$Form.Controls.Add($ChkDesktop)
+
 $ChkStartup = New-Object System.Windows.Forms.CheckBox
 $ChkStartup.Text = "🔄 Windows 起動時に自動でバックグラウンド実行 (スタートアップ常駐)"
-$ChkStartup.Location = New-Object System.Drawing.Point(20, 574)
-$ChkStartup.Size = New-Object System.Drawing.Size(470, 20)
-$ChkStartup.Checked = if ($null -ne $Config.startup) { [bool]$Config.startup } else { $true }
+$ChkStartup.Location = New-Object System.Drawing.Point(20, 636)
+$ChkStartup.Size = New-Object System.Drawing.Size(480, 20)
+$ChkStartup.Checked = if ($null -ne $Config.startup) { [bool]$Config.startup } else { $false }
 $Form.Controls.Add($ChkStartup)
 
 $ChkSave = New-Object System.Windows.Forms.CheckBox
-$ChkSave.Text = "💾 この設定をローカルに記憶する (次回から即起動)"
-$ChkSave.Location = New-Object System.Drawing.Point(20, 598)
-$ChkSave.Size = New-Object System.Drawing.Size(470, 20)
+$ChkSave.Text = "💾 この設定をローカルに記憶する"
+$ChkSave.Location = New-Object System.Drawing.Point(20, 658)
+$ChkSave.Size = New-Object System.Drawing.Size(480, 20)
 $ChkSave.Checked = $true
 $Form.Controls.Add($ChkSave)
 
 # --- ボタン ---
 $BtnCancel = New-Object System.Windows.Forms.Button
 $BtnCancel.Text = "キャンセル"
-$BtnCancel.Location = New-Object System.Drawing.Point(270, 635)
+$BtnCancel.Location = New-Object System.Drawing.Point(280, 695)
 $BtnCancel.Size = New-Object System.Drawing.Size(100, 32)
 $BtnCancel.BackColor = [System.Drawing.Color]::FromArgb(79, 84, 92)
 $BtnCancel.ForeColor = [System.Drawing.Color]::White
@@ -514,13 +591,39 @@ $Form.Controls.Add($BtnCancel)
 $BtnStart = New-Object System.Windows.Forms.Button
 $BtnStart.Text = "起動する 🚀"
 $BtnStart.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-$BtnStart.Location = New-Object System.Drawing.Point(380, 635)
+$BtnStart.Location = New-Object System.Drawing.Point(390, 695)
 $BtnStart.Size = New-Object System.Drawing.Size(110, 32)
 $BtnStart.BackColor = $ColorAccent
 $BtnStart.ForeColor = [System.Drawing.Color]::White
 $BtnStart.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-$BtnStart.DialogResult = [System.Windows.Forms.DialogResult]::OK
 $Form.Controls.Add($BtnStart)
+
+$BtnStart.Add_Click({
+    # 共有トークン必須バリデーション
+    if (-not $TxtToken.Text.Trim()) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "共有トークンの入力は必須です。`nCloudflare Tunnel / インターネット経由の安全な接続には認証トークンが必要です。`n管理者から受領したトークンを入力してください。",
+            "共有トークン必須",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        $TxtToken.Focus()
+        return
+    }
+
+    if (-not $ChkVv.Checked -and -not $ChkCi.Checked -and -not $ChkSv.Checked) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "提供する音声合成エンジンを少なくとも1つ選択してください。",
+            "エンジン未選択",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+        return
+    }
+
+    $Form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $Form.Close()
+})
 
 $Form.AcceptButton = $BtnStart
 $Form.CancelButton = $BtnCancel
@@ -529,10 +632,28 @@ $Form.CancelButton = $BtnCancel
 $Result = $Form.ShowDialog()
 
 if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
-    # 自動起動オプションが有効で、かつVOICEVOX未起動なら今すぐ起動
-    if ($ChkAutoEngine.Checked -and -not $DetectedEngines["voicevox"]) {
-        Write-Host "▶ VOICEVOX を自動起動中..." -ForegroundColor Cyan
-        Start-VoicevoxEngine
+    $ChosenRuntime = if ($RadDocker.Checked) { "docker" } else { "native" }
+
+    # 自動起動オプション有効時の処理
+    if ($ChkAutoEngine.Checked) {
+        if ($ChosenRuntime -eq "docker") {
+            Write-Host "🐳 Docker Desktop で音声合成コンテナを起動中..." -ForegroundColor Cyan
+            Start-DockerEngines $ChkVv.Checked $ChkSv.Checked
+        } else {
+            # ネイティブ最小化起動
+            if ($ChkVv.Checked -and -not $DetectedEngines["voicevox"]) {
+                Write-Host "▶ VOICEVOX を最小化起動中..." -ForegroundColor Cyan
+                Start-NativeVoicevox
+            }
+            if ($ChkSv.Checked -and -not $DetectedEngines["sharevox"]) {
+                Write-Host "▶ SHAREVOX を最小化起動中..." -ForegroundColor Cyan
+                Start-NativeSharevox
+            }
+            # バージョン確認 (ユーザー承認付きアップデート案内)
+            if ($ChkVv.Checked) {
+                Check-VoicevoxUpdate
+            }
+        }
         Start-Sleep -Seconds 1
         $DetectedEngines = Scan-AllLocalEngines
     }
@@ -543,17 +664,14 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
     if ($ChkCi.Checked) { $EnginesList += "coeiroink" }
     if ($ChkSv.Checked) { $EnginesList += "sharevox" }
 
-    # 検出された実際の URL (VOICEVOX と SHAREVOX のポート 50021 衝突を自動回避)
     $vvUrl = if ($DetectedEngines["voicevox"]) { $DetectedEngines["voicevox"].url } else { "http://127.0.0.1:50021" }
     $svUrl = if ($DetectedEngines["sharevox"]) {
-        # 既に 50025 または別ポートで動いていればそのポート、もし 50021 で VOICEVOX と被るなら 50025 を優先
         if ($ChkVv.Checked -and $DetectedEngines["sharevox"].port -eq 50021 -and $DetectedEngines["voicevox"]) {
             "http://127.0.0.1:50025"
         } else {
             $DetectedEngines["sharevox"].url
         }
     } else {
-        # VOICEVOX と同時選択の場合は 50025 に自動分離
         if ($ChkVv.Checked) { "http://127.0.0.1:50025" } else { "http://127.0.0.1:50021" }
     }
     $ciUrl = if ($DetectedEngines["coeiroink"]) { $DetectedEngines["coeiroink"].url } else { "http://127.0.0.1:50031" }
@@ -570,6 +688,7 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
     $NewConfig = [ordered]@{
         server_url         = $TxtServer.Text.Trim()
         token              = $TxtToken.Text.Trim()
+        runtime            = $ChosenRuntime
         exclusive_guild_id = $ExclusiveGuildId
         engines            = $EnginesList
         engine_urls        = $EngineUrls
@@ -587,26 +706,43 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
         Write-Host "✅ 設定を $ConfigPath に保存しました。" -ForegroundColor Green
     }
 
-    # スタートアップ登録制御
-    $StartupDir = [System.Environment]::GetFolderPath('Startup')
-    $ShortcutPath = Join-Path $StartupDir "TTSBotVolunteerWorker.lnk"
-
-    if ($ChkStartup.Checked) {
+    # ショートカット作成ヘルパー
+    function Create-LnkShortcut([string]$lnkPath, [string]$target, [string]$workDir, [string]$desc) {
         try {
             $WScriptShell = New-Object -ComObject WScript.Shell
-            $Shortcut = $WScriptShell.CreateShortcut($ShortcutPath)
-            $Shortcut.TargetPath = Join-Path $WorkerDir "run_volunteer.bat"
-            $Shortcut.WorkingDirectory = $WorkerDir
-            $Shortcut.WindowStyle = 7 # 7 = Minimized (最小化)
-            $Shortcut.Description = "TTSBot Volunteer Worker Agent"
+            $Shortcut = $WScriptShell.CreateShortcut($lnkPath)
+            $Shortcut.TargetPath = $target
+            $Shortcut.WorkingDirectory = $workDir
+            $Shortcut.WindowStyle = 7 # 7 = Minimized
+            $Shortcut.Description = $desc
             $Shortcut.Save()
-            Write-Host "✅ Windows スタートアップに登録しました (最小化起動)" -ForegroundColor Green
+            return $true
         } catch {
-            Write-Warning "スタートアップ登録に失敗しました: $_"
+            return $false
+        }
+    }
+
+    $batPath = Join-Path $WorkerDir "run_volunteer.bat"
+
+    # デスクトップショートカット作成
+    $DesktopDir = [System.Environment]::GetFolderPath('Desktop')
+    $DesktopShortcut = Join-Path $DesktopDir "TTSBot Volunteer Worker.lnk"
+    if ($ChkDesktop.Checked) {
+        if (Create-LnkShortcut $DesktopShortcut $batPath $WorkerDir "TTSBot Volunteer Worker (ボランティア参加ツール)") {
+            Write-Host "✅ デスクトップにショートカットを作成しました: $DesktopShortcut" -ForegroundColor Green
+        }
+    }
+
+    # スタートアップ登録制御
+    $StartupDir = [System.Environment]::GetFolderPath('Startup')
+    $StartupShortcut = Join-Path $StartupDir "TTSBotVolunteerWorker.lnk"
+    if ($ChkStartup.Checked) {
+        if (Create-LnkShortcut $StartupShortcut $batPath $WorkerDir "TTSBot Volunteer Worker Agent") {
+            Write-Host "✅ Windows スタートアップに登録しました (最小化起動)" -ForegroundColor Green
         }
     } else {
-        if (Test-Path $ShortcutPath) {
-            Remove-Item $ShortcutPath -Force -ErrorAction SilentlyContinue
+        if (Test-Path $StartupShortcut) {
+            Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
             Write-Host "ℹ️ スタートアップ登録を解除しました。" -ForegroundColor Yellow
         }
     }
@@ -615,15 +751,12 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
     $InvokedFromBat = ($MyInvocation.Line -match "run_volunteer\.bat") -or ($env:TTSBOT_WORKER_INVOKED_BY_BAT -eq "1")
 
     if (-not $InvokedFromBat -and -not $PSScriptRoot) {
-        # ワンライナー (irm ... | iex) 等から直接 PowerShell で実行された場合:
-        # 必要なエージェントファイルを ~/.ttsbot-worker に自動展開し、直接起動する
+        # ワンライナー (irm ... | iex) 等から直接実行された場合
         Write-Host "`n🚀 ボランティア Worker エージェントの準備中..." -ForegroundColor Green
 
-        # 1. サーバーURLから HTTP ベースURLを特定
         $serverUrl = $NewConfig.server_url
         $httpBase = $serverUrl -replace '^wss://', 'https://' -replace '^ws://', 'http://' -replace '/api/worker/ws/?$', '' -replace '/+$', ''
 
-        # 2. 必要なスクリプト (volunteer_worker.py, run_volunteer.bat) の自動取得
         foreach ($file in @("volunteer_worker.py", "run_volunteer.bat", "run_volunteer_gui.ps1")) {
             $destPath = Join-Path $WorkerDir $file
             if (-not (Test-Path $destPath)) {
@@ -637,11 +770,9 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
             }
         }
 
-        # 3. Python の存在確認
+        # Python の存在確認
         $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-        if (-not $pythonCmd) {
-            $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue
-        }
+        if (-not $pythonCmd) { $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue }
         if (-not $pythonCmd) {
             [System.Windows.Forms.MessageBox]::Show(
                 "Python が見つかりませんでした。`nPython 3.9 以上をインストールし、『Add Python to PATH』にチェックを入れてください。`n`nダウンロード: https://www.python.org/downloads/",
@@ -653,14 +784,14 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
             exit 1
         }
 
-        # 4. aiohttp の存在確認 & インストール
+        # aiohttp の確認 & インストール
         & $pythonCmd.Source -c "import aiohttp" 2>$null
         if ($LASTEXITCODE -ne 0) {
             Write-Host "▶ 必要なライブラリ (aiohttp) をインストール中..." -ForegroundColor Cyan
             & $pythonCmd.Source -m pip install aiohttp
         }
 
-        # 5. volunteer_worker.py の起動
+        # volunteer_worker.py の起動
         $workerScript = Join-Path $WorkerDir "volunteer_worker.py"
         if (Test-Path $workerScript) {
             $pyArgs = @($workerScript, "--server-url", $NewConfig.server_url)
@@ -679,14 +810,14 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
             Write-Host "  🎙️ TTSBot Volunteer Worker 起動完了" -ForegroundColor Cyan
             Write-Host "======================================================" -ForegroundColor Cyan
             Write-Host "▶ サーバー      : $($NewConfig.server_url)" -ForegroundColor White
+            Write-Host "▶ 共有トークン  : 設定完了 (認証保護)" -ForegroundColor White
+            Write-Host "▶ 実行環境      : $($NewConfig.runtime)" -ForegroundColor White
             Write-Host "▶ ノード名      : $($NewConfig.node_name)" -ForegroundColor White
             Write-Host "▶ キャパシティ  : $($NewConfig.capacity) 並列" -ForegroundColor White
             Write-Host "▶ プロセス優先度: $(if($NewConfig.game_priority){'ゲーム優先モード (BelowNormal)'}else{'通常 (Normal)'})" -ForegroundColor White
             Write-Host "`n✨ ボランティアエージェントが接続を開始しました (終了するには Ctrl+C を押してください)...`n" -ForegroundColor Green
 
             & $pythonCmd.Source $pyArgs
-        } else {
-            Write-Host "❌ volunteer_worker.py が見つかりませんでした。" -ForegroundColor Red
         }
     }
 

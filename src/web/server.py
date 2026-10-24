@@ -452,12 +452,22 @@ class WebServer:
             "/static/agent.py",
         )
         if is_wan and any(path == p or path.startswith(p) for p in worker_sensitive_prefixes):
-            # 例外: WebUIダッシュボードの管理用API (/api/worker/nodes, /api/worker/logs, /api/worker/update) は認証済み管理者なら許可
+            # 例外1: WebUIダッシュボードの管理用API (/api/worker/nodes, /api/worker/logs, /api/worker/update等) は認証済み管理者なら許可
             if path in ("/api/worker/nodes", "/api/worker/logs", "/api/worker/update",
                         "/api/worker/rolling", "/api/worker/rolling/status", "/api/worker/restart"):
                 user = self.auth.get_current_user(request)
                 if not user:
                     return web.json_response({"error": "Forbidden: WAN access requires authentication"}, status=403)
+            # 例外2: リモートボランティア Worker 接続エンドポイント (/api/worker/ws, /api/worker/register, /api/worker/models/)
+            # 外部 (Cloudflare Tunnel / インターネット) からの安全な接続のため、正当な共有トークン (WORKER_SHARED_SECRET) が【必須】
+            elif path in ("/api/worker/ws", "/api/worker/register") or path.startswith("/api/worker/models/"):
+                if not self._verify_worker_auth(request):
+                    client_ip = request.headers.get("CF-Connecting-IP") or request.remote or "unknown"
+                    logger.warning(f"🚫 [Security] Blocked WAN worker request (missing or invalid shared token) to '{path}' from {client_ip}")
+                    return web.json_response(
+                        {"error": "Forbidden: Valid worker shared token is required for WAN access."},
+                        status=403
+                    )
             else:
                 client_ip = request.headers.get("CF-Connecting-IP") or request.remote or "unknown"
                 logger.warning(f"🚫 [Security] Blocked WAN access to worker-internal endpoint '{path}' from {client_ip}")

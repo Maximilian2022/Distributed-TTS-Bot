@@ -55,6 +55,9 @@ echo ""
 RECONFIGURE=0
 if [ "${1:-}" = "--config" ] || [ ! -f "${CONFIG_FILE}" ]; then
     RECONFIGURE=1
+elif ! python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}', 'r', encoding='utf-8')); assert cfg.get('token')" &>/dev/null; then
+    echo -e "${C_YELLOW}⚠️ 共有トークンが設定されていないため、セットアップを行います (WAN接続には必須です)。${C_RESET}"
+    RECONFIGURE=1
 fi
 
 AUTO_SERVER_URL="__DEFAULT_SERVER_WS_URL__"
@@ -74,9 +77,12 @@ if [ "${RECONFIGURE}" -eq 1 ]; then
     # URLプロトコル自動補正
     SERVER_URL=$(echo "${SERVER_URL}" | sed -E 's|^https://|wss://|' | sed -E 's|^http://|ws://|')
 
-    if [ -z "${TOKEN}" ]; then
-        read_input "共有トークン (管理者から受領した場合のみ、無ければEnter): " TOKEN "${AUTO_TOKEN}"
-    fi
+    while [ -z "${TOKEN}" ]; do
+        read_input "共有トークン [必須] (管理者から受領したトークンを入力): " TOKEN "${AUTO_TOKEN}"
+        if [ -z "${TOKEN}" ]; then
+            echo -e "${C_RED}❌ 共有トークンは必須です。Cloudflare / WAN経由の接続には認証が必要です。${C_RESET}"
+        fi
+    done
 
     echo -e "\n${C_BOLD}[2/5] 提供範囲 (スコープ)${C_RESET}"
     echo "  1) 全体共有プール (全サーバーの読み上げを支援・推奨)"
@@ -113,18 +119,32 @@ if [ "${RECONFIGURE}" -eq 1 ]; then
     echo -e "\n${C_BOLD}[5/5] 表示ノード名 (ニックネーム)${C_RESET}"
     read_input "ノード名 [デフォルト: ${DEFAULT_NODE_NAME}]: " NODE_NAME "${DEFAULT_NODE_NAME}"
 
-    # 設定ファイルの保存 (デフォルトON)
-    cat <<EOF > "${CONFIG_FILE}"
-{
-  "server_url": "${SERVER_URL}",
-  "token": "${TOKEN}",
-  "exclusive_guild_id": "${EXCLUSIVE_GUILD_ID}",
-  "engines": ${ENGINES},
-  "capacity": ${CAP_ANS},
-  "node_name": "${NODE_NAME}",
-  "game_priority": true
+    # 設定ファイルの保存 (Pythonのjson.dumpで100%安全・確実にJSON生成)
+    python3 -c "
+import json
+try:
+    engines = json.loads('''${ENGINES}''')
+except Exception:
+    engines = ['voicevox']
+
+cap = 2
+try:
+    cap = int('${CAP_ANS}')
+except Exception:
+    pass
+
+cfg = {
+    'server_url': '''${SERVER_URL}''',
+    'token': '''${TOKEN}''',
+    'exclusive_guild_id': '''${EXCLUSIVE_GUILD_ID}''',
+    'engines': engines,
+    'capacity': cap,
+    'node_name': '''${NODE_NAME}''',
+    'game_priority': True
 }
-EOF
+with open('${CONFIG_FILE}', 'w', encoding='utf-8') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+"
     echo -e "${C_GREEN}✓ 設定を ${CONFIG_FILE} に保存しました (次回から即起動)${C_RESET}\n"
 else
     echo -e "${C_GREEN}✓ 既存の設定 (${CONFIG_FILE}) を読み込みました (再設定は --config)${C_RESET}"
@@ -232,8 +252,11 @@ echo -e "${C_GREEN}🚀 ボランティアエージェントを起動します (
 python3 -c "
 import json, sys, subprocess
 
-with open('${CONFIG_FILE}', 'r', encoding='utf-8') as f:
-    cfg = json.load(f)
+try:
+    with open('${CONFIG_FILE}', 'r', encoding='utf-8') as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
 
 args = [
     sys.executable,
