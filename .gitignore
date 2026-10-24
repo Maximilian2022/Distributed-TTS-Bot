@@ -71,8 +71,9 @@ scratch/
 .DS_Store
 Thumbs.db
 
-# Worker Access & SSH Keys
+# Worker Access & SSH Keys (ローカル開発専用・非公開)
 WorkerAccess/
+setup-windows-ssh.ps1
 id_rsa
 id_rsa.pub
 

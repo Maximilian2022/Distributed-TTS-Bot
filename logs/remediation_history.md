@@ -5951,3 +5951,25 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 - 本番コンテナ瞬断再起動 (`docker compose restart app`) により反映。
 - `/health` エンドポイントにて `status: "ok"`, `bot.is_ready: true`, 全9ノード健全接続を確認。
 
+---
+
+## 2026-10-24 10:50: WorkerAccess / SSHリモート操作の非公開化・完全ローカル専用化
+
+### 1. 課題と背景
+- ボランティア参加型の不特定多数ノードを想定したOSSプロジェクトにおいて、Masterサーバーからワーカーマシンへ勝手にSSH接続・リモート操作する仕組みやスクリプトが公開されていると、参加者にセキュリティ上の重大な不安・リスクを与える。
+- `WorkerAccess/` は元々開発者のローカル開発環境アクセス用プライベートツールであるため、外部公開リポジトリ（OSS）およびWeb配信から完全に除外・分離する必要があった。
+
+### 2. 実施した修正
+1. **公開ディレクトリからの削除 & Git除外**:
+   - `src/web/static/setup-windows-ssh.ps1` を削除 (`git rm`)。
+   - `.gitignore` に `setup-windows-ssh.ps1` を追加（`WorkerAccess/` は既存で除外済み）。
+   - ローカル開発専用ツールとして `WorkerAccess/` 配下にのみ保持。
+2. **WebUI テンプレートの参照修正**:
+   - `src/web/templates/index.html`: `WorkerAccess/README.md` への案内リンクを、公開向けの `worker/README.md` に修正。
+3. **ドキュメントの改訂**:
+   - `docs/DEBIAN_WORKER_SETUP.md`:
+     - 「SSH 経由での直接リモート操作」手順を完全削除。
+     - ワーカー側ローカルでの `docker ps` / `docker logs` による確認、および Master WebUI（「ℹ️ システム状況」タブ）を通じた自律型ハートビート監視手順に刷新。
+     - Master からワーカーへのインバウンド接続（SSH等）は不要で安全に運用できる旨を明記。
+
+

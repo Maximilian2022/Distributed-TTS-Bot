@@ -57,26 +57,27 @@ curl -sSL https://<YOUR_TTSBOT_DOMAIN>/setup-worker.sh | bash
 
 ---
 
-## ステップ 3: Master 側からのリモート管理・診断
+## ステップ 3: 動作確認と状態監視
 
-Master サーバーには、Debian Worker を遠隔管理するための SSH 共通鍵と診断 CLI が用意されています。
+ワーカーは Master サーバーへ自律的に接続・登録を行い、定期的なハートビート通信を行います。Master 側からワーカーマシンへのインバウンド接続（SSH等）は不要であり、安全に監視・運用が可能です。
 
-### 1. 診断 CLI で全ワーカーの生存確認
-Master 側からいつでも一括状況確認が可能です：
+### 1. ワーカー側での確認 (ローカル)
+Debian 上でコンテナの状態や稼働ログを確認します：
 ```bash
-/path/to/ttsbot/scripts/check_workers.sh
+# コンテナの稼働状況
+docker ps
+
+# ワーカーエージェントのログ確認 (リアルタイム)
+docker logs --tail 50 -f ttsworker-agent
 ```
 
-### 2. SSH 経由での直接リモート操作
-[`WorkerAccess/README.md`](file:///root/ttsbot/WorkerAccess/README.md) に従って生成した SSH 秘密鍵を使ってログインやワンライナー確認ができます：
+### 2. Master WebUI での確認
+Master サーバーの Web ダッシュボード（「ℹ️ システム状況」タブ）にアクセスすると、自動登録されたワーカーのスペック、対応エンジン、応答遅延がリアルタイムに表示されます。
+
+### 3. (管理者向け) CLI 診断ツール
+Master サーバー上から HTTP API 経由でノードの死活・ログを一括確認できます：
 ```bash
-# ログイン
-ssh -i /path/to/WorkerAccess/id_rsa <USER>@<WORKER_IP>
-
-# コンテナ状態確認
-ssh -i /path/to/WorkerAccess/id_rsa <USER>@<WORKER_IP> "docker ps"
-
-# ワーカーエージェントのログ確認
-ssh -i /path/to/WorkerAccess/id_rsa <USER>@<WORKER_IP> "docker logs --tail 50 ttsworker-agent"
+./scripts/check_workers.sh
 ```
+
 
