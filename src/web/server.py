@@ -13,6 +13,7 @@ import aiosqlite
 import base64
 import secrets
 from datetime import datetime
+import socket
 from aiohttp import web
 import discord
 
@@ -105,9 +106,64 @@ class WebServer:
             client_max_size=1024 * 1024 * 1024,
             middlewares=[self._security_and_rate_limit_middleware]
         )
+        self._start_time = time.time()
+        self.ha_slaves: Dict[str, Dict[str, Any]] = {}
+        self.ha_revoked_nodes: set = set()
+        self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
+        self._load_ha_nodes()
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
         self._setup_routes()
+
+    def _load_ha_nodes(self):
+        try:
+            if self.ha_nodes_file.exists():
+                data = json.loads(self.ha_nodes_file.read_text(encoding="utf-8"))
+                self.ha_slaves = data.get("slaves", {})
+                self.ha_revoked_nodes = set(data.get("revoked_node_ids", []))
+        except Exception as e:
+            logger.error(f"[HA] Failed to load ha_manager_nodes.json: {e}")
+
+    def _save_ha_nodes(self):
+        try:
+            data = {
+                "slaves": self.ha_slaves,
+                "revoked_node_ids": list(self.ha_revoked_nodes)
+            }
+            self.ha_nodes_file.parent.mkdir(parents=True, exist_ok=True)
+            self.ha_nodes_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.error(f"[HA] Failed to save ha_manager_nodes.json: {e}")
+
+    def _record_ha_slave_heartbeat(self, node_id: str, hostname: str, ip: str, is_sync: bool = False, user_agent: str = ""):
+        if not node_id:
+            return
+        now = time.time()
+        if node_id not in self.ha_slaves:
+            self.ha_slaves[node_id] = {
+                "node_id": node_id,
+                "hostname": hostname,
+                "ip": ip,
+                "first_seen": now,
+                "last_seen": now,
+                "last_sync": now if is_sync else 0.0,
+                "status": "online",
+                "user_agent": user_agent
+            }
+        else:
+            entry = self.ha_slaves[node_id]
+            entry["hostname"] = hostname or entry.get("hostname", "unknown")
+            entry["ip"] = ip or entry.get("ip", "unknown")
+            entry["last_seen"] = now
+            if is_sync:
+                entry["last_sync"] = now
+            if node_id in self.ha_revoked_nodes:
+                entry["status"] = "revoked"
+            else:
+                entry["status"] = "online"
+            if user_agent:
+                entry["user_agent"] = user_agent
+        self._save_ha_nodes()
 
     async def _get_or_fetch_member(self, guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
         """
@@ -262,6 +318,10 @@ class WebServer:
         # HA (High Availability) & Standby 同期 API
         self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
         self.app.router.add_get("/api/ha/status", self.api_ha_status)
+        self.app.router.add_get("/api/system/manager_nodes", self.api_system_get_manager_nodes)
+        self.app.router.add_post("/api/system/manager_nodes/revoke", self.api_system_revoke_manager_node)
+        self.app.router.add_delete("/api/system/manager_nodes/{node_id}", self.api_system_delete_manager_node)
+        self.app.router.add_post("/api/worker/kick", self.api_worker_kick_node)
 
         # テスト・シミュレーション API (ローカルまたは管理者用)
         self.app.router.add_post("/api/test/simulate", self.api_test_simulate)
@@ -746,9 +806,27 @@ class WebServer:
         return secrets.compare_digest(token, expected)
 
     async def api_ha_status(self, request: web.Request) -> web.Response:
-        """HA 状態確認 API (Slave からの死活 & メタデータ照会)"""
+        """HA 状態確認 API (Slave からの死活 & メタデータ照会 & ハートビート記録)"""
         if not self._verify_ha_auth(request):
             return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
+
+        node_id = request.headers.get("X-HA-Node-ID", "").strip()
+        hostname = request.headers.get("X-HA-Hostname", "").strip() or "Slave Node"
+        client_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "unknown"
+        user_agent = request.headers.get("User-Agent", "")
+
+        if node_id and (node_id in self.ha_revoked_nodes or self.ha_slaves.get(node_id, {}).get("status") == "revoked"):
+            logger.warning(f"🛑 [HA] Status check from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
+            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=False, user_agent=user_agent)
+            return web.json_response({
+                "action": "terminate",
+                "error": "This Manager Slave node has been revoked and decommissioned by Master.",
+                "revoked": True,
+                "node_id": node_id
+            }, status=410)
+
+        if node_id:
+            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=False, user_agent=user_agent)
 
         db_path = self.config.db_path
         db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
@@ -773,6 +851,24 @@ class WebServer:
         """Slave 同期用 SQLite 完全整合性バックアップ (gzip 圧縮) 配信"""
         if not self._verify_ha_auth(request):
             return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
+
+        node_id = request.headers.get("X-HA-Node-ID", "").strip()
+        hostname = request.headers.get("X-HA-Hostname", "").strip() or "Slave Node"
+        client_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "unknown"
+        user_agent = request.headers.get("User-Agent", "")
+
+        if node_id and (node_id in self.ha_revoked_nodes or self.ha_slaves.get(node_id, {}).get("status") == "revoked"):
+            logger.warning(f"🛑 [HA] Snapshot sync from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
+            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=False, user_agent=user_agent)
+            return web.json_response({
+                "action": "terminate",
+                "error": "This Manager Slave node has been revoked and decommissioned by Master.",
+                "revoked": True,
+                "node_id": node_id
+            }, status=410)
+
+        if node_id:
+            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=True, user_agent=user_agent)
 
         db_path = self.config.db_path
         if not os.path.exists(db_path):
@@ -826,6 +922,105 @@ class WebServer:
         except Exception as e:
             logger.error(f"[HA] Failed to generate DB snapshot: {e}", exc_info=True)
             return web.json_response({"error": f"Failed to generate DB snapshot: {str(e)}"}, status=500)
+
+    async def api_system_get_manager_nodes(self, request: web.Request) -> web.Response:
+        """Master-Slave HA 構成のノード一覧と死活状況を取得 (管理者のみ)"""
+        await self._require_admin(request)
+        now = time.time()
+        active_bots = self.bot_pool.get_active_bot_count() if (self.bot_pool and hasattr(self.bot_pool, "get_active_bot_count")) else 1
+
+        master_info = {
+            "node_id": "master_primary",
+            "role": "master",
+            "hostname": socket.gethostname(),
+            "ip": request.host.split(":")[0] if request.host else "127.0.0.1",
+            "status": "active",
+            "status_display": "稼働中 (Active Master)",
+            "active_bots": active_bots,
+            "version": AGENT_VERSION,
+            "is_current": True,
+            "uptime_seconds": int(now - getattr(self, "_start_time", now))
+        }
+
+        slaves_list = []
+        for node_id, slave in list(self.ha_slaves.items()):
+            last_seen = slave.get("last_seen", 0)
+            is_revoked = node_id in self.ha_revoked_nodes or slave.get("status") == "revoked"
+            # 60秒以上アクセスがなければ offline 判定
+            is_online = (now - last_seen) < 60.0 and not is_revoked
+
+            status = "revoked" if is_revoked else ("online" if is_online else "offline")
+            status_display = "停止・除外済 (Revoked)" if is_revoked else ("待機中 (Standby)" if is_online else "切断 (Offline)")
+
+            slaves_list.append({
+                "node_id": node_id,
+                "hostname": slave.get("hostname", "unknown"),
+                "ip": slave.get("ip", "unknown"),
+                "last_seen": last_seen,
+                "last_seen_ago": int(now - last_seen) if last_seen > 0 else -1,
+                "last_sync": slave.get("last_sync", 0),
+                "last_sync_ago": int(now - slave.get("last_sync", 0)) if slave.get("last_sync", 0) > 0 else -1,
+                "status": status,
+                "status_display": status_display,
+                "user_agent": slave.get("user_agent", "")
+            })
+
+        slaves_list.sort(key=lambda s: (0 if s["status"] == "online" else (1 if s["status"] == "offline" else 2), -s["last_seen"]))
+
+        return web.json_response({
+            "status": "ok",
+            "master": master_info,
+            "slaves": slaves_list,
+            "ha_secret_configured": bool(self.config.ha_secret),
+            "total_nodes": 1 + len(slaves_list)
+        })
+
+    async def api_system_revoke_manager_node(self, request: web.Request) -> web.Response:
+        """指定した Slave Node を除外・自律停止対象に登録 (管理者のみ)"""
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        node_id = str(data.get("node_id", "")).strip()
+        if not node_id:
+            return web.json_response({"error": "node_id is required"}, status=400)
+
+        self.ha_revoked_nodes.add(node_id)
+        if node_id in self.ha_slaves:
+            self.ha_slaves[node_id]["status"] = "revoked"
+            self.ha_slaves[node_id]["revoked_at"] = time.time()
+        self._save_ha_nodes()
+
+        logger.warning(f"🛑 [HA] Manager Slave '{node_id}' has been marked as REVOKED by admin. Next heartbeat will return HTTP 410 Gone.")
+        return web.json_response({
+            "status": "ok",
+            "message": f"Slave '{node_id}' を除外・停止対象に登録しました。次回ハートビート時に自律停止指令 (410 Gone) が送出されます。",
+            "node_id": node_id
+        })
+
+    async def api_system_delete_manager_node(self, request: web.Request) -> web.Response:
+        """指定した Slave Node の登録履歴を完全に削除 (管理者のみ)"""
+        await self._require_admin(request)
+        node_id = request.match_info.get("node_id", "").strip()
+        if not node_id:
+            return web.json_response({"error": "node_id is required"}, status=400)
+
+        removed = False
+        if node_id in self.ha_slaves:
+            del self.ha_slaves[node_id]
+            removed = True
+        if node_id in self.ha_revoked_nodes:
+            self.ha_revoked_nodes.remove(node_id)
+            removed = True
+
+        self._save_ha_nodes()
+        return web.json_response({
+            "status": "ok",
+            "message": f"Slave '{node_id}' の登録情報を削除しました。",
+            "removed": removed
+        })
     async def handle_worker_agent_script(self, request: web.Request) -> web.Response:
         """Worker Agent スクリプト (agent.py) を配信 - Worker 側がインストール時に取得 (src.version.AGENT_VERSION と完全同期)"""
         agent_paths = [
@@ -931,6 +1126,7 @@ class WebServer:
             "ttsbot_session",
             token,
             max_age=86400 * 7,
+            path="/",
             httponly=True,
             samesite="Lax",
             secure=True
@@ -3315,6 +3511,62 @@ class WebServer:
 
         return web.json_response({"pools": result})
 
+    async def api_worker_kick_node(self, request: web.Request) -> web.Response:
+        """指定した Worker ノードの切断・キック・除外 (管理者のみ)"""
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+
+        node_id = str(data.get("node_id", "")).strip()
+        ip = str(data.get("ip", "")).strip()
+        if not node_id and not ip:
+            return web.json_response({"error": "node_id or ip is required"}, status=400)
+
+        kicked = False
+        target_name = node_id or ip
+
+        # 1. ボランティア Worker (WebSocket) の切断
+        for cid, conn in list(self.worker_ws_connections.items()):
+            conn_node_id = getattr(conn, "node_id", None) or cid
+            conn_ip = getattr(conn, "remote_ip", None) or ""
+            if (node_id and (conn_node_id == node_id or cid == node_id)) or (ip and conn_ip == ip):
+                try:
+                    ws = getattr(conn, "ws", conn)
+                    if hasattr(ws, "close") and not ws.closed:
+                        await ws.close(code=4000, message=b"Kicked by administrator")
+                    kicked = True
+                    logger.info(f"🔌 [Worker Kick] Volunteer Worker {cid} (node: {conn_node_id}) was kicked by admin.")
+                except Exception as e:
+                    logger.warning(f"Error kicking WS connection {cid}: {e}")
+
+        # 2. 常設 Worker Pool からの無効化 / 除外
+        pool_map = {
+            "voicevox": self.tts_manager.voicevox_pool,
+            "sharevox": self.tts_manager.sharevox_pool,
+            "coeiroink": self.tts_manager.coeiroink_pool,
+        }
+        for engine_name, pool in pool_map.items():
+            if hasattr(pool, "nodes"):
+                for n in list(pool.nodes):
+                    nid = getattr(n, "id", "")
+                    nurl = getattr(n, "url", "")
+                    if (node_id and (nid == node_id or nurl == node_id)) or (ip and (ip in nurl or getattr(n, "host", "") == ip)):
+                        if hasattr(n, "is_active"):
+                            n.is_active = False
+                        if hasattr(pool, "remove_node"):
+                            pool.remove_node(n.id)
+                        kicked = True
+                        logger.info(f"🚫 [Worker Kick] 常設 Worker {nid} ({nurl}) in {engine_name} was removed/deactivated.")
+
+        return web.json_response({
+            "status": "ok",
+            "kicked": kicked,
+            "target": target_name,
+            "message": f"Worker ノード '{target_name}' を切断・除外しました。"
+        })
+
     async def api_worker_trigger_update(self, request: web.Request) -> web.Response:
         """指定ノードまたは全ノードの Worker Agent に自己アップデート・完全再構成を指示する (管理者権限必須)"""
         await self._require_admin(request)
@@ -4094,11 +4346,12 @@ class WebServer:
         }
         token = self.auth.create_session_token(user_data, is_admin=True)
 
-        resp = web.json_response({"success": True, "message": "管理者としてログインしました。"})
+        resp = web.json_response({"success": True, "status": "ok", "message": "管理者としてログインしました。"})
         resp.set_cookie(
             "ttsbot_session",
             token,
             max_age=86400 * 7,
+            path="/",
             httponly=True,
             samesite="Lax"
         )

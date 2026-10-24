@@ -21,6 +21,7 @@ import urllib.request
 import urllib.error
 import http.client
 import socket
+import uuid
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -114,11 +115,47 @@ class HAWatchdog:
         self.db_path = Path(os.getenv("TTSBOT_LOCAL_DB_PATH", "/app/data/bot.db"))
         self.docker = DockerSocketClient(os.getenv("TTSBOT_DOCKER_SOCKET", "/var/run/docker.sock"))
 
+        self.hostname = socket.gethostname()
+        self.node_id = self._init_node_id()
+
         self.current_state = "standby"  # "standby" or "active"
         self.fail_count = 0
         self.last_sync_time = 0.0
         self.last_db_hash: Optional[str] = None
         self.running = True
+
+        logger.info(f"🆔 HA Watchdog initialized. Node ID: {self.node_id} (Host: {self.hostname})")
+
+    def _init_node_id(self) -> str:
+        """永続的な Node ID を初期化または取得"""
+        env_id = os.getenv("TTSBOT_HA_NODE_ID", "").strip()
+        if env_id:
+            return env_id
+        try:
+            id_file = self.db_path.parent / "ha_node_id"
+            if id_file.exists():
+                saved = id_file.read_text(encoding="utf-8").strip()
+                if saved:
+                    return saved
+            clean_host = self.hostname.replace(" ", "_").replace(".", "_")
+            new_id = f"slave_{clean_host}_{uuid.uuid4().hex[:8]}"
+            id_file.parent.mkdir(parents=True, exist_ok=True)
+            id_file.write_text(new_id, encoding="utf-8")
+            return new_id
+        except Exception:
+            return f"slave_{self.hostname}_{uuid.uuid4().hex[:8]}"
+
+    def _get_common_headers(self) -> dict:
+        """Master 送信用の認証・ノード識別ヘッダー"""
+        headers = {
+            "User-Agent": f"TTSBot-HA-Watchdog/{self.node_id}",
+            "X-HA-Node-ID": self.node_id,
+            "X-HA-Hostname": self.hostname,
+        }
+        if self.ha_secret:
+            headers["Authorization"] = f"Bearer {self.ha_secret}"
+            headers["X-HA-Secret"] = self.ha_secret
+        return headers
 
     def check_internet_connectivity(self) -> bool:
         """外向きインターネット接続 (Cloudflare/Discord) 疎通検証"""
@@ -132,27 +169,58 @@ class HAWatchdog:
         return False
 
     def is_master_healthy(self) -> bool:
-        """Master の /health エンドポイント死活確認"""
+        """Master の死活確認 & ハートビート送信 (410 Gone で自律停止)"""
         if not self.master_url:
             return False
 
-        health_url = f"{self.master_url}/health"
-        req = urllib.request.Request(
-            health_url,
-            headers={"User-Agent": "TTSBot-HA-Watchdog"}
-        )
+        # まず /api/ha/status で認証付き死活確認 ＆ ハートビート送信
+        status_url = f"{self.master_url}/api/ha/status"
+        req = urllib.request.Request(status_url, headers=self._get_common_headers())
         try:
             with urllib.request.urlopen(req, timeout=4.0) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
-                    # status == "ok" かつ bot.is_ready が True
+                    return data.get("is_active", True)
+                elif resp.status == 410:
+                    self._handle_revocation()
+                    return False
+        except urllib.error.HTTPError as e:
+            if e.code == 410:
+                self._handle_revocation()
+                return False
+            logger.debug(f"Master HA status check HTTP {e.code}: {e.reason}")
+        except Exception as e:
+            logger.debug(f"Master HA status check failed: {e}")
+
+        # フォールバック: 通常の /health
+        health_url = f"{self.master_url}/health"
+        req_health = urllib.request.Request(health_url, headers=self._get_common_headers())
+        try:
+            with urllib.request.urlopen(req_health, timeout=4.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
                     is_ok = data.get("status") == "ok"
                     bot_ready = data.get("bot", {}).get("is_ready", False)
                     return is_ok and bot_ready
+                elif resp.status == 410:
+                    self._handle_revocation()
+                    return False
+        except urllib.error.HTTPError as e:
+            if e.code == 410:
+                self._handle_revocation()
+                return False
+            logger.debug(f"Master health check failed: {e}")
         except Exception as e:
             logger.debug(f"Master health check failed: {e}")
             return False
         return False
+
+    def _handle_revocation(self):
+        """Master からの登録解除・自律停止指令を受信した際の安全停止"""
+        logger.critical("🛑 [HA Watchdog] Master から自律停止・登録解除指令 (HTTP 410 Gone / Revoked) を受信しました。")
+        logger.critical("🛑 スプリットブレイン (多重昇格) 防止のため、Watchdog を直ちに安全停止します。")
+        self.running = False
+        sys.exit(0)
 
     def sync_db_snapshot(self) -> bool:
         """Master の /api/ha/db_snapshot から SQLite バックアップをプル同期"""
@@ -160,10 +228,7 @@ class HAWatchdog:
             return False
 
         sync_url = f"{self.master_url}/api/ha/db_snapshot"
-        headers = {
-            "Authorization": f"Bearer {self.ha_secret}",
-            "User-Agent": "TTSBot-HA-Watchdog"
-        }
+        headers = self._get_common_headers()
         if self.last_db_hash:
             headers["If-None-Match"] = f'"{self.last_db_hash}"'
 
@@ -174,6 +239,10 @@ class HAWatchdog:
                     logger.debug("DB snapshot unchanged (304 Not Modified).")
                     self.last_sync_time = time.time()
                     return True
+
+                if resp.status == 410:
+                    self._handle_revocation()
+                    return False
 
                 if resp.status != 200:
                     logger.warning(f"DB snapshot sync failed with HTTP {resp.status}")
@@ -210,6 +279,9 @@ class HAWatchdog:
             if e.code == 304:
                 self.last_sync_time = time.time()
                 return True
+            if e.code == 410:
+                self._handle_revocation()
+                return False
             logger.warning(f"DB sync HTTP error: {e.code} {e.reason}")
         except Exception as e:
             logger.error(f"DB sync error: {e}")

@@ -18,6 +18,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // ログイン済みの場合にデータを初期ロード
   if (window.APP_IS_LOGGED_IN) {
+    updatePermissionsUI();
     loadUserProfile();
     loadVoices();
     loadGuilds();
@@ -86,7 +87,9 @@ function setupTabs() {
 
       // タブごとのロード
       if (tabId === "bots") {
+        if (typeof loadManagerNodes === "function") loadManagerNodes();
         loadBotSlots();
+        if (typeof loadWorkerNodes === "function") loadWorkerNodes();
       }
       if (tabId === "credentials") {
         loadCredentials();
@@ -2757,7 +2760,7 @@ function renderWorkerNodes(nodesData) {
       ? `<span style="background:rgba(80,230,255,0.2);color:#50e6ff;padding:1px 6px;border-radius:4px;font-weight:700;">実行中: ${totalActive} / ${maxConcurrent}並列</span>`
       : `<span>上限: ${maxConcurrent}並列</span>`;
 
-    // アクションボタン (再起動・完全再構成) (ローカル自機およびボランティアノード以外)
+    // アクションボタン (再起動・完全再構成・キック)
     let actionButtons = '';
     if (!isMaster && !isVolunteer && nodeIp) {
       const restartBtn = `<button onclick="triggerWorkerRestart('${escapeHtml(nodeIp)}', this)" 
@@ -2781,6 +2784,20 @@ function renderWorkerNodes(nodesData) {
            </button>`
         : '';
       actionButtons = `${restartBtn} ${updateBtn}`;
+    }
+
+    if (!isMaster) {
+      const targetParam = node.id || nodeIp;
+      const kickBtn = `<button onclick="kickWorkerNode('${escapeHtml(targetParam)}', '${escapeHtml(nodeIp)}', this)" 
+           title="このWorkerノードを切断・除外します"
+           style="font-size:10px;padding:3px 8px;border-radius:5px;border:1px solid rgba(231,76,60,0.4);
+                  background:rgba(231,76,60,0.15);color:#ff6b6b;cursor:pointer;font-weight:600;
+                  transition:all 0.2s;"
+           onmouseover="this.style.background='rgba(231,76,60,0.4)';this.style.color='white'"
+           onmouseout="this.style.background='rgba(231,76,60,0.15)';this.style.color='#ff6b6b'">
+           🔌 切断
+         </button>`;
+      actionButtons = `${actionButtons} ${kickBtn}`.trim();
     }
 
     // レイテンシトラッカーからの実測平均推論ms
@@ -6630,7 +6647,7 @@ async function handlePasswordLogin(event) {
       body: JSON.stringify({ password: password })
     });
     const data = await res.json();
-    if (res.ok && data.status === "ok") {
+    if (res.ok && (data.success || data.status === "ok")) {
       showToast("管理者としてログインしました 🔑", "success");
       setTimeout(() => {
         window.location.reload();
@@ -6651,7 +6668,252 @@ async function handlePasswordLogin(event) {
     if (btn) btn.disabled = false;
   }
 }
-window.handlePasswordLogin = handlePasswordLogin;
+// ==========================================
+// 1.5. Manager Node (HA Active-Standby) 管理 & Worker ノード統制
+// ==========================================
+function formatUptime(seconds) {
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (d > 0) return `${d}日 ${h}時間 ${m}分`;
+  if (h > 0) return `${h}時間 ${m}分 ${s}秒`;
+  return `${m}分 ${s}秒`;
+}
+
+async function loadManagerNodes() {
+  const grid = document.getElementById("manager-nodes-grid");
+  const badge = document.getElementById("manager-nodes-badge");
+  if (!grid) return;
+
+  try {
+    const res = await fetch("/api/system/manager_nodes");
+    if (!res.ok) {
+      const raw = await res.text();
+      let err = {};
+      try { err = JSON.parse(raw); } catch(_) {}
+      grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Manager Node情報の取得に失敗しました: ${escapeHtml(err.error || res.statusText || raw.slice(0, 80))}</div>`;
+      return;
+    }
+    const data = await res.json();
+    const master = data.master || {};
+    const slaves = data.slaves || [];
+
+    if (badge) {
+      const activeSlaves = slaves.filter(s => s.status === "online").length;
+      badge.textContent = `Active 1台 / Standby ${activeSlaves}台 (計${1 + slaves.length}ノード)`;
+      badge.style.background = activeSlaves > 0 ? "#3ba55c" : "var(--primary, #5865f2)";
+    }
+
+    // 現在のオリジンURLを案内ボックスに反映
+    const currentOrigin = window.location.origin;
+    document.querySelectorAll(".current-origin-url").forEach(el => {
+      el.textContent = currentOrigin;
+    });
+    const setupBox = document.getElementById("standby-setup-command-box");
+    if (setupBox) {
+      setupBox.textContent = `curl -sSL ${currentOrigin}/setup-standby.sh | sudo bash`;
+    }
+
+    let cardsHtml = "";
+
+    // 1. Master カード
+    const masterUptime = master.uptime_seconds != null ? formatUptime(master.uptime_seconds) : "-";
+    cardsHtml += `
+      <div class="card" style="background:rgba(88,101,242,0.08);border:1px solid rgba(88,101,242,0.35);padding:16px;border-radius:10px;position:relative;">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+          <div>
+            <div style="font-size:12px;color:#7289da;font-weight:700;display:flex;align-items:center;gap:6px;">
+              <span>👑 主系ノード (Primary Master)</span>
+            </div>
+            <h4 style="margin:4px 0 0;font-size:16px;color:var(--text-normal);display:flex;align-items:center;gap:8px;">
+              <span>${escapeHtml(master.hostname || "Master Node")}</span>
+            </h4>
+          </div>
+          <span class="badge" style="background:rgba(46,204,113,0.2);color:#2ecc71;border:1px solid rgba(46,204,113,0.4);font-weight:700;">🟢 Active (稼働中)</span>
+        </div>
+
+        <div style="font-size:12px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,0.2);padding:10px;border-radius:6px;margin-bottom:12px;">
+          <div>IP: <strong style="color:var(--text-normal);">${escapeHtml(master.ip || "-")}</strong></div>
+          <div>Version: <strong style="color:var(--text-normal);">v${escapeHtml(master.version || "-")}</strong></div>
+          <div>稼働Bot数: <strong style="color:#50e6ff;">${master.active_bots || 1}台</strong></div>
+          <div>稼働時間: <strong style="color:var(--text-normal);">${masterUptime}</strong></div>
+        </div>
+
+        <div style="font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">
+          <span>⚡</span>
+          <span>Discord VC接続・WebUI・SQLite DB書き込みを担当する主系ノードです。</span>
+        </div>
+      </div>
+    `;
+
+    // 2. Slave カード群
+    if (slaves.length === 0) {
+      cardsHtml += `
+        <div class="card" style="padding:20px;background:rgba(0,0,0,0.15);border:1px dashed rgba(255,255,255,0.12);border-radius:10px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;">
+          <div style="font-size:28px;margin-bottom:8px;">🛡️</div>
+          <div style="font-weight:600;font-size:14px;color:var(--text-muted);">Standby (Slave) ノード未登録</div>
+          <div style="font-size:12px;color:var(--text-dim);margin-top:4px;max-width:320px;">
+            副系サーバーを用意し、下のワンライナーを実行することで無停止フェイルオーバー対応のHAクラスタを組むことができます。
+          </div>
+        </div>
+      `;
+    } else {
+      slaves.forEach(slave => {
+        let statusBadge = "";
+        let borderCol = "rgba(255,255,255,0.08)";
+        if (slave.status === "online") {
+          statusBadge = `<span class="badge" style="background:rgba(46,204,113,0.2);color:#2ecc71;border:1px solid rgba(46,204,113,0.4);font-weight:700;">🟢 Standby (待機中)</span>`;
+          borderCol = "rgba(46,204,113,0.3)";
+        } else if (slave.status === "revoked") {
+          statusBadge = `<span class="badge" style="background:rgba(231,76,60,0.15);color:#ff6b6b;border:1px solid rgba(231,76,60,0.3);font-weight:700;">🛑 停止・除外済</span>`;
+          borderCol = "rgba(231,76,60,0.25)";
+        } else {
+          statusBadge = `<span class="badge" style="background:rgba(241,196,15,0.2);color:#f1c40f;border:1px solid rgba(241,196,15,0.4);font-weight:700;">⚪ 切断 (${slave.last_seen_ago >= 0 ? slave.last_seen_ago + '秒前' : '未交信'})</span>`;
+          borderCol = "rgba(241,196,15,0.25)";
+        }
+
+        const lastSyncText = slave.last_sync_ago >= 0 ? `${slave.last_sync_ago}秒前` : (slave.last_sync > 0 ? new Date(slave.last_sync * 1000).toLocaleTimeString() : "未同期");
+        const lastSeenText = slave.last_seen_ago >= 0 ? `${slave.last_seen_ago}秒前` : (slave.last_seen > 0 ? new Date(slave.last_seen * 1000).toLocaleTimeString() : "未交信");
+
+        let actionBtnHtml = "";
+        if (slave.status !== "revoked") {
+          actionBtnHtml = `
+            <button class="btn btn-sm" onclick="revokeManagerSlave('${escapeHtml(slave.node_id)}')" style="background:rgba(231,76,60,0.15);border:1px solid rgba(231,76,60,0.4);color:#ff6b6b;cursor:pointer;font-weight:600;padding:4px 10px;border-radius:6px;transition:all 0.2s;" title="このSlaveノードを除外・停止します。次回アクセス時に410 Goneが送られ安全停止します。">
+              🛑 登録解除 & 停止 (Revoke)
+            </button>
+          `;
+        } else {
+          actionBtnHtml = `
+            <button class="btn btn-sm" onclick="deleteManagerSlave('${escapeHtml(slave.node_id)}')" style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);color:var(--text-muted);cursor:pointer;padding:4px 10px;border-radius:6px;" title="登録履歴から完全に削除します">
+              🗑️ 履歴から削除
+            </button>
+          `;
+        }
+
+        cardsHtml += `
+          <div class="card" style="background:rgba(0,0,0,0.2);border:1px solid ${borderCol};padding:16px;border-radius:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+              <div>
+                <div style="font-size:12px;color:var(--text-muted);font-weight:700;display:flex;align-items:center;gap:6px;">
+                  <span>🛡️ 副系ノード (Standby Slave)</span>
+                </div>
+                <h4 style="margin:4px 0 0;font-size:15px;color:var(--text-normal);">
+                  ${escapeHtml(slave.hostname || "Slave Node")}
+                </h4>
+                <div style="font-size:11px;color:var(--text-dim);font-family:monospace;margin-top:2px;">
+                  ID: ${escapeHtml(slave.node_id)}
+                </div>
+              </div>
+              ${statusBadge}
+            </div>
+
+            <div style="font-size:12px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,0.25);padding:10px;border-radius:6px;margin-bottom:12px;">
+              <div>IP: <strong style="color:var(--text-normal);">${escapeHtml(slave.ip || "-")}</strong></div>
+              <div>最終ハートビート: <strong style="color:var(--text-normal);">${lastSeenText}</strong></div>
+              <div style="grid-column:1/-1;">最終DB同期: <strong style="color:#50e6ff;">${lastSyncText}</strong></div>
+            </div>
+
+            <div style="display:flex;justify-content:space-between;align-items:center;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);">
+              <span style="font-size:11px;color:var(--text-dim);">${slave.status === 'revoked' ? '除外済（再アクセス時に停止指令）' : '自動同期待機中'}</span>
+              <div>${actionBtnHtml}</div>
+            </div>
+          </div>
+        `;
+      });
+    }
+
+    grid.innerHTML = cardsHtml;
+  } catch (err) {
+    console.error("loadManagerNodes error:", err);
+    grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Manager Node情報の取得中にエラーが発生しました: ${escapeHtml(err.message)}</div>`;
+  }
+}
+window.loadManagerNodes = loadManagerNodes;
+
+async function revokeManagerSlave(nodeId) {
+  if (!confirm(`⚠️ Manager Slave [${nodeId}] を除外・自律停止しますか？\n\n次回アクセス時に自律停止指令 (HTTP 410 Gone) が送出され、誤昇格（スプリットブレイン）を起こすことなく安全にプロセスが停止します。`)) {
+    return;
+  }
+  try {
+    const res = await fetch("/api/system/manager_nodes/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      alert(data.message || "Slaveを除外・停止対象に登録しました。");
+      loadManagerNodes();
+    } else {
+      alert("除外・停止に失敗しました: " + (data.error || res.statusText));
+    }
+  } catch (err) {
+    alert("通信エラー: " + err.message);
+  }
+}
+window.revokeManagerSlave = revokeManagerSlave;
+
+async function deleteManagerSlave(nodeId) {
+  if (!confirm(`Manager Slave [${nodeId}] の登録履歴を完全に削除しますか？`)) {
+    return;
+  }
+  try {
+    const res = await fetch(`/api/system/manager_nodes/${encodeURIComponent(nodeId)}`, {
+      method: "DELETE"
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      alert(data.message || "登録履歴を削除しました。");
+      loadManagerNodes();
+    } else {
+      alert("削除に失敗しました: " + (data.error || res.statusText));
+    }
+  } catch (err) {
+    alert("通信エラー: " + err.message);
+  }
+}
+window.deleteManagerSlave = deleteManagerSlave;
+
+async function loadWorkerNodes() {
+  try {
+    const res = await fetch("/api/worker/nodes");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.pools) {
+      renderWorkerNodes(data.pools);
+    }
+  } catch (err) {
+    console.error("loadWorkerNodes error:", err);
+  }
+}
+window.loadWorkerNodes = loadWorkerNodes;
+
+async function kickWorkerNode(nodeId, ip, btn) {
+  if (!confirm(`Workerノード [${nodeId || ip}] を切断・キックしますか？\nボランティア接続の場合はWebSocketが即座にクローズされます。`)) {
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch("/api/worker/kick", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId, ip: ip })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      alert(data.message || "Workerノードを切断しました。");
+      loadWorkerNodes();
+    } else {
+      alert("切断に失敗しました: " + (data.error || res.statusText));
+    }
+  } catch (err) {
+    alert("通信エラー: " + err.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+window.kickWorkerNode = kickWorkerNode;
 
 // ==========================================
 // 2. Discord Bot プール管理 (1〜10号機)

@@ -1,5 +1,35 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] Manager Node管理新設 & Worker Node管理移設・自律停止 (HTTP 410 Gone) によるライフサイクル統制
+- **概要**:
+  - WebUIの「Bot管理」を「🤖 Bot & ノード管理」に改称し、インフラ基盤（Managerクラスタ、Botアカウントプール、分散Worker）を一元管理できるように再編。
+  - HA Slave（副系待機ノード）の除外・停止時に、Masterから自律停止信号（HTTP 410 Gone / `action: "terminate"`）を返送し、Slave Watchdogが安全停止して多重昇格（スプリットブレイン事故）を100%防止する仕組みを実装。
+  - 「システム & ワーカー」タブから「Worker Node管理」を「Bot & ノード管理」へ移設し、システムタブを純粋なパフォーマンス・ログ監視にスリム化。
+  - 各Workerカードに管理者による切断・キック（`POST /api/worker/kick`）ボタンを配備。
+- **改修詳細**:
+  1. **Slave Watchdog 自律停止 (`src/ha_watchdog.py`)**:
+     - `_init_node_id()`: ホスト名＋UUIDによる一意な `node_id` を生成し `data/ha_node_id` に永続化。
+     - 全リクエストに `X-HA-Node-ID`, `X-HA-Hostname`, `Authorization` ヘッダーを自動付与。
+     - Masterから HTTP 410 Gone または `action: "terminate"` を受信した際に、フェイルオーバー昇格を一切行わずに `sys.exit(0)` で安全に自律停止する `_handle_revocation()` を配備。
+  2. **Master バックエンド (`src/web/server.py`)**:
+     - Slave の死活・同期・メタデータ自動記録（`self.ha_slaves`）および Revoked ノード管理（`self.ha_revoked_nodes`）。`data/ha_manager_nodes.json` への完全永続化。
+     - `/api/ha/status` および `/api/ha/db_snapshot`: 除外対象 Slave からの通信に対して直ちに HTTP 410 Gone を返却。
+     - 新設API:
+       - `GET /api/system/manager_nodes`: Active Master と各 Standby Slave の一覧・死活状況を返却。
+       - `POST /api/system/manager_nodes/revoke`: 指定 Slave を除外・自律停止対象に登録。
+       - `DELETE /api/system/manager_nodes/{node_id}`: オフラインノードの履歴を完全削除。
+       - `POST /api/worker/kick`: 指定 Worker ノードの切断・キック（ボランティアWSS切断、常設Worker無効化）。
+     - Cookie属性の最適化: `api_auth_login_password` において `path="/"` を明示設定。
+  3. **フロントエンド再編成 (`src/web/templates/index.html` & `src/web/static/app.js`)**:
+     - タブボタンを「🤖 Bot & ノード管理」および「📊 システム & キャッシュ」に更新。
+     - `#tab-bots` の第1セクションに「🏢 Manager Node クラスタ管理 (HA Active-Standby)」カードを新設。Master情報、Slave一覧グリッド、Standby追加ワンライナー案内を配置。
+     - `#tab-bots` の第3セクションへ `worker-nodes-card` を移設し、各Workerカードに「🔌 切断」ボタンを追加。
+     - `loadManagerNodes()`, `revokeManagerSlave()`, `deleteManagerSlave()`, `loadWorkerNodes()`, `kickWorkerNode()` を実装。
+     - 初期化時（DOMContentLoaded）に即時 `updatePermissionsUI()` を呼び出すことで管理者タブ表示の遅延を解消。
+- **検証**:
+  - 単体テストスクリプトによる HA 記録・永続化・再読込・Revoke 判定の完全成功確認。
+  - 実機ブラウザによるログイン、タブ遷移、「Bot & ノード管理」画面の全カード（Manager Node、Botスロット、Worker Node）の正常描画を確認・画像記録。
+
 ## [2026-10-24] 一般ユーザー（非権限者）に対するアクセス不可タブの完全非表示化（統一）
 - **概要**:
   - これまで「⚙️ ボット設定」および「📊 システム & ワーカー状況」タブが非管理者に対して半透明の 🔒 表示となっていたが、他の管理者タブ（Bot管理、API設定、メンバー音声）と同様に `style.display = "none"` で最初から完全に非表示となるよう統一。

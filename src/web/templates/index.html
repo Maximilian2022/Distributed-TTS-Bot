@@ -118,9 +118,9 @@
             <button class="tab-btn" id="tab-btn-volunteer" data-tab="volunteer">🤝 ボランティア参加</button>
             <button class="tab-btn" id="tab-btn-member-voices" data-tab="member-voices" style="display:none;">👥 メンバー音声</button>
             <button class="tab-btn" id="tab-btn-config" data-tab="config" style="display:none;">⚙️ ボット設定</button>
-            <button class="tab-btn" id="tab-btn-bots" data-tab="bots" style="display:none;">🤖 Bot管理</button>
+            <button class="tab-btn" id="tab-btn-bots" data-tab="bots" style="display:none;">🤖 Bot & ノード管理</button>
             <button class="tab-btn" id="tab-btn-credentials" data-tab="credentials" style="display:none;">🔑 API・連携設定</button>
-            <button class="tab-btn" id="tab-btn-system" data-tab="system" style="display:none;">📊 システム & ワーカー</button>
+            <button class="tab-btn" id="tab-btn-system" data-tab="system" style="display:none;">📊 システム & キャッシュ</button>
             <button class="tab-btn" id="tab-btn-help" data-tab="help">ℹ️ ヘルプ</button>
           </nav>
 
@@ -887,11 +887,53 @@
             </div>
           </section>
 
-          <!-- 5. Discord Bot 管理タブ (最大10台プール) -->
+          <!-- 5. Discord Bot & ノード管理タブ (Manager / Botスロット / Worker) -->
           <section id="tab-bots" class="tab-pane">
-            <div class="section-title">🤖 Discord Bot プール管理 (動的スケール)</div>
-            <div class="section-desc">最大10台のDiscord Botアカウントを一元管理します。同一サーバー内で複数のVC通話が同時に行われても、空き号機が自動的に参加して並行読み上げを行います。</div>
+            <div class="section-title">🤖 Bot & ノード管理 (インフラ統制)</div>
+            <div class="section-desc">Manager Node (Master-Slave HAクラスタ)、Discord Botアカウントプール（1〜10号機）、推論オフロード用Worker Nodeを一元管理・監視します。</div>
 
+            <!-- 1. 🏢 Manager Node 管理 (Active / Standby HA クラスタ) -->
+            <div class="card" id="manager-nodes-card" style="margin-bottom:20px;padding:20px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+                <div>
+                  <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+                    <span>🏢 Manager Node クラスタ管理 (HA Active-Standby)</span>
+                    <span id="manager-nodes-badge" class="badge" style="background:var(--primary);color:#fff;">取得中...</span>
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    Master（主系）とSlave（副系）の死活・DBレプリケーション同期状況を監視します。Slaveの登録解除時は安全停止信号 (410 Gone) を送信して誤昇格を防止します。
+                  </div>
+                </div>
+                <div style="display:flex;gap:8px;">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="loadManagerNodes()">
+                    🔄 クラスタ状態を更新
+                  </button>
+                </div>
+              </div>
+
+              <!-- Manager ノード一覧表示グリッド -->
+              <div id="manager-nodes-grid" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:14px;margin-bottom:16px;">
+                <div style="color:var(--text-muted);font-size:13px;padding:20px;">Manager Node 情報を読み込み中...</div>
+              </div>
+
+              <!-- Standbyノード追加案内アコーディオン -->
+              <details style="background:rgba(0,0,0,0.18);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:12px 14px;font-size:12px;">
+                <summary style="cursor:pointer;font-weight:600;color:var(--text-normal);display:flex;align-items:center;gap:6px;">
+                  <span>➕ 新しい Standby (Slave) ノードをクラスタに追加する手順</span>
+                </summary>
+                <div style="margin-top:10px;color:var(--text-muted);line-height:1.6;">
+                  <p style="margin:0 0 8px;">副系サーバー（Debian / Ubuntu / Docker等）で以下のワンライナーを実行すると、本Masterノードと自動同期するHA Standbyノードが構築されます：</p>
+                  <div style="background:#1e1f22;padding:10px 12px;border-radius:6px;font-family:monospace;font-size:11px;color:#00ffcc;user-select:all;word-break:break-all;" id="standby-setup-command-box">
+                    curl -sSL http://127.0.0.1:8088/setup-standby.sh | sudo bash
+                  </div>
+                  <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">
+                    ※ 事前に本Masterの <code>TTSBOT_HA_SECRET</code> が副系の環境変数と一致していることを確認してください。
+                  </div>
+                </div>
+              </details>
+            </div>
+
+            <!-- 2. 🤖 Discord Bot プール管理 (動的スケール) -->
             <div class="card" style="margin-bottom:20px;padding:20px;">
               <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
                 <div>
@@ -914,7 +956,7 @@
             </div>
 
             <!-- Bot招待リンク生成カード -->
-            <div class="card" style="padding:20px;">
+            <div class="card" style="margin-bottom:20px;padding:20px;">
               <h3 style="margin:0 0 8px;font-size:15px;">🔗 Discord Bot 招待URL生成</h3>
               <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
                 作成したBotアカウントをDiscordサーバーへ招待するための公式OAuth2リンクを生成します。必要な権限（ボイス接続・発言・メッセージ読み取り・スラッシュコマンド）が自動付与されます。
@@ -922,6 +964,52 @@
               <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                 <input type="text" id="invite-client-id-input" class="form-input" placeholder="Application Client ID (Discord Developer Portalより取得)" style="flex:1;min-width:240px;">
                 <button type="button" class="btn btn-secondary" onclick="generateBotInviteLink()">招待リンクを開く ↗</button>
+              </div>
+            </div>
+
+            <!-- 3. 🖥️ 分散コンピュートノード (Compute Worker) 稼働状況 -->
+            <div class="card" id="worker-nodes-card" style="margin-bottom:20px;padding:20px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                <div>
+                  <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                    <span>🖥️</span> 分散コンピュートワーカー (マルチノード推論)
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    外部GPUノードへ推論負荷を自動オフロード。VC在室連動スリープおよびオンデマンド遠隔起動に対応
+                  </div>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <button id="btn-update-all-workers" class="btn btn-primary btn-sm" onclick="triggerRollingJob('update')" style="background:#5865f2;color:white;font-weight:600;padding:6px 12px;border-radius:6px;display:flex;align-items:center;gap:6px;cursor:pointer;border:none;transition:all 0.2s;" title="全ワーカーノードを1台ずつ順次ドレイン・更新・検証します">
+                    <span>⚡</span> 全ワーカー一括更新 (ローリング)
+                  </button>
+                  <button id="btn-restart-all-workers" class="btn btn-secondary btn-sm" onclick="triggerRollingJob('restart')" style="background:rgba(250,166,26,0.18);border:1px solid rgba(250,166,26,0.45);color:#ffcc66;font-weight:600;padding:6px 12px;border-radius:6px;display:flex;align-items:center;gap:6px;cursor:pointer;transition:all 0.2s;" title="全ワーカーのTTSエンジンおよびAgentコンテナを1台ずつ順次再起動します">
+                    <span>🔄</span> 全ワーカー再起動 (ローリング)
+                  </button>
+                  <span id="worker-latest-version-badge" class="badge" style="background:rgba(88,101,242,0.2);color:#8ea1e1;font-weight:600;padding:5px 10px;border-radius:12px;font-size:11px;border:1px solid rgba(88,101,242,0.3);">
+                    最新 Agent v3.13.2 (自律同期対応)
+                  </span>
+                </div>
+              </div>
+
+              <!-- ノード一覧表示コンテナ (軽量・運用情報特化) -->
+              <div id="worker-nodes-container" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:12px;margin-bottom:12px;">
+                <div style="background:rgba(0,0,0,0.2);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px;grid-column:1/-1;">
+                  <div style="font-size:24px;">🔄</div>
+                  <div style="flex:1;">
+                    <div style="font-weight:600;font-size:13px;color:var(--text-muted);">ワーカーノード情報を取得中...</div>
+                    <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">分散コンピュートワーカーの状態を確認しています</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 運用手順案内リンク -->
+              <div style="background:rgba(0,0,0,0.15);padding:10px 14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);font-size:11px;color:var(--text-dim);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+                <div>
+                  <span>💡 外部ワーカーの参加手順・ワンクリック起動ツールは </span>
+                  <strong style="color:var(--text-normal);">worker/README.md</strong>
+                  <span> に集約されています。</span>
+                </div>
+                <span class="badge" style="background:rgba(255,255,255,0.08);color:#eee;font-size:10px;padding:2px 6px;">Auto-Managed</span>
               </div>
             </div>
           </section>
@@ -1019,8 +1107,8 @@
 
           <!-- 4. システム & キャッシュ状況タブ -->
           <section id="tab-system" class="tab-pane">
-            <div class="section-title">📊 システム & 分散ワーカー・キャッシュ状況</div>
-            <div class="section-desc">分散コンピュートワーカーの稼働・リソース消費モニタリング、クラウドTTS利用状況、キャッシュ使用量、ボット接続状況とログを確認できます。</div>
+            <div class="section-title">📊 システム & キャッシュ状況</div>
+            <div class="section-desc">ホストリソース消費モニタリング、クラウドTTS利用状況、キャッシュ使用量、ボット接続状況とログを確認できます。</div>
 
             <div id="system-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
               <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
@@ -1302,52 +1390,6 @@
                 <div style="margin-top:12px;font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">
                   <span>💡</span>
                   <span>CPU負荷適応型制御: 通常時は2並列処理、CPU 70%超過で直列化（1並列）、85%超過時はホスト保護のため即座にEdge-TTSへ退避します。</span>
-                </div>
-              </div>
-
-              <!-- 0.5. 🖥️ 分散コンピュートノード (Compute Worker) 稼働状況 -->
-              <div class="card" id="worker-nodes-card" style="margin-bottom:20px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
-                  <div>
-                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
-                      <span>🖥️</span> 分散コンピュートワーカー (マルチノード推論)
-                    </h3>
-                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
-                      外部GPUノードへ推論負荷を自動オフロード。VC在室連動スリープおよびオンデマンド遠隔起動に対応
-                    </div>
-                  </div>
-                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <button id="btn-update-all-workers" class="btn btn-primary btn-sm" onclick="triggerRollingJob('update')" style="background:#5865f2;color:white;font-weight:600;padding:6px 12px;border-radius:6px;display:flex;align-items:center;gap:6px;cursor:pointer;border:none;transition:all 0.2s;" title="全ワーカーノードを1台ずつ順次ドレイン・更新・検証します">
-                      <span>⚡</span> 全ワーカー一括更新 (ローリング)
-                    </button>
-                    <button id="btn-restart-all-workers" class="btn btn-secondary btn-sm" onclick="triggerRollingJob('restart')" style="background:rgba(250,166,26,0.18);border:1px solid rgba(250,166,26,0.45);color:#ffcc66;font-weight:600;padding:6px 12px;border-radius:6px;display:flex;align-items:center;gap:6px;cursor:pointer;transition:all 0.2s;" title="全ワーカーのTTSエンジンおよびAgentコンテナを1台ずつ順次再起動します">
-                      <span>🔄</span> 全ワーカー再起動 (ローリング)
-                    </button>
-                    <span id="worker-latest-version-badge" class="badge" style="background:rgba(88,101,242,0.2);color:#8ea1e1;font-weight:600;padding:5px 10px;border-radius:12px;font-size:11px;border:1px solid rgba(88,101,242,0.3);">
-                      最新 Agent v3.13.2 (自律同期対応)
-                    </span>
-                  </div>
-                </div>
-
-                <!-- ノード一覧表示コンテナ (軽量・運用情報特化) -->
-                <div id="worker-nodes-container" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(280px, 1fr));gap:12px;margin-bottom:12px;">
-                  <div style="background:rgba(0,0,0,0.2);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px;grid-column:1/-1;">
-                    <div style="font-size:24px;">🔄</div>
-                    <div style="flex:1;">
-                      <div style="font-weight:600;font-size:13px;color:var(--text-muted);">ワーカーノード情報を取得中...</div>
-                      <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">分散コンピュートワーカーの状態を確認しています</div>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- 運用手順案内リンク (ワンライナーUIはドキュメントへ集約) -->
-                <div style="background:rgba(0,0,0,0.15);padding:10px 14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);font-size:11px;color:var(--text-dim);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-                  <div>
-                    <span>💡 外部ワーカーの参加手順・ワンクリック起動ツールは </span>
-                    <strong style="color:var(--text-normal);">worker/README.md</strong>
-                    <span> に集約されています。</span>
-                  </div>
-                  <span class="badge" style="background:rgba(255,255,255,0.08);color:#eee;font-size:10px;padding:2px 6px;">Auto-Managed</span>
                 </div>
               </div>
 
