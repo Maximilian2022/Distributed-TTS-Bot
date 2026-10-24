@@ -58,9 +58,7 @@ logs/*
 !logs/remediation_history.md
 
 # Temporary / Scratch files
-scratch/*
-!scratch/memo.md
-!scratch/remaining.md
+scratch/
 
 # IDE / Editor
 .idea/
