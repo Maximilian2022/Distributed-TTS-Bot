@@ -33,9 +33,10 @@ _RE_SLANG_EXCL_REPEAT = re.compile(r'[!！]{2,}')
 _RE_SLANG_QUES_REPEAT = re.compile(r'[\?？]{2,}')
 _RE_SLANG_DASH_REPEAT = re.compile(r'[~〜ー]{2,}')
 _RE_SLANG_KUSA_REPEAT = re.compile(r'草{2,}')
-_RE_TRAILING_MARKS_ALL = re.compile(r'[!！?？~〜ーwｗ\s。、]+$')
-_RE_TRAILING_MARKS_EXCEPT_QUES = re.compile(r'[!！~〜ーwｗ\s。、]+$')
-_RE_TRAILING_QUES = re.compile(r'[?？]+$')
+# 安全な末尾トリム用文字セット (ReDoS / CWE-1333 根本防止: rstrip による完全 O(N) 処理)
+_TRAILING_MARKS_CHARS = "!！?？~〜ーwｗ \t\r\n\u3000。、"
+_TRAILING_MARKS_NO_QUES_CHARS = "!！~〜ーwｗ \t\r\n\u3000。、"
+_QUESTION_CHARS = "?？"
 _RE_HAS_QUES = re.compile(r'[?？]')
 _RE_BEEP_TAG = re.compile(r'<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::(\d+))?(?:__)?>>')
 _RE_BEEP_SPLIT = re.compile(r'(<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::\d+)?(?:__)?>>)')
@@ -43,7 +44,6 @@ _RE_BEEP_SPLIT = re.compile(r'(<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::\d+)?(?:__)?>>
 # 句読点なし多段チャンキング & 30文字ハードキャップ用の事前コンパイル定数 (PERF-3)
 _MAX_CHUNK_CHARS = 30
 _MIN_PART_CHARS = 5
-_RE_SPLIT_SPACE = re.compile(r'(?<![a-zA-Z0-9])[\s\u3000]+(?![a-zA-Z0-9])')
 _RE_SPLIT_SLANG_DELIM = re.compile(r'((?:(?<![a-zA-Z0-9])[wｗW]+(?![a-zA-Z0-9])|草+|パチパチ))[\s\u3000]*')
 _RE_SPLIT_ENDING = re.compile(r'((?:です|ます|でした|ました|ですね|ですよ|ですよね|だよね|じゃん|だし)(?:よ|ね|な)?)(?=[^\s、。！？\d])')
 
@@ -614,6 +614,41 @@ class TextCleaner:
         return slices if slices else [(text, delim)]
 
     @staticmethod
+    def _split_by_space_boundary(sentence: str) -> List[str]:
+        """
+        英単語間の空白 (Hello World 等) を保護しつつ、空白境界で文を分割する。
+        正規表現のバックトラッキング (ReDoS / CWE-1333) を排除した完全 O(N) 線形スキャン。
+        """
+        if not sentence:
+            return []
+        parts: List[str] = []
+        current: List[str] = []
+        i = 0
+        n = len(sentence)
+        while i < n:
+            ch = sentence[i]
+            if ch in (' ', '\t', '\n', '\r', '\u3000'):
+                prev_alnum = (i > 0 and sentence[i - 1].isalnum() and sentence[i - 1].isascii())
+                j = i
+                while j < n and sentence[j] in (' ', '\t', '\n', '\r', '\u3000'):
+                    j += 1
+                next_alnum = (j < n and sentence[j].isalnum() and sentence[j].isascii())
+
+                if prev_alnum and next_alnum:
+                    current.append(sentence[i:j])
+                else:
+                    if current:
+                        parts.append("".join(current))
+                        current = []
+                i = j
+            else:
+                current.append(ch)
+                i += 1
+        if current:
+            parts.append("".join(current))
+        return parts
+
+    @staticmethod
     def split_into_chunks(text: str, author_prefix: Optional[str] = None) -> List['TextChunk']:
         """
         テキストを発言者名プレフィックスおよび多段文境界（句点・読点・スペース・スラング・終助詞・形態素・30文字ハードキャップ）で超低遅延パーツ分割する。
@@ -685,12 +720,12 @@ class TextCleaner:
             else:
                 comma_refined.append((sentence, delim))
 
-        # 4. スペース（空白）境界分割 (新設: 14文字超、英単語間スペース保護)
+        # 4. スペース（空白）境界分割 (新設: 14文字超、英単語間スペース保護、O(N)スキャン)
         space_refined: List[Tuple[str, str]] = []
         for sentence, delim in comma_refined:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
             if raw_len > 14:
-                s_parts = _RE_SPLIT_SPACE.split(sentence)
+                s_parts = TextCleaner._split_by_space_boundary(sentence)
                 if len(s_parts) > 1 and all(len(_RE_STRIP_PUNCT_SPACES.sub('', p)) >= _MIN_PART_CHARS for p in s_parts):
                     for p_idx, p in enumerate(s_parts):
                         p_delim = delim if p_idx == len(s_parts) - 1 else "space"
@@ -855,18 +890,18 @@ class TextCleaner:
             "りょうかいです": "了解です",
             "りょうかい": "了解",
         }
-        base_no_marks = _RE_TRAILING_MARKS_ALL.sub('', t)
+        base_no_marks = t.rstrip(_TRAILING_MARKS_CHARS)
         if base_no_marks in greeting_map:
             t = greeting_map[base_no_marks] + t[len(base_no_marks):]
 
         # 2. 疑問符の有無判定（イントネーション保持）
-        has_question = bool(_RE_HAS_QUES.search(t[-3:] if len(t) >= 3 else t))
+        has_question = any(c in _QUESTION_CHARS for c in t[-3:])
 
-        # 3. 文末の連続する装飾記号（！、ー、〜、w、ｗ、。、空白、読点）を除去
-        t = _RE_TRAILING_MARKS_EXCEPT_QUES.sub('', t).strip()
+        # 3. 文末の連続する装飾記号（！、ー、〜、w、ｗ、。、空白、読点）を除去 (完全 O(N) rstrip)
+        t = t.rstrip(_TRAILING_MARKS_NO_QUES_CHARS).strip()
 
         # 疑問符があった場合は「？」を1つだけ末尾に統一付与
         if has_question:
-            t = _RE_TRAILING_QUES.sub('', t).strip() + "？"
+            t = t.rstrip(_QUESTION_CHARS).strip() + "？"
 
         return t

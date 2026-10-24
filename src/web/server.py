@@ -905,19 +905,35 @@ class WebServer:
         return web.Response(text="# portainer-stack.yml not found\n", status=404, content_type="text/plain")
 
     async def handle_volunteer_file(self, request: web.Request) -> web.Response:
-        """ボランティアツールの個別スクリプトファイルを配信"""
-        filename = request.path.split("/")[-1]
-        allowed = {"run_volunteer.bat", "run_volunteer_gui.ps1", "run_volunteer.sh", "volunteer_worker.py", "README.md"}
-        if filename not in allowed:
+        """ボランティアツールの個別スクリプトファイルを配信 (CWE-22 / CodeQL Path Injection 対策済み)"""
+        VOLUNTEER_SAFE_FILES = {
+            "run_volunteer.bat": "run_volunteer.bat",
+            "run_volunteer_gui.ps1": "run_volunteer_gui.ps1",
+            "run_volunteer.sh": "run_volunteer.sh",
+            "volunteer_worker.py": "volunteer_worker.py",
+            "README.md": "README.md",
+        }
+        raw_name = request.path.split("/")[-1]
+        safe_filename = VOLUNTEER_SAFE_FILES.get(raw_name)
+        if not safe_filename:
             return web.Response(text="File not found", status=404)
-        file_path = Path(__file__).resolve().parent / "static" / "volunteer" / filename
-        if not file_path.exists():
-            file_path = Path("/app/worker") / filename
-        if not file_path.exists():
-            file_path = Path(__file__).resolve().parent.parent.parent / "worker" / filename
-        if not file_path.exists():
+
+        candidate_dirs = [
+            (Path(__file__).resolve().parent / "static" / "volunteer"),
+            Path("/app/worker"),
+            (Path(__file__).resolve().parent.parent.parent / "worker"),
+        ]
+        file_path = None
+        for base_dir in candidate_dirs:
+            safe_p = validate_safe_path(base_dir, safe_filename)
+            if safe_p and safe_p.is_file():
+                file_path = safe_p
+                break
+
+        if not file_path:
             return web.Response(text="File not found", status=404)
-        if filename.endswith((".sh", ".ps1", ".bat")):
+
+        if safe_filename.endswith((".sh", ".ps1", ".bat")):
             content = file_path.read_text(encoding="utf-8")
             master_base_url = self._get_master_base_url(request)
             ws_url = master_base_url.replace("http://", "ws://").replace("https://", "wss://").rstrip("/") + "/api/worker/ws"
@@ -928,7 +944,7 @@ class WebServer:
             content = content.lstrip("\ufeff")
             return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
-        ct = "text/plain" if filename.endswith((".py", ".md")) else "application/octet-stream"
+        ct = "text/plain" if safe_filename.endswith((".py", ".md")) else "application/octet-stream"
         return web.Response(body=file_path.read_bytes(), content_type=ct, charset="utf-8" if ct.startswith("text") else None)
 
     async def handle_volunteer_zip(self, request: web.Request) -> web.Response:

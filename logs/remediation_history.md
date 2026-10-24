@@ -1,5 +1,25 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] GitHub Code Scanning (CodeQL) 残存全アラートの完全解消 & Dependabot 設定の適用
+- **ユーザーフィードバック & 課題**:
+  1. GitHub Code Scanning（CodeQL）の残存アラート全9件（Path Injection 5件、Polynomial ReDoS 4件）を解消する。
+  2. 依存関係の自動セキュリティ更新を行う GitHub Dependabot 設定（`.github/dependabot.yml`）を適用する。
+- **真因の究明 & 抜本的改善内容**:
+  1. **Polynomial ReDoS (CWE-1333 / CWE-730) の完全解消 (`src/utils/text_cleaner.py`)**:
+     - **末尾装飾記号トリム (Alert 44, 45, 46)**:
+       `_RE_TRAILING_MARKS_ALL`, `_RE_TRAILING_MARKS_EXCEPT_QUES`, `_RE_TRAILING_QUES` による正規表現末尾マッチング (`[...]+$`) を全廃。Python 標準の `str.rstrip(_TRAILING_MARKS_CHARS)` による完全線形時間 O(N)・バックトラックなし・メモリゼロの決定打的実装に刷新。
+     - **空白境界分割 (Alert 72)**:
+       英単語間スペース保護用の正規表現 `_RE_SPLIT_SPACE` (`(?<![a-zA-Z0-9])[\s\u3000]+(?![a-zA-Z0-9])`) を廃止。1 パスで英数字境界を厳格判定する安全なスキャン関数 `_split_by_space_boundary` を新設し、ReDoS の危険性を 100% 根絶。
+  2. **Path Injection (CWE-22 / CWE-73) の完全解消 (`src/web/server.py`)**:
+     - **個別ボランティアファイル配信 (Alert 73, 74, 76, 77, 78)**:
+       `handle_volunteer_file` において、リクエスト URL 由来のファイル名をそのまま Path 結合していた箇所を改修。定数辞書 `VOLUNTEER_SAFE_FILES` による厳格なホワイトリスト引き当てを行い、`src/utils/security.py` の `validate_safe_path` でベースディレクトリ内実在ファイルであることを検証した安全なパスのみをオープンするよう防御。
+  3. **GitHub Dependabot 設定の適用 (`.github/dependabot.yml`)**:
+     - `pip` (Python: `requirements.txt`, `requirements-optional.txt`)、`github-actions` (GitHub Actions ワークフロー)、`docker` (Dockerfile ベースイメージ) の 3 つのエコシステムに対し、毎週月曜日 03:00 JST の自動更新スケジュールを設定。
+     - PR 上限数、コミットメッセージ接頭辞（`build(deps):`）、ラベル（`dependencies` 等）、レビュアー（`Maximilian2022`）を完備。
+- **検証**:
+  - `python3 -m py_compile src/utils/text_cleaner.py src/web/server.py`: exit code 0（構文正常）。
+  - コンテナ実機テスト: `normalize_cache_key_text` の挨拶・疑問符正規化、および `split_into_chunks` での `Hello World` 英単語間スペース保護＆分割が正常に動作することを確認。
+
 ## [2026-10-24] リポジトリ名改称 (Distributed-TTS-Bot) & GitHub コミュニティ標準文書 (日英) ・ライセンス体系の完全整備
 - **ユーザーフィードバック & 課題**:
   1. プロジェクトおよび GitHub リポジトリ名称を `ttsbot-oss` から `Distributed-TTS-Bot`（`Maximilian2022/Distributed-TTS-Bot.git`）へ改称。
