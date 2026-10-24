@@ -109,6 +109,28 @@ if [ "${RECONFIGURE}" -eq 1 ]; then
         4) ENGINES="[\"voicevox\", \"coeiroink\", \"sharevox\"]" ;;
     esac
 
+    # COEIROINK 選択時の注意事項と確認
+    if [ "${ENG_ANS}" = "2" ] || [ "${ENG_ANS}" = "4" ]; then
+        echo -e "\n${C_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+        echo -e "${C_BOLD}${C_YELLOW}⚠️  【重要】COEIROINK の自動セットアップに関する注意事項${C_RESET}"
+        echo -e "${C_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+        echo -e "  COEIROINK はエンジンおよび音声モデルのファイルサイズが大きく (${C_BOLD}約 3.5GB${C_RESET})、"
+        echo -e "  ダウンロードと Docker コンテナの構築に ${C_BOLD}10〜30分程度${C_RESET} かかります。"
+        echo -e "  ディスク空き容量（10GB 以上推奨）と安定したインターネット回線が必要です。"
+        echo -e "${C_YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+        read_input "それでも COEIROINK の自動ダウンロード＆起動を行いますか？ (y/N) [デフォルト: N]: " CI_CONFIRM "N"
+        if [[ ! "${CI_CONFIRM}" =~ ^[Yy]$ ]]; then
+            echo -e "${C_BLUE}ℹ️ COEIROINK のセットアップをスキップします。${C_RESET}"
+            if [ "${ENG_ANS}" = "2" ]; then
+                ENGINES="[\"voicevox\"]"
+            else
+                ENGINES="[\"voicevox\", \"sharevox\"]"
+            fi
+        else
+            echo -e "${C_GREEN}✓ COEIROINK の自動セットアップを承諾しました。${C_RESET}"
+        fi
+    fi
+
     echo -e "\n${C_BOLD}[4/5] 同時処理タスク数 (キャパシティ)${C_RESET}"
     echo "  1) 1件 (低負荷・CPU向け)"
     echo "  2) 2件 (標準・GPU向け 推奨)"
@@ -213,9 +235,94 @@ EOF
 EOF
     fi
 
-    echo -e "${C_CYAN}▶ エンジンコンテナを起動中 (バックグラウンド)...${C_RESET}"
-    (cd "${WORK_DIR}" && docker compose up -d) || true
-    echo -e "${C_GREEN}✓ 音声合成エンジンコンテナが起動しました (VOICEVOX: 50021 / SHAREVOX: 50025 自動分離)${C_RESET}"
+    # COEIROINK: ポート 50031
+    if echo "${ENGINES_VAL}" | grep -q "coeiroink"; then
+        echo -e "${C_CYAN}▶ COEIROINK Docker ビルド環境を準備中 (容量約3.5GB)...${C_RESET}"
+        CI_DOCKER_DIR="${WORK_DIR}/docker/coeiroink"
+        mkdir -p "${CI_DOCKER_DIR}"
+
+        HAS_GPU="false"
+        if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | grep -q .; then
+            HAS_GPU="true"
+            CI_BASE_IMAGE="nvidia/cuda:11.8.0-base-ubuntu22.04"
+            CI_ZIP_URL="https://www.dropbox.com/scl/fi/pisvh3pwlinz6hdep2fcr/COEIROINK_LINUX_GPU_v.2025.4.1.zip?rlkey=4dg1368zzdbplahcjdbqoj2tg&st=3k7yonjs&dl=1"
+        else
+            CI_BASE_IMAGE="ubuntu:22.04"
+            CI_ZIP_URL="https://www.dropbox.com/scl/fi/o7xnjfo0jw81otgn2jxar/COEIROINK_LINUX_CPU_v.2025.4.1.zip?rlkey=dt1z2bxrbo3ikm2iiioxh9wx7&st=tso7516f&dl=1"
+        fi
+
+        cat > "${CI_DOCKER_DIR}/Dockerfile" << EOF
+FROM ${CI_BASE_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y curl unzip ca-certificates libgomp1 libsndfile1 socat && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/coeiroink
+RUN curl -L -o /tmp/coeiroink.zip "${CI_ZIP_URL}" && \\
+    unzip -q /tmp/coeiroink.zip -d /opt/coeiroink && \\
+    rm /tmp/coeiroink.zip && \\
+    find /opt/coeiroink -type f -name "engine" -exec chmod +x {} +
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+EXPOSE 50031 50032
+ENTRYPOINT ["/entrypoint.sh"]
+EOF
+
+        cat > "${CI_DOCKER_DIR}/entrypoint.sh" << 'EOF'
+#!/bin/bash
+set -e
+DIR=$(find /opt/coeiroink -maxdepth 2 -type d -name "COEIROINK_LINUX_*" | head -n 1)
+if [ -z "$DIR" ]; then
+    DIR="/opt/coeiroink"
+fi
+if [ -d "$DIR/engine" ]; then
+    cd "$DIR/engine"
+    export LD_LIBRARY_PATH="$DIR/engine:$DIR/engine/torch/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+    socat TCP-LISTEN:50031,fork,reuseaddr TCP:127.0.0.1:50032 &
+    SOCAT_PID=$!
+    "$DIR/engine/engine" &
+    ENGINE_PID=$!
+    wait -n $ENGINE_PID $SOCAT_PID
+else
+    echo "COEIROINK engine directory not found in $DIR"
+    exit 1
+fi
+EOF
+        chmod +x "${CI_DOCKER_DIR}/entrypoint.sh"
+
+        if [ "$HAS_GPU" = "true" ]; then
+            cat <<EOF >> "${COMPOSE_FILE}"
+  coeiroink:
+    build:
+      context: ./docker/coeiroink
+      dockerfile: Dockerfile
+    container_name: ttsbot-worker-coeiroink
+    ports:
+      - "127.0.0.1:50031:50031"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+EOF
+        else
+            cat <<EOF >> "${COMPOSE_FILE}"
+  coeiroink:
+    build:
+      context: ./docker/coeiroink
+      dockerfile: Dockerfile
+    container_name: ttsbot-worker-coeiroink
+    ports:
+      - "127.0.0.1:50031:50031"
+    restart: unless-stopped
+EOF
+        fi
+    fi
+
+    echo -e "${C_CYAN}▶ エンジンコンテナをビルド・起動中 (バックグラウンド)...${C_RESET}"
+    (cd "${WORK_DIR}" && docker compose up -d --build) || true
+    echo -e "${C_GREEN}✓ 音声合成エンジンコンテナが起動しました (VOICEVOX / SHAREVOX / COEIROINK)${C_RESET}"
 fi
 
 # 4. Python 実行環境の確認 & ライブラリ導入

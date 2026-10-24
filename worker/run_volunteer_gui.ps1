@@ -196,7 +196,7 @@ function Get-EngineInstallInfo {
         if (Test-Path $p) { $info["sharevox"] = $p; break }
     }
 
-    # COEIROINK 探索 (ポータブル / 各種配置先)
+    # COEIROINK 探索 (ポータブル / 各種配置先 / サブディレクトリ探索)
     $ciPaths = @(
         (Join-Path $env:LOCALAPPDATA "Programs\COEIROINK\COEIROINKonv2.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\COEIROINK\COEIROINK.exe"),
@@ -207,6 +207,23 @@ function Get-EngineInstallInfo {
     )
     foreach ($p in $ciPaths) {
         if (Test-Path $p) { $info["coeiroink"] = $p; break }
+    }
+    if (-not $info["coeiroink"]) {
+        $ciDirs = @(
+            (Join-Path $env:LOCALAPPDATA "Programs\COEIROINK"),
+            (Join-Path $env:USERPROFILE "COEIROINK"),
+            "C:\COEIROINK"
+        )
+        foreach ($dir in $ciDirs) {
+            if (Test-Path $dir) {
+                $foundExe = Get-ChildItem -Path $dir -Recurse -Depth 2 -Filter "*.exe" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "^(COEIROINK.*|engine)\.exe$" } | Select-Object -First 1
+                if ($foundExe) {
+                    $info["coeiroink"] = $foundExe.FullName
+                    break
+                }
+            }
+        }
     }
 
     return $info
@@ -418,6 +435,270 @@ function Install-EngineFromUrl([string]$engineName, [string]$downloadUrl, [strin
         if ($statusLabel) { $statusLabel.Text = "[情報] ダウンロードがキャンセルされました" }
     }
     return $false
+}
+
+function Install-CoeiroinkZip([System.Windows.Forms.Label]$statusLabel, [System.Windows.Forms.Form]$parentForm) {
+    # 1. GPU (CUDA) 判定
+    $hasCuda = $false
+    try {
+        if (Get-Command "nvidia-smi" -ErrorAction SilentlyContinue) {
+            $gpuOut = nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
+            if ($gpuOut) { $hasCuda = $true }
+        }
+    } catch { }
+
+    if ($hasCuda) {
+        $zipUrl = "https://www.dropbox.com/scl/fi/uivcv13hmkkuoyvsyzesv/COEIROINK_WIN_GPU_v.2025.4.1.zip?rlkey=flaswi8zim1c4cvs5e6y1ixbv&st=youhrrf3&dl=1"
+        $flavor = "GPU (CUDA)"
+    } else {
+        $zipUrl = "https://www.dropbox.com/scl/fi/knhqbjjfhe3awenz4begr/COEIROINK_WIN_CPU_v.2025.4.1.zip?rlkey=5rb3ddczp5j7ojjzimnm1k9zr&st=6chlsoav&dl=1"
+        $flavor = "CPU"
+    }
+
+    $tempZip = Join-Path ([System.IO.Path]::GetTempPath()) "COEIROINK_v2025_4_1.zip"
+    $targetDir = Join-Path $env:LOCALAPPDATA "Programs\COEIROINK"
+
+    # ダウンロード進捗ダイアログ
+    $pDlg = New-Object System.Windows.Forms.Form
+    $pDlg.Text = "COEIROINK ($flavor) のダウンロード & セットアップ"
+    $pDlg.Size = New-Object System.Drawing.Size(480, 220)
+    $pDlg.StartPosition = "CenterParent"
+    $pDlg.FormBorderStyle = "FixedDialog"
+    $pDlg.MaximizeBox = $false
+    $pDlg.MinimizeBox = $false
+    $pDlg.TopMost = $true
+    $pDlg.BackColor = [System.Drawing.Color]::FromArgb(47, 49, 54)
+    $pDlg.ForeColor = [System.Drawing.Color]::White
+
+    $pMsg = New-Object System.Windows.Forms.Label
+    $pMsg.Text = "COEIROINK ($flavor) をダウンロード中 (約3.5GB)...`n環境により10〜20分程度かかる場合があります。このままお待ちください。"
+    $pMsg.Location = New-Object System.Drawing.Point(20, 16)
+    $pMsg.Size = New-Object System.Drawing.Size(430, 36)
+    $pMsg.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $pDlg.Controls.Add($pMsg)
+
+    $pBar = New-Object System.Windows.Forms.ProgressBar
+    $pBar.Location = New-Object System.Drawing.Point(20, 60)
+    $pBar.Size = New-Object System.Drawing.Size(425, 24)
+    $pBar.Minimum = 0
+    $pBar.Maximum = 100
+    $pDlg.Controls.Add($pBar)
+
+    $pDetail = New-Object System.Windows.Forms.Label
+    $pDetail.Text = "接続中..."
+    $pDetail.Location = New-Object System.Drawing.Point(20, 92)
+    $pDetail.Size = New-Object System.Drawing.Size(425, 20)
+    $pDetail.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $pDetail.ForeColor = [System.Drawing.Color]::LightGray
+    $pDlg.Controls.Add($pDetail)
+
+    $pCancel = New-Object System.Windows.Forms.Button
+    $pCancel.Text = "キャンセル"
+    $pCancel.Location = New-Object System.Drawing.Point(345, 130)
+    $pCancel.Size = New-Object System.Drawing.Size(100, 28)
+    $pCancel.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+    $pCancel.ForeColor = [System.Drawing.Color]::White
+    $pCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $pCancel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $pDlg.Controls.Add($pCancel)
+
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add("User-Agent", "TTSBot-Volunteer-Worker/2.0")
+
+    $script:lastLoggedPct = 0
+    $wc.Add_DownloadProgressChanged({
+        param($s, $e)
+        try {
+            $pBar.Value = [math]::Min(100, [math]::Max(0, $e.ProgressPercentage))
+            $recMb = [math]::Round($e.BytesReceived / 1MB, 1)
+            if ($e.TotalBytesToReceive -gt 0) {
+                $totMb = [math]::Round($e.TotalBytesToReceive / 1MB, 1)
+                $pDetail.Text = "$($e.ProgressPercentage)% ($recMb MB / $totMb MB)"
+            } else {
+                $pDetail.Text = "$recMb MB 受信中..."
+            }
+            if ($e.ProgressPercentage -ge ($script:lastLoggedPct + 20)) {
+                $script:lastLoggedPct = $e.ProgressPercentage
+                Write-Host "  ... COEIROINK ダウンロード進捗: $($e.ProgressPercentage)%" -ForegroundColor DarkGray
+            }
+        } catch { }
+    })
+
+    $script:dlSuccess = $false
+    $script:dlError = $null
+    $wc.Add_DownloadFileCompleted({
+        param($s, $e)
+        if ($e.Cancelled) {
+            $script:dlSuccess = $false
+        } elseif ($e.Error) {
+            $script:dlSuccess = $false
+            $script:dlError = $e.Error
+        } else {
+            $script:dlSuccess = $true
+        }
+        $pDlg.Close()
+    })
+
+    $pCancel.Add_Click({
+        $wc.CancelAsync()
+        $pDlg.Close()
+    })
+
+    if ($statusLabel) { $statusLabel.Text = "[DL中] COEIROINK ($flavor) をダウンロード中 (約3.5GB)..." }
+    Write-Host "▶ COEIROINK ($flavor) をダウンロード中 (約3.5GB): $zipUrl" -ForegroundColor Cyan
+
+    try {
+        $uri = New-Object System.Uri($zipUrl)
+        $wc.DownloadFileAsync($uri, $tempZip)
+        if ($parentForm) {
+            $pDlg.ShowDialog($parentForm) | Out-Null
+        } else {
+            $pDlg.ShowDialog() | Out-Null
+        }
+    } catch {
+        $script:dlError = $_
+    } finally {
+        $wc.Dispose()
+    }
+
+    if ($script:dlSuccess -and (Test-Path $tempZip)) {
+        if ($statusLabel) { $statusLabel.Text = "[展開中] COEIROINK を展開中 (数分かかります)..." }
+        Write-Host "✓ ダウンロード完了: $tempZip" -ForegroundColor Green
+        Write-Host "▶ COEIROINK を展開中: $targetDir" -ForegroundColor Cyan
+
+        try {
+            if (-not (Test-Path $targetDir)) {
+                New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+            }
+            # ZIP 展開
+            try {
+                [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
+                [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $targetDir)
+            } catch {
+                Expand-Archive -Path $tempZip -DestinationPath $targetDir -Force
+            }
+            Write-Host "✓ 展開完了！" -ForegroundColor Green
+
+            # 一時ファイル削除
+            Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
+
+            if ($statusLabel) { $statusLabel.Text = "[起動] COEIROINK を起動しています..." }
+            Start-Sleep -Seconds 1
+            $started = Start-NativeCoeiroink $statusLabel
+            if ($started) {
+                Write-Host "✨ COEIROINK が正常に起動しました (ポート 50031/50032)" -ForegroundColor Green
+                return $true
+            } else {
+                Write-Host "⚠️ COEIROINK の自動起動を確認できませんでした。手動で起動してください: $targetDir" -ForegroundColor Yellow
+                return $true
+            }
+        } catch {
+            Write-Warning "COEIROINK の展開に失敗しました: $_"
+            if ($statusLabel) { $statusLabel.Text = "[エラー] ZIP の展開に失敗しました" }
+            [System.Windows.Forms.MessageBox]::Show(
+                "COEIROINK の展開に失敗しました。`nエラー: $_`n`n手動でダウンロードフォルダの ZIP を展開してください。",
+                "展開エラー",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+            return $false
+        }
+    } elseif ($script:dlError) {
+        Write-Warning "ダウンロードに失敗しました: $($script:dlError)"
+        if ($statusLabel) { $statusLabel.Text = "[エラー] ダウンロード失敗。手動でお試しください" }
+        [System.Windows.Forms.MessageBox]::Show(
+            "COEIROINK のダウンロードに失敗しました。`nエラー: $($script:dlError)`n`n手動で公式サイトからダウンロードしてください。",
+            "ダウンロードエラー",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+        return $false
+    } else {
+        if ($statusLabel) { $statusLabel.Text = "[情報] ダウンロードがキャンセルされました" }
+        Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+function Show-CoeiroinkInstallDialog([System.Windows.Forms.Label]$statusLabel, [System.Windows.Forms.Form]$parentForm) {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "COEIROINK のセットアップ (約3.5GB)"
+    $dlg.Size = New-Object System.Drawing.Size(500, 310)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.BackColor = [System.Drawing.Color]::FromArgb(47, 49, 54)
+    $dlg.ForeColor = [System.Drawing.Color]::White
+
+    $lblTitle = New-Object System.Windows.Forms.Label
+    $lblTitle.Text = "COEIROINK がPCにインストールされていません"
+    $lblTitle.Location = New-Object System.Drawing.Point(20, 16)
+    $lblTitle.Size = New-Object System.Drawing.Size(450, 22)
+    $lblTitle.Font = New-Object System.Drawing.Font("Segoe UI", 10.5, [System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($lblTitle)
+
+    # 警告・注意枠
+    $grpNotice = New-Object System.Windows.Forms.Panel
+    $grpNotice.Location = New-Object System.Drawing.Point(20, 42)
+    $grpNotice.Size = New-Object System.Drawing.Size(445, 84)
+    $grpNotice.BackColor = [System.Drawing.Color]::FromArgb(60, 45, 20)
+    $grpNotice.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $dlg.Controls.Add($grpNotice)
+
+    $lblNotice = New-Object System.Windows.Forms.Label
+    $lblNotice.Text = "⚠️ 【重要】セットアップ時間に関する注意事項`nCOEIROINK は本体および音声モデルの容量が約 3.5GB あります。`n自動ダウンロード＆展開には 10〜20分程度 かかります。`n（10GB以上のディスク空き容量と安定した通信環境を推奨します）"
+    $lblNotice.Location = New-Object System.Drawing.Point(10, 8)
+    $lblNotice.Size = New-Object System.Drawing.Size(425, 68)
+    $lblNotice.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $lblNotice.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 100)
+    $grpNotice.Controls.Add($lblNotice)
+
+    # 1. 自動インストールボタン
+    $btnAuto = New-Object System.Windows.Forms.Button
+    $btnAuto.Text = "自動ダウンロード＆展開してセットアップ (約3.5GB)"
+    $btnAuto.Location = New-Object System.Drawing.Point(20, 138)
+    $btnAuto.Size = New-Object System.Drawing.Size(445, 38)
+    $btnAuto.BackColor = [System.Drawing.Color]::FromArgb(88, 101, 242)
+    $btnAuto.ForeColor = [System.Drawing.Color]::White
+    $btnAuto.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnAuto.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+    $btnAuto.Add_Click({
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dlg.Close()
+        Install-CoeiroinkZip $statusLabel $parentForm
+    })
+    $dlg.Controls.Add($btnAuto)
+
+    # 2. 手動ダウンロードボタン
+    $btnManual = New-Object System.Windows.Forms.Button
+    $btnManual.Text = "手動でダウンロード (公式サイトを開く)"
+    $btnManual.Location = New-Object System.Drawing.Point(20, 184)
+    $btnManual.Size = New-Object System.Drawing.Size(445, 32)
+    $btnManual.BackColor = [System.Drawing.Color]::FromArgb(79, 84, 92)
+    $btnManual.ForeColor = [System.Drawing.Color]::White
+    $btnManual.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnManual.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $btnManual.Add_Click({
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+        $dlg.Close()
+        Start-Process "https://coeiroink.com/download"
+    })
+    $dlg.Controls.Add($btnManual)
+
+    # 3. キャンセルボタン
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "キャンセル"
+    $btnCancel.Location = New-Object System.Drawing.Point(365, 226)
+    $btnCancel.Size = New-Object System.Drawing.Size(100, 26)
+    $btnCancel.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+    $btnCancel.ForeColor = [System.Drawing.Color]::White
+    $btnCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnCancel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.ShowDialog($parentForm) | Out-Null
 }
 
 function Show-EngineInstallOptionsDialog([string]$engineName, [string]$websiteUrl, [string]$autoInstallerUrl, [string]$installerFileName, [System.Windows.Forms.Label]$statusLabel, [System.Windows.Forms.Form]$parentForm) {
@@ -808,7 +1089,7 @@ $BtnSetupCi.Add_Click({
         $script:DetectedEngines = Scan-AllLocalEngines
         Update-EngineCheckboxTexts
     } else {
-        Show-EngineInstallOptionsDialog "COEIROINK" "https://coeiroink.com/download" "" "" $LblEngineStatus $Form
+        Show-CoeiroinkInstallDialog $LblEngineStatus $Form
         Start-Sleep -Seconds 1
         $script:DetectedEngines = Scan-AllLocalEngines
         Update-EngineCheckboxTexts
@@ -1022,6 +1303,10 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
             if ($ChkVv.Checked -and -not $DetectedEngines["voicevox"]) {
                 Write-Host "▶ VOICEVOX を最小化起動中..." -ForegroundColor Cyan
                 Start-NativeVoicevox
+            }
+            if ($ChkCi.Checked -and -not $DetectedEngines["coeiroink"]) {
+                Write-Host "▶ COEIROINK を最小化起動中..." -ForegroundColor Cyan
+                Start-NativeCoeiroink
             }
             if ($ChkSv.Checked -and -not $DetectedEngines["sharevox"]) {
                 Write-Host "▶ SHAREVOX を最小化起動中..." -ForegroundColor Cyan
