@@ -8,9 +8,11 @@ TTSBot Volunteer Worker Agent
 - 自動エンジン検出: ローカルで起動している VOICEVOX / COEIROINK / SHAREVOX を自動検出
 - ゼロコピーバイナリ転送: 高速なバイナリWebSocketフレームで音声を返送
 - 自動再接続: 切断時の指数バックオフリトライ
+- 【Dockerモード】: アイドル時 (10分) の自動スリープ (docker stop) & オンデマンド復帰 (docker start) & 終了時クリーンアップ
+- 【ネイティブモード】: ユーザーがローカルエンジンを閉じた場合にエージェントも安全に自動終了
 
 【実行例】
-python volunteer_worker.py --server-url wss://tts.example.com/api/worker/ws --token YOUR_TOKEN --name "MyGamingPC"
+python volunteer_worker.py --server-url wss://tts.example.com/api/worker/ws --token YOUR_TOKEN --name "MyGamingPC" --runtime docker
 """
 
 import os
@@ -22,8 +24,9 @@ import platform
 import argparse
 import asyncio
 import logging
+import subprocess
 import urllib.parse
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 try:
     import aiohttp
@@ -40,9 +43,15 @@ logging.basicConfig(
 logger = logging.getLogger("VolunteerWorker")
 
 # プロトコル定数
-PROTOCOL_VERSION = "2.0.0"
+PROTOCOL_VERSION = "2.1.0"
 BINARY_HEADER_FORMAT = ">32sIB"
 FLAG_FINAL_CHUNK = 0x01
+
+DOCKER_CONTAINER_MAP = {
+    "voicevox": "ttsbot-worker-voicevox",
+    "sharevox": "ttsbot-worker-sharevox",
+    "coeiroink": "ttsbot-worker-coeiroink",
+}
 
 def pack_binary_chunk(req_id: str, chunk_index: int, payload: bytes, is_final: bool = True) -> bytes:
     req_id_bytes = req_id.encode('ascii')[:32].ljust(32, b' ')
@@ -60,6 +69,9 @@ class VolunteerWorker:
         self.priority = args.priority
         self.exclusive_guild_id = getattr(args, "exclusive_guild_id", "") or None
         self.game_priority = getattr(args, "game_priority", False)
+        self.runtime = getattr(args, "runtime", "native").lower()
+        self.idle_timeout = getattr(args, "idle_timeout", 600)  # 10分 (600秒)
+        self.auto_exit = not getattr(args, "no_auto_exit", False)
         
         self.engine_urls = {
             "voicevox": args.voicevox_url.rstrip("/"),
@@ -67,9 +79,12 @@ class VolunteerWorker:
             "sharevox": args.sharevox_url.rstrip("/"),
         }
         self.supported_engines: List[str] = []
+        self.detected_ports: Set[int] = set()
         self.session: Optional[aiohttp.ClientSession] = None
         self.active_tasks = 0
         self.start_time = time.time()
+        self.last_activity_time = time.time()
+        self._bg_tasks: List[asyncio.Task] = []
 
         if self.game_priority:
             self._apply_low_process_priority()
@@ -79,7 +94,6 @@ class VolunteerWorker:
         try:
             if platform.system() == "Windows":
                 import ctypes
-                # BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
                 handle = ctypes.windll.kernel32.GetCurrentProcess()
                 ctypes.windll.kernel32.SetPriorityClass(handle, 0x00004000)
                 logger.info("🎮 [GameMode] プロセス優先度を '通常以下 (BelowNormal)' に設定しました (ゲームFPS優先)")
@@ -89,12 +103,74 @@ class VolunteerWorker:
         except Exception as e:
             logger.debug(f"優先度設定スキップ: {e}")
 
+    # ==========================================
+    # Docker 管理ヘルパー
+    # ==========================================
+    def _is_container_running(self, container_name: str) -> bool:
+        try:
+            out = subprocess.check_output(
+                ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+                stderr=subprocess.DEVNULL, timeout=3.0
+            ).decode().strip()
+            return out.lower() == "true"
+        except Exception:
+            return False
+
+    def _start_docker_container(self, container_name: str) -> bool:
+        try:
+            logger.info(f"⚡ [Docker] コンテナ '{container_name}' をオンデマンド起動中...")
+            subprocess.run(["docker", "start", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10.0)
+            return True
+        except Exception as e:
+            logger.error(f"❌ コンテナ {container_name} 起動エラー: {e}")
+            return False
+
+    def _stop_docker_container(self, container_name: str) -> bool:
+        try:
+            logger.info(f"💤 [Docker] コンテナ '{container_name}' を停止 (スリープ/解放) 中...")
+            subprocess.run(["docker", "stop", "-t", "5", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10.0)
+            return True
+        except Exception as e:
+            logger.error(f"❌ コンテナ {container_name} 停止エラー: {e}")
+            return False
+
+    async def _is_port_open(self, host: str, port: int) -> bool:
+        try:
+            _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=0.8)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            return False
+
+    async def _ensure_engine_ready(self, engine: str):
+        """リクエスト受信時に Docker コンテナが停止していればオンデマンドで即座に復帰"""
+        self.last_activity_time = time.time()
+        if self.runtime != "docker":
+            return
+
+        cname = DOCKER_CONTAINER_MAP.get(engine)
+        if not cname:
+            return
+
+        if not self._is_container_running(cname):
+            self._start_docker_container(cname)
+            target_port = 50021 if engine == "voicevox" else (50025 if engine == "sharevox" else 50031)
+            for _ in range(30):
+                if await self._is_port_open("127.0.0.1", target_port):
+                    logger.info(f"✨ [Docker] エンジン '{engine}' の準備が完了しました")
+                    return
+                await asyncio.sleep(0.5)
+            logger.warning(f"⚠️ [Docker] エンジン '{engine}' のポート応答タイムアウト")
+
+    # ==========================================
+    # エンジン検出 & スペック収集
+    # ==========================================
     async def detect_local_engines(self) -> List[str]:
-        """ローカルで稼働している各音声合成エンジンをスマートAPI判定 (デフォルトポート差異・重複対応)"""
+        """ローカルで稼働している各音声合成エンジンをスマートAPI判定"""
         available = set()
         timeout = aiohttp.ClientTimeout(total=2.0)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            # 探索対象候補ポート (公式デフォルト 50021, 旧環境SHAREVOX 50025, COEIROINK 50031, 50032)
             candidate_ports = [50021, 50025, 50031, 50032]
             for u in self.engine_urls.values():
                 try:
@@ -106,7 +182,7 @@ class VolunteerWorker:
 
             for port in candidate_ports:
                 base = f"http://127.0.0.1:{port}"
-                # 1. engine_manifest による判定 (VOICEVOX / SHAREVOX 公式API)
+                # 1. engine_manifest による判定
                 try:
                     async with s.get(f"{base}/engine_manifest") as r:
                         if r.status == 200:
@@ -116,27 +192,30 @@ class VolunteerWorker:
                                 logger.info(f"✨ SHAREVOX 検出 (manifest判定): {base}")
                                 self.engine_urls["sharevox"] = base
                                 available.add("sharevox")
+                                self.detected_ports.add(port)
                                 continue
                             elif "VOICEVOX" in brand:
                                 logger.info(f"✨ VOICEVOX 検出 (manifest判定): {base}")
                                 self.engine_urls["voicevox"] = base
                                 available.add("voicevox")
+                                self.detected_ports.add(port)
                                 continue
                 except Exception:
                     pass
 
-                # 2. COEIROINK v1/v2 判定 (/v1/speakers)
+                # 2. COEIROINK v1/v2 判定
                 try:
                     async with s.get(f"{base}/v1/speakers") as r:
                         if r.status == 200:
                             logger.info(f"✨ COEIROINK 検出 (API判定): {base}")
                             self.engine_urls["coeiroink"] = base
                             available.add("coeiroink")
+                            self.detected_ports.add(port)
                             continue
                 except Exception:
                     pass
 
-                # 3. /speakers による話者名判定フォールバック (VOICEVOX vs SHAREVOX)
+                # 3. /speakers による話者名判定フォールバック
                 try:
                     async with s.get(f"{base}/speakers") as r:
                         if r.status == 200:
@@ -145,12 +224,25 @@ class VolunteerWorker:
                                 logger.info(f"✨ SHAREVOX 検出 (話者リスト判定): {base}")
                                 self.engine_urls["sharevox"] = base
                                 available.add("sharevox")
+                                self.detected_ports.add(port)
                             else:
                                 logger.info(f"✨ VOICEVOX 検出 (話者リスト判定): {base}")
                                 self.engine_urls["voicevox"] = base
                                 available.add("voicevox")
+                                self.detected_ports.add(port)
                 except Exception:
                     pass
+
+        # Docker モード時: コンテナが存在するエンジンはスリープ中であってもサポート対象として認識
+        if self.runtime == "docker":
+            for eng, cname in DOCKER_CONTAINER_MAP.items():
+                if eng not in available:
+                    try:
+                        subprocess.check_output(["docker", "inspect", cname], stderr=subprocess.DEVNULL)
+                        available.add(eng)
+                        logger.info(f"🐳 Docker エンジンコンテナ '{cname}' (休止中/待機) を提供対象として認識")
+                    except Exception:
+                        pass
 
         return list(available)
 
@@ -163,9 +255,7 @@ class VolunteerWorker:
             "gpu": False,
             "gpu_name": "CPU"
         }
-        # NVIDIA GPU 検出試行 (Windows / Linux)
         try:
-            import subprocess
             out = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
                 stderr=subprocess.DEVNULL
@@ -177,36 +267,106 @@ class VolunteerWorker:
             pass
         return specs
 
+    # ==========================================
+    # バックグラウンド監視ループ群
+    # ==========================================
+    async def _idle_monitor_loop(self):
+        """Dockerモード時のアイドル自動スリープ (10分間リクエストなしで docker stop)"""
+        if self.runtime != "docker":
+            return
+        logger.info(f"⏱️ [Docker] アイドル監視タスク開始 (無通信 {self.idle_timeout // 60}分でコンテナ自動スリープ)")
+        while True:
+            await asyncio.sleep(30.0)
+            if self.active_tasks > 0:
+                continue
+            idle_sec = time.time() - self.last_activity_time
+            if idle_sec >= self.idle_timeout:
+                for eng in self.supported_engines:
+                    cname = DOCKER_CONTAINER_MAP.get(eng)
+                    if cname and self._is_container_running(cname):
+                        logger.info(f"💤 [Idle Sleep] {idle_sec / 60:.1f}分間リクエストがなかったため、{eng} ({cname}) を一時停止してメモリ/CPUを解放します")
+                        self._stop_docker_container(cname)
+
+    async def _native_engine_monitor_loop(self):
+        """ネイティブモード時: ユーザーがローカルエンジンを閉じた場合にエージェントも自動終了"""
+        if self.runtime != "native" or not self.auto_exit:
+            return
+        # 起動直後の猶予期間（30秒）
+        await asyncio.sleep(30.0)
+        while True:
+            await asyncio.sleep(15.0)
+            if self.active_tasks > 0:
+                continue
+            if not self.detected_ports:
+                continue
+
+            any_alive = False
+            for port in self.detected_ports:
+                if await self._is_port_open("127.0.0.1", port):
+                    any_alive = True
+                    break
+
+            if not any_alive:
+                logger.info("🛑 [AutoExit] 提供中の音声合成エンジンがすべて終了したことを検出しました。")
+                logger.info("   ユーザーがアプリを閉じたため、Volunteer Worker エージェントを自動終了します。")
+                os._exit(0)
+
+    # ==========================================
+    # メインループ & WebSocket 接続
+    # ==========================================
     async def run(self):
         """メインループ (常時接続 & 指数バックオフ再接続)"""
         logger.info("==================================================")
         logger.info(f"🚀 TTSBot Volunteer Worker Agent (v{PROTOCOL_VERSION})")
         logger.info(f"   Node ID   : {self.node_id}")
         logger.info(f"   Node Name : {self.node_name}")
+        logger.info(f"   Runtime   : {self.runtime.upper()}")
         logger.info(f"   Server    : {self.server_url}")
+        if self.runtime == "docker":
+            logger.info(f"   Auto Sleep: {self.idle_timeout // 60}分アイドルで docker stop (省電力・低メモリ)")
+        elif self.runtime == "native" and self.auto_exit:
+            logger.info("   Auto Exit : ローカルエンジン終了時にエージェントも自動終了")
         logger.info("==================================================")
 
         # 1. ローカルエンジンの初回検出
         self.supported_engines = await self.detect_local_engines()
         if not self.supported_engines:
             logger.warning("⚠️ ローカルで起動している音声合成エンジン (VOICEVOX / COEIROINK / SHAREVOX) が見つかりませんでした。")
-            logger.warning("   エンジンを起動してから再実行してください。")
-            # 終了せず、後から起動される可能性も考慮して継続
+            if self.runtime != "docker":
+                logger.warning("   エンジンを起動してから再実行してください。")
+
+        # バックグラウンド監視タスク開始
+        self._bg_tasks.append(asyncio.create_task(self._idle_monitor_loop()))
+        self._bg_tasks.append(asyncio.create_task(self._native_engine_monitor_loop()))
 
         # 接続ループ
         backoff = 2.0
-        while True:
-            try:
-                await self._connect_and_serve()
-                backoff = 2.0  # 正常終了時はリセット
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.warning(f"🔌 サーバー接続切断または失敗: {e}。 {backoff:.1f}秒後に再接続します...")
-                await asyncio.sleep(backoff)
-                backoff = min(30.0, backoff * 1.5)
-            except Exception as e:
-                logger.error(f"❌ 予期しないエラー: {e}", exc_info=True)
-                await asyncio.sleep(backoff)
-                backoff = min(30.0, backoff * 1.5)
+        try:
+            while True:
+                try:
+                    await self._connect_and_serve()
+                    backoff = 2.0
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.warning(f"🔌 サーバー接続切断または失敗: {e}。 {backoff:.1f}秒後に再接続します...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(30.0, backoff * 1.5)
+                except Exception as e:
+                    logger.error(f"❌ 予期しないエラー: {e}", exc_info=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(30.0, backoff * 1.5)
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """終了時クリーンアップ"""
+        for t in self._bg_tasks:
+            t.cancel()
+        if self.runtime == "docker":
+            logger.info("🧹 [Cleanup] Worker 終了に伴い、管理対象の Docker エンジンコンテナを安全に停止します...")
+            for eng in self.supported_engines:
+                cname = DOCKER_CONTAINER_MAP.get(eng)
+                if cname and self._is_container_running(cname):
+                    self._stop_docker_container(cname)
 
     async def _connect_and_serve(self):
         """1 回の WebSocket セッションの管理"""
@@ -214,7 +374,6 @@ class VolunteerWorker:
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
 
-        # URLパラメータにトークンも含める（Cloudflare / リバースプロキシ対策）
         url = self.server_url
         if self.token and "?" not in url:
             url += f"?token={urllib.parse.quote(self.token)}"
@@ -230,11 +389,9 @@ class VolunteerWorker:
             ) as ws:
                 logger.info(f"✅ サーバーに接続しました: {self.server_url}")
 
-                # 最新のエンジン状態とスペックを再収集
                 self.supported_engines = await self.detect_local_engines()
                 specs = self.collect_specs()
 
-                # 登録メッセージ送信
                 reg_payload = {
                     "type": "register",
                     "node_id": self.node_id,
@@ -248,9 +405,7 @@ class VolunteerWorker:
                 }
                 await ws.send_json(reg_payload)
 
-                # ハートビート送信タスク起動
                 hb_task = asyncio.create_task(self._heartbeat_loop(ws))
-
                 try:
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -265,7 +420,6 @@ class VolunteerWorker:
                                 logger.info(f"🎉 サーバーにワーカーとして登録されました (Priority: {data.get('assigned_priority', self.priority)})")
 
                             elif m_type == "synthesize_request":
-                                # バックグラウンドタスクとして音声合成を実行 (並列実行)
                                 asyncio.create_task(self._handle_synthesize(ws, data))
 
                             elif m_type == "heartbeat_ack":
@@ -308,15 +462,18 @@ class VolunteerWorker:
         pitch = float(req.get("pitch", 0.0))
 
         self.active_tasks += 1
+        self.last_activity_time = time.time()
         t0 = time.time()
         preview = text[:20] + ("..." if len(text) > 20 else "")
         logger.info(f"🎙️ [Request] {engine.upper()} 合成開始: '{preview}' (req_id={req_id[:8]})")
 
         try:
+            # Dockerモード時: スリープ中ならオンデマンドで復帰
+            await self._ensure_engine_ready(engine)
+
             audio_bytes = await self._synthesize_on_engine(engine, speaker_id, text, speed, pitch)
             elapsed_ms = (time.time() - t0) * 1000.0
 
-            # ゼロコピー・バイナリフレームをパッキングして即時返信
             bin_packet = pack_binary_chunk(req_id, chunk_idx, audio_bytes, is_final=True)
             await ws.send_bytes(bin_packet)
             logger.info(f"✨ [Success] {engine.upper()} 合成完了 ({elapsed_ms:.0f}ms, {len(audio_bytes)} bytes)")
@@ -333,6 +490,7 @@ class VolunteerWorker:
                 pass
         finally:
             self.active_tasks = max(0, self.active_tasks - 1)
+            self.last_activity_time = time.time()
 
     async def _synthesize_on_engine(self, engine: str, speaker_id: Any, text: str, speed: float, pitch: float) -> bytes:
         """ローカルエンジンへの HTTP リクエスト実行"""
@@ -346,7 +504,6 @@ class VolunteerWorker:
         encoded_text = urllib.parse.quote(text)
 
         if engine in ("voicevox", "sharevox"):
-            # 1. audio_query
             q_url = f"{target_base}/audio_query?text={encoded_text}&speaker={speaker_id}"
             async with self.session.post(q_url, timeout=aiohttp.ClientTimeout(total=5.0)) as q_resp:
                 if q_resp.status != 200:
@@ -354,13 +511,11 @@ class VolunteerWorker:
                     raise RuntimeError(f"{engine} audio_query failed ({q_resp.status}): {err}")
                 query_data = await q_resp.json()
 
-            # パラメータ調整
             if speed != 1.0:
                 query_data["speedScale"] = speed
             if pitch != 0.0:
                 query_data["pitchScale"] = pitch
 
-            # 2. synthesis
             s_url = f"{target_base}/synthesis?speaker={speaker_id}"
             async with self.session.post(s_url, json=query_data, timeout=aiohttp.ClientTimeout(total=8.0)) as s_resp:
                 if s_resp.status != 200:
@@ -369,11 +524,9 @@ class VolunteerWorker:
                 return await s_resp.read()
 
         elif engine == "coeiroink":
-            # COEIROINK v1
             style_id = int(str(speaker_id).split("_")[-1]) if "_" in str(speaker_id) else int(speaker_id)
             speaker_uuid = str(speaker_id).split("_")[0] if "_" in str(speaker_id) else "d312d0fb-d38d-434e-825d-cbcbfd105ad0"
 
-            # 1. estimate_prosody
             ep_url = f"{target_base}/v1/estimate_prosody"
             ep_payload = {"text": text}
             async with self.session.post(ep_url, json=ep_payload, timeout=aiohttp.ClientTimeout(total=5.0)) as ep_resp:
@@ -382,7 +535,6 @@ class VolunteerWorker:
                     raise RuntimeError(f"coeiroink estimate_prosody failed ({ep_resp.status}): {err}")
                 prosody_data = await ep_resp.json()
 
-            # 2. synthesis
             s_url = f"{target_base}/v1/synthesis"
             synth_payload = {
                 "speakerUuid": speaker_uuid,
@@ -414,6 +566,9 @@ def main():
     parser.add_argument("--priority", type=int, default=50, help="Node priority (lower = higher priority, default: 50)")
     parser.add_argument("--exclusive-guild-id", default="", help="Dedicate this node to a specific Discord Guild ID (optional)")
     parser.add_argument("--game-priority", action="store_true", help="Run process with BelowNormal priority to protect game FPS")
+    parser.add_argument("--runtime", choices=["native", "docker"], default="native", help="Execution runtime (native or docker)")
+    parser.add_argument("--idle-timeout", type=int, default=600, help="Idle timeout in seconds before sleeping Docker engines (default: 600s)")
+    parser.add_argument("--no-auto-exit", action="store_true", help="Disable auto-exit when native engines close")
     parser.add_argument("--voicevox-url", default="http://127.0.0.1:50021", help="Local VOICEVOX Engine URL")
     parser.add_argument("--coeiroink-url", default="http://127.0.0.1:50031", help="Local COEIROINK Engine URL")
     parser.add_argument("--sharevox-url", default="http://127.0.0.1:50025", help="Local SHAREVOX Engine URL")
@@ -425,6 +580,8 @@ def main():
         asyncio.run(worker.run())
     except KeyboardInterrupt:
         logger.info("🛑 ユーザー操作によりワーカーを停止しました。")
+    finally:
+        worker.cleanup()
 
 if __name__ == "__main__":
     main()

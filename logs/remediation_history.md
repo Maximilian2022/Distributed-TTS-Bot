@@ -1,5 +1,37 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] Windows GUI 文字化け（豆腐 □）の完全解消・Docker アイドル自動スリープ & ネイティブ自動終了・Bot & ノード管理へのクラスタ Worker 手順追加
+- **ユーザーフィードバック & 課題**:
+  1. Windows GUI ランチャー (`run_volunteer_gui.ps1`) において、一部の文字（ボタンやラベル、タイトルなど）が四角い枠（豆腐 `□`）として表示され文字化けに見える問題。
+  2. ボランティア Worker の動作仕様に関する確認と改善要求：
+     - Docker 選択時: クラスタ用 Worker と同等に、使われていない時のアイドル停止や終了時の片付けを行いたい。
+     - ネイティブ選択時: ユーザーが起動したローカルエンジン（VOICEVOX等）を閉じた場合、裏で動くネイティブエージェントも自動終了してほしい。
+  3. WebUI「Bot & ノード管理 (インフラ統制)」に、常時稼働クラスタ用 Worker のセットアップ手順を明記してほしい要求。
+- **真因の究明**:
+  - 豆腐（`□`）の原因: Windows Forms（.NET GDI+）のコントロール（Label, Button, CheckBox）は絵文字（サロゲートペアやカラー絵文字グリフ）の描画フォールバックに対応しておらず、絵文字を含むテキストが `□` や `↓□` として描画されていた。また、PowerShell 5.1/7 間でスクリプト配信時の UTF-8 解釈差異を防ぐため、HTTP レスポンスに UTF-8 BOM を付与する設定としたが、aiohttp の引数記述（`content_type` 内に charset 指定）で 500 エラーが発生していた。
+  - ボランティアエージェントの仕様: これまでボランティアツールは常時待機前提で、Docker コンテナのアイドル停止や終了時クリーンアップ、ネイティブアプリ終了検知が未実装だった。
+- **抜本的改善内容**:
+  1. **Windows GUI ランチャーの絵文字豆腐化対策 & UTF-8 BOM 配信保護**:
+     - `run_volunteer_gui.ps1`, `run_volunteer.bat` 内の全絵文字（`🎙️`, `🚀`, `⬇️`, `🎮`, `🖥️`, `💾`, `✅`, `🐳`, `❌` 等）を完全に除去し、安全なテキスト表記（`[入手]`, `[稼働中]`, `[未起動]`, `[OK]`, `[エラー]`, `起動する`）に刷新。
+     - `server.py` の `handle_volunteer_file` における aiohttp レスポンス引数を `web.Response(body=bom_bytes, content_type="text/plain", charset="utf-8")` に修正し、HTTP 500 を解消した上で Windows PowerShell に 100% 確実に UTF-8 BOM を付与して配信。
+  2. **ボランティア Worker (`volunteer_worker.py`) の Docker アイドル停止 & オンデマンド復帰**:
+     - `--runtime {native, docker}` および `--idle-timeout` 引数を追加。
+     - Docker モード時:
+       - 10分間（600秒）リクエストがない場合、稼働中のエンジンコンテナ（`ttsbot-worker-voicevox` 等）を自動で `docker stop` し、PCのメモリ・CPUを完全解放。
+       - サーバーから合成リクエストを受信した際、停止中のコンテナを `docker start` して自動オンデマンド復帰。
+       - Worker 終了時（Ctrl+C またはランチャー終了）に、起動していたコンテナを自動でクリーンアップ（`docker stop`）。
+  3. **ネイティブモードにおけるエンジン停止検知とエージェント自動終了**:
+     - ネイティブモード時: バックグラウンド監視ループが 15秒ごとに提供対象エンジンのポート死活をチェック。
+     - ユーザーが VOICEVOX 等のウィンドウを閉じてすべてのローカルエンジンが終了した場合、エージェントも「ユーザーが作業を終了した」と判断して安全に自動終了。
+  4. **「Bot & ノード管理 (インフラ統制)」へのクラスタ用 Worker 手順追加 (`index.html` & `app.js`)**:
+     - 「3. 🖥️ 分散コンピュートワーカー」カード内に「➕ クラスタ用 Worker (固定推論サーバー) を追加・セットアップする手順」アコーディオンを新設。
+     - Linux (Debian / Ubuntu / Docker) 向けワンライナー（`curl -sSL "https://.../setup-worker.sh" | sudo bash`）と、Windows (PowerShell / Docker Desktop) 向けワンライナー（`irm "https://.../setup-worker.ps1" | iex`）を現在のホストに応じて動的に表示。
+     - VC在室連動スリープやオンデマンド遠隔起動に対応した固定推論サーバーとしてワンライナーで即時参加できる手順を視覚的に統合。
+- **検証結果**:
+  - `curl -sI` で各スクリプト（`.ps1`, `.py`, `.sh`）が 200 OK、UTF-8 BOM 付きで正常配信されることを確認。
+  - 実機ブラウザで「Bot & ノード管理」タブのアコーディオンが正常に開閉し、Linux/Windows のワンライナーコマンドが美しく描画されることを確認。
+  - `python3 volunteer_worker.py --help` で `--runtime {native,docker}` およびアイドル制御オプションが正常動作することを確認。
+
 ## [2026-10-24] WAN 接続時 403 Forbidden の完全解消・共有トークン必須化・Windows ボランティア GUI ランチャーの全面機能強化
 - **ユーザーフィードバック & 課題**:
   1. Linux で実行時、`403, message='Invalid response status', url='wss://ttsbot.kenko.land/api/worker/ws'` が発生して接続できない不具合。

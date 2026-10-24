@@ -3,7 +3,7 @@ chcp 65001 > nul
 setlocal enabledelayedexpansion
 
 echo ======================================================
-echo   🎙️ TTSBot Volunteer Worker (ボランティア参加ツール)
+echo   [TTSBot Volunteer Worker (ボランティア参加ツール)]
 echo ======================================================
 echo.
 
@@ -76,6 +76,7 @@ name = cfg.get('node_name', '')
 capacity = str(cfg.get('capacity', 2))
 ex_guild = cfg.get('exclusive_guild_id', '')
 game_priority = cfg.get('game_priority', True)
+runtime = cfg.get('runtime', 'native')
 engine_urls = cfg.get('engine_urls', {})
 
 args = [sys.executable, r'%SCRIPT_DIR%volunteer_worker.py', '--server-url', server_url]
@@ -89,6 +90,8 @@ if ex_guild:
     args.extend(['--exclusive-guild-id', ex_guild])
 if game_priority:
     args.append('--game-priority')
+if runtime:
+    args.extend(['--runtime', runtime])
 
 if 'voicevox' in engine_urls:
     args.extend(['--voicevox-url', engine_urls['voicevox']])
@@ -104,7 +107,7 @@ print('▶ ゲーム優先    : ' + ('有効 (低負荷)' if game_priority else 
 if engine_urls:
     print('▶ 音声エンジン  : ' + ', '.join([f'{k} ({v})' for k, v in engine_urls.items()]))
 print('')
-print('🎙️ ボランティアエージェントを起動します (停止は Ctrl+C またはウィンドウを閉じてください)...')
+print('[起動] ボランティアエージェントを起動します (停止は Ctrl+C またはウィンドウを閉じてください)...')
 
 sys.exit(subprocess.call(args))
 "

@@ -289,6 +289,7 @@ function updatePermissionsUI() {
   }
   if (hasAccess) {
     updateStandbyOneliner();
+    updateClusterWorkerOneliner();
   }
 
   if (cardSystemForbidden && areaSystemContent) {
@@ -2213,6 +2214,7 @@ async function loadBotConfig(guildId) {
       errorContactInput.value = (cfg.error_contact_user_id && cfg.error_contact_user_id !== "0") ? String(cfg.error_contact_user_id) : "";
     }
     updateStandbyOneliner();
+    updateClusterWorkerOneliner();
   } catch (e) {
     console.error("Failed to load bot config:", e);
   }
@@ -7288,6 +7290,20 @@ function updateStandbyOneliner() {
   if (ps1Pre) ps1Pre.textContent = ps1Cmd;
   if (setupBox) setupBox.textContent = shCmd;
 }
+
+function updateClusterWorkerOneliner() {
+  const shBox = document.getElementById("cluster-worker-setup-sh");
+  const ps1Box = document.getElementById("cluster-worker-setup-ps1");
+  if (!shBox && !ps1Box) return;
+
+  const origin = window.location.origin.replace(/\/$/, "");
+  const shCmd = `curl -sSL "${origin}/setup-worker.sh" | sudo bash`;
+  const ps1Cmd = `irm "${origin}/setup-worker.ps1" | iex`;
+
+  if (shBox) shBox.textContent = shCmd;
+  if (ps1Box) ps1Box.textContent = ps1Cmd;
+}
+window.updateClusterWorkerOneliner = updateClusterWorkerOneliner;
 window.updateStandbyOneliner = updateStandbyOneliner;
 
 function updateVolunteerOneliner() {
@@ -7424,6 +7440,7 @@ async function loadCredentials() {
     }
 
     updateWorkerOneliner(data.web_base_url, data.worker_shared_secret);
+    updateClusterWorkerOneliner();
 
     // システム全体エラー通知先
     const credErrorContact = document.getElementById("cred-error-contact-user-id");

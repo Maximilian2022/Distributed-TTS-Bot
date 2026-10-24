@@ -1027,6 +1027,38 @@
                 </div>
               </div>
 
+              <!-- クラスタ用 Worker ノード追加案内アコーディオン -->
+              <details style="background:rgba(0,0,0,0.18);border:1px solid rgba(255,255,255,0.06);border-radius:8px;padding:12px 14px;font-size:12px;margin-bottom:12px;">
+                <summary style="cursor:pointer;font-weight:600;color:var(--text-normal);display:flex;align-items:center;gap:6px;">
+                  <span>➕ クラスタ用 Worker (固定推論サーバー) を追加・セットアップする手順</span>
+                </summary>
+                <div style="margin-top:10px;color:var(--text-muted);line-height:1.6;">
+                  <p style="margin:0 0 8px;">
+                    常時稼働の専用サーバーや自宅GPUサーバー（Debian / Ubuntu / Windows Docker）をクラスタに追加し、音声合成負荷をオフロードします。<br>
+                    <strong>VC在室連動スリープ (docker stop)</strong>、<strong>オンデマンド遠隔起動 (docker start)</strong>、<strong>GPU優先自動ルーティング</strong>に対応した推論ノードが全自動で構築されます。
+                  </p>
+                  
+                  <div style="margin-top:8px;">
+                    <div style="font-weight:600;color:var(--text-normal);font-size:11px;margin-bottom:4px;">🐧 Linux サーバー (Debian / Ubuntu / Docker):</div>
+                    <div style="background:#1e1f22;padding:10px 12px;border-radius:6px;font-family:monospace;font-size:11px;color:#00ffcc;user-select:all;word-break:break-all;" id="cluster-worker-setup-sh">
+                      curl -sSL "https://ttsbot.kenko.land/setup-worker.sh" | sudo bash
+                    </div>
+                  </div>
+
+                  <div style="margin-top:8px;">
+                    <div style="font-weight:600;color:var(--text-normal);font-size:11px;margin-bottom:4px;">🪟 Windows サーバー (PowerShell / Docker Desktop):</div>
+                    <div style="background:#1e1f22;padding:10px 12px;border-radius:6px;font-family:monospace;font-size:11px;color:#00ffcc;user-select:all;word-break:break-all;" id="cluster-worker-setup-ps1">
+                      irm "https://ttsbot.kenko.land/setup-worker.ps1" | iex
+                    </div>
+                  </div>
+
+                  <div style="font-size:11px;color:var(--text-dim);margin-top:8px;">
+                    ※ スクリプト実行時に共有トークン（WORKER_SHARED_SECRET）が自動検証され、本Masterの管理下ノードとして即時登録されます。<br>
+                    ※ 個人PC等で一時的に余剰パワーを提供したい場合は、上部「ボランティア参加」をご利用ください。
+                  </div>
+                </div>
+              </details>
+
               <!-- 運用手順案内リンク -->
               <div style="background:rgba(0,0,0,0.15);padding:10px 14px;border-radius:6px;border:1px solid rgba(255,255,255,0.05);font-size:11px;color:var(--text-dim);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
                 <div>

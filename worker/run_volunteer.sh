@@ -140,6 +140,7 @@ cfg = {
     'engines': engines,
     'capacity': cap,
     'node_name': '''${NODE_NAME}''',
+    'runtime': 'docker' if int('${USE_DOCKER:-0}') == 1 else 'native',
     'game_priority': True
 }
 with open('${CONFIG_FILE}', 'w', encoding='utf-8') as f:
@@ -272,6 +273,9 @@ if cfg.get('exclusive_guild_id'):
     args.extend(['--exclusive-guild-id', cfg.get('exclusive_guild_id')])
 if cfg.get('game_priority', True):
     args.append('--game-priority')
+runtime = cfg.get('runtime', 'docker' if int('${USE_DOCKER:-0}') == 1 else 'native')
+if runtime:
+    args.extend(['--runtime', runtime])
 
 sys.exit(subprocess.call(args))
 "

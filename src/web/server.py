@@ -916,6 +916,10 @@ class WebServer:
 
             content = content.replace("__DEFAULT_SERVER_WS_URL__", ws_url)
             content = content.replace("__DEFAULT_WORKER_TOKEN__", worker_token)
+            if filename.endswith(".ps1"):
+                # Windows PowerShell (5.1/7) での文字コード誤認（Shift-JIS解釈）を完全防止するため UTF-8 BOM を付与
+                bom_bytes = b'\xef\xbb\xbf' + content.encode('utf-8')
+                return web.Response(body=bom_bytes, content_type="text/plain", charset="utf-8")
             return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
         ct = "text/plain" if filename.endswith((".py", ".md")) else "application/octet-stream"
