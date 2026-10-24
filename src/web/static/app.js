@@ -7301,11 +7301,15 @@ function updateVolunteerOneliner() {
     wsUrl = `${wsUrl}/api/worker/ws`;
   }
 
+  const token = window.VOLUNTEER_WORKER_TOKEN || "";
+  const tokenEnvPs1 = token ? `$env:TTSBOT_WORKER_TOKEN="${token}"; ` : "";
+  const tokenArgSh = token ? ` "${token}"` : "";
+
   if (ps1Pre) {
-    ps1Pre.textContent = `$env:TTSBOT_SERVER_URL="${wsUrl}"; irm "${origin}/volunteer/run_volunteer_gui.ps1" | iex`;
+    ps1Pre.textContent = `$env:TTSBOT_SERVER_URL="${wsUrl}"; ${tokenEnvPs1}irm "${origin}/volunteer/run_volunteer_gui.ps1" | iex`;
   }
   if (shPre) {
-    shPre.textContent = `curl -sSL "${origin}/volunteer/run_volunteer.sh" | bash -s -- "${wsUrl}"`;
+    shPre.textContent = `curl -sSL "${origin}/volunteer/run_volunteer.sh" | bash -s -- "${wsUrl}"${tokenArgSh}`;
   }
 }
 window.updateVolunteerOneliner = updateVolunteerOneliner;

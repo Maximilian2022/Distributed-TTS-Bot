@@ -14,7 +14,8 @@
     {
       "is_logged_in": {{IS_LOGGED_IN}},
       "client_configured": {{CLIENT_CONFIGURED}},
-      "user_data": {{USER_DATA}}
+      "user_data": {{USER_DATA}},
+      "worker_token": "{{WORKER_TOKEN}}"
     }
   </script>
   <script>
@@ -23,6 +24,7 @@
     window.APP_IS_LOGGED_IN = serverData.is_logged_in;
     window.APP_CLIENT_CONFIGURED = serverData.client_configured;
     window.APP_USER_DATA = serverData.user_data;
+    window.VOLUNTEER_WORKER_TOKEN = serverData.worker_token || "";
     window.switchMetricsNode = function(nodeKey) {
       if (typeof window.doSwitchMetricsNode === 'function') {
         window.doSwitchMetricsNode(nodeKey);

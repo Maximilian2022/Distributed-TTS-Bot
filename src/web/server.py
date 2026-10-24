@@ -752,9 +752,12 @@ class WebServer:
         css_mtime = int(style_css_path.stat().st_mtime) if style_css_path.exists() else 0
         asset_v = f"{BUILD_VERSION}-{max(js_mtime, css_mtime)}"
 
+        worker_token = getattr(self.config, "worker_shared_secret", "").strip()
+
         html = html.replace("{{IS_LOGGED_IN}}", is_logged_in)
         html = html.replace("{{CLIENT_CONFIGURED}}", client_configured)
         html = html.replace("{{USER_DATA}}", user_json)
+        html = html.replace("{{WORKER_TOKEN}}", worker_token)
         html = html.replace("{{BUILD_ID}}", BUILD_VERSION)
         html = html.replace("{{BUILD_DATE}}", BUILD_DATE)
         html = html.replace("{{ASSET_V}}", asset_v)
@@ -895,7 +898,17 @@ class WebServer:
             file_path = Path(__file__).resolve().parent.parent.parent / "worker" / filename
         if not file_path.exists():
             return web.Response(text="File not found", status=404)
-        ct = "text/plain" if filename.endswith((".sh", ".ps1", ".py", ".md")) else "application/octet-stream"
+        if filename.endswith((".sh", ".ps1", ".bat")):
+            content = file_path.read_text(encoding="utf-8")
+            master_base_url = self._get_master_base_url(request)
+            ws_url = master_base_url.replace("http://", "ws://").replace("https://", "wss://").rstrip("/") + "/api/worker/ws"
+            worker_token = getattr(self.config, "worker_shared_secret", "").strip()
+
+            content = content.replace("__DEFAULT_SERVER_WS_URL__", ws_url)
+            content = content.replace("__DEFAULT_WORKER_TOKEN__", worker_token)
+            return web.Response(text=content, content_type="text/plain", charset="utf-8")
+
+        ct = "text/plain" if filename.endswith((".py", ".md")) else "application/octet-stream"
         return web.Response(body=file_path.read_bytes(), content_type=ct, charset="utf-8" if ct.startswith("text") else None)
 
     async def handle_volunteer_zip(self, request: web.Request) -> web.Response:

@@ -9,10 +9,13 @@
 # ==============================================================================
 
 param(
-    [string]$DefaultServerUrl = "",
-    [string]$DefaultToken = "",
+    [string]$DefaultServerUrl = "__DEFAULT_SERVER_WS_URL__",
+    [string]$DefaultToken = "__DEFAULT_WORKER_TOKEN__",
     [switch]$AutoStartEngineOnly
 )
+
+if ($DefaultServerUrl -like "*__DEFAULT_*") { $DefaultServerUrl = "" }
+if ($DefaultToken -like "*__DEFAULT_*") { $DefaultToken = "" }
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing

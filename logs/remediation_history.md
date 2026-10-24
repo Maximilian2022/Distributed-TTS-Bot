@@ -1,5 +1,35 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] Linux 向けボランティアスクリプト (run_volunteer.sh) のパイプ実行構文エラー解消 & WebUI ワンライナーへの共有トークン自動組み込み
+- **ユーザーフィードバック & 課題**:
+  1. Linux サーバー（Debian）で `curl -sSL "https://.../run_volunteer.sh" | bash -s -- "wss://..."` を実行した際、以下のエラーが発生して中断する不具合：
+     ```
+     bash: 行 22: BASH_SOURCE[0]: 未割り当ての変数です
+     ...
+     bash: 行 110: 予期しないトークン `else' 周辺に構文エラーがあります
+     ```
+  2. ボランティア参加時に必要な「共有トークン」の用途確認と、WebUI のワンライナーへのトークン自動組み込み要求。
+- **真因の究明**:
+  - `BASH_SOURCE[0]` 未割り当て: `curl ... | bash` で標準入力から実行される場合、スクリプトファイルが存在しないため Bash の `BASH_SOURCE` 配列が空となり、`set -u`（未定義変数参照禁止）によって例外が発生していた。
+  - 予期しないトークン `else` 構文エラー: 標準入力が curl のスクリプト本文となっているパイプ実行状態において、スクリプト内の `read -rp` コマンドがユーザーのキーボードではなく「スクリプト本文の残りの行」を入力値として読み込んで消費してしまっていた。その結果、途中の `if` 文などの構造が欠落し、後続の `else` が孤立して構文エラーとなっていた。
+- **抜本的改善内容**:
+  1. **対話入力の `/dev/tty` 安全化 (`worker/run_volunteer.sh` & `src/web/static/volunteer/run_volunteer.sh`)**:
+     - 安全入力関数 `read_input` を実装。標準入力がパイプであっても必ず `/dev/tty` からキー入力を受け取るように保護し、スクリプト本文が吸い込まれる問題を完全根絶。
+     - `${BASH_SOURCE[0]:-}` の安全参照により未割り当て変数の例外を解消。
+     - パイプ実行時にローカルにエージェントコードが存在しない場合、Master サーバーから `volunteer_worker.py` を自動ダウンロードする処理を追加。
+  2. **WebUI ワンライナーへの共有トークン自動組み込み (`src/web/server.py`, `src/web/templates/index.html`, `src/web/static/app.js`)**:
+     - `index.html` および `app.js` に `window.VOLUNTEER_WORKER_TOKEN` を注入。
+     - 「🤝 ボランティア参加」タブの PowerShell および Linux ワンライナーに、現在のサーバーの共有トークンを自動で組み込んで表示：
+       - PowerShell: `$env:TTSBOT_SERVER_URL="..."; $env:TTSBOT_WORKER_TOKEN="<token>"; irm "..." | iex`
+       - Linux: `curl -sSL "..." | bash -s -- "wss://..." "<token>"`
+  3. **スクリプト配信時の動的プレースホルダー置換 (`src/web/server.py`)**:
+     - `/volunteer/run_volunteer.sh` および `/volunteer/run_volunteer_gui.ps1` の配信時に、スクリプト内のプレースホルダーをそのサーバーの実際の WS URL と Worker Token へ動的置換。
+     - これにより、引数や環境変数を省略したワンライナーであっても、最初からトークンが初期適用され、ワンクリックで接続が完了する仕様を実現。
+- **検証**:
+  - `curl -s http://localhost:8088/volunteer/run_volunteer.sh | bash -n` による構文検証が Exit code 0 で通過。
+  - スクリプト配信時に `AUTO_SERVER_URL` と `AUTO_TOKEN` が実値に置換されて配信されることを確認。
+  - WebUI 上に `window.VOLUNTEER_WORKER_TOKEN` が正常に展開されていることを確認。
+
 ## [2026-10-24] Windows 向けボランティア GUI ランチャー (run_volunteer_gui.ps1) の PowerShell ワンライナー (iex) 実行時 Join-Path エラー解消 & 自己完結自動セットアップ対応
 - **ユーザーフィードバック & 課題**:
   - WebUI「🤝 ボランティア参加」タブに表示されている PowerShell ワンライナー (`irm "https://.../run_volunteer_gui.ps1" | iex`) を実行した際、以下のエラーが発生して起動できない不具合の報告：
