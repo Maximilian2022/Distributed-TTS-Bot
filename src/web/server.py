@@ -1077,7 +1077,8 @@ class WebServer:
                 })
 
         # 更新中フラグ (.ha_updating) の確認 (HA 相手ノードの誤昇格を防止)
-        updating_flag = Path(self.config.data_dir) / ".ha_updating"
+        data_dir = getattr(self.config, "data_dir", None) or Path(getattr(self.config, "db_path", "/app/data/bot.db")).parent
+        updating_flag = Path(data_dir) / ".ha_updating"
         is_updating = updating_flag.exists()
 
         return web.json_response({
@@ -3661,7 +3662,13 @@ class WebServer:
                 max_concurrent=engine_info.get("max_concurrent", mac),
                 enabled=True,
             )
-            pool.register_or_update(node_config, specs=dict(specs), hostname=hostname)
+            eng_running = engine_info.get("running", True)
+            node_specs = dict(specs)
+            node_specs["engine_running"] = eng_running
+            target_node = pool.register_or_update(node_config, specs=node_specs, hostname=hostname)
+            target_node.engine_running = eng_running
+            if not eng_running:
+                target_node.is_healthy = False
             registered_engines.append(engine_name)
 
         try:
@@ -3737,8 +3744,11 @@ class WebServer:
                         node.specs["engine_running"] = eng_running
                         is_eng_healthy = eng_info.get("healthy", True)
                         node.specs["engine_healthy"] = is_eng_healthy
+                        # エンジン停止中 (スリープ等) は健全フラグも明示的にFalseにしてリクエスト誤送信を防止
+                        if not eng_running:
+                            node.is_healthy = False
                         # ワーカー側でハング検知中 (Auto-Heal中) の場合は即座に一時隔離 (スリープ停止中は除外)
-                        if eng_running and not is_eng_healthy:
+                        elif not is_eng_healthy:
                             node.is_healthy = False
                             node.unhealthy_until = time.time() + 20.0
                         # リソース情報 (CPU/メモリ/GPU) を更新

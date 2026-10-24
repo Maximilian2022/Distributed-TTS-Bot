@@ -233,6 +233,7 @@ class TTSNode:
         """ワーカーのAgentに対してエンジンのオンデマンド遠隔起動を試みる (GPU・CPU・自ホスト問わず自律復帰)"""
         if not self.url:
             return False
+        self.last_start_attempt = time.time()
         try:
             from urllib.parse import urlparse
             p = urlparse(self.url)
@@ -413,6 +414,25 @@ class TTSNode:
         if not was_healthy:
             # 既に隔離中のノードに対する連続エラー時は、多重通知を抑止
             return
+
+        # スリープ中・コールドスタート起動中（接続拒否・切断）の判定
+        is_sleeping_or_starting = (
+            self.engine_running is False
+            or self.specs.get("engine_running") is False
+            or (now - getattr(self, "last_start_attempt", 0.0) < 60.0)
+        )
+        is_conn_error = any(kw in str(reason).lower() for kw in [
+            "server disconnected", "connection refused", "connect call failed",
+            "cannot connect to host", "clientconnectorerror", "connectionreseterror"
+        ])
+
+        if is_sleeping_or_starting and is_conn_error:
+            logger.info(
+                f"ℹ️ [NodePool] Node '{self.id}' ({self.url}) is offline or starting up from sleep ({reason}). "
+                f"Suppressing error alert DM as this is normal cold-start fallback."
+            )
+            return
+
         try:
             from src.utils.alert_service import (
                 alert_service,
@@ -436,9 +456,11 @@ class TTSNode:
     def update_heartbeat(self):
         """ハートビート受信時の生存更新"""
         self.last_heartbeat = time.time()
+        # エンジンが停止中 (False) の場合は、ハートビートを受信しても勝手に is_healthy = True に復帰させない
+        is_eng_running = (self.engine_running is not False) and (self.specs.get("engine_running", True) is not False)
         if not self.is_healthy and self.unhealthy_until <= time.time():
-            self.is_healthy = True
-            if self.specs.get("engine_running") is not False:
+            if is_eng_running:
+                self.is_healthy = True
                 logger.info(f"💚 [NodePool] Node '{self.id}' ({self.url}) recovered via heartbeat.")
 
     def to_dict(self) -> Dict[str, Any]:

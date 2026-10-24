@@ -1711,7 +1711,8 @@ hosts allow = *
                 k: {
                     "port": v["port"],
                     "priority": pri,
-                    "max_concurrent": mac
+                    "max_concurrent": mac,
+                    "running": is_container_running(v["container_name"])
                 }
                 for k, v in ENGINES.items()
             }
@@ -1867,6 +1868,7 @@ hosts allow = *
         while True:
             try:
                 await asyncio.sleep(20)
+                now = time.time()
                 session = await self.get_session()
                 local_ip = get_local_ip()
                 candidate_hosts = ["127.0.0.1"]
@@ -1911,6 +1913,10 @@ hosts allow = *
                     if eng in self._starting_engines:
                         continue
 
+                    # 起動直後（または start_engine から 60秒以内）は初期化猶予 (Startup Grace Period) として失敗判定を猶予
+                    last_started = self.last_used_time.get(eng, 0.0)
+                    in_startup_grace = (now - last_started) < 60.0
+
                     # 4) 稼働中コンテナのアクティブプローブ (ヘルスチェック)
                     probe_ok = False
                     for h in candidate_hosts:
@@ -1930,6 +1936,9 @@ hosts allow = *
                         self.engine_fail_count[eng] = 0
                         self.engine_restart_count[eng] = 0
                     else:
+                        if in_startup_grace:
+                            logger.debug(f"⏳ [Watchdog] '{eng}' ({cname}) は起動初期化中です (Startup Grace Period)。")
+                            continue
                         cnt = self.engine_fail_count.get(eng, 0) + 1
                         self.engine_fail_count[eng] = cnt
                         logger.warning(

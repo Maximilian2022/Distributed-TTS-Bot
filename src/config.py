@@ -75,6 +75,10 @@ class AppConfig:
     voicevox_cache_target_size_bytes: int = 18253611008  # 17GB
     cache_cleanup_interval_seconds: int = 300
 
+    @property
+    def data_dir(self) -> str:
+        return str(Path(self.db_path).parent)
+
     # TTS
     tts_primary: str = "azure"
     tts_fallback: str = "google"
