@@ -1069,6 +1069,57 @@
                 <span class="badge" style="background:rgba(255,255,255,0.08);color:#eee;font-size:10px;padding:2px 6px;">Auto-Managed</span>
               </div>
             </div>
+
+            <!-- 4. 🎯 音声合成 4段階 Tier ルーティング優先順位設定 (エンジン別動的制御) -->
+            <div class="card" id="tier-routing-card" style="margin-bottom:20px;padding:20px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+                <div>
+                  <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+                    <span>🎯 音声合成 Tier ルーティング優先順位設定</span>
+                    <span id="tier-routing-active-badge" class="badge" style="background:var(--primary);color:#fff;">動的制御中</span>
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    各音声合成エンジンが推論ノードを選択する際の優先順位（Tier 1〜4）を動的に並び替えます。メモリ常駐（RAMDisk）やGPU有無に応じた最適なルーティングをエンジン毎に個別調整可能です。
+                  </div>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="resetTierRoutingCurrent()" title="選択中のエンジンをデフォルト順序に戻します">
+                    🔄 デフォルトに戻す
+                  </button>
+                  <button type="button" class="btn btn-primary btn-sm" onclick="saveCurrentTierRouting()" id="btn-save-tier-routing" style="background:#00b0f4;color:#fff;font-weight:600;">
+                    💾 順序を保存
+                  </button>
+                </div>
+              </div>
+
+              <!-- エンジン選択セレクタ / タブボタン群 -->
+              <div style="margin-bottom:16px;background:rgba(0,0,0,0.22);padding:8px 12px;border-radius:8px;border:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span style="font-size:12px;font-weight:600;color:var(--text-dim);margin-right:4px;">対象エンジン:</span>
+                  <div id="tier-engine-buttons" style="display:flex;gap:6px;flex-wrap:wrap;">
+                    <!-- JSで動的生成: default, coeiroink, voicevox, sharevox -->
+                  </div>
+                </div>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="applyTierRoutingToAllEngines()" style="font-size:11px;padding:4px 8px;" title="現在選択中の順序をすべてのエンジンに一括コピーします">
+                  📋 全エンジンに一括コピー
+                </button>
+              </div>
+
+              <!-- Tier アイテムリスト表示領域 -->
+              <div id="tier-items-container" style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px;">
+                <div style="color:var(--text-muted);font-size:13px;padding:20px;text-align:center;">Tier ルーティング設定を読み込み中...</div>
+              </div>
+
+              <!-- 説明案内 -->
+              <div style="background:rgba(88,101,242,0.08);border:1px solid rgba(88,101,242,0.25);border-radius:6px;padding:10px 14px;font-size:11px;color:var(--text-muted);line-height:1.5;">
+                <strong style="color:#8ea1e1;">💡 推奨デフォルト順序:</strong>
+                <span style="color:#00ffcc;font-weight:600;">GPU + RAMDisk</span> (最速) ➔ 
+                <span style="color:#5865f2;font-weight:600;">CPU + RAMDisk</span> (GPU温存・高速) ➔ 
+                <span style="color:#f39c12;font-weight:600;">GPU + SSD</span> (中速) ➔ 
+                <span style="color:#95a5a6;font-weight:600;">CPU + SSD</span> (最小フォールバック)<br>
+                自環境のハードウェアリソースやGPU負荷傾向に合わせて、エンジン毎に自由に▲/▼ボタンで順序を組み替え可能です。
+              </div>
+            </div>
           </section>
 
           <!-- 6. API・クレデンシャル設定タブ -->

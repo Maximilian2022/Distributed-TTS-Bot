@@ -28,7 +28,7 @@ graph TD
 
     subgraph "Distributed Compute Worker Pool"
         LocalFast["Fast Local Engine<br>In-Memory Synthesis (Edge-TTS / Open JTalk)"]
-        GPUWorker["Dedicated GPU Worker<br>AI Voice Synthesis (VOICEVOX / COEIROINK)"]
+        GPUWorker["Dedicated GPU Worker<br>AI Voice Synthesis (VOICEVOX / SHAREVOX / COEIROINK)"]
         WorkerVol["Volunteer Worker (Community PC)<br>Outbound WebSocket / Zero Open Ports"]
         Cloud["Cloud Fallback Engine<br>Azure / GCP / Edge-TTS"]
     end
@@ -58,12 +58,14 @@ graph TD
 - **Smart Model Pinpoint Routing**: Automatically detects which speech models (e.g., specific COEIROINK characters or MYCOEIROINK UUIDs) each node owns, routing inference tasks exclusively to nodes that have the requested model ready.
 - **Game-Friendly Low Resource Mode**: Features low process priority on Windows, automatic idle container sleep (releasing VRAM/RAM to the OS), and on-demand container waking.
 
-### 3. 🎯 Hardware-Adaptive Intelligent Routing
-Automatically profiles hardware capabilities (GPU availability, RAM size, storage performance) across connected nodes to dynamically dispatch synthesis tasks with minimal latency:
-- **In-Memory Ultra-Fast Inference**: Zero-disk latency using memory-cached models.
-- **GPU-Accelerated Inference**: High-throughput neural voice synthesis powered by dedicated GPU workers.
-- **Lightweight CPU Synthesis**: Instant local playback using Edge-TTS or Open JTalk.
-- **Cloud Failover**: Dynamic cloud offloading during heavy local load spikes.
+### 3. 🎯 4-Tier Dynamic Routing & Per-Engine Customization
+Automatically profiles connected worker hardware specs (GPU presence, RAMDisk resident models, storage bandwidth) and dispatches inference requests with minimal latency:
+- **Tier 1: GPU + RAMDisk (Ultra-Fast / Default Top Priority)**: Zero disk I/O latency combined with dedicated GPU compute speed.
+- **Tier 2: CPU + RAMDisk (High-Speed / GPU Conservation)**: RAMDisk-resident model inference on CPU, freeing up GPU compute for heavy workloads while providing instant response.
+- **Tier 3: GPU + SSD (Medium-Speed / Large Models)**: Neural AI inference accelerated by GPU power with models stored on fast SSD.
+- **Tier 4: CPU + SSD (Universal Fallback)**: General-purpose fallback inference across cluster nodes.
+- **🎛️ Real-Time Dynamic Reordering in WebUI**: Administrators can reorder tiers using ▲/▼ buttons for each individual synthesis engine (COEIROINK, VOICEVOX, SHAREVOX, etc.) under the "Bot & Node Management" tab.
+
 
 ### 4. ☁️ Multi-Engine Cloud Fallback (Edge-TTS First)
 - **Zero Configuration Required**: Works right out of the box using high-quality **Edge-TTS** and **Open JTalk** without needing proprietary GPU hardware or paid API keys.

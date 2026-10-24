@@ -6,9 +6,11 @@
 """
 
 import re
+import json
 import asyncio
 import time
 import logging
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 import aiohttp
 from src.config import TTSNodeConfig
@@ -16,6 +18,120 @@ from src.tts.base import TTSConnectionError, TTSError
 from src.utils.latency_profiler import latency_profiler
 
 logger = logging.getLogger(__name__)
+
+# 動的Tierルーティング設定 (デフォルト: GPU+RAMDisk, CPU+RAMDisk, GPU+SSD, CPU+SSD)
+DEFAULT_TIER_ROUTING_ORDER: List[str] = ["gpu_ram", "cpu_ram", "gpu_ssd", "cpu_ssd"]
+
+# エンジン別設定 (未設定時は default を参照)
+_tier_routing_by_engine: Dict[str, List[str]] = {
+    "default": list(DEFAULT_TIER_ROUTING_ORDER),
+    "coeiroink": list(DEFAULT_TIER_ROUTING_ORDER),
+    "voicevox": list(DEFAULT_TIER_ROUTING_ORDER),
+    "sharevox": list(DEFAULT_TIER_ROUTING_ORDER),
+}
+
+TIER_METADATA: Dict[str, Dict[str, str]] = {
+    "gpu_ram": {
+        "name": "GPU + RAMDisk",
+        "description": "GPU高速推論 & メモリ常駐 (最速・即時応答)",
+        "badge": "最速",
+        "badge_color": "#00ffcc"
+    },
+    "cpu_ram": {
+        "name": "CPU + RAMDisk",
+        "description": "CPU高速推論 & メモリ常駐 (GPU温存・即時応答)",
+        "badge": "高速",
+        "badge_color": "#5865f2"
+    },
+    "gpu_ssd": {
+        "name": "GPU + SSD",
+        "description": "GPU高速推論 & SSDモデル (中速・大容量モデル)",
+        "badge": "中速",
+        "badge_color": "#f39c12"
+    },
+    "cpu_ssd": {
+        "name": "CPU + SSD",
+        "description": "汎用CPU & SSDモデル (低速フォールバック)",
+        "badge": "最小",
+        "badge_color": "#95a5a6"
+    }
+}
+
+SUPPORTED_ROUTING_ENGINES = [
+    {"id": "default", "name": "共通デフォルト", "icon": "🌐"},
+    {"id": "coeiroink", "name": "COEIROINK", "icon": "🎨"},
+    {"id": "voicevox", "name": "VOICEVOX", "icon": "🔊"},
+    {"id": "sharevox", "name": "SHAREVOX", "icon": "📢"},
+]
+
+TIER_ROUTING_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "tier_routing.json"
+
+def get_tier_routing_order(engine: Optional[str] = None) -> List[str]:
+    """指定エンジン（またはデフォルト）のTierルーティング優先順位を取得"""
+    global _tier_routing_by_engine
+    if engine:
+        eng_clean = str(engine).strip().lower()
+        if eng_clean in _tier_routing_by_engine:
+            return list(_tier_routing_by_engine[eng_clean])
+    return list(_tier_routing_by_engine.get("default", DEFAULT_TIER_ROUTING_ORDER))
+
+def get_all_tier_routing_orders() -> Dict[str, List[str]]:
+    """全エンジンのTierルーティング優先順位を取得"""
+    global _tier_routing_by_engine
+    return {k: list(v) for k, v in _tier_routing_by_engine.items()}
+
+def set_tier_routing_order(engine: str, order: List[str]) -> bool:
+    """指定エンジンのTierルーティング優先順位を検証して設定"""
+    global _tier_routing_by_engine
+    valid_keys = {"gpu_ram", "cpu_ram", "gpu_ssd", "cpu_ssd"}
+    if isinstance(order, list) and len(order) == 4 and set(order) == valid_keys:
+        eng_clean = str(engine).strip().lower()
+        _tier_routing_by_engine[eng_clean] = list(order)
+        return True
+    return False
+
+def load_tier_routing_from_disk() -> None:
+    """ディスクからTierルーティング設定をロード"""
+    global _tier_routing_by_engine
+    try:
+        if TIER_ROUTING_CONFIG_PATH.exists():
+            data = json.loads(TIER_ROUTING_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                engines = data.get("engines")
+                if isinstance(engines, dict):
+                    for eng, ord_list in engines.items():
+                        set_tier_routing_order(eng, ord_list)
+                single_order = data.get("tier_order")
+                if single_order and isinstance(single_order, list):
+                    set_tier_routing_order("default", single_order)
+            logger.info(f"Loaded dynamic tier routing orders from disk: {_tier_routing_by_engine}")
+    except Exception as e:
+        logger.warning(f"Failed to load tier routing order from disk: {e}")
+
+def save_tier_routing_to_disk(engine_orders: Optional[Dict[str, List[str]]] = None) -> bool:
+    """Tierルーティング設定をディスクに永続化保存"""
+    global _tier_routing_by_engine
+    if engine_orders:
+        for eng, ord_list in engine_orders.items():
+            set_tier_routing_order(eng, ord_list)
+    try:
+        TIER_ROUTING_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "engines": get_all_tier_routing_orders(),
+            "tier_order": get_tier_routing_order("default")
+        }
+        TIER_ROUTING_CONFIG_PATH.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        logger.info(f"Saved dynamic tier routing orders to disk: {payload}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save tier routing order: {e}")
+        return False
+
+# モジュールインポート時にディスクから最新設定を読み込み
+load_tier_routing_from_disk()
 
 _HEX12_RE = re.compile(r"^[0-9a-fA-F]{12}$")
 
@@ -523,48 +639,36 @@ class TTSNodePool:
         guild_id: Optional[Any] = None
     ) -> Optional[NodeLease]:
         """
-        - COEIROINK: メモリ常駐とハードウェア性能に応じた4段階 Tier ルーティング
-          Tier 1: CPU + メモリ常駐 (高速&メモリ潤沢: メモリ常駐ノード優先でGPUを温存)
-          Tier 2: GPU + メモリ常駐 (最速: GPU搭載マシンのメモリ常駐モデル)
-          Tier 3: GPU + SSD     (中速: GPUの爆速推論)
-          Tier 4: CPU + SSD     (低速: 最下位フォールバック)
-        - VOICEVOX / SHAREVOX: 常に GPU 最優先 (GPU長文ルーティング)
-        全ノードがビジーの場合は空くまで最大 timeout 秒待機
+        エンジン毎の動的 4段階 Tier ルーティング (WebUIでエンジン毎に優先順位を設定可能)
+        - デフォルト: GPU+RAMDisk -> CPU+RAMDisk -> GPU+SSD -> CPU+SSD
+        - 全ノードがビジーの場合は空くまで最大 timeout 秒待機
         """
-        # オンデマンド遠隔起動のトリガー判定
         now_ts = time.time()
-        is_coeiroink = (self.engine_name.lower() == "coeiroink")
+        eng_key = self.engine_name.lower()
+        current_order = get_tier_routing_order(eng_key)
 
-        if is_coeiroink:
-            # COEIROINK:
-            # 1. model_name 指定時: 該当モデルをRAMDiskに持つノード(Tier 1/Tier 2)が停止中なら優先起動
-            # 2. 利用可能ノードが不足している場合: Tier 1 (CPU+RAMDisk: MasterDebian/Ubuntu) を最優先で起動し、次いで Tier 2 (GPU+RAMDisk) を起動
-            candidates_to_start = []
-            if model_name:
-                for n in self.nodes:
-                    if n.enabled and not n.is_available and not n.draining and n.has_model_in_ram(model_name):
-                        candidates_to_start.append(n)
+        # 1. オンデマンド遠隔起動のトリガー判定
+        # 現在設定されている Tier 優先順位の上位 Tier に属するノードが停止中の場合、起動をトリガー
+        candidates_to_start = []
+        for n in self.nodes:
+            if n.enabled and not n.is_available and not n.draining:
+                candidates_to_start.append(n)
 
-            if not candidates_to_start and not any(n.is_available for n in self.nodes):
-                for n in self.nodes:
-                    if n.enabled and not n.is_available and not n.draining:
-                        candidates_to_start.append(n)
+        if candidates_to_start:
+            def get_node_tier_rank(node: TTSNode) -> int:
+                in_ram = node.has_model_in_ram(model_name) if model_name else bool(node.specs.get("ram_models") or node.specs.get("is_ramdisk"))
+                tier_key = ("gpu" if node.has_gpu else "cpu") + "_" + ("ram" if in_ram else "ssd")
+                try:
+                    return current_order.index(tier_key)
+                except ValueError:
+                    return 99
 
-            # 優先度順 (Tier 1: CPU+RAMDisk 最優先、次に GPU+RAMDisk)
-            candidates_to_start.sort(key=lambda n: (n.has_gpu, n.priority))
-            for n in candidates_to_start:
+            candidates_to_start.sort(key=lambda n: (get_node_tier_rank(n), n.priority))
+            # 最上位の候補からオンデマンド遠隔起動
+            for n in candidates_to_start[:2]:
                 if now_ts - getattr(n, "last_start_attempt", 0.0) > 10.0:
                     n.last_start_attempt = now_ts
                     asyncio.create_task(n.try_remote_start())
-        else:
-            # VOICEVOX / SHAREVOX:
-            # 常に GPU ノード最優先でオンデマンド遠隔起動
-            if not any(n.is_available and n.has_gpu for n in self.nodes):
-                for n in self.nodes:
-                    if n.enabled and n.has_gpu and not n.is_available and not n.draining:
-                        if now_ts - getattr(n, "last_start_attempt", 0.0) > 10.0:
-                            n.last_start_attempt = now_ts
-                            asyncio.create_task(n.try_remote_start())
 
         start = time.time()
         while time.time() - start < timeout:
@@ -591,97 +695,48 @@ class TTSNodePool:
                 await asyncio.sleep(0.1)
                 continue
 
-            # COEIROINK かつ model_name 指定ありの場合は 4段階 Tier ルーティング
-            # Tier 1: CPU + メモリ常駐 (高速&メモリ潤沢: メモリ常駐ノード優先でGPUを温存)
-            # Tier 2: GPU + メモリ常駐 (最速: GPU搭載マシンのメモリ常駐モデル)
-            # Tier 3: GPU + SSD     (中速: GPUの爆速推論)
-            # Tier 4: CPU + SSD     (低速: 最下位フォールバック)
-            if is_coeiroink and model_name:
-                tier1 = [n for n in available if not n.has_gpu and n.has_model_in_ram(model_name)]
-                tier2 = [n for n in available if n.has_gpu and n.has_model_in_ram(model_name)]
-                tier3 = [n for n in available if n.has_gpu and not n.has_model_in_ram(model_name)]
-                tier4 = [n for n in available if not n.has_gpu and not n.has_model_in_ram(model_name)]
+            # 4段階 Tier バケット分類
+            # ノードが対象モデルを RAMDisk に保持しているか（model_name 未指定時はエンジンの RAM 常駐フラグ判定）
+            def is_node_in_ram(node: TTSNode) -> bool:
+                if model_name:
+                    return node.has_model_in_ram(model_name)
+                return bool(node.specs.get("ram_models") or node.specs.get("is_ramdisk") or node.specs.get("in_ramdisk"))
 
-                tier1.sort(key=lambda n: (n.active_count, n.priority, n.last_latency_ms))
-                tier2.sort(key=lambda n: (n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority))
-                tier3.sort(key=lambda n: (n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority))
-                tier4.sort(key=lambda n: (n.active_count, n.priority))
+            buckets = {
+                "gpu_ram": [n for n in available if n.has_gpu and is_node_in_ram(n)],
+                "cpu_ram": [n for n in available if not n.has_gpu and is_node_in_ram(n)],
+                "gpu_ssd": [n for n in available if n.has_gpu and not is_node_in_ram(n)],
+                "cpu_ssd": [n for n in available if not n.has_gpu and not is_node_in_ram(n)],
+            }
 
-                ordered_nodes = tier1 + tier2 + tier3 + tier4
-
-                logger.info(
-                    f"🎯 [COEIROINK Routing] model={model_name} | "
-                    f"Tier1(CPU+RAM)={[n.machine_name for n in tier1]} | "
-                    f"Tier2(GPU+RAM)={[n.machine_name for n in tier2]} | "
-                    f"Tier3(GPU+SSD)={[n.machine_name for n in tier3]} | "
-                    f"Tier4(CPU+SSD)={[n.machine_name for n in tier4]} | "
-                    f"Selected => {ordered_nodes[0].machine_name if ordered_nodes else 'None'}"
-                )
-
-                for node in ordered_nodes:
-                    if not node.semaphore.locked():
-                        try:
-                            await asyncio.wait_for(node.semaphore.acquire(), timeout=0.01)
-                            node.active_count += 1
-                            node.total_requests += 1
-                            return NodeLease(self, node, text_len=text_len)
-                        except asyncio.TimeoutError:
-                            continue
-
-                # 空きがない場合は Tier 1 または Tier 2 の最良ノードの解放を待つ
-                elapsed = time.time() - start
-                remaining = timeout - elapsed
-                best_ram_candidates = tier1 or tier2
-                if best_ram_candidates and remaining > 0.4:
-                    best_cand = best_ram_candidates[0]
-                    wait_time = min(0.2, max(0.01, remaining - 0.3))
-                    try:
-                        await asyncio.wait_for(best_cand.semaphore.acquire(), timeout=wait_time)
-                        best_cand.active_count += 1
-                        best_cand.total_requests += 1
-                        return NodeLease(self, best_cand, text_len=text_len)
-                    except asyncio.TimeoutError:
-                        pass
-                elif ordered_nodes:
-                    best_cand = ordered_nodes[0]
-                    wait_time = min(0.1, max(0.01, timeout - (time.time() - start)))
-                    try:
-                        await asyncio.wait_for(best_cand.semaphore.acquire(), timeout=wait_time)
-                        best_cand.active_count += 1
-                        best_cand.total_requests += 1
-                        return NodeLease(self, best_cand, text_len=text_len)
-                    except asyncio.TimeoutError:
-                        pass
-                continue
-
-            # VOICEVOX / SHAREVOX またはモデル未指定時: GPU最優先ルーティング
-            gpu_nodes = [n for n in available if n.has_gpu]
-            cpu_nodes = [n for n in available if not n.has_gpu]
-
-            # GPUノードのソート:
-            # 長文 (text_len >= 18 または is_longest_chunk) の場合:
-            # 最強GPU (RTX 3090等、gpu_power_score 最大) を最優先！
+            # バケット内ソート:
+            # GPUノード: 長文 (text_len >= 18 または is_longest_chunk) の場合は最強GPU (gpu_power_score 最大) を最優先
+            # 短文の場合はサブGPU等を活かして最適化
             if is_longest_chunk or text_len >= 18:
-                gpu_nodes.sort(key=lambda n: (
-                    n.active_count,
-                    -latency_profiler.get_or_create(n).gpu_power_score,
-                    n.priority,
-                    n.last_latency_ms
-                ))
+                gpu_sort_key = lambda n: (n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
             else:
-                # 短文 (text_len < 18) の場合:
-                # サブGPU (GTX 1080 Ti等) が空いていれば優先的に利用し、最強GPUを温存
-                gpu_nodes.sort(key=lambda n: (
-                    n.active_count,
-                    latency_profiler.get_or_create(n).gpu_power_score,
-                    n.priority,
-                    n.last_latency_ms
-                ))
+                gpu_sort_key = lambda n: (n.active_count, latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
 
-            cpu_nodes.sort(key=lambda n: (n.active_count, n.priority))
+            cpu_sort_key = lambda n: (n.active_count, n.priority, n.last_latency_ms)
 
-            # 1. GPUノードで即座に空いているものを最優先で確保
-            for node in gpu_nodes:
+            buckets["gpu_ram"].sort(key=gpu_sort_key)
+            buckets["gpu_ssd"].sort(key=gpu_sort_key)
+            buckets["cpu_ram"].sort(key=cpu_sort_key)
+            buckets["cpu_ssd"].sort(key=cpu_sort_key)
+
+            # 現在のエンジン設定に従ってノード順序を組み立て
+            ordered_nodes = []
+            for tier_key in current_order:
+                ordered_nodes.extend(buckets.get(tier_key, []))
+
+            tier_names_log = " | ".join(f"{k}={[n.machine_name for n in buckets[k]]}" for k in current_order)
+            logger.info(
+                f"🎯 [{self.engine_name} Dynamic Routing] model={model_name or 'any'} | {tier_names_log} | "
+                f"Selected => {ordered_nodes[0].machine_name if ordered_nodes else 'None'}"
+            )
+
+            # 1. 即座に空いているノードを最優先で確保
+            for node in ordered_nodes:
                 if not node.semaphore.locked():
                     try:
                         await asyncio.wait_for(node.semaphore.acquire(), timeout=0.01)
@@ -691,42 +746,30 @@ class TTSNodePool:
                     except asyncio.TimeoutError:
                         continue
 
-            # 2. 全GPUがビジーの場合:
-            # タイムアウトの残り時間に余裕がある場合 (残り > 0.4s) は、最良GPUのセマフォ解放を待つ
+            # 2. 全ノードがビジーの場合:
+            # タイムアウトの残り時間に余裕がある場合 (残り > 0.4s) は、最優先Tierノードのセマフォ解放を待つ
             elapsed = time.time() - start
             remaining = timeout - elapsed
-            if gpu_nodes and remaining > 0.4:
-                best_gpu = gpu_nodes[0]
+            if ordered_nodes and remaining > 0.4:
+                best_cand = ordered_nodes[0]
                 wait_time = min(0.2, max(0.01, remaining - 0.3))
                 try:
-                    await asyncio.wait_for(best_gpu.semaphore.acquire(), timeout=wait_time)
-                    best_gpu.active_count += 1
-                    best_gpu.total_requests += 1
-                    return NodeLease(self, best_gpu, text_len=text_len)
+                    await asyncio.wait_for(best_cand.semaphore.acquire(), timeout=wait_time)
+                    best_cand.active_count += 1
+                    best_cand.total_requests += 1
+                    return NodeLease(self, best_cand, text_len=text_len)
                 except asyncio.TimeoutError:
                     pass
-
-            # 3. GPUノードが存在しない、またはGPUの待ち時間が限界に近い場合のみ、CPUノードへ緊急退避
-            for node in cpu_nodes:
-                if not node.semaphore.locked():
-                    try:
-                        await asyncio.wait_for(node.semaphore.acquire(), timeout=0.01)
-                        node.active_count += 1
-                        node.total_requests += 1
-                        return NodeLease(self, node, text_len=text_len)
-                    except asyncio.TimeoutError:
-                        continue
-
-            # 4. 最良ノードの空きを少し待機
-            best_candidate = (gpu_nodes or cpu_nodes)[0]
-            wait_time = min(0.1, max(0.01, timeout - (time.time() - start)))
-            try:
-                await asyncio.wait_for(best_candidate.semaphore.acquire(), timeout=wait_time)
-                best_candidate.active_count += 1
-                best_candidate.total_requests += 1
-                return NodeLease(self, best_candidate, text_len=text_len)
-            except asyncio.TimeoutError:
-                pass
+            elif ordered_nodes:
+                best_cand = ordered_nodes[0]
+                wait_time = min(0.1, max(0.01, timeout - (time.time() - start)))
+                try:
+                    await asyncio.wait_for(best_cand.semaphore.acquire(), timeout=wait_time)
+                    best_cand.active_count += 1
+                    best_cand.total_requests += 1
+                    return NodeLease(self, best_cand, text_len=text_len)
+                except asyncio.TimeoutError:
+                    pass
 
             await asyncio.sleep(0.03)
 

@@ -357,6 +357,8 @@ class WebServer:
         self.app.router.add_post("/api/system/tunnel/restart", self.api_system_tunnel_restart)
         self.app.router.add_post("/api/system/tunnel/stop", self.api_system_tunnel_stop)
         self.app.router.add_post("/api/system/alert/test", self.api_system_alert_test)
+        self.app.router.add_get("/api/system/tier_routing", self.api_system_get_tier_routing)
+        self.app.router.add_post("/api/system/tier_routing", self.api_system_save_tier_routing)
         self.app.router.add_get("/api/worker/ws", self.api_worker_ws)
 
         # HA (High Availability) & Standby 同期 API
@@ -5302,6 +5304,65 @@ class WebServer:
             "audio_base64": audio_b64,
             "error": message if not success else None
         })
+
+    async def api_system_get_tier_routing(self, request: web.Request) -> web.Response:
+        """エンジン毎の動的 Tier ルーティング設定を取得 (管理者のみ)"""
+        await self._require_admin(request)
+        from src.tts.node_pool import (
+            get_all_tier_routing_orders,
+            DEFAULT_TIER_ROUTING_ORDER,
+            SUPPORTED_ROUTING_ENGINES,
+            TIER_METADATA
+        )
+        return web.json_response({
+            "status": "ok",
+            "engines": get_all_tier_routing_orders(),
+            "default_order": list(DEFAULT_TIER_ROUTING_ORDER),
+            "supported_engines": SUPPORTED_ROUTING_ENGINES,
+            "metadata": TIER_METADATA
+        })
+
+    async def api_system_save_tier_routing(self, request: web.Request) -> web.Response:
+        """エンジン毎の動的 Tier ルーティング設定を保存 (管理者のみ)"""
+        await self._require_admin(request)
+        from src.tts.node_pool import save_tier_routing_to_disk, get_all_tier_routing_orders
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON body"}, status=400)
+
+        engine_orders: Dict[str, List[str]] = {}
+        valid_tier_keys = {"gpu_ram", "cpu_ram", "gpu_ssd", "cpu_ssd"}
+
+        if "engines" in body and isinstance(body["engines"], dict):
+            for eng, ord_list in body["engines"].items():
+                if isinstance(ord_list, list) and set(ord_list) == valid_tier_keys and len(ord_list) == 4:
+                    engine_orders[str(eng).lower()] = ord_list
+        elif "engine" in body and "tier_order" in body:
+            eng = str(body["engine"]).strip().lower()
+            ord_list = body["tier_order"]
+            if isinstance(ord_list, list) and set(ord_list) == valid_tier_keys and len(ord_list) == 4:
+                engine_orders[eng] = ord_list
+            else:
+                return web.json_response({
+                    "status": "error",
+                    "message": "tier_order must contain exactly 4 unique keys: gpu_ram, cpu_ram, gpu_ssd, cpu_ssd"
+                }, status=400)
+        else:
+            return web.json_response({"status": "error", "message": "Missing 'engine'/'tier_order' or 'engines' in request"}, status=400)
+
+        if not engine_orders:
+            return web.json_response({"status": "error", "message": "No valid engine routing configuration provided"}, status=400)
+
+        success = save_tier_routing_to_disk(engine_orders)
+        if success:
+            return web.json_response({
+                "status": "ok",
+                "message": "Tier routing order successfully saved",
+                "engines": get_all_tier_routing_orders()
+            })
+        else:
+            return web.json_response({"status": "error", "message": "Failed to persist tier routing configuration"}, status=500)
 
     async def api_worker_ws(self, request: web.Request) -> web.WebSocketResponse:
         """

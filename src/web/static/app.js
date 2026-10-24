@@ -91,6 +91,7 @@ function setupTabs() {
         if (typeof loadManagerNodes === "function") loadManagerNodes();
         loadBotSlots();
         if (typeof loadWorkerNodes === "function") loadWorkerNodes();
+        if (typeof loadTierRouting === "function") loadTierRouting();
       }
       if (tabId === "credentials") {
         loadCredentials();
@@ -7720,3 +7721,213 @@ async function testCredential(provider) {
   }
 }
 window.testCredential = testCredential;
+
+// ============================================================
+// 🎯 音声合成 4段階 Tier ルーティング動的制御 (エンジン別)
+// ============================================================
+let tierRoutingData = {
+  currentEngine: "default",
+  engines: {},
+  defaultOrder: ["gpu_ram", "cpu_ram", "gpu_ssd", "cpu_ssd"],
+  supportedEngines: [
+    { id: "default", name: "共通デフォルト", icon: "🌐" },
+    { id: "coeiroink", name: "COEIROINK", icon: "🎨" },
+    { id: "voicevox", name: "VOICEVOX", icon: "🔊" },
+    { id: "sharevox", name: "SHAREVOX", icon: "📢" }
+  ],
+  metadata: {
+    "gpu_ram": { name: "GPU + RAMDisk", description: "GPU高速推論 & メモリ常駐 (最速・即時応答)", badge: "最速", badge_color: "#00ffcc" },
+    "cpu_ram": { name: "CPU + RAMDisk", description: "CPU高速推論 & メモリ常駐 (GPU温存・即時応答)", badge: "高速", badge_color: "#5865f2" },
+    "gpu_ssd": { name: "GPU + SSD", description: "GPU高速推論 & SSDモデル (中速・大容量モデル)", badge: "中速", badge_color: "#f39c12" },
+    "cpu_ssd": { name: "CPU + SSD", description: "汎用CPU & SSDモデル (低速フォールバック)", badge: "最小", badge_color: "#95a5a6" }
+  }
+};
+
+async function loadTierRouting() {
+  const container = document.getElementById("tier-items-container");
+  if (!container) return;
+
+  try {
+    const res = await fetch("/api/system/tier_routing");
+    if (!res.ok) {
+      if (res.status === 403) return; // 非管理者時は何もしない
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    if (data.status === "ok") {
+      tierRoutingData.engines = data.engines || {};
+      tierRoutingData.defaultOrder = data.default_order || tierRoutingData.defaultOrder;
+      if (data.supported_engines) tierRoutingData.supportedEngines = data.supported_engines;
+      if (data.metadata) tierRoutingData.metadata = data.metadata;
+
+      // 現在選択エンジンが未初期化なら default
+      if (!tierRoutingData.currentEngine || !tierRoutingData.engines[tierRoutingData.currentEngine]) {
+        tierRoutingData.currentEngine = "default";
+      }
+
+      renderTierEngineButtons();
+      renderTierRoutingItems();
+    }
+  } catch (err) {
+    console.warn("loadTierRouting failed:", err);
+    if (container) {
+      container.innerHTML = `<div style="color:var(--text-danger);font-size:12px;padding:12px;">Tier ルーティング設定の取得に失敗しました: ${err.message}</div>`;
+    }
+  }
+}
+
+function renderTierEngineButtons() {
+  const btnContainer = document.getElementById("tier-engine-buttons");
+  if (!btnContainer) return;
+
+  btnContainer.innerHTML = tierRoutingData.supportedEngines.map(eng => {
+    const isSelected = eng.id === tierRoutingData.currentEngine;
+    const activeStyle = isSelected
+      ? "background:#5865f2;color:#fff;border-color:#5865f2;font-weight:600;box-shadow:0 0 8px rgba(88,101,242,0.5);"
+      : "background:rgba(255,255,255,0.05);color:var(--text-muted);border:1px solid rgba(255,255,255,0.1);";
+    return `
+      <button type="button" class="btn btn-sm" onclick="selectTierEngine('${eng.id}')" style="display:inline-flex;align-items:center;gap:6px;border-radius:6px;padding:5px 12px;font-size:12px;transition:all 0.2s;${activeStyle}">
+        <span>${eng.icon || "⚙️"}</span>
+        <span>${eng.name}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function selectTierEngine(engId) {
+  tierRoutingData.currentEngine = engId;
+  renderTierEngineButtons();
+  renderTierRoutingItems();
+}
+
+function renderTierRoutingItems() {
+  const container = document.getElementById("tier-items-container");
+  if (!container) return;
+
+  const eng = tierRoutingData.currentEngine || "default";
+  let order = tierRoutingData.engines[eng];
+  if (!order || !Array.isArray(order) || order.length !== 4) {
+    order = [...tierRoutingData.defaultOrder];
+    tierRoutingData.engines[eng] = order;
+  }
+
+  const itemsHtml = order.map((tierKey, idx) => {
+    const meta = tierRoutingData.metadata[tierKey] || {
+      name: tierKey,
+      description: "",
+      badge: `Tier ${idx + 1}`,
+      badge_color: "#5865f2"
+    };
+
+    const isFirst = idx === 0;
+    const isLast = idx === order.length - 1;
+
+    return `
+      <div style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.07);border-radius:8px;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:14px;transition:all 0.2s;box-shadow:0 2px 6px rgba(0,0,0,0.15);" id="tier-item-${tierKey}">
+        <div style="display:flex;align-items:center;gap:12px;min-width:0;flex:1;">
+          <div style="display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,0.1);font-weight:700;font-size:13px;color:var(--text-normal);">
+            ${idx + 1}
+          </div>
+          <div style="min-width:0;flex:1;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+              <span style="font-weight:700;font-size:14px;color:var(--text-normal);">${meta.name}</span>
+              <span class="badge" style="background:${meta.badge_color}22;color:${meta.badge_color};border:1px solid ${meta.badge_color}55;font-size:11px;padding:2px 8px;border-radius:10px;font-weight:600;">
+                ${meta.badge}
+              </span>
+              <code style="font-size:10px;color:var(--text-dim);background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:4px;">${tierKey}</code>
+            </div>
+            <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
+              ${meta.description}
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:6px;align-items:center;">
+          <button type="button" class="btn btn-secondary btn-sm" onclick="moveTierItem(${idx}, -1)" ${isFirst ? 'disabled style="opacity:0.3;cursor:not-allowed;"' : ''} title="優先度を上げる (上へ移動)" style="padding:4px 8px;font-size:12px;">
+            ▲
+          </button>
+          <button type="button" class="btn btn-secondary btn-sm" onclick="moveTierItem(${idx}, 1)" ${isLast ? 'disabled style="opacity:0.3;cursor:not-allowed;"' : ''} title="優先度を下げる (下へ移動)" style="padding:4px 8px;font-size:12px;">
+            ▼
+          </button>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  container.innerHTML = itemsHtml;
+}
+
+function moveTierItem(idx, direction) {
+  const eng = tierRoutingData.currentEngine || "default";
+  const order = tierRoutingData.engines[eng];
+  if (!order) return;
+
+  const targetIdx = idx + direction;
+  if (targetIdx < 0 || targetIdx >= order.length) return;
+
+  // 要素のスワップ
+  const temp = order[idx];
+  order[idx] = order[targetIdx];
+  order[targetIdx] = temp;
+
+  renderTierRoutingItems();
+}
+
+function resetTierRoutingCurrent() {
+  const eng = tierRoutingData.currentEngine || "default";
+  tierRoutingData.engines[eng] = [...tierRoutingData.defaultOrder];
+  renderTierRoutingItems();
+  showToast(`🔄 [${eng.toUpperCase()}] の優先順位をデフォルトにリセットしました (保存ボタンで確定)`, "info");
+}
+
+function applyTierRoutingToAllEngines() {
+  const currentEng = tierRoutingData.currentEngine || "default";
+  const currentOrder = tierRoutingData.engines[currentEng];
+  if (!currentOrder) return;
+
+  tierRoutingData.supportedEngines.forEach(eng => {
+    tierRoutingData.engines[eng.id] = [...currentOrder];
+  });
+
+  renderTierRoutingItems();
+  showToast(`📋 全エンジンに [${currentEng.toUpperCase()}] の順序をコピーしました (保存ボタンで確定)`, "success");
+}
+
+async function saveCurrentTierRouting() {
+  const eng = tierRoutingData.currentEngine || "default";
+  const btn = document.getElementById("btn-save-tier-routing");
+  if (btn) btn.disabled = true;
+
+  try {
+    const payload = {
+      engines: tierRoutingData.engines
+    };
+
+    const res = await fetch("/api/system/tier_routing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      tierRoutingData.engines = data.engines || tierRoutingData.engines;
+      showToast(`💾 Tier ルーティング順序を保存しました！ (即座に有効化)`, "success");
+      renderTierRoutingItems();
+    } else {
+      showToast(`❌ 保存失敗: ${data.message || res.statusText}`, "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+window.loadTierRouting = loadTierRouting;
+window.selectTierEngine = selectTierEngine;
+window.moveTierItem = moveTierItem;
+window.resetTierRoutingCurrent = resetTierRoutingCurrent;
+window.applyTierRoutingToAllEngines = applyTierRoutingToAllEngines;
+window.saveCurrentTierRouting = saveCurrentTierRouting;
+
