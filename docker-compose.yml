@@ -44,6 +44,7 @@ x-bot-base: &bot-base
     - ./worker:/app/worker:ro
     - ./gcp-key.json:/app/gcp-key.json:ro
     - /var/run/docker.sock:/var/run/docker.sock
+    - ./.env:/app/.env
   env_file:
     - .env
   environment:

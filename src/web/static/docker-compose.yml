@@ -1,0 +1,124 @@
+# ==============================================================================
+# TTSBot OSS Manager (オーケストレータ) Docker Compose 設定ファイル
+#
+# クイックスタート (Manager スタンドアロン):
+#   docker compose up -d
+#
+# オプション機能付き起動:
+#   - Cloudflare Tunnel 同梱:      docker compose --profile tunnel up -d
+#   - HA Standby Slave 待機起動:   docker compose --profile standby up -d
+#
+# ※ 音声合成エンジン (VOICEVOX / SHAREVOX / COEIROINK 等) について:
+#   本ComposeはManager (管理・Discord接続・WebUI・オーケストレーション) 専用です。
+#   ローカルマシンで音声合成エンジンを稼働させる場合も、すべて独立した
+#   「Worker Node (ttsworker-agent)」としてセットアップし接続します。
+#   (セットアップ: WebUI「Bot & ノード管理」または worker/README.md 参照)
+# ==============================================================================
+
+x-bot-base: &bot-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  init: true
+  deploy:
+    resources:
+      limits:
+        cpus: '2.0'
+        memory: 2048M
+      reservations:
+        memory: 512M
+  healthcheck:
+    test: ["CMD-SHELL", "python -c 'import urllib.request, os, sys; p = os.getenv(\"WEB_PORT\", \"8080\"); sys.exit(0 if urllib.request.urlopen(f\"http://127.0.0.1:{p}/health\", timeout=3).status == 200 else 1)' 2>/dev/null || exit 1"]
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+  volumes:
+    - ./src:/app/src
+    - ./data:/app/data
+    - ./logs:/app/logs
+    - tts_cache:/app/cache
+    - voicevox_cache:/app/cache_voicevox
+    - coeiroink_models:/app/coeiroink_models
+    - ./openjtalk_voices:/app/openjtalk_voices:ro
+    - ./worker:/app/worker:ro
+    - ./gcp-key.json:/app/gcp-key.json:ro
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ./.env:/app/.env
+  env_file:
+    - .env
+  environment:
+    - PYTHONUNBUFFERED=1
+    - PYTHONPATH=/app
+    - TZ=Asia/Tokyo
+    - COEIROINK_MODEL_DIR=/app/coeiroink_models
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. メインアプリケーション (Manager オーケストレータ)
+  # ----------------------------------------------------------------------------
+  app:
+    <<: *bot-base
+    restart: unless-stopped
+    ports:
+      - "${HOST_WEB_PORT:-8088}:${WEB_PORT:-8080}"
+    networks:
+      default:
+        aliases:
+          - router
+          - ttsbot
+          - ttsbot-router
+
+  # ----------------------------------------------------------------------------
+  # 2. Cloudflare Tunnel (オプション: --profile tunnel)
+  # ----------------------------------------------------------------------------
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles:
+      - tunnel
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - app
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  # ----------------------------------------------------------------------------
+  # 3. HA Standby Watchdog (Slave待機・自動同期: --profile standby)
+  # ----------------------------------------------------------------------------
+  standby-watchdog:
+    <<: *bot-base
+    restart: unless-stopped
+    profiles:
+      - standby
+    command: python -m src.ha_watchdog
+    healthcheck:
+      disable: true
+    environment:
+      - TTSBOT_HA_ROLE=slave
+      - TTSBOT_MASTER_URL=${TTSBOT_MASTER_URL:-}
+      - TTSBOT_HA_SECRET=${TTSBOT_HA_SECRET:-}
+      - TTSBOT_CHECK_INTERVAL=${TTSBOT_CHECK_INTERVAL:-5}
+      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-6}
+      - TTSBOT_SYNC_INTERVAL=${TTSBOT_SYNC_INTERVAL:-60}
+      - TTSBOT_LOCAL_DB_PATH=/app/data/bot.db
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  tts_cache:
+  voicevox_cache:
+  coeiroink_models:

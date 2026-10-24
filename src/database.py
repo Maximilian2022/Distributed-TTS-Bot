@@ -388,6 +388,9 @@ class Database:
                 if "speculative_timeout_seconds" not in cols:
                     await db.execute("ALTER TABLE guild_settings ADD COLUMN speculative_timeout_seconds REAL DEFAULT 1.5")
                     logger.info("Migrated guild_settings table: added speculative_timeout_seconds column")
+                if "error_contact_user_id" not in cols:
+                    await db.execute("ALTER TABLE guild_settings ADD COLUMN error_contact_user_id INTEGER DEFAULT 0")
+                    logger.info("Migrated guild_settings table: added error_contact_user_id column")
 
             # 4. 月別TTS利用量トラッキング
             await db.execute("""
@@ -541,6 +544,12 @@ class Database:
                     value TEXT NOT NULL,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+
+            # デフォルトエラー連絡先ユーザーID (未登録の場合に現行IDで初期化)
+            await db.execute("""
+                INSERT OR IGNORE INTO system_credentials (key, value, updated_at)
+                VALUES ('error_contact_user_id', '310034034690359308', CURRENT_TIMESTAMP)
             """)
 
             # 12. Discord Botトークンプール (最大10台動的スケーリング)
@@ -1697,6 +1706,7 @@ class Database:
                     res["announce_vc_events"] = int(res.get("announce_vc_events", 0) or 0)
                     res["speculative_timeout_seconds"] = float(res.get("speculative_timeout_seconds", 1.5) or 1.5)
                     res["disaster_volume"] = float(res.get("disaster_volume", 1.0) if res.get("disaster_volume") is not None else 1.0)
+                    res["error_contact_user_id"] = int(res.get("error_contact_user_id", 0) or 0)
 
                     self._guild_settings_cache[guild_id] = (now, dict(res))
                     return res
@@ -1733,7 +1743,8 @@ class Database:
             "disaster_min_scale": 30,
             "disaster_pref_filter": "",
             "disaster_alert_weather": 1,
-            "disaster_volume": 1.0
+            "disaster_volume": 1.0,
+            "error_contact_user_id": 0
         }
 
         async with self.get_connection() as db:
@@ -1810,9 +1821,9 @@ class Database:
                     auto_join_pairs, admin_role_id, default_speaker, read_username,
                     announce_vc_events, speculative_timeout_seconds, ignore_prefixes,
                     disaster_alert_enabled, disaster_min_scale, disaster_pref_filter,
-                    disaster_alert_weather, disaster_volume, updated_at
+                    disaster_alert_weather, disaster_volume, error_contact_user_id, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     command_prefix=excluded.command_prefix,
                     max_text_length=excluded.max_text_length,
@@ -1832,6 +1843,7 @@ class Database:
                     disaster_pref_filter=excluded.disaster_pref_filter,
                     disaster_alert_weather=excluded.disaster_alert_weather,
                     disaster_volume=excluded.disaster_volume,
+                    error_contact_user_id=excluded.error_contact_user_id,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -1853,7 +1865,8 @@ class Database:
                     int(current.get("disaster_min_scale", 30)),
                     str(current.get("disaster_pref_filter", "")),
                     1 if current.get("disaster_alert_weather", 1) else 0,
-                    float(current.get("disaster_volume", 1.0) if current.get("disaster_volume") is not None else 1.0)
+                    float(current.get("disaster_volume", 1.0) if current.get("disaster_volume") is not None else 1.0),
+                    int(current.get("error_contact_user_id", 0) or 0)
                 )
             )
             await db.commit()

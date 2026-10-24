@@ -91,8 +91,14 @@ Set-Location $InstallDir
 if (-not (Test-Path (Join-Path $InstallDir "docker-compose.yml"))) {
     $gitCmd = Get-Command git -ErrorAction SilentlyContinue
     if ($gitCmd) {
-        Write-Host "  リポジトリを取得中..."
+        Write-Host "  リポジトリを取得中 (git clone)..."
         git clone https://github.com/Maximilian2022/ttsbot-oss.git . 2>$null
+    }
+    if (-not (Test-Path (Join-Path $InstallDir "docker-compose.yml"))) {
+        Write-Host "  Master から docker-compose.yml を取得中..."
+        try {
+            Invoke-WebRequest -Uri "$MasterUrl/docker-compose.yml" -OutFile (Join-Path $InstallDir "docker-compose.yml") -TimeoutSec 10 -ErrorAction SilentlyContinue
+        } catch {}
     }
 }
 
@@ -127,9 +133,9 @@ CLOUDFLARE_TUNNEL_TOKEN=$TunnelToken
 Set-Content -Path $EnvFile -Value $envContent -Encoding UTF8
 Write-Host "  ✓ .env ファイル作成完了: $EnvFile" -ForegroundColor Green
 
-# 5. Standby Watchdog コンテナの起動
+# 5. Standby Watchdog コンテナの起動 (--profile standby 指定)
 Write-Host "`n[4/4] Slave Standby Watchdog を起動中..." -ForegroundColor Yellow
-docker compose up -d standby-watchdog
+docker compose --profile standby up -d standby-watchdog
 
 Write-Host "`n======================================================" -ForegroundColor Green
 Write-Host "  🎉 TTSBot Slave (Standby) のセットアップが完了しました！" -ForegroundColor Green
@@ -137,7 +143,7 @@ Write-Host "======================================================" -ForegroundC
 Write-Host "  ・動作モード   : Slave (Standby 待機・自動同期)" -ForegroundColor Cyan
 Write-Host "  ・監視対象     : $MasterUrl" -ForegroundColor Cyan
 Write-Host "  ・管理コマンド :"
-Write-Host "     - ログ確認 : cd $InstallDir; docker compose logs -f standby-watchdog" -ForegroundColor White
-Write-Host "     - 停止     : cd $InstallDir; docker compose stop standby-watchdog" -ForegroundColor White
-Write-Host "     - 再開     : cd $InstallDir; docker compose up -d standby-watchdog" -ForegroundColor White
+Write-Host "     - ログ確認 : cd $InstallDir; docker compose --profile standby logs -f standby-watchdog" -ForegroundColor White
+Write-Host "     - 停止     : cd $InstallDir; docker compose --profile standby stop standby-watchdog" -ForegroundColor White
+Write-Host "     - 再開     : cd $InstallDir; docker compose --profile standby up -d standby-watchdog" -ForegroundColor White
 Write-Host "`n💡 Master がダウンした際は自動的に Active に昇格し、Master が復旧すると自動的に Standby に戻ります。`n"

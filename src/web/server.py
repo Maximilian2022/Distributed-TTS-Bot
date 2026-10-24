@@ -14,6 +14,7 @@ import base64
 import secrets
 from datetime import datetime
 import socket
+import aiohttp
 from aiohttp import web
 import discord
 
@@ -223,6 +224,7 @@ class WebServer:
         self.app.router.add_get("/setup-worker.ps1", self.handle_setup_worker_ps1)
         self.app.router.add_get("/setup-standby.sh", self.handle_setup_standby_sh)
         self.app.router.add_get("/setup-standby.ps1", self.handle_setup_standby_ps1)
+        self.app.router.add_get("/docker-compose.yml", self.handle_docker_compose_yml)
         self.app.router.add_get("/static/agent.py", self.handle_worker_agent_script)
 
         # ボランティアWorkerツール配信 (全ユーザー向け)
@@ -313,6 +315,9 @@ class WebServer:
         self.app.router.add_get("/api/system/credentials", self.api_system_get_credentials)
         self.app.router.add_post("/api/system/credentials", self.api_system_save_credentials)
         self.app.router.add_post("/api/system/credentials/test", self.api_system_test_credentials)
+        self.app.router.add_post("/api/system/tunnel/restart", self.api_system_tunnel_restart)
+        self.app.router.add_post("/api/system/tunnel/stop", self.api_system_tunnel_stop)
+        self.app.router.add_post("/api/system/alert/test", self.api_system_alert_test)
         self.app.router.add_get("/api/worker/ws", self.api_worker_ws)
 
         # HA (High Availability) & Standby 同期 API
@@ -749,6 +754,19 @@ class WebServer:
         if not script_path.exists():
             return web.Response(text="Write-Host 'Error: setup-standby.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
         return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+
+    async def handle_docker_compose_yml(self, request: web.Request) -> web.Response:
+        """Standby/Worker 用 docker-compose.yml を配信"""
+        candidates = [
+            Path(__file__).resolve().parent / "static" / "docker-compose.yml",
+            Path("/app/docker-compose.yml"),
+            Path("docker-compose.yml"),
+            Path(__file__).resolve().parent.parent.parent / "docker-compose.yml"
+        ]
+        for p in candidates:
+            if p.exists():
+                return web.Response(text=p.read_text(encoding="utf-8"), content_type="text/yaml", charset="utf-8")
+        return web.Response(text="# docker-compose.yml not found\n", status=404, content_type="text/plain")
 
     async def handle_volunteer_file(self, request: web.Request) -> web.Response:
         """ボランティアツールの個別スクリプトファイルを配信"""
@@ -1682,6 +1700,7 @@ class WebServer:
             "disaster_pref_filter": str(settings.get("disaster_pref_filter", "")),
             "disaster_alert_weather": bool(settings.get("disaster_alert_weather", 1)),
             "disaster_volume": float(settings.get("disaster_volume", 1.0) if settings.get("disaster_volume") is not None else 1.0),
+            "error_contact_user_id": str(settings.get("error_contact_user_id", "") or ""),
             "is_admin": perms["is_admin"],
             "has_role": perms["has_role"]
         })
@@ -1757,6 +1776,12 @@ class WebServer:
             try:
                 v = float(data["disaster_volume"])
                 update_fields["disaster_volume"] = max(0.0, min(v, 2.0))
+            except (ValueError, TypeError):
+                pass
+        if "error_contact_user_id" in data:
+            try:
+                raw_cid = str(data["error_contact_user_id"]).strip()
+                update_fields["error_contact_user_id"] = int(raw_cid) if raw_cid.isdigit() else 0
             except (ValueError, TypeError):
                 pass
 
@@ -4504,6 +4529,28 @@ class WebServer:
             os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         )
 
+        tunnel_info = await self._get_docker_tunnel_status()
+        cf_token = self.config.cloudflare_tunnel_token or (tunnel_info.get("token_in_container") if tunnel_info.get("has_token") else "")
+
+        # システム共通エラー通知先DiscordユーザーID
+        system_contact_id = await self.db.get_credential("error_contact_user_id")
+        if not system_contact_id:
+            from src.utils.alert_service import alert_service
+            system_contact_id = str(alert_service.INITIAL_DEFAULT_CONTACT_ID)
+
+        # HA共有認証シークレット (Master-Slave間)
+        ha_secret = self.config.ha_secret
+        if not ha_secret:
+            ha_secret = await self.db.get_credential("ha_secret")
+        if not ha_secret:
+            import secrets
+            ha_secret = secrets.token_urlsafe(24)
+            await self.db.set_credential("ha_secret", ha_secret, is_secret=True)
+            self.config.ha_secret = ha_secret
+            logger.info("🔐 Generated and saved default TTSBOT_HA_SECRET for cluster HA.")
+        else:
+            self.config.ha_secret = ha_secret
+
         return web.json_response({
             "status": "ok",
             "azure_speech_key": _mask(self.config.azure_speech_key),
@@ -4516,7 +4563,17 @@ class WebServer:
             "google_api_key": _mask(self.config.google_api_key),
             "worker_shared_secret": self.config.worker_shared_secret,
             "web_base_url": self.config.web_dashboard_url,
-            "admin_password_configured": bool(self.config.admin_password)
+            "admin_password_configured": bool(self.config.admin_password),
+            # Cloudflare Tunnel 状態
+            "cloudflare_tunnel_configured": bool(cf_token),
+            "cloudflare_tunnel_token": _mask(cf_token),
+            "cloudflare_tunnel_status": tunnel_info.get("status", "not_created"),
+            "cloudflare_tunnel_running": bool(tunnel_info.get("running", False)),
+            "cloudflare_tunnel_container_id": tunnel_info.get("container_id", ""),
+            # システム共通エラー通知先
+            "error_contact_user_id": str(system_contact_id),
+            # HA共有認証シークレット
+            "ha_secret": self.config.ha_secret
         })
 
     async def api_system_save_credentials(self, request: web.Request) -> web.Response:
@@ -4617,6 +4674,42 @@ class WebServer:
                     await self.db.set_credential("admin_password", new_pwd, is_secret=True)
                     self.config.admin_password = new_pwd
 
+            # 8. Cloudflare Tunnel Token & 自動起動連動
+            tunnel_message = ""
+            if "cloudflare_tunnel_token" in data:
+                raw_cf_token = str(data["cloudflare_tunnel_token"]).strip()
+                if not raw_cf_token.startswith("•"):
+                    old_token = (self.config.cloudflare_tunnel_token or "").strip()
+                    if raw_cf_token:
+                        # トークン保存
+                        await self.db.set_credential("cloudflare_tunnel_token", raw_cf_token, is_secret=True)
+                        self.config.cloudflare_tunnel_token = raw_cf_token
+                        self._sync_cloudflare_token_to_env(raw_cf_token)
+
+                        # 「Tokenが無いところから投入されたら起動する」
+                        # またはTokenが変更された場合、あるいは現在停止中なら再作成・起動
+                        tunnel_stat = await self._get_docker_tunnel_status()
+                        if not old_token or old_token != raw_cf_token or not tunnel_stat.get("running"):
+                            succ, t_msg = await self._start_or_update_docker_tunnel(raw_cf_token)
+                            tunnel_message = f" ({t_msg})"
+                    else:
+                        # 空文字が明示的に送信された場合はクリア＆停止
+                        if old_token:
+                            await self.db.set_credential("cloudflare_tunnel_token", "", is_secret=False)
+                            self.config.cloudflare_tunnel_token = ""
+                            self._sync_cloudflare_token_to_env("")
+                            succ, t_msg = await self._stop_docker_tunnel()
+                            tunnel_message = f" ({t_msg})"
+
+            # 9. システム共通エラー連絡先 (Discord ユーザーID)
+            if "error_contact_user_id" in data:
+                raw_ec_id = str(data["error_contact_user_id"]).strip()
+                if raw_ec_id.isdigit():
+                    await self.db.set_credential("error_contact_user_id", raw_ec_id)
+                elif not raw_ec_id:
+                    from src.utils.alert_service import alert_service
+                    await self.db.set_credential("error_contact_user_id", str(alert_service.INITIAL_DEFAULT_CONTACT_ID))
+
             # ホットリロード
             if self.tts_manager:
                 self.tts_manager.reload_cloud_credentials(
@@ -4629,14 +4722,268 @@ class WebServer:
             return web.json_response({
                 "status": "ok",
                 "success": True,
-                "message": "設定を保存し、ホットリロードしました。"
+                "message": f"設定を保存し、ホットリロードしました。{tunnel_message}"
             })
         except Exception as e:
-            logger.exception("Failed to save credentials")
+            logger.exception("api_system_save_credentials failed")
+            return web.json_response({"status": "error", "error": f"保存中にエラーが発生しました: {e}"}, status=500)
+
+    async def api_system_alert_test(self, request: web.Request) -> web.Response:
+        """エラー連絡先へのテストDM送信"""
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+
+            guild_id_raw = data.get("guild_id")
+            guild_id = int(guild_id_raw) if guild_id_raw and str(guild_id_raw).isdigit() else None
+
+            # 権限チェック: ギルドIDがある場合はギルドの管理者/設定ロール、ない場合はシステム管理者
+            if guild_id:
+                try:
+                    guild, perms = await self._get_guild_and_perms(request, guild_id)
+                    if not (perms["is_admin"] or perms["has_role"]):
+                        return web.json_response({"status": "error", "error": "権限がありません (管理者または設定ロールが必要)"}, status=403)
+                except Exception:
+                    await self._require_admin(request)
+            else:
+                await self._require_admin(request)
+
+            target_user_id_raw = data.get("target_user_id")
+            explicit_target_id = int(target_user_id_raw) if target_user_id_raw and str(target_user_id_raw).isdigit() else None
+
+            from src.utils.alert_service import alert_service, SEVERITY_INFO, CATEGORY_BOT
+
+            resolved_id = await alert_service.resolve_target_user_id(guild_id=guild_id, explicit_target_id=explicit_target_id)
+            if not resolved_id or resolved_id <= 0:
+                return web.json_response({
+                    "status": "error",
+                    "error": "通知先のDiscordユーザーIDが未指定または無効です"
+                }, status=400)
+
+            if not alert_service.bot or not alert_service.bot.is_ready():
+                return web.json_response({
+                    "status": "error",
+                    "error": "Discord Bot が準備中または未接続のため、DMを送信できません。しばらく待ってから再試行してください。"
+                }, status=503)
+
+            # ユーザー確認
+            try:
+                user = alert_service.bot.get_user(resolved_id)
+                if not user:
+                    user = await alert_service.bot.fetch_user(resolved_id)
+            except Exception as e:
+                return web.json_response({
+                    "status": "error",
+                    "error": f"Discord ユーザー (ID: {resolved_id}) が見つかりませんでした: {e}"
+                }, status=400)
+
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            test_title = "🔔 エラー連絡先 DM 通知テスト"
+            test_msg = (
+                f"TTSBot のエラー・障害通知先テストメッセージです。\n"
+                f"このDMを受信できている場合、通知先設定 (ID: `{resolved_id}`) は正常に機能しています。\n"
+                f"送信日時: {now_str}"
+            )
+            test_details = f"送信元: {'サーバー設定 (Guild: ' + str(guild_id) + ')' if guild_id else 'システム共通設定'}"
+
+            success = await alert_service.send_alert(
+                title=test_title,
+                message=test_msg,
+                category=CATEGORY_BOT,
+                severity=SEVERITY_INFO,
+                details=test_details,
+                cooldown_seconds=0,
+                guild_id=guild_id,
+                target_user_id=resolved_id
+            )
+
+            if success:
+                return web.json_response({
+                    "status": "ok",
+                    "success": True,
+                    "target_user_id": str(resolved_id),
+                    "target_user_name": str(user),
+                    "message": f"Discord ユーザー「{user}」(ID: {resolved_id}) 宛てにテストDMを送信しました！"
+                })
+            else:
+                return web.json_response({
+                    "status": "error",
+                    "error": f"テストDM送信に失敗しました。ユーザー「{user}」がBotからのDM受信を拒否しているか、共通サーバーに存在しない可能性があります。"
+                }, status=500)
+        except Exception as e:
+            logger.exception("api_system_alert_test failed")
+            return web.json_response({"status": "error", "error": f"テスト送信中にエラーが発生しました: {e}"}, status=500)
+
+    # --------------------------------------------------------------------------
+    # Docker Engine API (/var/run/docker.sock) 連携 & Cloudflare Tunnel 制御
+    # --------------------------------------------------------------------------
+    async def _docker_request(self, method: str, path: str, json_data: Any = None) -> Tuple[int, Any]:
+        """Docker Engine API (/var/run/docker.sock) への非同期リクエスト"""
+        socket_path = "/var/run/docker.sock"
+        if not os.path.exists(socket_path):
+            return 503, {"error": "docker.sock not found"}
+        try:
+            connector = aiohttp.UnixConnector(path=socket_path)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                url = f"http://localhost{path}"
+                async with session.request(method, url, json=json_data) as resp:
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = await resp.text()
+                    return resp.status, data
+        except Exception as e:
+            logger.warning(f"Docker API error ({method} {path}): {e}")
+            return 500, {"error": str(e)}
+
+    async def _get_docker_tunnel_status(self) -> Dict[str, Any]:
+        """Cloudflare Tunnel (ttsbot-tunnel-1) コンテナの稼働ステータスを取得"""
+        status_code, data = await self._docker_request("GET", "/containers/ttsbot-tunnel-1/json")
+        if status_code == 200 and isinstance(data, dict):
+            state = data.get("State", {})
+            config = data.get("Config", {})
+            env_list = config.get("Env", [])
+            token_in_container = ""
+            for item in env_list:
+                if item.startswith("TUNNEL_TOKEN="):
+                    token_in_container = item[len("TUNNEL_TOKEN="):]
+                    break
+            return {
+                "exists": True,
+                "running": bool(state.get("Running", False)),
+                "status": state.get("Status", "unknown"),
+                "started_at": state.get("StartedAt"),
+                "container_id": data.get("Id", "")[:12],
+                "has_token": bool(token_in_container.strip()),
+                "token_in_container": token_in_container.strip(),
+                "image": config.get("Image")
+            }
+        elif status_code == 404:
+            return {
+                "exists": False,
+                "running": False,
+                "status": "not_created",
+                "has_token": False
+            }
+        else:
+            return {
+                "exists": False,
+                "running": False,
+                "status": "error",
+                "error": str(data),
+                "has_token": False
+            }
+
+    async def _start_or_update_docker_tunnel(self, token: str) -> Tuple[bool, str]:
+        """Cloudflare Tunnel (ttsbot-tunnel-1) を指定トークンで起動・再作成"""
+        if not token or not token.strip():
+            return False, "有効な Cloudflare Tunnel Token を指定してください"
+        token = token.strip()
+
+        # 既存コンテナの存在確認
+        info = await self._get_docker_tunnel_status()
+        if info.get("exists"):
+            # すでに同一トークンで起動中であれば何もしない
+            if info.get("running") and info.get("token_in_container") == token:
+                logger.info("Cloudflare Tunnel is already running with the same token.")
+                return True, "Cloudflare Tunnel は既に同一トークンで稼働中です"
+
+            logger.info("Stopping and removing existing ttsbot-tunnel-1 container...")
+            await self._docker_request("POST", "/containers/ttsbot-tunnel-1/stop?t=5")
+            await self._docker_request("DELETE", "/containers/ttsbot-tunnel-1?force=true")
+
+        # 新規コンテナ作成 (docker-compose.yml の定義と完全互換)
+        create_payload = {
+            "Image": "cloudflare/cloudflared:latest",
+            "Cmd": ["tunnel", "--no-autoupdate", "run"],
+            "Env": [
+                f"TUNNEL_TOKEN={token}",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+            ],
+            "HostConfig": {
+                "RestartPolicy": {"Name": "unless-stopped"},
+                "NetworkMode": "ttsbot_default",
+                "NanoCpus": 500000000,
+                "Memory": 268435456
+            },
+            "Labels": {
+                "com.docker.compose.project": "ttsbot",
+                "com.docker.compose.service": "tunnel"
+            }
+        }
+        status_code, resp_data = await self._docker_request("POST", "/containers/create?name=ttsbot-tunnel-1", create_payload)
+        if status_code not in (200, 201):
+            err_msg = f"Tunnelコンテナ作成に失敗しました (Status {status_code}): {resp_data}"
+            logger.error(err_msg)
+            return False, err_msg
+
+        container_id = resp_data.get("Id", "ttsbot-tunnel-1")
+        start_code, start_resp = await self._docker_request("POST", f"/containers/{container_id}/start")
+        if start_code not in (200, 204, 304):
+            err_msg = f"Tunnelコンテナ起動に失敗しました (Status {start_code}): {start_resp}"
+            logger.error(err_msg)
+            return False, err_msg
+
+        logger.info(f"🚀 Cloudflare Tunnel container started successfully (ID: {container_id[:12]})")
+        return True, "Cloudflare Tunnel を起動しました"
+
+    async def _stop_docker_tunnel(self) -> Tuple[bool, str]:
+        """Cloudflare Tunnel コンテナを停止"""
+        info = await self._get_docker_tunnel_status()
+        if not info.get("exists"):
+            return True, "Cloudflare Tunnel は起動していません"
+
+        await self._docker_request("POST", "/containers/ttsbot-tunnel-1/stop?t=5")
+        return True, "Cloudflare Tunnel を停止しました"
+
+    def _sync_cloudflare_token_to_env(self, token: str) -> None:
+        """ホスト/コンテナ内の .env ファイルの CLOUDFLARE_TUNNEL_TOKEN を同期更新"""
+        for env_file in [Path(".env"), Path("/app/.env")]:
+            if env_file.exists():
+                try:
+                    content = env_file.read_text(encoding="utf-8")
+                    if "CLOUDFLARE_TUNNEL_TOKEN=" in content:
+                        new_content = re.sub(r'CLOUDFLARE_TUNNEL_TOKEN=.*', f'CLOUDFLARE_TUNNEL_TOKEN={token}', content)
+                    else:
+                        new_content = content.rstrip() + f"\nCLOUDFLARE_TUNNEL_TOKEN={token}\n"
+                    env_file.write_text(new_content, encoding="utf-8")
+                    logger.info(f"💾 Synced CLOUDFLARE_TUNNEL_TOKEN to {env_file}")
+                    break
+                except Exception as e:
+                    logger.warning(f"Could not update {env_file}: {e}")
+
+    async def api_system_tunnel_restart(self, request: web.Request) -> web.Response:
+        """Cloudflare Tunnel 手動再起動 (管理者のみ)"""
+        await self._require_admin(request)
+        token = (self.config.cloudflare_tunnel_token or "").strip()
+        if not token:
+            t_stat = await self._get_docker_tunnel_status()
+            token = (t_stat.get("token_in_container") or "").strip()
+        if not token:
             return web.json_response({
                 "status": "error",
-                "error": f"設定保存中にエラーが発生しました: {e}"
-            }, status=500)
+                "error": "Cloudflare Tunnel Token が設定されていません"
+            }, status=400)
+
+        success, msg = await self._start_or_update_docker_tunnel(token)
+        return web.json_response({
+            "status": "ok" if success else "error",
+            "success": success,
+            "message": msg
+        })
+
+    async def api_system_tunnel_stop(self, request: web.Request) -> web.Response:
+        """Cloudflare Tunnel 手動停止 (管理者のみ)"""
+        await self._require_admin(request)
+        success, msg = await self._stop_docker_tunnel()
+        return web.json_response({
+            "status": "ok" if success else "error",
+            "success": success,
+            "message": msg
+        })
 
     async def api_system_test_credentials(self, request: web.Request) -> web.Response:
         """指定TTSプロバイダの即時疎通・音声合成テスト (管理者のみ)"""

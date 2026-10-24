@@ -1,5 +1,42 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] エラー通知先DM設定の動的化 & Standby待機ノードセットアップエラーの解消
+- **概要**:
+  1. **エラー通知先DM設定の動的化**:
+     - これまで管理者Discord User ID（`310034034690359308`）が固定値としてコード内に存在していたのを改修し、サーバー固有設定（ボット設定タブ）およびシステム全体設定（API・連携設定タブ）から任意のエラー連絡先DiscordユーザーIDを指定可能にした。
+     - 現行の通知先ID（`310034034690359308`）を初期値（デフォルトフォールバック）として安全に維持・登録。
+     - **例示・プレースホルダーにユーザーの実IDを一切使い回さず、ダミーID（`例: 123456789012345678`）のみを記載するプライバシー保護・安全設計**を徹底。
+     - WebUIからワンクリックでDiscord DM疎通を確認できる「テスト送信 📨」ボタンを両画面に新設。
+  2. **Standby (Slave) ノード登録エラー (`no such service: standby-watchdog`) の解消**:
+     - `curl -sSL ... | sudo bash` 実行時に `profiles: [standby]` に起因して発生していた `no such service` エラー、およびパイプ実行時の対話入力（`read`）空振り問題を抜本的に解消。
+     - WebUIのコピーワンライナーに最初から Master URL と HA Secret を引数として自動注入（`bash -s -- <URL> <SECRET>`）し、一切の対話入力不要で100%確実に起動できるように最適化。
+- **改修詳細**:
+  1. **エラー通知サブシステム (`src/utils/alert_service.py` & `src/main.py`)**:
+     - `INITIAL_DEFAULT_CONTACT_ID = 310034034690359308` を定義。
+     - `resolve_target_user_id(guild_id, explicit_target_id)` を新設: ギルド固有設定 → システム全体設定 → デフォルトID の3段階フォールバック解決。
+     - `notify` および `send_alert` で解決されたユーザー宛てにリアルタイムEmbed DMを送信。
+  2. **データベース層 (`src/database.py`)**:
+     - `guild_settings` テーブルに `error_contact_user_id INTEGER DEFAULT 0` カラムをマイグレーション追加。
+     - `system_credentials` テーブルの初期値として `('error_contact_user_id', '310034034690359308')` を `INSERT OR IGNORE`。
+  3. **バックエンドAPI (`src/web/server.py`)**:
+     - `api_get_config` / `api_update_config`: サーバーごとの `error_contact_user_id` の取得・更新。
+     - `api_system_get_credentials` / `api_system_save_credentials`: システム全体の `error_contact_user_id` および `ha_secret` の取得・保存。`ha_secret` 未設定時は安全なランダムキーを自動生成・永続化。
+     - `api_system_alert_test` (`POST /api/system/alert/test`): 指定ID宛てにテストDMを即時送信し、ユーザー確認と結果を返却。
+     - `handle_docker_compose_yml` (`GET /docker-compose.yml`): Slaveノードが git コマンド不在でも単体ダウンロードできるよう配信エンドポイントを新設。
+  4. **Standby 自動セットアップスクリプト (`src/web/static/setup-standby.sh` & `.ps1`)**:
+     - 起動コマンドに `--profile standby` を明示付与（`${DOCKER_COMPOSE_CMD} --profile standby up -d standby-watchdog`）。
+     - 対話入力時に標準入力ではなく `/dev/tty` から安全に読み取るよう改修し、パイプ実行時の空振りを防止。
+     - `git clone` 失敗時でも Master から `docker-compose.yml` を直接ダウンロード補完するフォールバックを実装。
+  5. **フロントエンド (`src/web/templates/index.html` & `src/web/static/app.js`)**:
+     - 「ボット設定」タブに「🚨 障害・エラー通知先 Discord ユーザーID」と「テスト送信 📨」ボタンを追加。
+     - 「API・外部サービス連携設定」タブに「🚨 システム全体 エラー通知先 Discord ユーザーID」と「テスト送信 📨」ボタンを追加。
+     - プレースホルダーは全て `例: 123456789012345678` に統一。
+     - Standby ワンライナーを引数付き（`bash -s -- "${origin}" "${haSecret}"`）で動的生成。
+- **実機検証**:
+  - `docker compose restart app` による安全なホットリロード。
+  - 実機ブラウザで全画面の正常描画、初期値（`310034034690359308`）の表示、プレースホルダーのダミー表記、Standbyワンライナーへのシークレット自動注入を確認（スクリーンショット記録済み）。
+  - `curl -s http://localhost:8088/docker-compose.yml` (200 OK)、`/setup-standby.sh` (200 OK) の疎通確認完了。
+
 ## [2026-10-24] docker-compose.yml の Manager 専任化（ローカルエンジンサービスの完全分離）
 - **概要**:
   - ルートの `docker-compose.yml` は Manager（管理・Discord Bot接続・WebUI・クラスタオーケストレーション）専用である設計方針に基づき、分散Worker化以前の残骸であった `voicevox` サービス（`--profile voicevox`）を完全削除。

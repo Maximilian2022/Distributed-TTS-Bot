@@ -154,7 +154,7 @@ class TTSBot(commands.Bot):
         if self.bot_index == 1:
             # 障害検知・管理者DM通知サービスの初期化
             from src.utils.alert_service import alert_service
-            alert_service.set_bot(self)
+            alert_service.set_bot(self, db=self.db)
 
             # データベース初期化 (WALモード・マイグレーション)
             await self.db.init_db()

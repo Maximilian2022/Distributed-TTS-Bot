@@ -130,6 +130,7 @@ class AppConfig:
     gemini_model: str = "gemini-2.5-flash"
     admin_password: str = ""
     ha_secret: str = ""
+    cloudflare_tunnel_token: str = ""
 
     def get_discord_tokens(self) -> List[Tuple[int, str]]:
         """有効な全Botトークンを (bot_index, token) の昇順リストで取得 (最大10台対応)"""
@@ -157,6 +158,8 @@ class AppConfig:
             self.worker_shared_secret = credentials["worker_shared_secret"]
         if credentials.get("ha_secret"):
             self.ha_secret = credentials["ha_secret"]
+        if credentials.get("cloudflare_tunnel_token") is not None:
+            self.cloudflare_tunnel_token = credentials["cloudflare_tunnel_token"]
         if credentials.get("web_base_url"):
             base = credentials["web_base_url"].strip().rstrip("/")
             self.web_dashboard_url = base
@@ -334,6 +337,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     cfg.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
     cfg.speculative_timeout_seconds = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", cfg.speculative_timeout_seconds))
+    cfg.cloudflare_tunnel_token = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", cfg.cloudflare_tunnel_token).strip()
 
     # Web UI & OAuth2 環境変数 (汎用WEB_BASE_URL対応)
     cfg.admin_password = os.getenv("ADMIN_PASSWORD", cfg.admin_password).strip()

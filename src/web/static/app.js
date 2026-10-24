@@ -24,6 +24,7 @@ document.addEventListener("DOMContentLoaded", () => {
     loadGuilds();
     loadCharacterTerms();
     loadStats();
+    loadCredentials();
   }
   renderCharacterTermsTable();
 });
@@ -2205,6 +2206,12 @@ async function loadBotConfig(guildId) {
     if (roleSelect && cfg.admin_role_id) {
       roleSelect.value = String(cfg.admin_role_id);
     }
+
+    // エラー連絡先 Discord ユーザーID (サーバー固有)
+    const errorContactInput = document.getElementById("cfg-error-contact-user-id");
+    if (errorContactInput) {
+      errorContactInput.value = (cfg.error_contact_user_id && cfg.error_contact_user_id !== "0") ? String(cfg.error_contact_user_id) : "";
+    }
     updateStandbyOneliner();
   } catch (e) {
     console.error("Failed to load bot config:", e);
@@ -2313,7 +2320,8 @@ async function saveBotConfig(e) {
     disaster_min_scale: disasterMinScale,
     disaster_pref_filter: disasterPref,
     disaster_alert_weather: disasterWeather,
-    disaster_volume: disasterVolume
+    disaster_volume: disasterVolume,
+    error_contact_user_id: document.getElementById("cfg-error-contact-user-id")?.value?.trim() || ""
   };
 
   // 管理者の場合のみ管理者ロール変更を含める
@@ -6712,7 +6720,8 @@ async function loadManagerNodes() {
     });
     const setupBox = document.getElementById("standby-setup-command-box");
     if (setupBox) {
-      setupBox.textContent = `curl -sSL ${currentOrigin}/setup-standby.sh | sudo bash`;
+      const haSec = window.currentHaSecret || "";
+      setupBox.textContent = `curl -sSL "${currentOrigin}/setup-standby.sh" | sudo bash -s -- "${currentOrigin}" "${haSec}"`;
     }
 
     let cardsHtml = "";
@@ -7202,18 +7211,21 @@ function updateWorkerOneliner(webBaseUrl, secret) {
   pre.textContent = cmd;
 }
 
-function updateStandbyOneliner() {
+function updateStandbyOneliner(haSecret) {
   const shPre = document.getElementById("standby-oneliner-sh");
   const ps1Pre = document.getElementById("standby-oneliner-ps1");
-  if (!shPre && !ps1Pre) return;
+  const setupBox = document.getElementById("standby-setup-command-box");
+  if (!shPre && !ps1Pre && !setupBox) return;
 
   const origin = window.location.origin.replace(/\/$/, "");
-  if (shPre) {
-    shPre.textContent = `curl -sSL "${origin}/setup-standby.sh" | bash`;
-  }
-  if (ps1Pre) {
-    ps1Pre.textContent = `irm "${origin}/setup-standby.ps1" | iex`;
-  }
+  const sec = haSecret || window.currentHaSecret || "your_ha_secret_here";
+
+  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo bash -s -- "${origin}" "${sec}"`;
+  const ps1Cmd = `$env:TTSBOT_MASTER_URL="${origin}"; $env:TTSBOT_HA_SECRET="${sec}"; irm "${origin}/setup-standby.ps1" | iex`;
+
+  if (shPre) shPre.textContent = shCmd;
+  if (ps1Pre) ps1Pre.textContent = ps1Cmd;
+  if (setupBox) setupBox.textContent = shCmd;
 }
 window.updateStandbyOneliner = updateStandbyOneliner;
 
@@ -7243,6 +7255,18 @@ async function loadCredentials() {
   const azureRegionInput = document.getElementById("cred-azure-region");
   const workerSecretInput = document.getElementById("cred-worker-secret");
   const webBaseUrlInput = document.getElementById("cred-web-base-url");
+
+  // Cloudflare Tunnel
+  const tunnelBadge = document.getElementById("tunnel-status-badge");
+  const tunnelInput = document.getElementById("cred-cloudflare-tunnel-token");
+  const tunnelTokenState = document.getElementById("tunnel-token-state");
+  const btnRestartTunnel = document.getElementById("btn-restart-tunnel");
+  const btnStopTunnel = document.getElementById("btn-stop-tunnel");
+  const btnClearToken = document.getElementById("btn-clear-tunnel-token");
+  const tunnelRuntimeInfo = document.getElementById("tunnel-runtime-info");
+  const tunnelStateText = document.getElementById("tunnel-container-state-text");
+  const tunnelIdSpan = document.getElementById("tunnel-container-id-span");
+  const tunnelIdText = document.getElementById("tunnel-container-id-text");
 
   try {
     const res = await fetch("/api/system/credentials");
@@ -7276,7 +7300,77 @@ async function loadCredentials() {
       webBaseUrlInput.value = data.web_base_url || window.location.origin;
     }
 
+    // Cloudflare Tunnel のステータス反映
+    if (tunnelBadge) {
+      const isConfigured = !!data.cloudflare_tunnel_configured;
+      const isRunning = !!data.cloudflare_tunnel_running;
+      const tStatus = data.cloudflare_tunnel_status || "not_created";
+
+      if (isConfigured && isRunning) {
+        tunnelBadge.textContent = "🟢 稼働中";
+        tunnelBadge.style.background = "rgba(46,204,113,0.2)";
+        tunnelBadge.style.color = "#2ecc71";
+      } else if (isConfigured && !isRunning) {
+        tunnelBadge.textContent = "🟡 停止中";
+        tunnelBadge.style.background = "rgba(241,196,15,0.2)";
+        tunnelBadge.style.color = "#f1c40f";
+      } else {
+        tunnelBadge.textContent = "⚪ 未設定";
+        tunnelBadge.style.background = "rgba(255,255,255,0.06)";
+        tunnelBadge.style.color = "var(--text-dim)";
+      }
+
+      if (btnRestartTunnel) {
+        btnRestartTunnel.style.display = isConfigured ? "inline-block" : "none";
+      }
+      if (btnStopTunnel) {
+        btnStopTunnel.style.display = (isConfigured && isRunning) ? "inline-block" : "none";
+      }
+      if (btnClearToken) {
+        btnClearToken.style.display = isConfigured ? "inline-block" : "none";
+      }
+
+      if (tunnelTokenState) {
+        tunnelTokenState.textContent = isConfigured ? `(設定済み: ${data.cloudflare_tunnel_token})` : "(未設定)";
+      }
+      if (tunnelInput) {
+        tunnelInput.placeholder = isConfigured ? "設定済み (変更する場合のみ新しいTokenを入力)" : "未設定 (入力して保存すると自動起動します)";
+      }
+
+      if (tunnelRuntimeInfo) {
+        if (tStatus !== "not_created") {
+          tunnelRuntimeInfo.style.display = "block";
+          if (tunnelStateText) {
+            tunnelStateText.textContent = isRunning ? "running (正常稼働)" : tStatus;
+            tunnelStateText.style.color = isRunning ? "#2ecc71" : "#e67e22";
+          }
+          if (tunnelIdSpan && tunnelIdText) {
+            if (data.cloudflare_tunnel_container_id) {
+              tunnelIdSpan.style.display = "inline";
+              tunnelIdText.textContent = data.cloudflare_tunnel_container_id;
+            } else {
+              tunnelIdSpan.style.display = "none";
+            }
+          }
+        } else {
+          tunnelRuntimeInfo.style.display = "none";
+        }
+      }
+    }
+
     updateWorkerOneliner(data.web_base_url, data.worker_shared_secret);
+
+    // システム全体エラー通知先
+    const credErrorContact = document.getElementById("cred-error-contact-user-id");
+    if (credErrorContact) {
+      credErrorContact.value = (data.error_contact_user_id && data.error_contact_user_id !== "0") ? String(data.error_contact_user_id) : "";
+    }
+
+    // HA Secret の保持とワンライナー更新
+    if (data.ha_secret) {
+      window.currentHaSecret = data.ha_secret;
+      updateStandbyOneliner(data.ha_secret);
+    }
   } catch (err) {
     console.error("loadCredentials error:", err);
     showToast(`クレデンシャル読み込み失敗: ${err.message}`, "error");
@@ -7328,6 +7422,80 @@ function copyWorkerOneliner() {
 }
 window.copyWorkerOneliner = copyWorkerOneliner;
 
+// パスワード/トークン表示・非表示トグル
+function togglePasswordVisibility(inputId, btn) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+  if (input.type === "password") {
+    input.type = "text";
+    if (btn) btn.textContent = "🔒";
+  } else {
+    input.type = "password";
+    if (btn) btn.textContent = "👁️";
+  }
+}
+window.togglePasswordVisibility = togglePasswordVisibility;
+
+async function restartTunnelService() {
+  if (!confirm("Cloudflare Tunnel を再起動しますか？")) return;
+  showToast("🔄 Cloudflare Tunnel を再起動中...", "info");
+  try {
+    const res = await fetch("/api/system/tunnel/restart", { method: "POST" });
+    const data = await res.json();
+    if (res.ok && (data.status === "ok" || data.success)) {
+      showToast(data.message || "Cloudflare Tunnel を再起動しました", "success");
+      loadCredentials();
+    } else {
+      showToast(data.error || "Tunnel再起動に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  }
+}
+window.restartTunnelService = restartTunnelService;
+
+async function stopTunnelService() {
+  if (!confirm("Cloudflare Tunnel を停止しますか？\n外部（WAN）からのアクセスが遮断されます。")) return;
+  showToast("⏹️ Cloudflare Tunnel を停止中...", "info");
+  try {
+    const res = await fetch("/api/system/tunnel/stop", { method: "POST" });
+    const data = await res.json();
+    if (res.ok && (data.status === "ok" || data.success)) {
+      showToast(data.message || "Cloudflare Tunnel を停止しました", "success");
+      loadCredentials();
+    } else {
+      showToast(data.error || "Tunnel停止に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  }
+}
+window.stopTunnelService = stopTunnelService;
+
+async function clearTunnelToken() {
+  if (!confirm("Cloudflare Tunnel Token をクリアしてトンネルを停止しますか？\n外部公開用トンネルが停止・破棄されます。")) return;
+  showToast("🗑️ TokenをクリアしTunnelを停止中...", "info");
+  try {
+    const res = await fetch("/api/system/credentials", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cloudflare_tunnel_token: "" })
+    });
+    const data = await res.json();
+    if (res.ok && (data.status === "ok" || data.success)) {
+      showToast("Tunnel Token を削除し、トンネルを停止しました", "success");
+      const inp = document.getElementById("cred-cloudflare-tunnel-token");
+      if (inp) inp.value = "";
+      loadCredentials();
+    } else {
+      showToast(data.error || "Token削除に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  }
+}
+window.clearTunnelToken = clearTunnelToken;
+
 async function saveCredentials(event) {
   event.preventDefault();
   const azureKey = document.getElementById("cred-azure-key")?.value?.trim() || "";
@@ -7337,6 +7505,7 @@ async function saveCredentials(event) {
   const workerSecret = document.getElementById("cred-worker-secret")?.value?.trim() || "";
   const webBaseUrl = document.getElementById("cred-web-base-url")?.value?.trim() || "";
   const adminPassword = document.getElementById("cred-admin-password")?.value?.trim() || "";
+  const cfTunnelToken = document.getElementById("cred-cloudflare-tunnel-token")?.value?.trim();
 
   const payload = {
     azure_speech_region: azureRegion,
@@ -7350,6 +7519,13 @@ async function saveCredentials(event) {
   }
   if (googleKey) payload.google_api_key = googleKey;
   if (adminPassword) payload.admin_password = adminPassword;
+  if (cfTunnelToken !== undefined && cfTunnelToken !== "") {
+    payload.cloudflare_tunnel_token = cfTunnelToken;
+  }
+  const credErrorContactVal = document.getElementById("cred-error-contact-user-id")?.value?.trim();
+  if (credErrorContactVal !== undefined) {
+    payload.error_contact_user_id = credErrorContactVal;
+  }
 
   try {
     const res = await fetch("/api/system/credentials", {
@@ -7367,15 +7543,17 @@ async function saveCredentials(event) {
     }
 
     if (res.ok && (data.status === "ok" || data.success)) {
-      showToast("設定を保存し、ホットリロードを完了しました 💾", "success");
+      showToast(data.message || "設定を保存し、ホットリロードを完了しました 💾", "success");
       const k1 = document.getElementById("cred-azure-key");
       const k2 = document.getElementById("cred-google-json");
       const k3 = document.getElementById("cred-google-key");
       const k4 = document.getElementById("cred-admin-password");
+      const k5 = document.getElementById("cred-cloudflare-tunnel-token");
       if (k1) k1.value = "";
       if (k2) k2.value = "";
       if (k3) k3.value = "";
       if (k4) k4.value = "";
+      if (k5) k5.value = "";
       loadCredentials();
     } else {
       showToast(data.error || "設定保存に失敗しました", "error");
@@ -7385,6 +7563,49 @@ async function saveCredentials(event) {
   }
 }
 window.saveCredentials = saveCredentials;
+
+// 障害・エラー通知先へのテストDM送信
+async function testErrorAlert(isGuild) {
+  const btn = document.getElementById(isGuild ? "btn-test-error-alert-guild" : "btn-test-error-alert-system");
+  const input = document.getElementById(isGuild ? "cfg-error-contact-user-id" : "cred-error-contact-user-id");
+  const originalHtml = btn ? btn.innerHTML : "";
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span>⏳ 送信中...</span>';
+  }
+
+  const targetUserId = input ? input.value.trim() : "";
+  const payload = {};
+  if (isGuild && typeof currentGuildId !== "undefined" && currentGuildId) {
+    payload.guild_id = currentGuildId;
+  }
+  if (targetUserId) {
+    payload.target_user_id = targetUserId;
+  }
+
+  try {
+    const res = await fetch("/api/system/alert/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (res.ok && (data.status === "ok" || data.success)) {
+      showToast(data.message || `Discord ユーザー (ID: ${data.target_user_id}) 宛てにテストDMを送信しました！`, "success");
+    } else {
+      showToast(data.error || "テスト送信に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast(`通信エラー: ${err.message}`, "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    }
+  }
+}
+window.testErrorAlert = testErrorAlert;
 
 async function testCredential(provider) {
   showToast(`⚡ ${provider.toUpperCase()} のテスト音声合成を実行中...`, "success");
