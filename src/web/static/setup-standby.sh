@@ -21,12 +21,28 @@ echo -e "${BOLD}${CYAN}======================================================${R
 echo -e "${BOLD}${CYAN}  🎙️ TTSBot Manager Slave (Standby) 自動セットアップ${RESET}"
 echo -e "${BOLD}${CYAN}======================================================${RESET}"
 
-# 1. 引数または環境変数の取得
-MASTER_URL="${1:-${TTSBOT_MASTER_URL:-}}"
-HA_SECRET="${2:-${TTSBOT_HA_SECRET:-}}"
+# 1. 配信元 Master サーバーから自動埋め込みされた規定値
+# (Master から curl ダウンロードされた時点で自動的に置換・埋め込まれます)
+AUTO_DETECTED_MASTER_URL="__DEFAULT_MASTER_URL__"
+AUTO_DETECTED_HA_SECRET="__DEFAULT_HA_SECRET__"
+
+# プレースホルダーの判定 (置換されずにそのまま残っている場合は未設定扱い)
+case "$AUTO_DETECTED_MASTER_URL" in
+    *"__DEFAULT"*) AUTO_DETECTED_MASTER_URL="" ;;
+esac
+case "$AUTO_DETECTED_HA_SECRET" in
+    *"__DEFAULT"*) AUTO_DETECTED_HA_SECRET="" ;;
+esac
+
+# 引数 -> 環境変数 -> 配信元埋め込み値 の順に優先度判定
+MASTER_URL="${1:-${TTSBOT_MASTER_URL:-${AUTO_DETECTED_MASTER_URL}}}"
+HA_SECRET="${2:-${TTSBOT_HA_SECRET:-${AUTO_DETECTED_HA_SECRET}}}"
 TUNNEL_TOKEN="${3:-${CLOUDFLARE_TUNNEL_TOKEN:-}}"
 
-# 2. 未指定時に対話入力 (パイプ実行時の /dev/tty 読み取り対応)
+# 末尾スラッシュ除去
+MASTER_URL=$(echo "$MASTER_URL" | sed 's:/*$::')
+
+# 2. 自動特定できなかった場合のみ対話入力へフォールバック
 if [ -z "$MASTER_URL" ]; then
     if [ -t 0 ]; then
         echo -e "${YELLOW}Master (主系) サーバーのベースURLを入力してください:${RESET}"
@@ -35,14 +51,11 @@ if [ -z "$MASTER_URL" ]; then
         echo -e "${YELLOW}Master (主系) サーバーのベースURLを入力してください:${RESET}" > /dev/tty
         read -rp "Master URL (例: https://ttsbot.example.com): " MASTER_URL < /dev/tty || true
     fi
+    MASTER_URL=$(echo "$MASTER_URL" | sed 's:/*$::')
 fi
 
-# 末尾スラッシュ除去
-MASTER_URL=$(echo "$MASTER_URL" | sed 's:/*$::')
-
 if [ -z "$MASTER_URL" ]; then
-    echo -e "${RED}エラー: Master (主系) サーバーのURLが指定されていません。${RESET}"
-    echo "使用例: curl -sSL https://<Master-URL>/setup-standby.sh | sudo bash -s -- https://<Master-URL> <HA_SECRET>"
+    echo -e "${RED}エラー: Master (主系) サーバーのURLが特定できませんでした。${RESET}"
     exit 1
 fi
 
@@ -58,9 +71,11 @@ fi
 
 if [ -z "$HA_SECRET" ]; then
     echo -e "${RED}エラー: HA 共有認証シークレットキー (TTSBOT_HA_SECRET) が指定されていません。${RESET}"
-    echo "使用例: curl -sSL https://<Master-URL>/setup-standby.sh | sudo bash -s -- https://<Master-URL> <HA_SECRET>"
     exit 1
 fi
+
+echo -e "  ✓ 接続先 Master URL: ${GREEN}${MASTER_URL}${RESET}"
+echo -e "  ✓ HA 認証シークレット: ${GREEN}設定完了 (自動認証・暗号化同期)${RESET}"
 
 # 3. Docker 稼働チェック
 echo -e "\n${BOLD}[1/4] Docker 環境の確認中...${RESET}"

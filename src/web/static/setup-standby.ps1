@@ -19,19 +19,30 @@ Write-Host "======================================================" -ForegroundC
 Write-Host "  🎙️ TTSBot Manager Slave (Standby) 自動セットアップ (Windows)" -ForegroundColor Cyan
 Write-Host "======================================================" -ForegroundColor Cyan
 
-# 1. 未指定時の対話入力
-if (-not $MasterUrl) {
+# 1. 配信元 Master サーバーから自動埋め込みされた規定値
+$EmbeddedMasterUrl = "__DEFAULT_MASTER_URL__"
+$EmbeddedHaSecret = "__DEFAULT_HA_SECRET__"
+
+if ($EmbeddedMasterUrl -like "*__DEFAULT*") { $EmbeddedMasterUrl = "" }
+if ($EmbeddedHaSecret -like "*__DEFAULT*") { $EmbeddedHaSecret = "" }
+
+# 引数 -> 環境変数 -> 配信元埋め込み値 の順に優先度判定
+if (-not $MasterUrl -or $MasterUrl -eq "__DEFAULT_MASTER_URL__") {
     if ($env:TTSBOT_MASTER_URL) {
         $MasterUrl = $env:TTSBOT_MASTER_URL
+    } elseif ($EmbeddedMasterUrl) {
+        $MasterUrl = $EmbeddedMasterUrl
     } else {
         $MasterUrl = Read-Host "Master (主系) サーバーのベースURL (例: https://ttsbot.example.com)"
     }
 }
 $MasterUrl = $MasterUrl.TrimEnd("/")
 
-if (-not $HaSecret) {
+if (-not $HaSecret -or $HaSecret -eq "__DEFAULT_HA_SECRET__") {
     if ($env:TTSBOT_HA_SECRET) {
         $HaSecret = $env:TTSBOT_HA_SECRET
+    } elseif ($EmbeddedHaSecret) {
+        $HaSecret = $EmbeddedHaSecret
     } else {
         $HaSecret = Read-Host "HA 共有認証シークレットキー (TTSBOT_HA_SECRET)"
     }
@@ -40,6 +51,9 @@ if (-not $HaSecret) {
 if (-not $TunnelToken -and $env:CLOUDFLARE_TUNNEL_TOKEN) {
     $TunnelToken = $env:CLOUDFLARE_TUNNEL_TOKEN
 }
+
+Write-Host "  ✓ 接続先 Master URL: $MasterUrl" -ForegroundColor Green
+Write-Host "  ✓ HA 認証シークレット: 設定完了 (自動認証・暗号化同期)" -ForegroundColor Green
 
 # 2. Docker 稼働チェック
 Write-Host "`n[1/4] Docker Desktop 環境の確認中..." -ForegroundColor Yellow

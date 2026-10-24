@@ -7211,17 +7211,16 @@ function updateWorkerOneliner(webBaseUrl, secret) {
   pre.textContent = cmd;
 }
 
-function updateStandbyOneliner(haSecret) {
+function updateStandbyOneliner() {
   const shPre = document.getElementById("standby-oneliner-sh");
   const ps1Pre = document.getElementById("standby-oneliner-ps1");
   const setupBox = document.getElementById("standby-setup-command-box");
   if (!shPre && !ps1Pre && !setupBox) return;
 
   const origin = window.location.origin.replace(/\/$/, "");
-  const sec = haSecret || window.currentHaSecret || "your_ha_secret_here";
 
-  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo bash -s -- "${origin}" "${sec}"`;
-  const ps1Cmd = `$env:TTSBOT_MASTER_URL="${origin}"; $env:TTSBOT_HA_SECRET="${sec}"; irm "${origin}/setup-standby.ps1" | iex`;
+  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo bash`;
+  const ps1Cmd = `irm "${origin}/setup-standby.ps1" | iex`;
 
   if (shPre) shPre.textContent = shCmd;
   if (ps1Pre) ps1Pre.textContent = ps1Cmd;

@@ -741,19 +741,67 @@ class WebServer:
             return web.Response(text="Write-Host 'Error: setup-worker.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
         return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
 
+    def _get_master_base_url(self, request: web.Request) -> str:
+        """アクセス元リクエストおよび設定から Master サーバーのベースURLを自動特定"""
+        if self.config.web_dashboard_url and self.config.web_dashboard_url.startswith("http"):
+            return self.config.web_dashboard_url.rstrip("/")
+
+        proto = request.headers.get("X-Forwarded-Proto") or request.headers.get("CF-Visitor", "")
+        if "https" in proto:
+            scheme = "https"
+        else:
+            scheme = request.scheme or "http"
+
+        host = (
+            request.headers.get("X-Forwarded-Host") or
+            request.headers.get("Host") or
+            request.host or
+            "localhost:8080"
+        )
+        return f"{scheme}://{host}".rstrip("/")
+
+    async def _ensure_ha_secret(self) -> str:
+        """HA共有認証シークレットの取得（未設定時は自動生成＆永続化）"""
+        ha_secret = self.config.ha_secret
+        if not ha_secret:
+            ha_secret = await self.db.get_credential("ha_secret")
+        if not ha_secret:
+            import secrets
+            ha_secret = secrets.token_urlsafe(24)
+            await self.db.set_credential("ha_secret", ha_secret, is_secret=True)
+            self.config.ha_secret = ha_secret
+            logger.info("🔐 Generated and saved default TTSBOT_HA_SECRET for cluster HA.")
+        else:
+            self.config.ha_secret = ha_secret
+        return ha_secret
+
     async def handle_setup_standby_sh(self, request: web.Request) -> web.Response:
-        """Linux/macOS 用 Standby (Slave) ワンライナー自動セットアップスクリプトを配信"""
+        """Linux/macOS 用 Standby (Slave) ワンライナー自動セットアップスクリプトを配信 (Master URL/Secret動的埋め込み)"""
         script_path = Path(__file__).resolve().parent / "static" / "setup-standby.sh"
         if not script_path.exists():
             return web.Response(text="#!/bin/bash\necho 'Error: setup-standby.sh not found'\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
-        return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+
+        master_url = self._get_master_base_url(request)
+        ha_secret = await self._ensure_ha_secret()
+
+        content = script_path.read_text(encoding="utf-8")
+        content = content.replace("__DEFAULT_MASTER_URL__", master_url)
+        content = content.replace("__DEFAULT_HA_SECRET__", ha_secret)
+        return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
     async def handle_setup_standby_ps1(self, request: web.Request) -> web.Response:
-        """Windows 用 Standby (Slave) ワンライナー自動セットアップスクリプトを配信"""
+        """Windows 用 Standby (Slave) ワンライナー自動セットアップスクリプトを配信 (Master URL/Secret動的埋め込み)"""
         script_path = Path(__file__).resolve().parent / "static" / "setup-standby.ps1"
         if not script_path.exists():
             return web.Response(text="Write-Host 'Error: setup-standby.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
-        return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+
+        master_url = self._get_master_base_url(request)
+        ha_secret = await self._ensure_ha_secret()
+
+        content = script_path.read_text(encoding="utf-8")
+        content = content.replace("__DEFAULT_MASTER_URL__", master_url)
+        content = content.replace("__DEFAULT_HA_SECRET__", ha_secret)
+        return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
     async def handle_docker_compose_yml(self, request: web.Request) -> web.Response:
         """Standby/Worker 用 docker-compose.yml を配信"""

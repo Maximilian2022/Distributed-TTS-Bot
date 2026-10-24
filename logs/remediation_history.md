@@ -1,5 +1,22 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] Standby (Slave) セットアップスクリプトへの Master URL / HA Secret 動的自動埋め込み配信（ゼロ対話化）
+- **ユーザーフィードバック & 課題**:
+  - `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` でスクリプトを主系（Master）自身からダウンロードしているにもかかわらず、スクリプト実行時に対話プロンプト「Master (主系) サーバーのベースURLを入力してください:」が表示されるのは二度手間で不自然という指摘。
+- **抜本的改善内容**:
+  1. **Master 配信時の動的テンプレート置換 (`src/web/server.py`)**:
+     - `handle_setup_standby_sh` / `handle_setup_standby_ps1` において、アクセス元リクエストの Host / Protocol ヘッダーや `WEB_BASE_URL` 設定から Master 自身のベースURLを自動特定（`_get_master_base_url`）。
+     - さらに Master 側の HA 共有シークレット（`TTSBOT_HA_SECRET`）を取得（`_ensure_ha_secret`）。
+     - スクリプト内のプレースホルダー（`__DEFAULT_MASTER_URL__`, `__DEFAULT_HA_SECRET__`）を動的に置換して配信。
+  2. **スクリプトの対話ゼロ化 (`src/web/static/setup-standby.sh` & `.ps1`)**:
+     - Master からダウンロードされたスクリプトには、最初から接続先 Master URL と HA Secret が埋め込まれているため、対話プロンプトは一切表示されずに即座にスキップ。
+     - 「✓ 接続先 Master URL: https://ttsbot.kenko.land」「✓ HA 認証シークレット: 設定完了」と自動認識・表示され、即座に Docker チェックおよび Watchdog 起動へ進む完全全自動化を達成。
+  3. **WebUI のワンライナー表記最適化 (`src/web/static/app.js`)**:
+     - 余計な引数のない最も美しくシンプルなコマンド `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` で100%確実に全自動セットアップが完了するように改修。
+- **実機検証**:
+  - `curl -s http://localhost:8088/setup-standby.sh` の配信結果において、`AUTO_DETECTED_MASTER_URL="https://ttsbot.kenko.land"` および `AUTO_DETECTED_HA_SECRET="..."` が最初から埋め込まれていることを確認。
+  - パイプ実行テストで、Master URL / Secret の対話入力が一切要求されず、自動認識されて即座に進行することを確認。
+
 ## [2026-10-24] エラー通知先DM設定の動的化 & Standby待機ノードセットアップエラーの解消
 - **概要**:
   1. **エラー通知先DM設定の動的化**:
