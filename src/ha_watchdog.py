@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# TTSBot HA Watchdog & DB Synchronizer (Slave/Standby Daemon)
+# ==============================================================================
+# Master-Slave Active-Standby 高可用性オーケストレータ
+# - 平常時: Master の死活監視 & /api/ha/db_snapshot からの暗号化DB自動プル同期
+# - 障害時: Master 無応答検知で Slave を自律 Active 昇格 (Failover)
+# - 復帰時: Master 復旧検知で Slave を自律 Standby 降格 (Preempt Demote)
+# ==============================================================================
+
+import os
+import sys
+import time
+import gzip
+import json
+import logging
+import asyncio
+import hashlib
+import tempfile
+import urllib.request
+import urllib.error
+import http.client
+import socket
+from pathlib import Path
+from typing import Optional, Tuple
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [%(levelname)s] [HA-Watchdog] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout
+)
+logger = logging.getLogger("HAWatchdog")
+
+
+class DockerSocketClient:
+    """Unix Socket (/var/run/docker.sock) 経由で Docker Engine API を直接制御する軽量クライアント"""
+
+    def __init__(self, socket_path: str = "/var/run/docker.sock"):
+        self.socket_path = socket_path
+
+    def is_available(self) -> bool:
+        return os.path.exists(self.socket_path)
+
+    def _send_request(self, method: str, path: str, body: Optional[bytes] = None) -> Tuple[int, bytes]:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(10.0)
+            sock.connect(self.socket_path)
+            req = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+            if body:
+                req += f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+                sock.sendall(req.encode("utf-8") + body)
+            else:
+                req += "\r\n"
+                sock.sendall(req.encode("utf-8"))
+
+            res_data = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                res_data += chunk
+
+            header_part, _, body_part = res_data.partition(b"\r\n\r\n")
+            lines = header_part.split(b"\r\n")
+            status_code = 500
+            if lines:
+                parts = lines[0].split(b" ")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    status_code = int(parts[1])
+            return status_code, body_part
+        finally:
+            sock.close()
+
+    def find_containers_by_prefix(self, prefix: str) -> list:
+        status, body = self._send_request("GET", "/containers/json?all=1")
+        if status != 200:
+            return []
+        try:
+            containers = json.loads(body.decode("utf-8"))
+            results = []
+            for c in containers:
+                names = [n.lstrip("/") for n in c.get("Names", [])]
+                if any(n.startswith(prefix) for n in names):
+                    results.append(c)
+            return results
+        except Exception:
+            return []
+
+    def start_container(self, container_id: str) -> bool:
+        status, _ = self._send_request("POST", f"/containers/{container_id}/start")
+        return status in (204, 304)
+
+    def stop_container(self, container_id: str, timeout_sec: int = 5) -> bool:
+        status, _ = self._send_request("POST", f"/containers/{container_id}/stop?t={timeout_sec}")
+        return status in (204, 304)
+
+
+class HAWatchdog:
+    """Master-Slave HA 監視・同期・調停マネージャー"""
+
+    def __init__(self):
+        self.master_url = os.getenv("TTSBOT_MASTER_URL", "").strip().rstrip("/")
+        if not self.master_url:
+            self.master_url = os.getenv("TTSBOT_PRIMARY_HEALTH_URL", "").strip().rstrip("/")
+            if self.master_url.endswith("/health"):
+                self.master_url = self.master_url[:-7]
+
+        self.ha_secret = os.getenv("TTSBOT_HA_SECRET", os.getenv("HA_SECRET", "")).strip()
+        self.check_interval = float(os.getenv("TTSBOT_CHECK_INTERVAL", "5.0"))
+        self.fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "6"))  # 約30秒連続無応答で昇格
+        self.sync_interval = float(os.getenv("TTSBOT_SYNC_INTERVAL", "60.0"))  # 1分周期でDB同期
+        self.db_path = Path(os.getenv("TTSBOT_LOCAL_DB_PATH", "/app/data/bot.db"))
+        self.docker = DockerSocketClient(os.getenv("TTSBOT_DOCKER_SOCKET", "/var/run/docker.sock"))
+
+        self.current_state = "standby"  # "standby" or "active"
+        self.fail_count = 0
+        self.last_sync_time = 0.0
+        self.last_db_hash: Optional[str] = None
+        self.running = True
+
+    def check_internet_connectivity(self) -> bool:
+        """外向きインターネット接続 (Cloudflare/Discord) 疎通検証"""
+        for host, port in [("discord.com", 443), ("1.1.1.1", 443), ("8.8.8.8", 53)]:
+            try:
+                s = socket.create_connection((host, port), timeout=3.0)
+                s.close()
+                return True
+            except Exception:
+                pass
+        return False
+
+    def is_master_healthy(self) -> bool:
+        """Master の /health エンドポイント死活確認"""
+        if not self.master_url:
+            return False
+
+        health_url = f"{self.master_url}/health"
+        req = urllib.request.Request(
+            health_url,
+            headers={"User-Agent": "TTSBot-HA-Watchdog"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    # status == "ok" かつ bot.is_ready が True
+                    is_ok = data.get("status") == "ok"
+                    bot_ready = data.get("bot", {}).get("is_ready", False)
+                    return is_ok and bot_ready
+        except Exception as e:
+            logger.debug(f"Master health check failed: {e}")
+            return False
+        return False
+
+    def sync_db_snapshot(self) -> bool:
+        """Master の /api/ha/db_snapshot から SQLite バックアップをプル同期"""
+        if not self.master_url or not self.ha_secret:
+            return False
+
+        sync_url = f"{self.master_url}/api/ha/db_snapshot"
+        headers = {
+            "Authorization": f"Bearer {self.ha_secret}",
+            "User-Agent": "TTSBot-HA-Watchdog"
+        }
+        if self.last_db_hash:
+            headers["If-None-Match"] = f'"{self.last_db_hash}"'
+
+        req = urllib.request.Request(sync_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
+                if resp.status == 304:
+                    logger.debug("DB snapshot unchanged (304 Not Modified).")
+                    self.last_sync_time = time.time()
+                    return True
+
+                if resp.status != 200:
+                    logger.warning(f"DB snapshot sync failed with HTTP {resp.status}")
+                    return False
+
+                compressed = resp.read()
+                raw_bytes = gzip.decompress(compressed)
+                sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+                # ハッシュが同じなら書き込みスキップ
+                if sha256 == self.last_db_hash and self.db_path.exists():
+                    self.last_sync_time = time.time()
+                    return True
+
+                # 一時ファイルへ保存しアトミック配置
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_target = self.db_path.with_suffix(".db.sync_tmp")
+                tmp_target.write_bytes(raw_bytes)
+                tmp_target.replace(self.db_path)
+
+                # 単一整合性DBとして読み込ませるため古い WAL/SHM を掃除
+                wal_file = self.db_path.with_name(f"{self.db_path.name}-wal")
+                shm_file = self.db_path.with_name(f"{self.db_path.name}-shm")
+                if wal_file.exists():
+                    wal_file.unlink(missing_ok=True)
+                if shm_file.exists():
+                    shm_file.unlink(missing_ok=True)
+
+                self.last_db_hash = sha256
+                self.last_sync_time = time.time()
+                logger.info(f"✨ DB snapshot synchronized successfully! (Size: {len(raw_bytes)} bytes, Hash: {sha256[:10]}...)")
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                self.last_sync_time = time.time()
+                return True
+            logger.warning(f"DB sync HTTP error: {e.code} {e.reason}")
+        except Exception as e:
+            logger.error(f"DB sync error: {e}")
+        return False
+
+    async def promote_to_active(self):
+        """Slave を ACTIVE に昇格 (Docker で app コンテナを起動)"""
+        logger.warning("🚨 [FAILOVER] Master outage detected! Promoting Slave to ACTIVE...")
+
+        promoted = False
+        # 1. Docker CLI による起動
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "compose", "up", "-d", "app",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                logger.info("✓ [Docker Compose] 'app' container started successfully.")
+                promoted = True
+        except Exception as e:
+            logger.debug(f"Docker compose CLI exec failed: {e}")
+
+        # 2. Unix Socket による直接起動 (CLI が無い環境のフォールバック)
+        if not promoted and self.docker.is_available():
+            containers = self.docker.find_containers_by_prefix("ttsbot-app")
+            for c in containers:
+                c_id = c.get("Id", "")
+                if self.docker.start_container(c_id):
+                    logger.info(f"✓ [Docker Socket] Started container: {c_id[:12]}")
+                    promoted = True
+
+        if promoted:
+            self.current_state = "active"
+            logger.info("🎉 Slave is now ACTIVE! Discord Gateway and VC connections taken over.")
+        else:
+            logger.error("❌ Failed to start app container during promotion!")
+
+    async def demote_to_standby(self):
+        """Slave を STANDBY に降格 (Master 復旧時の自動プリエンプト)"""
+        logger.info("✨ [PREEMPT] Master is healthy again (/health 200 OK)! Demoting Slave to STANDBY...")
+
+        demoted = False
+        # 1. Docker CLI による停止
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "compose", "stop", "app",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                logger.info("✓ [Docker Compose] 'app' container stopped successfully.")
+                demoted = True
+        except Exception as e:
+            logger.debug(f"Docker compose CLI stop failed: {e}")
+
+        # 2. Unix Socket による直接停止
+        if not demoted and self.docker.is_available():
+            containers = self.docker.find_containers_by_prefix("ttsbot-app")
+            for c in containers:
+                c_id = c.get("Id", "")
+                if self.docker.stop_container(c_id, timeout_sec=5):
+                    logger.info(f"✓ [Docker Socket] Stopped container: {c_id[:12]}")
+                    demoted = True
+
+        self.current_state = "standby"
+        self.fail_count = 0
+        logger.info("💤 Slave is now in STANDBY mode. Monitoring Master...")
+
+    async def run_loop(self):
+        """メイン監視・同期ループ"""
+        logger.info("======================================================")
+        logger.info("  TTSBot Slave (Standby) Watchdog Started")
+        logger.info(f"  Master URL     : {self.master_url or '(Not set)'}")
+        logger.info(f"  Check Interval : {self.check_interval}s")
+        logger.info(f"  Fail Threshold : {self.fail_threshold} consecutive fails")
+        logger.info(f"  Sync Interval  : {self.sync_interval}s")
+        logger.info(f"  Local DB       : {self.db_path}")
+        logger.info("======================================================")
+
+        if not self.master_url:
+            logger.error("FATAL: TTSBOT_MASTER_URL is not set. Please specify Master URL.")
+            return
+
+        # 初回起動時に即座に初回DBプルを試行
+        logger.info("Initiating first DB snapshot synchronization from Master...")
+        self.sync_db_snapshot()
+
+        while self.running:
+            try:
+                loop = asyncio.get_running_loop()
+                is_healthy = await loop.run_in_executor(None, self.is_master_healthy)
+
+                if is_healthy:
+                    self.fail_count = 0
+
+                    # Master が健全なのに Slave が Active の場合は即座に降格 (Preempt Demote)
+                    if self.current_state == "active":
+                        await self.demote_to_standby()
+
+                    # 定期 DB 同期
+                    now = time.time()
+                    if now - self.last_sync_time >= self.sync_interval:
+                        await loop.run_in_executor(None, self.sync_db_snapshot)
+
+                else:
+                    self.fail_count += 1
+                    logger.warning(
+                        f"⚠️ Master health check failed ({self.fail_count}/{self.fail_threshold})"
+                    )
+
+                    # 閾値到達 & 現在 Standby ならば昇格判定
+                    if self.fail_count >= self.fail_threshold and self.current_state == "standby":
+                        # 外向きインターネット疎通の二重確認
+                        has_net = await loop.run_in_executor(None, self.check_internet_connectivity)
+                        if has_net:
+                            await self.promote_to_active()
+                        else:
+                            logger.error(
+                                "🚫 Outbound internet connectivity check failed on Slave. "
+                                "Suppressing promotion to avoid false failover during local network outage."
+                            )
+
+            except Exception as e:
+                logger.error(f"Unexpected error in Watchdog loop: {e}", exc_info=True)
+
+            await asyncio.sleep(self.check_interval)
+
+
+def main():
+    watchdog = HAWatchdog()
+    try:
+        asyncio.run(watchdog.run_loop())
+    except KeyboardInterrupt:
+        logger.info("HA Watchdog received shutdown signal. Exiting.")
+
+
+if __name__ == "__main__":
+    main()

@@ -102,6 +102,31 @@ services:
           cpus: '0.5'
           memory: 256M
 
+  # ----------------------------------------------------------------------------
+  # 4. HA Standby Watchdog (Slave待機・自動同期: --profile standby)
+  # ----------------------------------------------------------------------------
+  standby-watchdog:
+    <<: *bot-base
+    restart: unless-stopped
+    profiles:
+      - standby
+    command: python -m src.ha_watchdog
+    healthcheck:
+      disable: true
+    environment:
+      - TTSBOT_HA_ROLE=slave
+      - TTSBOT_MASTER_URL=${TTSBOT_MASTER_URL:-}
+      - TTSBOT_HA_SECRET=${TTSBOT_HA_SECRET:-}
+      - TTSBOT_CHECK_INTERVAL=${TTSBOT_CHECK_INTERVAL:-5}
+      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-6}
+      - TTSBOT_SYNC_INTERVAL=${TTSBOT_SYNC_INTERVAL:-60}
+      - TTSBOT_LOCAL_DB_PATH=/app/data/bot.db
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
 volumes:
   tts_cache:
   voicevox_cache:

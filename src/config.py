@@ -129,6 +129,7 @@ class AppConfig:
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     admin_password: str = ""
+    ha_secret: str = ""
 
     def get_discord_tokens(self) -> List[Tuple[int, str]]:
         """有効な全Botトークンを (bot_index, token) の昇順リストで取得 (最大10台対応)"""
@@ -154,6 +155,8 @@ class AppConfig:
             self.google_credentials_json = credentials["google_credentials_json"]
         if credentials.get("worker_shared_secret"):
             self.worker_shared_secret = credentials["worker_shared_secret"]
+        if credentials.get("ha_secret"):
+            self.ha_secret = credentials["ha_secret"]
         if credentials.get("web_base_url"):
             base = credentials["web_base_url"].strip().rstrip("/")
             self.web_dashboard_url = base
@@ -355,6 +358,8 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.worker_shared_secret = os.getenv("WORKER_SHARED_SECRET", "").strip()
     if not cfg.worker_shared_secret:
         cfg.worker_shared_secret = secrets.token_hex(16)
+
+    cfg.ha_secret = os.getenv("TTSBOT_HA_SECRET", os.getenv("HA_SECRET", "")).strip()
 
     # ホスト直接実行時にもローカルディレクトリが存在するように作成
     for directory in [Path(cfg.cache_dir), Path(cfg.db_path).parent, Path(cfg.log_file).parent]:

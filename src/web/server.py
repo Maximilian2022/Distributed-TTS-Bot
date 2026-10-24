@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import asdict
 import aiosqlite
 import base64
+import secrets
 from datetime import datetime
 from aiohttp import web
 import discord
@@ -164,6 +165,8 @@ class WebServer:
         self.app.router.add_get("/logout", self.handle_logout)
         self.app.router.add_get("/setup-worker.sh", self.handle_setup_worker_sh)
         self.app.router.add_get("/setup-worker.ps1", self.handle_setup_worker_ps1)
+        self.app.router.add_get("/setup-standby.sh", self.handle_setup_standby_sh)
+        self.app.router.add_get("/setup-standby.ps1", self.handle_setup_standby_ps1)
         self.app.router.add_get("/static/agent.py", self.handle_worker_agent_script)
 
         # API (認証必要)
@@ -248,6 +251,10 @@ class WebServer:
         self.app.router.add_post("/api/system/credentials", self.api_system_save_credentials)
         self.app.router.add_post("/api/system/credentials/test", self.api_system_test_credentials)
         self.app.router.add_get("/api/worker/ws", self.api_worker_ws)
+
+        # HA (High Availability) & Standby 同期 API
+        self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
+        self.app.router.add_get("/api/ha/status", self.api_ha_status)
 
         # テスト・シミュレーション API (ローカルまたは管理者用)
         self.app.router.add_post("/api/test/simulate", self.api_test_simulate)
@@ -661,6 +668,120 @@ class WebServer:
         if not script_path.exists():
             return web.Response(text="Write-Host 'Error: setup-worker.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
         return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+
+    async def handle_setup_standby_sh(self, request: web.Request) -> web.Response:
+        """Linux/macOS 用 Standby (Slave) ワンライナー自動セットアップスクリプトを配信"""
+        script_path = Path(__file__).resolve().parent / "static" / "setup-standby.sh"
+        if not script_path.exists():
+            return web.Response(text="#!/bin/bash\necho 'Error: setup-standby.sh not found'\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
+        return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+
+    async def handle_setup_standby_ps1(self, request: web.Request) -> web.Response:
+        """Windows 用 Standby (Slave) ワンライナー自動セットアップスクリプトを配信"""
+        script_path = Path(__file__).resolve().parent / "static" / "setup-standby.ps1"
+        if not script_path.exists():
+            return web.Response(text="Write-Host 'Error: setup-standby.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
+        return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+
+    def _verify_ha_auth(self, request: web.Request) -> bool:
+        """HA API 共有シークレット認証 (Master-Slave間)"""
+        expected = (self.config.ha_secret or "").strip()
+        if not expected:
+            logger.warning("[HA] Auth rejected: TTSBOT_HA_SECRET is not configured on Master node.")
+            return False
+
+        auth_header = request.headers.get("Authorization", "")
+        token = ""
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+        if not token:
+            token = request.headers.get("X-HA-Secret", "").strip()
+
+        if not token:
+            return False
+        return secrets.compare_digest(token, expected)
+
+    async def api_ha_status(self, request: web.Request) -> web.Response:
+        """HA 状態確認 API (Slave からの死活 & メタデータ照会)"""
+        if not self._verify_ha_auth(request):
+            return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
+
+        db_path = self.config.db_path
+        db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+        db_mtime = os.path.getmtime(db_path) if os.path.exists(db_path) else 0
+
+        active_bots = 1
+        if self.bot_pool and hasattr(self.bot_pool, "get_active_bot_count"):
+            active_bots = self.bot_pool.get_active_bot_count()
+
+        return web.json_response({
+            "status": "ok",
+            "role": "master",
+            "is_active": True,
+            "active_bots": active_bots,
+            "db_size_bytes": db_size,
+            "db_mtime": db_mtime,
+            "timestamp": time.time(),
+            "version": AGENT_VERSION
+        })
+
+    async def api_ha_db_snapshot(self, request: web.Request) -> web.Response:
+        """Slave 同期用 SQLite 完全整合性バックアップ (gzip 圧縮) 配信"""
+        if not self._verify_ha_auth(request):
+            return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
+
+        db_path = self.config.db_path
+        if not os.path.exists(db_path):
+            return web.json_response({"error": "Database file not found on Master node"}, status=404)
+
+        loop = asyncio.get_running_loop()
+
+        def _generate_compressed_snapshot():
+            import sqlite3, gzip, hashlib, tempfile
+            with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_f:
+                tmp_path = tmp_f.name
+            try:
+                # Read-only URI で WAL モード下でもアトミックバックアップ
+                src_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                dst_conn = sqlite3.connect(tmp_path)
+                src_conn.backup(dst_conn)
+                dst_conn.close()
+                src_conn.close()
+
+                with open(tmp_path, "rb") as f:
+                    raw_data = f.read()
+
+                sha256 = hashlib.sha256(raw_data).hexdigest()
+                compressed = gzip.compress(raw_data, compresslevel=6)
+                return compressed, sha256, len(raw_data)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
+
+        try:
+            compressed_data, sha256_hash, raw_size = await loop.run_in_executor(None, _generate_compressed_snapshot)
+
+            # If-None-Match による帯域節約 (変更なしなら 304)
+            if_none_match = request.headers.get("If-None-Match", "").strip('"')
+            if if_none_match == sha256_hash:
+                return web.Response(status=304, headers={"ETag": f'"{sha256_hash}"'})
+
+            headers = {
+                "Content-Type": "application/x-sqlite3-gzip",
+                "Content-Disposition": 'attachment; filename="bot.db.gz"',
+                "ETag": f'"{sha256_hash}"',
+                "X-DB-Hash": sha256_hash,
+                "X-DB-Raw-Size": str(raw_size),
+                "X-DB-Timestamp": str(int(time.time())),
+                "Cache-Control": "no-cache"
+            }
+            return web.Response(body=compressed_data, headers=headers)
+        except Exception as e:
+            logger.error(f"[HA] Failed to generate DB snapshot: {e}", exc_info=True)
+            return web.json_response({"error": f"Failed to generate DB snapshot: {str(e)}"}, status=500)
     async def handle_worker_agent_script(self, request: web.Request) -> web.Response:
         """Worker Agent スクリプト (agent.py) を配信 - Worker 側がインストール時に取得 (src.version.AGENT_VERSION と完全同期)"""
         agent_paths = [

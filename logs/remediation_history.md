@@ -5997,5 +5997,38 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - `saveBotConfig`: DOMに存在する行数（稼働Bot数分）を動的に走査して保存。
      - `renderBotPool`: ボットプール一覧の定期ポーリング時にも、稼働Bot数（`readyCount`）の変化を即座にペアリング設定へ連動・再描画。
 
+---
+
+## 2026-10-24 11:25: Master-Slave HA (Cloudflare Tunnel経由の暗号化DB同期 ＆ Standbyワンライナー) 実装
+
+### 1. 課題と背景
+- 従来の HA は同一LAN内（`192.168.11.x`）の直接SSH・直接ポート通信を前提としていた。
+- クラウドのデフォルトファイアウォール（全インバウンド閉鎖）や自宅ルーターのNAT/CGNAT配下の環境において、ポート開放やSSH鍵設定を不要にし、Cloudflare Tunnel（外向きHTTPS）のみで安全に疎通・DB同期・フェイルオーバーが完結するアーキテクチャが求められた。
+- 用語とモデルを「Manager（HA構成: Master=固定優先Active, Slave=Standby待機）」および「Worker（ボランティアPC）」に統一。
+
+### 2. 実施した修正
+1. **設定層 (`src/config.py`, `.env.example`)**:
+   - `ha_secret` フィールド、環境変数 `TTSBOT_HA_SECRET`、DBクレデンシャル連携を追加。
+   - `.env.example` に HA 設定セクションを整備。
+2. **Master側 (Active) HA API (`src/web/server.py`)**:
+   - `GET /api/ha/db_snapshot`:
+     - `TTSBOT_HA_SECRET` による Bearer / X-HA-Secret 認証。
+     - SQLite Online Backup API（`sqlite3.backup`）により、WALモード下でも無停止・完全整合性のスナップショットを取得。
+     - gzip 圧縮ストリーム返却、ETag / SHA256 ヘッダー付与、If-None-Match による `304 Not Modified` 帯域節約を実装。
+   - `GET /api/ha/status`: HA ステータス（Role: master, active_bots, db_size, timestamp等）を安全に返却。
+   - `GET /setup-standby.sh` & `/setup-standby.ps1`: ワンライナー配布エンドポイントを追加。
+3. **Slave側 (Standby) Watchdog デーモン (`src/ha_watchdog.py`)**:
+   - Python 製クロスプラットフォーム HA Watchdog を新設。
+   - 5秒ごとの Master `/health` 死活監視。
+   - 60秒ごとの `/api/ha/db_snapshot` プル同期（SHA256変化時のみアトミック置換）。
+   - Master 障害検知時（6回連続失敗＋外部インターネット疎通の二重確認）に、Docker 経由で Slave 側 `app` を自律 Active 昇格（Failover）。
+   - Master 復帰検知（200 OK）時に、Slave 側 `app` を自動停止して Standby へ自律降格（Preempt Demote）。
+4. **Docker Compose 統合 (`docker-compose.yml`)**:
+   - `standby-watchdog` サービス（`profiles: [standby]`）を追加。
+5. **ワンライナー自動セットアップスクリプト**:
+   - `src/web/static/setup-standby.sh`: Linux / macOS 用（対話入力、Dockerチェック、`.env` 自動生成、Watchdog起動）。
+   - `src/web/static/setup-standby.ps1`: Windows 用 PowerShell スクリプト（Docker Desktop 連携、`.env` 自動生成、Watchdog起動）。
+
+
 
 
