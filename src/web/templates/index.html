@@ -693,6 +693,61 @@
                 </div>
               </form>
             </div>
+
+            <!-- HA Standby (Slave) 自動セットアップ案内カード (管理者・Ownerのみ表示) -->
+            <div id="config-standby-card" class="card" style="margin-top:24px;border-left:4px solid #5865f2;background:rgba(88,101,242,0.03);">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:22px;">🛡️</span>
+                  <div>
+                    <h3 style="margin:0;font-size:16px;font-weight:700;">高可用性 Standby (Slave) 待機ノード自動セットアップ</h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
+                      Master (主系) 障害時に自動で読み上げを引き継ぐ予備ノード（Slave）を 1 コマンドで起動
+                    </div>
+                  </div>
+                </div>
+                <span class="badge" style="background:#5865f2;color:white;font-size:11px;padding:4px 8px;">Active-Standby HA</span>
+              </div>
+
+              <div style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:14px;margin-bottom:16px;">
+                <div style="font-size:12px;color:var(--text-dim);line-height:1.6;">
+                  平常時は待機（Standby）として Master の稼働状態を常駐監視し、SQLite DB（サーバー設定・辞書データ）をリアルタイムに暗号化同期します。<br>
+                  万が一 Master がダウンした場合は自律的に Active 昇格して読み上げを継続。Master が復旧すると即座に待機へ自動復帰（Preempt Demote）します。<br>
+                  <strong style="color:var(--text-normal);">※ セットアップ先のマシンに Docker および Docker Compose が必要です。</strong>
+                </div>
+              </div>
+
+              <!-- Linux / macOS ワンライナー -->
+              <div style="margin-bottom:14px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                  <label style="font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px;">
+                    <span>🐧</span> Linux / macOS (Bash) ワンライナー
+                  </label>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="copyToClipboard('standby-oneliner-sh', this)" style="padding:4px 10px;font-size:11px;">
+                    📋 コピー
+                  </button>
+                </div>
+                <pre id="standby-oneliner-sh" style="background:#111;padding:12px;border-radius:6px;font-size:12px;overflow-x:auto;color:#10b981;margin:0;border:1px solid rgba(255,255,255,0.06);font-family:monospace;"></pre>
+              </div>
+
+              <!-- Windows ワンライナー -->
+              <div style="margin-bottom:12px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                  <label style="font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px;">
+                    <span>🪟</span> Windows (PowerShell) ワンライナー
+                  </label>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="copyToClipboard('standby-oneliner-ps1', this)" style="padding:4px 10px;font-size:11px;">
+                    📋 コピー
+                  </button>
+                </div>
+                <pre id="standby-oneliner-ps1" style="background:#111;padding:12px;border-radius:6px;font-size:12px;overflow-x:auto;color:#38bdf8;margin:0;border:1px solid rgba(255,255,255,0.06);font-family:monospace;"></pre>
+              </div>
+
+              <div style="font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:6px;margin-top:10px;">
+                <span>ℹ️</span>
+                <span>スクリプトを実行すると対話形式で Master URL と HA シークレットの確認・設定、コンテナ起動が自動で行われます。</span>
+              </div>
+            </div>
           </section>
 
           <!-- 5. Discord Bot 管理タブ (最大10台プール) -->

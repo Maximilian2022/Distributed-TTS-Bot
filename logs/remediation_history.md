@@ -1,5 +1,42 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] WebUI「ボット設定 (サーバー固有)」タブへの高可用性 Standby (Slave) ワンライナー案内追加
+- **概要**:
+  - 管理者・Owner限定の「ボット設定 (サーバー固有)」タブ内に、Master障害時に自律フェイルオーバーするSlave (Standby) 待機ノードを 1 コマンドで起動できるワンライナー案内カードを追加。
+- **実施内容**:
+  1. **権限仕様の確認**:
+     - 「ボット設定 (サーバー固有)」タブは、Discordサーバーの管理者（Owner または Administrator権限）、環境変数のBot管理者（`ADMIN_USER_IDS`）、またはギルド設定で指定された管理者ロール（`admin_role_id`）を持つユーザーのみが閲覧・操作可能。
+     - バックエンド（`GET/POST /api/config`）でも厳格に 403 Forbidden 制御されており、一般ユーザーにはタブが 🔒 表示され中身は完全に秘匿されることを確認。
+  2. **フロントエンド UI 追加 (`src/web/templates/index.html`)**:
+     - `tab-config` 内の `config-form-card` 直後に `#config-standby-card` を新設。
+     - Linux / macOS用（Bash）および Windows用（PowerShell）のワンライナー表示枠とワンクリックコピーボタン（`copyToClipboard`）を配置。
+  3. **クライアント制御 (`src/web/static/app.js`)**:
+     - `updatePermissionsUI()` において、サーバー管理者権限を保持している場合のみ `#config-standby-card` を表示するよう連動。
+     - `updateStandbyOneliner()` を実装し、アクセス元のオリジンURL（`window.location.origin`）を用いて動的にスクリプトURLを自動補完。
+     - `loadBotConfig` 完了時にも自動呼び出しを行うよう追記。
+  4. **本番稼働検証**:
+     - 静的ファイル・テンプレートはコンテナにボリュームバインドされているため、稼働中コンテナの停止・再起動を伴わずに即時反映（ゼロダウンタイム）を確認。
+
+## [2026-10-24] Cloudflare Tunnel 経由 Active-Standby HA (アプローチA) & ワンライナーセットアップ基盤の実装
+- **概要**:
+  - Master (主系) 固定・Slave (副系) 待機の自律フェイルオーバー＆自動復帰型 HA アーキテクチャを実装。
+  - Cloudflare Tunnel（外向きHTTPS 443）経由でポート開放や直接SSHを一切不要とし、暗号化DB同期とワンライナー起動を実現。
+- **実施内容**:
+  1. **Master側 HA API 実装 (`src/web/server.py`)**:
+     - `GET /api/ha/db_snapshot`: `TTSBOT_HA_SECRET` による認証、`sqlite3.backup` による一貫性スナップショットの gzip ストリーム配信、ETag/304 Not Modified 対応。
+     - `GET /api/ha/status`: HAロールおよび稼働状況の返却。
+     - `GET /setup-standby.sh`, `/setup-standby.ps1`: ワンライナー配布ハンドラ。
+  2. **Slave側 自律監視 Watchdog (`src/ha_watchdog.py`)**:
+     - Master 死活監視（5秒毎）、定期DB差分プル同期（60秒毎）。
+     - Master 障害検知（6回連続失敗＋外部インターネット疎通確認）による自律 Active 昇格。
+     - Master 復帰検知（200 OK）による自律 Standby 降格（Preempt Demote）。
+  3. **Docker Compose 統合 (`docker-compose.yml`)**:
+     - `profiles: [standby]` として `standby-watchdog` サービスを追加。
+  4. **ワンライナー自動セットアップスクリプト**:
+     - `src/web/static/setup-standby.sh` (Linux/macOS用)
+     - `src/web/static/setup-standby.ps1` (Windows用)
+     - `.env.example` に HA 設定セクション追加。
+
 ## [2026-10-24] WebUIナビゲーションバーの「ヘルプ」見切れ解消・タブレイアウト最適化
 - **原因**:
   - 全9個のタブボタンの合計横幅（約1222px）がコンテナ幅（1152px）を超過していた。

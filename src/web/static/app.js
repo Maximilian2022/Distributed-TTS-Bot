@@ -238,6 +238,7 @@ function updatePermissionsUI() {
   const btnMemberVoices = document.getElementById("tab-btn-member-voices");
   const cardConfigForbidden = document.getElementById("config-forbidden-card");
   const cardConfigForm = document.getElementById("config-form-card");
+  const cardConfigStandby = document.getElementById("config-standby-card");
   const cardSystemForbidden = document.getElementById("system-forbidden-card");
   const areaSystemContent = document.getElementById("system-content-area");
   const cardMemberVoicesForbidden = document.getElementById("member-voices-forbidden-card");
@@ -275,6 +276,13 @@ function updatePermissionsUI() {
   if (cardConfigForbidden && cardConfigForm) {
     cardConfigForbidden.style.display = hasAccess ? "none" : "block";
     cardConfigForm.style.display = hasAccess ? "block" : "none";
+  }
+
+  if (cardConfigStandby) {
+    cardConfigStandby.style.display = hasAccess ? "block" : "none";
+  }
+  if (hasAccess) {
+    updateStandbyOneliner();
   }
 
   if (cardSystemForbidden && areaSystemContent) {
@@ -2192,6 +2200,7 @@ async function loadBotConfig(guildId) {
     if (roleSelect && cfg.admin_role_id) {
       roleSelect.value = String(cfg.admin_role_id);
     }
+    updateStandbyOneliner();
   } catch (e) {
     console.error("Failed to load bot config:", e);
   }
@@ -6928,6 +6937,21 @@ function updateWorkerOneliner(webBaseUrl, secret) {
   const cmd = `curl -sSL "${baseUrl}/static/setup-worker.sh" | bash -s -- --master-ws "${wsUrl}" --secret "${sec}"`;
   pre.textContent = cmd;
 }
+
+function updateStandbyOneliner() {
+  const shPre = document.getElementById("standby-oneliner-sh");
+  const ps1Pre = document.getElementById("standby-oneliner-ps1");
+  if (!shPre && !ps1Pre) return;
+
+  const origin = window.location.origin.replace(/\/$/, "");
+  if (shPre) {
+    shPre.textContent = `curl -sSL "${origin}/setup-standby.sh" | bash`;
+  }
+  if (ps1Pre) {
+    ps1Pre.textContent = `irm "${origin}/setup-standby.ps1" | iex`;
+  }
+}
+window.updateStandbyOneliner = updateStandbyOneliner;
 
 async function loadCredentials() {
   const azureBadge = document.getElementById("azure-status-badge");
