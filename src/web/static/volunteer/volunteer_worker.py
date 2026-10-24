@@ -90,40 +90,69 @@ class VolunteerWorker:
             logger.debug(f"優先度設定スキップ: {e}")
 
     async def detect_local_engines(self) -> List[str]:
-        """ローカルで稼働している各音声合成エンジンの死活を判定"""
-        available = []
+        """ローカルで稼働している各音声合成エンジンをスマートAPI判定 (デフォルトポート差異・重複対応)"""
+        available = set()
         timeout = aiohttp.ClientTimeout(total=2.0)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            # VOICEVOX (50021)
-            try:
-                async with s.get(f"{self.engine_urls['voicevox']}/version") as r:
-                    if r.status == 200:
-                        ver = await r.text()
-                        logger.info(f"✨ VOICEVOX 検出: v{ver.strip()} ({self.engine_urls['voicevox']})")
-                        available.append("voicevox")
-            except Exception:
-                pass
+            # 探索対象候補ポート (公式デフォルト 50021, 旧環境SHAREVOX 50025, COEIROINK 50031, 50032)
+            candidate_ports = [50021, 50025, 50031, 50032]
+            for u in self.engine_urls.values():
+                try:
+                    p = int(u.split(":")[-1].split("/")[0])
+                    if p not in candidate_ports:
+                        candidate_ports.append(p)
+                except Exception:
+                    pass
 
-            # COEIROINK (50031)
-            try:
-                async with s.get(f"{self.engine_urls['coeiroink']}/v1/speakers") as r:
-                    if r.status == 200:
-                        logger.info(f"✨ COEIROINK 検出: ({self.engine_urls['coeiroink']})")
-                        available.append("coeiroink")
-            except Exception:
-                pass
+            for port in candidate_ports:
+                base = f"http://127.0.0.1:{port}"
+                # 1. engine_manifest による判定 (VOICEVOX / SHAREVOX 公式API)
+                try:
+                    async with s.get(f"{base}/engine_manifest") as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            brand = str(data.get("brand_name") or data.get("name") or "").upper()
+                            if "SHAREVOX" in brand:
+                                logger.info(f"✨ SHAREVOX 検出 (manifest判定): {base}")
+                                self.engine_urls["sharevox"] = base
+                                available.add("sharevox")
+                                continue
+                            elif "VOICEVOX" in brand:
+                                logger.info(f"✨ VOICEVOX 検出 (manifest判定): {base}")
+                                self.engine_urls["voicevox"] = base
+                                available.add("voicevox")
+                                continue
+                except Exception:
+                    pass
 
-            # SHAREVOX (50025)
-            try:
-                async with s.get(f"{self.engine_urls['sharevox']}/version") as r:
-                    if r.status == 200:
-                        ver = await r.text()
-                        logger.info(f"✨ SHAREVOX 検出: v{ver.strip()} ({self.engine_urls['sharevox']})")
-                        available.append("sharevox")
-            except Exception:
-                pass
+                # 2. COEIROINK v1/v2 判定 (/v1/speakers)
+                try:
+                    async with s.get(f"{base}/v1/speakers") as r:
+                        if r.status == 200:
+                            logger.info(f"✨ COEIROINK 検出 (API判定): {base}")
+                            self.engine_urls["coeiroink"] = base
+                            available.add("coeiroink")
+                            continue
+                except Exception:
+                    pass
 
-        return available
+                # 3. /speakers による話者名判定フォールバック (VOICEVOX vs SHAREVOX)
+                try:
+                    async with s.get(f"{base}/speakers") as r:
+                        if r.status == 200:
+                            text = await r.text()
+                            if "小春音アミ" in text or "SHAREVOX" in text:
+                                logger.info(f"✨ SHAREVOX 検出 (話者リスト判定): {base}")
+                                self.engine_urls["sharevox"] = base
+                                available.add("sharevox")
+                            else:
+                                logger.info(f"✨ VOICEVOX 検出 (話者リスト判定): {base}")
+                                self.engine_urls["voicevox"] = base
+                                available.add("voicevox")
+                except Exception:
+                    pass
+
+        return list(available)
 
     def collect_specs(self) -> Dict[str, Any]:
         """PC スペック情報を収集"""

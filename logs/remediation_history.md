@@ -6140,6 +6140,35 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - ブラウザ画面にて「🤝 ボランティア参加」タブの表示、ダウンロードボタン、ワンライナー表示欄、コピーボタン動作（「✅ コピー完了！」）を確認。
    - 非管理者の場合の管理者専用タブ（ボット設定、システム、Bot管理、API設定、メンバー音声）の完全非表示（`display: none`）を確認。
 
+## [2026-10-24] Windows 向けローカルエンジンの自動セットアップ（Docker/winget/既存アプリ起動）& 各エンジン公式デフォルトポートのスマートAPI判定実装
+
+### 1. 課題と背景
+- ユーザーより以下の2点について指摘を受領：
+  1. 「Windowsのほう、ローカルエンジンの自動セットアップは？」: 事前に音声合成エンジンを自分で導入・起動していないボランティアでも、セットアップの中で自動で用意・起動される仕組みが必要。
+  2. 「ローカルポート 50021, 50025, 50031 て、旧環境で変更したものでデフォルトじゃなくない？」:
+     - SHAREVOX 公式のデフォルトポートは VOICEVOX と同じ **`50021`** であり、旧環境では同居のために 50025 へ手動変更していた。
+     - COEIROINK の公式デフォルトは `50031`（または v2/特定環境で `50032`）。
+     - 単純にポート番号決め打ちでスキャンすると、一般ユーザーが公式 SHAREVOX（50021）を単体で動かしている場合に VOICEVOX と誤認する問題や、COEIROINK のポート差異（50032）に対応できない問題があった。
+
+### 2. 実施した修正
+1. **Windows 向け VOICEVOX 自動セットアップ & 自動起動 (`worker/run_volunteer_gui.ps1`, `worker/run_volunteer.bat`)**:
+   - `Start-VoicevoxEngine` 関数を実装：
+     1. インストール済み `VOICEVOX.exe`（`%LOCALAPPDATA%\Programs\VOICEVOX\` 等）を検索し、存在すれば最小化バックグラウンド自動起動。
+     2. Docker Desktop が利用可能な場合は `docker run -d --name ttsbot-worker-voicevox --restart unless-stopped -p 50021:50021 voicevox/voicevox_engine:cpu-latest` でコンテナを自動起動。
+     3. winget が利用可能な環境（Windows 10/11標準）では `winget install --id Hiroshiba.VOICEVOX --silent` で公式アプリを自動サイレントインストールして即時起動。
+   - GUI 上に `[x] 🚀 未起動時は VOICEVOX を自動インストール・起動する (推奨)` チェックボックス（未起動時デフォON）と `[⚡ 今すぐ自動起動]` ボタンを配置。
+   - `run_volunteer.bat`: PC 再起動後などの起動時にも、`config.json` の `auto_setup_engine` が有効かつエンジン未起動ならバックグラウンドで `run_volunteer_gui.ps1 -AutoStartEngineOnly` を実行してから Python ワーカーを起動する手放し運用を実現。
+2. **公式デフォルトポート差異・重複対応のスマートAPI判定 (`worker/run_volunteer_gui.ps1`, `worker/volunteer_worker.py`)**:
+   - 探索候補ポート `50021` (VOICEVOX/SHAREVOX標準), `50025` (旧環境SHAREVOX), `50031` (COEIROINK標準), `50032` (COEIROINK v2) を走査。
+   - 単なるポート死活だけでなく、HTTP API（`/engine_manifest` の `brand_name`, `/speakers` の話者名リスト, `/v1/speakers`）の内容を解析して正確にエンジン種別を判定。
+   - 一般ユーザーが公式 SHAREVOX を 50021 で動かしている場合も、VOICEVOX と誤認せず SHAREVOX として自動検出。
+   - 検出された実際のポート番号付き URL（例: `http://127.0.0.1:50021`）を `config.json` の `engine_urls` に保存し、ワーカーへ正確に伝達。
+3. **WebUI および ドキュメントの更新 (`src/web/templates/index.html`, `worker/README.md`)**:
+   - 参加手順を「事前にエンジンを手動起動しておく」記述から「VOICEVOX が入っていなくてもランチャーが自動検出・自動インストール・自動起動する」案内へ更新。
+4. **配信ファイル同期**:
+   - `src/web/static/volunteer/` 配下の全ファイルを最新の `worker/` と同期。
+
+
 
 
 
