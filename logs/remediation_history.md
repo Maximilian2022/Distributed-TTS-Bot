@@ -37,9 +37,12 @@
      - 起動前に `docker compose --profile standby pull standby-watchdog` を実行し、Docker Hub から最新イメージを高速取得してローカルビルドをスキップ。
   7. **WebUI のフェイルオーバー時間表記同期 (`src/web/static/app.js`)**:
      - 優先度設定セレクトボックスおよびバッジ表示を「Priority 1 (約30秒 最速昇格)」「Priority 2 (約3分 待機昇格)」「Priority 3 (約5分 待機昇格)」に完全同期。
-- **検証**:
+- **検証 & 本番動作確認**:
   - 全関連ファイルの構文・Lint エラー 0 件を確認。
-  - 本番コンテナのリロードおよびヘルスチェック（200 OK）を確認。
+  - 本番コンテナのリロードおよびヘルスチェック（200 OK）、配信エンドポイント（`/docker-compose.slave.yml`, `/portainer-stack.yml`）の正常応答（200 OK）を確認。
+  - GitHub Actions ワークフロー (`Build, Push Docker Image & Create Release`) の初回自動実行が正常完了 (2m44s):
+    - Docker Hub (`madpiero/ttsbot:latest`, `madpiero/ttsbot:v2026.10.24.1`, `madpiero/ttsbot:sha-c46d118`) への Push 完了。
+    - GitHub Release [v2026.10.24.1](https://github.com/Maximilian2022/ttsbot-oss/releases/tag/v2026.10.24.1) の自動発行と 5 つのアセットファイル (`docker-compose.yml`, `docker-compose.slave.yml`, `portainer-stack.yml`, `setup-standby.sh`, `setup-standby.ps1`) の自動添付完了を確認。
 
 ## [2026-10-24] Slave セットアップの Dockerfile 不在エラー解消 & 複数台待機 (推奨2台) カスケード Priority 制御の実装
 - **ユーザーフィードバック & 課題**:
