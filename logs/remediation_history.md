@@ -1,5 +1,17 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] docker-compose.yml の Manager 専任化（ローカルエンジンサービスの完全分離）
+- **概要**:
+  - ルートの `docker-compose.yml` は Manager（管理・Discord Bot接続・WebUI・クラスタオーケストレーション）専用である設計方針に基づき、分散Worker化以前の残骸であった `voicevox` サービス（`--profile voicevox`）を完全削除。
+  - 同一ホスト上でローカル音声合成エンジンを動かす場合も含め、音声合成推論はすべて独立した「Worker Node (`ttsworker-agent`)」として参加するアーキテクチャに統一。
+- **改修内容**:
+  1. `docker-compose.yml`:
+     - ヘッダーコメントを Manager オーケストレータ専用ファイルとして改訂。
+     - `voicevox` サービス定義を削除。サービス構成を `app`, `tunnel`, `standby-watchdog` の3つに整理。
+  2. 稼働検証:
+     - `docker compose config --quiet` による構文検証完了。
+     - 本番稼働中の `ttsbot-app-1`, `ttsbot-tunnel-1` に一切影響を与えずに設定の整合性を確保。
+
 ## [2026-10-24] Manager Node管理新設 & Worker Node管理移設・自律停止 (HTTP 410 Gone) によるライフサイクル統制
 - **概要**:
   - WebUIの「Bot管理」を「🤖 Bot & ノード管理」に改称し、インフラ基盤（Managerクラスタ、Botアカウントプール、分散Worker）を一元管理できるように再編。

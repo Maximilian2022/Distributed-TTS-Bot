@@ -1,13 +1,18 @@
 # ==============================================================================
-# TTSBot OSS Docker Compose 設定ファイル
+# TTSBot OSS Manager (オーケストレータ) Docker Compose 設定ファイル
 #
-# クイックスタート (スタンドアロン):
+# クイックスタート (Manager スタンドアロン):
 #   docker compose up -d
 #
 # オプション機能付き起動:
-#   - ローカル VOICEVOX エンジン同梱: docker compose --profile voicevox up -d
 #   - Cloudflare Tunnel 同梱:      docker compose --profile tunnel up -d
-#   - 全て同梱:                    docker compose --profile voicevox --profile tunnel up -d
+#   - HA Standby Slave 待機起動:   docker compose --profile standby up -d
+#
+# ※ 音声合成エンジン (VOICEVOX / SHAREVOX / COEIROINK 等) について:
+#   本ComposeはManager (管理・Discord接続・WebUI・オーケストレーション) 専用です。
+#   ローカルマシンで音声合成エンジンを稼働させる場合も、すべて独立した
+#   「Worker Node (ttsworker-agent)」としてセットアップし接続します。
+#   (セットアップ: WebUI「Bot & ノード管理」または worker/README.md 参照)
 # ==============================================================================
 
 x-bot-base: &bot-base
@@ -54,7 +59,7 @@ x-bot-base: &bot-base
 
 services:
   # ----------------------------------------------------------------------------
-  # 1. メインアプリケーション (デフォルト: スタンドアロン起動)
+  # 1. メインアプリケーション (Manager オーケストレータ)
   # ----------------------------------------------------------------------------
   app:
     <<: *bot-base
@@ -69,23 +74,7 @@ services:
           - ttsbot-router
 
   # ----------------------------------------------------------------------------
-  # 2. ローカル VOICEVOX エンジン (オプション: --profile voicevox)
-  # ----------------------------------------------------------------------------
-  voicevox:
-    image: voicevox/voicevox_engine:cpu-ubuntu20.04-latest
-    restart: unless-stopped
-    profiles:
-      - voicevox
-    ports:
-      - "50021:50021"
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 2048M
-
-  # ----------------------------------------------------------------------------
-  # 3. Cloudflare Tunnel (オプション: --profile tunnel)
+  # 2. Cloudflare Tunnel (オプション: --profile tunnel)
   # ----------------------------------------------------------------------------
   tunnel:
     image: cloudflare/cloudflared:latest
@@ -104,7 +93,7 @@ services:
           memory: 256M
 
   # ----------------------------------------------------------------------------
-  # 4. HA Standby Watchdog (Slave待機・自動同期: --profile standby)
+  # 3. HA Standby Watchdog (Slave待機・自動同期: --profile standby)
   # ----------------------------------------------------------------------------
   standby-watchdog:
     <<: *bot-base
