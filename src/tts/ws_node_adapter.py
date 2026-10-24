@@ -39,7 +39,8 @@ class WSWorkerNode(TTSNode):
         supported_engines: List[str],
         capacity: int = 2,
         specs: Optional[Dict[str, Any]] = None,
-        priority: int = 50
+        priority: int = 50,
+        exclusive_guild_id: Optional[str] = None
     ):
         config = TTSNodeConfig(
             id=node_id,
@@ -52,6 +53,7 @@ class WSWorkerNode(TTSNode):
         self.is_ws: bool = True
         self.ws: web.WebSocketResponse = ws
         self.supported_engines: List[str] = [e.lower() for e in supported_engines]
+        self.exclusive_guild_id: Optional[str] = str(exclusive_guild_id).strip() if exclusive_guild_id else None
         self.pending_requests: Dict[str, asyncio.Future] = {}
         self.last_heartbeat = time.time()
         self.is_healthy = True
@@ -62,16 +64,19 @@ class WSWorkerNode(TTSNode):
         """UI/ログ用マシン表示"""
         gpu = self.specs.get("gpu_name") or ("GPU" if self.specs.get("gpu") else "CPU")
         gpu_clean = str(gpu).replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
-        return f"Volunteer-{self.hostname} ({gpu_clean})"
+        scope = f" [専用: {self.exclusive_guild_id}]" if self.exclusive_guild_id else ""
+        return f"Volunteer-{self.hostname} ({gpu_clean}){scope}"
 
     @property
     def short_label(self) -> str:
         engines_str = ",".join(self.supported_engines).upper()
-        return f"{self.machine_name} [WS/{engines_str}]"
+        scope = f" [専用]" if self.exclusive_guild_id else ""
+        return f"{self.machine_name} [WS/{engines_str}]{scope}"
 
     @property
     def summary_label(self) -> str:
-        return f"{self.machine_name} [WS]"
+        scope = f" [専用]" if self.exclusive_guild_id else ""
+        return f"{self.machine_name} [WS]{scope}"
 
     @property
     def is_external(self) -> bool:

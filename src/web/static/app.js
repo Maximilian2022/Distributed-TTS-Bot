@@ -14,6 +14,7 @@ let guildRoles = [];
 
 document.addEventListener("DOMContentLoaded", () => {
   setupTabs();
+  updateVolunteerOneliner();
 
   // ログイン済みの場合にデータを初期ロード
   if (window.APP_IS_LOGGED_IN) {
@@ -118,6 +119,9 @@ function setupTabs() {
       }
       if (tabId === "member-voices") {
         if (currentGuildId) loadMemberVoices(currentGuildId);
+      }
+      if (tabId === "volunteer") {
+        updateVolunteerOneliner();
       }
       if (tabId === "help") {
         renderCharacterTermsTable();
@@ -6950,6 +6954,26 @@ function updateStandbyOneliner() {
   }
 }
 window.updateStandbyOneliner = updateStandbyOneliner;
+
+function updateVolunteerOneliner() {
+  const ps1Pre = document.getElementById("volunteer-ps1-code");
+  const shPre = document.getElementById("volunteer-sh-code");
+  if (!ps1Pre && !shPre) return;
+
+  const origin = window.location.origin.replace(/\/$/, "");
+  let wsUrl = origin.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
+  if (!wsUrl.includes("/api/worker/ws")) {
+    wsUrl = `${wsUrl}/api/worker/ws`;
+  }
+
+  if (ps1Pre) {
+    ps1Pre.textContent = `$env:TTSBOT_SERVER_URL="${wsUrl}"; irm "${origin}/volunteer/run_volunteer_gui.ps1" | iex`;
+  }
+  if (shPre) {
+    shPre.textContent = `curl -sSL "${origin}/volunteer/run_volunteer.sh" | bash -s -- "${wsUrl}"`;
+  }
+}
+window.updateVolunteerOneliner = updateVolunteerOneliner;
 
 async function loadCredentials() {
   const azureBadge = document.getElementById("azure-status-badge");

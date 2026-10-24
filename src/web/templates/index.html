@@ -115,6 +115,7 @@
             <button class="tab-btn active" data-tab="voice">🎙️ マイ音声設定</button>
             <button class="tab-btn" data-tab="dict">📖 単語辞書</button>
             <button class="tab-btn" data-tab="ng">🚫 NGワード</button>
+            <button class="tab-btn" id="tab-btn-volunteer" data-tab="volunteer">🤝 ボランティア参加</button>
             <button class="tab-btn" id="tab-btn-member-voices" data-tab="member-voices" style="display:none;">👥 メンバー音声</button>
             <button class="tab-btn" id="tab-btn-config" data-tab="config" style="display:none;">⚙️ ボット設定</button>
             <button class="tab-btn" id="tab-btn-bots" data-tab="bots" style="display:none;">🤖 Bot管理</button>
@@ -461,6 +462,142 @@
                       💾 設定を保存
                     </button>
                   </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- 3.5. 🤝 ボランティア参加タブ (一般ユーザー全公開) -->
+          <section id="tab-volunteer" class="tab-pane">
+            <div class="section-title">🤝 ボランティア Worker 参加 (コミュニティ協調型TTS)</div>
+            <div class="section-desc">
+              あなたのPC（ゲーミングPCや普段使いPC、余剰サーバー）の余剰パワーを持ち寄って、Botの読み上げを高速化・冗長化しよう！<br>
+              ポート開放やルーター設定は一切不要。ゲーム中もFPSを落とさない「ゲーム優先モード」を標準搭載しています。
+            </div>
+
+            <!-- 3大安心ポイントカード -->
+            <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:14px;margin-bottom:20px;">
+              <div class="card" style="padding:16px;border-left:4px solid #23a55a;background:rgba(35,165,90,0.05);margin:0;">
+                <div style="font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;color:#2ecc71;margin-bottom:6px;">
+                  <span>🛡️</span> ポート開放・ルーター設定不要
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                  Webブラウザと同じ外向き通信（WSS: 443番ポート）で接続するため、自宅Wi-Fiやテザリングでもそのまま動きます。
+                </div>
+              </div>
+
+              <div class="card" style="padding:16px;border-left:4px solid #5865f2;background:rgba(88,101,242,0.05);margin:0;">
+                <div style="font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;color:#8ea1e1;margin-bottom:6px;">
+                  <span>🎮</span> ゲーム優先モード搭載
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                  Workerプロセスの優先度を「通常以下」で実行。自分がゲームプレイ中もフレームレートを落とさず安全に余剰リソースのみを使用します。
+                </div>
+              </div>
+
+              <div class="card" style="padding:16px;border-left:4px solid #f59e0b;background:rgba(245,158,11,0.05);margin:0;">
+                <div style="font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px;color:#f59e0b;margin-bottom:6px;">
+                  <span>🚪</span> いつでも自由に参加・中断
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);line-height:1.5;">
+                  ウィンドウを閉じたりPCをスリープさせれば即座に離脱。Botは自動でクラウドTTSや他ノードへ切り替わるため迷惑がかかりません。
+                </div>
+              </div>
+            </div>
+
+            <!-- Windows 向け参加カード -->
+            <div class="card" style="margin-bottom:20px;border-left:4px solid #38bdf8;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:24px;">🪟</span>
+                  <div>
+                    <h3 style="margin:0;font-size:16px;font-weight:700;">Windows で参加する (おすすめ)</h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
+                      ダブルクリックするだけでGUI設定ウィンドウが起動。初心者でも1分でセットアップできます。
+                    </div>
+                  </div>
+                </div>
+                <span class="badge" style="background:#38bdf8;color:#000;font-size:11px;font-weight:700;padding:4px 8px;">GUIランチャー対応</span>
+              </div>
+
+              <div style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:8px;padding:16px;margin-bottom:14px;">
+                <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:var(--text-main);">
+                  【参加手順 (たったの2ステップ)】
+                </div>
+                <ol style="margin:0;padding-left:20px;font-size:12px;color:var(--text-muted);line-height:1.8;">
+                  <li>
+                    <strong>音声合成エンジンを起動</strong>: お使いのPCで <a href="https://voicevox.hiroshiba.jp/" target="_blank" rel="noopener" style="color:#5865f2;font-weight:600;">VOICEVOX 公式アプリ ↗</a> （または COEIROINK / SHAREVOX）を通常通り起動しておきます。
+                  </li>
+                  <li>
+                    <strong>ツールをダウンロードして実行</strong>: 下のダウンロードボタンからzipを入手し、解凍して <code>run_volunteer.bat</code> をダブルクリックするだけ！
+                  </li>
+                </ol>
+
+                <div style="margin-top:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                  <a href="/volunteer/ttsbot-volunteer-worker.zip" class="btn btn-primary" style="padding:10px 22px;font-size:13px;font-weight:700;background:linear-gradient(135deg, #38bdf8, #0284c7);border:none;display:inline-flex;align-items:center;gap:8px;box-shadow:0 4px 12px rgba(56,189,248,0.25);">
+                    <span>📦</span> Windows用ツール一式をダウンロード (zip)
+                  </a>
+                  <span style="font-size:11px;color:var(--text-dim);">※ Python 3.9以上が必要です。設定内容は自動記憶されます。</span>
+                </div>
+              </div>
+
+              <!-- PowerShell ワンライナー方式 -->
+              <div style="margin-top:12px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                  <label style="font-size:12px;font-weight:600;color:var(--text-muted);">
+                    または PowerShell ワンライナーで起動:
+                  </label>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="copyToClipboard('volunteer-ps1-code', this)" style="padding:3px 9px;font-size:11px;">
+                    📋 コピー
+                  </button>
+                </div>
+                <pre id="volunteer-ps1-code" style="background:#111;padding:10px;border-radius:6px;font-size:11px;overflow-x:auto;color:#38bdf8;margin:0;border:1px solid rgba(255,255,255,0.06);font-family:monospace;"></pre>
+              </div>
+            </div>
+
+            <!-- Linux / macOS 向け参加カード -->
+            <div class="card" style="margin-bottom:20px;border-left:4px solid #10b981;">
+              <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:24px;">🐧</span>
+                  <div>
+                    <h3 style="margin:0;font-size:16px;font-weight:700;">Linux / macOS で参加する</h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
+                      Docker があれば自動で VOICEVOX エンジンをバックグラウンド展開。ワンライナーで即完了します。
+                    </div>
+                  </div>
+                </div>
+                <span class="badge" style="background:#10b981;color:#000;font-size:11px;font-weight:700;padding:4px 8px;">Docker 自動展開対応</span>
+              </div>
+
+              <div style="margin-bottom:12px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                  <label style="font-size:12px;font-weight:600;color:var(--text-muted);">
+                    ターミナルで以下のワンライナーを実行:
+                  </label>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="copyToClipboard('volunteer-sh-code', this)" style="padding:3px 9px;font-size:11px;">
+                    📋 コピー
+                  </button>
+                </div>
+                <pre id="volunteer-sh-code" style="background:#111;padding:10px;border-radius:6px;font-size:11px;overflow-x:auto;color:#10b981;margin:0;border:1px solid rgba(255,255,255,0.06);font-family:monospace;"></pre>
+              </div>
+
+              <div style="font-size:11px;color:var(--text-dim);line-height:1.5;">
+                ※ Docker が入っていない場合、インストールの確認プロンプトが出ます（Yesで自動導入）。設定は <code>~/.ttsbot-worker/config.json</code> に自動記憶されます。
+              </div>
+            </div>
+
+            <!-- 提供オプションの補足説明 -->
+            <div class="card" style="padding:18px;background:rgba(255,255,255,0.02);">
+              <h4 style="margin:0 0 10px;font-size:14px;color:var(--text-main);">💡 提供オプションについて</h4>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;font-size:12px;color:var(--text-muted);line-height:1.6;">
+                <div>
+                  <strong style="color:var(--text-main);">・全体共有プール:</strong><br>
+                  このBotが導入されている全Discordサーバーの読み上げを助けます。コミュニティ全体の読み上げ品質向上に最も貢献できます。
+                </div>
+                <div>
+                  <strong style="color:var(--text-main);">・自サーバー専用枠:</strong><br>
+                  自分の参加するDiscordサーバーのIDを指定することで、そのサーバーの通話専用のWorkerとして固定できます（他サーバーの処理には使われません）。
                 </div>
               </div>
             </div>

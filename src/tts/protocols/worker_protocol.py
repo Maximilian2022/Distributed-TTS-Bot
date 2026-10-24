@@ -26,6 +26,7 @@ class RegisterMessage:
     auth_token: str
     supported_engines: List[str]  # 例: ["voicevox", "coeiroink", "sharevox"]
     capacity: int = 2              # 同時実行可能並列数
+    exclusive_guild_id: Optional[str] = None  # 特定サーバー専用枠 (Noneまたは空なら全体共有)
     client_version: str = PROTOCOL_VERSION
     specs: Dict[str, Any] = field(default_factory=dict) # CPU, GPU, OS等
     type: str = "register"

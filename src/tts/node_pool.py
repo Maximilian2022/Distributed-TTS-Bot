@@ -515,7 +515,8 @@ class TTSNodePool:
         timeout: float = 6.0,
         text_len: int = 0,
         is_longest_chunk: bool = False,
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        guild_id: Optional[Any] = None
     ) -> Optional[NodeLease]:
         """
         利用可能な最良のノードを取得（優先度順 ＆ セマフォ空き優先）
@@ -563,10 +564,23 @@ class TTSNodePool:
                             asyncio.create_task(n.try_remote_start())
 
         start = time.time()
-        is_coeiroink = (self.engine_name.lower() == "coeiroink")
-
         while time.time() - start < timeout:
-            available = [n for n in self.nodes if n.is_available]
+            # ギルド専用ノード (exclusive_guild_id) のフィルタリング
+            filtered_nodes = []
+            target_gid_str = str(guild_id).strip() if guild_id is not None else None
+            for n in self.nodes:
+                if not n.is_available:
+                    continue
+                ex_gid = getattr(n, "exclusive_guild_id", None)
+                if ex_gid:
+                    # 特定ギルド専用ノード: リクエストのギルドIDと一致する場合のみ許可
+                    if target_gid_str and target_gid_str == str(ex_gid):
+                        filtered_nodes.append(n)
+                else:
+                    # 全体共有ノード: 全リクエストに提供可能
+                    filtered_nodes.append(n)
+
+            available = filtered_nodes
             if not available:
                 await asyncio.sleep(0.1)
                 continue

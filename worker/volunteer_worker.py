@@ -58,6 +58,8 @@ class VolunteerWorker:
         self.node_id = f"volunteer_{self.node_name.lower().replace(' ', '_')}_{int(time.time()) % 10000}"
         self.capacity = args.capacity
         self.priority = args.priority
+        self.exclusive_guild_id = getattr(args, "exclusive_guild_id", "") or None
+        self.game_priority = getattr(args, "game_priority", False)
         
         self.engine_urls = {
             "voicevox": args.voicevox_url.rstrip("/"),
@@ -68,6 +70,24 @@ class VolunteerWorker:
         self.session: Optional[aiohttp.ClientSession] = None
         self.active_tasks = 0
         self.start_time = time.time()
+
+        if self.game_priority:
+            self._apply_low_process_priority()
+
+    def _apply_low_process_priority(self):
+        """ゲームプレイへの影響を避けるためプロセス優先度を通常以下(BelowNormal)に設定"""
+        try:
+            if platform.system() == "Windows":
+                import ctypes
+                # BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+                handle = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.kernel32.SetPriorityClass(handle, 0x00004000)
+                logger.info("🎮 [GameMode] プロセス優先度を '通常以下 (BelowNormal)' に設定しました (ゲームFPS優先)")
+            else:
+                os.nice(10)
+                logger.info("🎮 [GameMode] プロセス nice 値を +10 に設定しました (PC負荷軽減)")
+        except Exception as e:
+            logger.debug(f"優先度設定スキップ: {e}")
 
     async def detect_local_engines(self) -> List[str]:
         """ローカルで稼働している各音声合成エンジンの死活を判定"""
@@ -193,6 +213,7 @@ class VolunteerWorker:
                     "supported_engines": self.supported_engines,
                     "capacity": self.capacity,
                     "priority": self.priority,
+                    "exclusive_guild_id": self.exclusive_guild_id,
                     "specs": specs,
                     "client_version": PROTOCOL_VERSION
                 }
@@ -362,6 +383,8 @@ def main():
     parser.add_argument("--name", default="", help="Friendly Name for this Worker Node")
     parser.add_argument("--capacity", type=int, default=2, help="Max concurrent tasks (default: 2)")
     parser.add_argument("--priority", type=int, default=50, help="Node priority (lower = higher priority, default: 50)")
+    parser.add_argument("--exclusive-guild-id", default="", help="Dedicate this node to a specific Discord Guild ID (optional)")
+    parser.add_argument("--game-priority", action="store_true", help="Run process with BelowNormal priority to protect game FPS")
     parser.add_argument("--voicevox-url", default="http://127.0.0.1:50021", help="Local VOICEVOX Engine URL")
     parser.add_argument("--coeiroink-url", default="http://127.0.0.1:50031", help="Local COEIROINK Engine URL")
     parser.add_argument("--sharevox-url", default="http://127.0.0.1:50025", help="Local SHAREVOX Engine URL")

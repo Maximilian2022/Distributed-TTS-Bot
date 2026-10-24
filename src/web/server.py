@@ -169,6 +169,13 @@ class WebServer:
         self.app.router.add_get("/setup-standby.ps1", self.handle_setup_standby_ps1)
         self.app.router.add_get("/static/agent.py", self.handle_worker_agent_script)
 
+        # ボランティアWorkerツール配信 (全ユーザー向け)
+        self.app.router.add_get("/volunteer/run_volunteer.bat", self.handle_volunteer_file)
+        self.app.router.add_get("/volunteer/run_volunteer_gui.ps1", self.handle_volunteer_file)
+        self.app.router.add_get("/volunteer/run_volunteer.sh", self.handle_volunteer_file)
+        self.app.router.add_get("/volunteer/volunteer_worker.py", self.handle_volunteer_file)
+        self.app.router.add_get("/volunteer/ttsbot-volunteer-worker.zip", self.handle_volunteer_zip)
+
         # API (認証必要)
         self.app.router.add_get("/api/me", self.api_get_me)
         self.app.router.add_post("/api/me/voice", self.api_update_voice)
@@ -682,6 +689,43 @@ class WebServer:
         if not script_path.exists():
             return web.Response(text="Write-Host 'Error: setup-standby.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
         return web.Response(text=script_path.read_text(encoding="utf-8"), content_type="text/plain", charset="utf-8")
+
+    async def handle_volunteer_file(self, request: web.Request) -> web.Response:
+        """ボランティアツールの個別スクリプトファイルを配信"""
+        filename = request.path.split("/")[-1]
+        allowed = {"run_volunteer.bat", "run_volunteer_gui.ps1", "run_volunteer.sh", "volunteer_worker.py", "README.md"}
+        if filename not in allowed:
+            return web.Response(text="File not found", status=404)
+        file_path = Path(__file__).resolve().parent / "static" / "volunteer" / filename
+        if not file_path.exists():
+            file_path = Path("/app/worker") / filename
+        if not file_path.exists():
+            file_path = Path(__file__).resolve().parent.parent.parent / "worker" / filename
+        if not file_path.exists():
+            return web.Response(text="File not found", status=404)
+        ct = "text/plain" if filename.endswith((".sh", ".ps1", ".py", ".md")) else "application/octet-stream"
+        return web.Response(body=file_path.read_bytes(), content_type=ct, charset="utf-8" if ct.startswith("text") else None)
+
+    async def handle_volunteer_zip(self, request: web.Request) -> web.Response:
+        """Windows向けボランティアツール一式 (zip) をオンザフライ生成して配信"""
+        import io
+        import zipfile
+        worker_dir = Path(__file__).resolve().parent / "static" / "volunteer"
+        if not worker_dir.exists():
+            worker_dir = Path("/app/worker")
+        if not worker_dir.exists():
+            worker_dir = Path(__file__).resolve().parent.parent.parent / "worker"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for item in worker_dir.glob("*"):
+                if item.is_file() and not item.name.startswith((".", "config.json")):
+                    zf.write(item, arcname=item.name)
+        buf.seek(0)
+        headers = {
+            "Content-Disposition": 'attachment; filename="ttsbot-volunteer-worker.zip"'
+        }
+        return web.Response(body=buf.read(), content_type="application/zip", headers=headers)
 
     def _verify_ha_auth(self, request: web.Request) -> bool:
         """HA API 共有シークレット認証 (Master-Slave間)"""
@@ -4420,6 +4464,7 @@ class WebServer:
                         capacity = int(data.get("capacity", 2))
                         specs = data.get("specs", {})
                         priority = int(data.get("priority", 50))
+                        exclusive_guild_id = data.get("exclusive_guild_id")
 
                         # WSWorkerNode を生成して TTSManager のプール群へ登録
                         ws_node = WSWorkerNode(
@@ -4429,7 +4474,8 @@ class WebServer:
                             supported_engines=supported_engines,
                             capacity=capacity,
                             specs=specs,
-                            priority=priority
+                            priority=priority,
+                            exclusive_guild_id=exclusive_guild_id
                         )
                         self.tts_manager.register_ws_worker_node(ws_node)
                         self.worker_ws_connections[worker_node_id] = ws
@@ -4438,9 +4484,11 @@ class WebServer:
                             "type": "register_ack",
                             "status": "ok",
                             "node_id": worker_node_id,
+                            "exclusive_guild_id": exclusive_guild_id,
                             "heartbeat_interval_sec": 10.0
                         })
-                        logger.info(f"✅ [WorkerWS] Volunteer Worker successfully registered: {worker_node_id} ({node_name}) - Engines: {supported_engines}")
+                        scope_desc = f" (Dedicated to Guild {exclusive_guild_id})" if exclusive_guild_id else " (Global Shared)"
+                        logger.info(f"✅ [WorkerWS] Volunteer Worker successfully registered: {worker_node_id} ({node_name}){scope_desc} - Engines: {supported_engines}")
 
                     elif msg_type == "heartbeat":
                         if ws_node is not None:

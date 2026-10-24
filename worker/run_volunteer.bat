@@ -7,63 +7,82 @@ echo   🎙️ TTSBot Volunteer Worker (ボランティア参加ツール)
 echo ======================================================
 echo.
 
-REM Pythonの存在確認
+REM 1. Pythonの存在確認
 where python >nul 2>nul
 if %errorlevel% neq 0 (
     echo [エラー] Python が見つかりませんでした。
-    echo Python 3.9 以上をインストールし、「PATHに追加する」にチェックを入れてください。
+    echo Python 3.9 以上をインストールし、「Add Python to PATH」にチェックを入れてください。
+    echo ダウンロード: https://www.python.org/downloads/
     pause
     exit /b 1
 )
 
-REM 設定の読み込みまたは対話入力
-set SERVER_URL=%~1
-if "%SERVER_URL%"=="" set SERVER_URL=%TTSBOT_SERVER_URL%
+set SCRIPT_DIR=%~dp0
+set CONFIG_FILE=%SCRIPT_DIR%config.json
+set OPEN_CONFIG=0
 
-if "%SERVER_URL%"=="" (
-    echo 接続先の TTSBot サーバーURLを入力してください
-    echo 例: wss://your-domain.com/api/worker/ws  または  ws://192.168.1.100:8080/api/worker/ws
-    set /p SERVER_URL="Server URL: "
+REM 引数に --config がある場合はGUIを強制起動
+if "%1"=="--config" set OPEN_CONFIG=1
+
+REM config.json が存在しない場合はGUI設定ランチャーを起動
+if not exist "%CONFIG_FILE%" set OPEN_CONFIG=1
+
+if "%OPEN_CONFIG%"=="1" (
+    echo ▶ 初回設定 GUI を起動しています...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%run_volunteer_gui.ps1" -DefaultServerUrl "%~1" -DefaultToken "%~2"
+    if not exist "%CONFIG_FILE%" (
+        echo 設定がキャンセルされました。
+        exit /b 0
+    )
 )
 
-if "%SERVER_URL%"=="" (
-    echo [エラー] 接続先サーバーURLが入力されませんでした。
-    pause
-    exit /b 1
-)
-
-REM http/https で入力された場合は ws/wss に自動変換
-if "!SERVER_URL:~0,8!"=="https://" set SERVER_URL=wss://!SERVER_URL:~8!
-if "!SERVER_URL:~0,7!"=="http://" set SERVER_URL=ws://!SERVER_URL:~7!
-
-set TOKEN=
-if not "%~2"=="" set TOKEN=%~2
-if "%TOKEN%"=="" set TOKEN=%TTSBOT_TOKEN%
-
-set NODE_NAME=%COMPUTERNAME%
-if not "%~3"=="" set NODE_NAME=%~3
-if not "%TTSBOT_NODE_NAME%"=="" set NODE_NAME=%TTSBOT_NODE_NAME%
-
-if "%TOKEN%"=="" (
-    echo 管理者から受け取った共有トークンを入力してください:
-    set /p TOKEN="Token: "
-)
-
-echo.
-echo ▶ 接続先サーバー : %SERVER_URL%
-echo ▶ ノード名       : %NODE_NAME%
-echo.
-
-REM 依存ライブラリのチェック & インストール
+REM 2. 依存ライブラリのチェック & インストール
 python -c "import aiohttp" >nul 2>nul
 if %errorlevel% neq 0 (
     echo ▶ 必要なライブラリ (aiohttp) をインストール中...
     pip install aiohttp
 )
 
-echo ▶ ボランティアエージェントを起動します...
-python "%~dp0volunteer_worker.py" --server-url "%SERVER_URL%" --token "%TOKEN%" --name "%NODE_NAME%"
+REM 3. config.json の読み込みと起動引数生成 (Pythonで安全に展開)
+python -c "
+import json, sys, subprocess, os
+
+config_path = r'%CONFIG_FILE%'
+if not os.path.exists(config_path):
+    sys.exit(1)
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    cfg = json.load(f)
+
+server_url = cfg.get('server_url', '')
+token = cfg.get('token', '')
+name = cfg.get('node_name', '')
+capacity = str(cfg.get('capacity', 2))
+ex_guild = cfg.get('exclusive_guild_id', '')
+game_priority = cfg.get('game_priority', True)
+
+args = [sys.executable, r'%SCRIPT_DIR%volunteer_worker.py', '--server-url', server_url]
+if token:
+    args.extend(['--token', token])
+if name:
+    args.extend(['--name', name])
+if capacity:
+    args.extend(['--capacity', capacity])
+if ex_guild:
+    args.extend(['--exclusive-guild-id', ex_guild])
+if game_priority:
+    args.append('--game-priority')
+
+print('▶ サーバー      : ' + server_url)
+print('▶ ノード名      : ' + name)
+print('▶ 提供範囲      : ' + ('専用サーバー (' + ex_guild + ')' if ex_guild else '全体共有プール'))
+print('▶ ゲーム優先    : ' + ('有効 (低負荷)' if game_priority else '無効 (通常)'))
+print('')
+print('🎙️ ボランティアエージェントを起動します (停止は Ctrl+C またはウィンドウを閉じてください)...')
+
+sys.exit(subprocess.call(args))
+"
 
 echo.
-echo エージェントが停止しました。
+echo エージェントが終了しました。
 pause

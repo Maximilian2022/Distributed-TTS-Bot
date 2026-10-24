@@ -6076,6 +6076,71 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - `src/web/static/setup-standby.sh`: Linux / macOS 用（対話入力、Dockerチェック、`.env` 自動生成、Watchdog起動）。
    - `src/web/static/setup-standby.ps1`: Windows 用 PowerShell スクリプト（Docker Desktop 連携、`.env` 自動生成、Watchdog起動）。
 
+## [2026-10-24] 🤝「ボランティア参加」専用タブ新設・非管理者タブ完全非表示化・Windows GUIランチャー・Linux Docker自動展開・自サーバー専用枠の実装
+
+### 1. 課題と背景
+- ボランティア（一般ユーザー）が自身のゲーミングPCや余剰サーバーのリソースを提供してBotの読み上げを支援できる仕組みを構築するにあたり、以下の要望があった：
+  1. 一般ユーザー（非管理者）向けに分かりやすい「🤝 ボランティア参加」専用タブを WebUI に新設すること。
+  2. 一般ユーザーがアクセスできない管理者専用タブ（ボット設定、システム、Bot管理、API設定、メンバー音声）は、半透明のアクセス制限表示ではなく完全非表示（`display: none`）に統一すること。
+  3. Windows 向けセットアップにおいて、初心者でも迷わず設定できるよう PowerShell ネイティブ GUI（外部依存ゼロ）でオプションを選択可能にすること（全体共有 vs 自サーバー専用枠、提供エンジン、ゲーム優先モード [BelowNormal、デフォON]、キャパシティ、設定自動保存 [デフォON]、スタートアップ常駐 [デフォON]）。
+  4. Linux 向けセットアップにおいて、Docker があれば優先利用し、無ければ Docker 導入確認（Y/n、デフォY）を行ってコンテナで音声合成エンジンを自動展開すること。
+  5. Master 側で `exclusive_guild_id` による厳格な振り分けを行い、自サーバー専用枠のノードには他サーバーのリクエストを一切回さない安全性を担保すること。
+
+### 2. 実施した修正
+1. **非権限タブの完全非表示化 (`src/web/templates/index.html`, `src/web/static/app.js`)**:
+   - `index.html`: 管理者専用タブボタン（`tab-btn-config`, `tab-btn-system`, `tab-btn-bots`, `tab-btn-creds`, `tab-btn-member-voices`）の初期スタイルを `style="display:none;"` に統一。
+   - `app.js`: `updatePermissionsUI()` において、非管理者の場合は `btnConfig`, `btnSystem`, `btnBots`, `btnCreds`, `btnMemberVoices` を `display: none` に設定。URLハッシュ直接入力による不正遷移ガードのフォールバック対象を網羅。
+2. **WebUI 🤝「ボランティア参加」専用タブ新設 (`src/web/templates/index.html`, `src/web/static/app.js`)**:
+   - `index.html`: ナビゲーションに一般公開タブ `tab-btn-volunteer` を新設。
+   - セクション `<section id="tab-volunteer" class="tab-pane">` を実装：
+     - 3大安心ポイント（🛡️ ポート開放不要 / 🎮 ゲーム優先モード搭載 / 🚪 自由に参加・中断）。
+     - Windows 向け参加カード（📦 zip 一括ダウンロードボタン、PowerShell ワンライナー表示欄、ワンクリックコピーボタン）。
+     - Linux / macOS 向け参加カード（🐧 Bash ワンライナー表示欄、ワンクリックコピーボタン）。
+     - 提供オプション解説（全体共有プール vs 自サーバー専用枠）。
+   - `app.js`: `updateVolunteerOneliner()` を新設。DOM初期化時およびタブ選択時に現在のオリジンに基づくコマンド（`$env:TTSBOT_SERVER_URL=...; irm ... | iex` および `curl -sSL ... | bash -s -- ...`）を動的補完。
+3. **Windows 向け PowerShell ネイティブ GUI ランチャー (`worker/run_volunteer_gui.ps1`, `worker/run_volunteer.bat`)**:
+   - `run_volunteer_gui.ps1`: PowerShell 標準の `.NET Windows Forms` を使用し外部ライブラリ導入ゼロで美しく高密度なGUIを構築。
+     - ポートスキャン（50021, 50025, 50031）による起動中エンジン自動検出。
+     - 提供範囲（全体共有プール vs 自サーバー専用枠 [Guild ID 指定]）。
+     - 提供エンジン選択（VOICEVOX, COEIROINK, SHAREVOX）。
+     - ゲーム優先モード（`BelowNormal` プロセス優先度設定、デフォルトON）。
+     - 同時処理タスク数（キャパシティ: 1〜3件）。
+     - 表示ノード名設定。
+     - Windows スタートアップ登録（最小化起動ショートカット自動生成、デフォルトON）。
+     - 設定ローカル自動保存（`config.json`、デフォルトON）。
+   - `run_volunteer.bat`: `config.json` があれば即時バックグラウンド起動、初回または `--config` 引数時は GUI 設定画面を起動。
+4. **Linux 向け Docker 優先 & 対話型自動展開 CLI (`worker/run_volunteer.sh`)**:
+   - Docker の存在を自動判定し、Docker があれば最優先で VOICEVOX エンジンコンテナをバックグラウンド起動。
+   - Docker がない場合は「Docker を導入してコンテナで起動しますか？ (Y/n)」を対話で確認（デフォルト Y で公式インストールスクリプト実行）。
+   - CLI 対話プロンプトで接続情報、提供範囲、提供エンジン、キャパシティを設定し、`~/.ttsbot-worker/config.json` へ自動保存。
+5. **Master 側プロトコル & 自サーバー専用枠ディスパッチ (`src/tts/`)**:
+   - `protocols/worker_protocol.py`: `RegisterMessage` に `exclusive_guild_id: Optional[str] = None` を追加。
+   - `ws_node_adapter.py`: `WSWorkerNode` に `exclusive_guild_id` を保持させ、UI 表示ラベルにも `[専用: GuildID]` を反映。
+   - `node_pool.py`: `acquire_node` に `guild_id` 引数を追加。`exclusive_guild_id` が設定されているノードはリクエストの `guild_id` と完全一致する場合のみ貸し出す厳格なフィルタリングを実装。
+   - `server.py`: `api_worker_ws` ハンドラで登録時に `exclusive_guild_id` を受け取り、`WSWorkerNode` に伝達。
+6. **配布配信エンドポイント (`src/web/server.py`, `docker-compose.yml`)**:
+   - `/volunteer/run_volunteer.bat`, `run_volunteer_gui.ps1`, `run_volunteer.sh`, `volunteer_worker.py` の静的配信ハンドラ `handle_volunteer_file` を追加。
+   - `/volunteer/ttsbot-volunteer-worker.zip` のオンザフライ zip パッケージ生成・配信ハンドラ `handle_volunteer_zip` を追加。
+   - `docker-compose.yml`: `./worker:/app/worker:ro` をコンテナにマウント。
+   - `src/web/static/volunteer/` に配布用ファイルを同期配置。
+
+### 3. 検証結果
+1. **静的構文チェック**:
+   - `python3 -m py_compile` による全修正ファイルの構文検証に合格。
+2. **単体テストによる専用枠ディスパッチ検証**:
+   - 共有ノードと専用ノード（Guild 111）をプールに登録し、他ギルド（Guild 222）およびギルドなしリクエストでは専用ノードが 100% 除外されて共有ノードのみが取得されること、Guild 111 のリクエストでは専用ノードが正常に取得されることを検証完了。
+3. **本番コンテナの無瞬断反映 & ヘルスチェック**:
+   - `docker compose up -d --no-deps app` で約 0.9 秒の最小瞬断にて反映。
+   - `GET /health`: `status: "ok"`, `bot.is_ready: true`, 外部Worker（RTX 3090）と即座に再接続され健全に稼働中。
+   - `GET /volunteer/run_volunteer.sh`: HTTP 200 OK。
+   - `GET /volunteer/run_volunteer_gui.ps1`: HTTP 200 OK。
+   - `GET /volunteer/run_volunteer.bat`: HTTP 200 OK。
+   - `GET /volunteer/ttsbot-volunteer-worker.zip`: 正常な zip アーカイブ（5ファイル格納）としてダウンロード可能であることを確認。
+4. **WebUI 画面表示 & クリップボード連携**:
+   - ブラウザ画面にて「🤝 ボランティア参加」タブの表示、ダウンロードボタン、ワンライナー表示欄、コピーボタン動作（「✅ コピー完了！」）を確認。
+   - 非管理者の場合の管理者専用タブ（ボット設定、システム、Bot管理、API設定、メンバー音声）の完全非表示（`display: none`）を確認。
+
+
 
 
 
