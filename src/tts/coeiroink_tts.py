@@ -178,9 +178,19 @@ class CoeiroinkTTSClient(BaseTTSClient):
                     # 外部ワーカーへのリクエストは最大12.0秒（Speculative TTSと調和させ、誤隔離を完全防止）
                     default_ext_timeout = min(self.timeout_seconds, 12.0)
                     worker_timeout = float(os.getenv("EXTERNAL_WORKER_TIMEOUT_SECONDS", str(default_ext_timeout))) if node.is_external else self.timeout_seconds
-                    res = await self._synthesize_on_node(
-                        node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout
-                    )
+                    if getattr(node, "is_ws", False):
+                        res = await node.synthesize(
+                            engine="coeiroink",
+                            text=text,
+                            voice_name=voice_name,
+                            pitch=pitch,
+                            speed=speed,
+                            timeout_seconds=worker_timeout
+                        )
+                    else:
+                        res = await self._synthesize_on_node(
+                            node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout
+                        )
                     latency_ms = (time.time() - t0) * 1000.0
                     self.last_worker_label = node.summary_label
                     logger.info(

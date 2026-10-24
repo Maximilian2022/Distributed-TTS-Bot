@@ -53,6 +53,7 @@ class TTSManager:
         self.voicevox_pool = TTSNodePool("voicevox", getattr(config, "voicevox_nodes", []))
         self.sharevox_pool = TTSNodePool("sharevox", getattr(config, "sharevox_nodes", []))
         self.coeiroink_pool = TTSNodePool("coeiroink", getattr(config, "coeiroink_nodes", []))
+        self.ws_worker_nodes: Dict[str, Any] = {}
 
         # 各TTSクライアントの初期化
         self.azure_client = AzureTTSClient(
@@ -447,6 +448,31 @@ class TTSManager:
         await self.coeiroink_client.close()
         await self.edge_client.close()
         await self.openjtalk_client.close()
+
+    def register_ws_worker_node(self, ws_node: Any):
+        """ボランティア型 WebSocket ワーカーノードを対応プールに動的配備"""
+        self.ws_worker_nodes[ws_node.id] = ws_node
+        for eng in ws_node.supported_engines:
+            if eng == "voicevox":
+                self.voicevox_pool.add_node(ws_node)
+            elif eng == "coeiroink":
+                self.coeiroink_pool.add_node(ws_node)
+            elif eng == "sharevox":
+                self.sharevox_pool.add_node(ws_node)
+        logger.info(f"✨ [TTSManager] WS Worker '{ws_node.id}' registered for engines: {ws_node.supported_engines}")
+
+    def unregister_ws_worker_node(self, node_id: str):
+        """切断された WebSocket ワーカーノードを全プールから安全に離脱"""
+        ws_node = self.ws_worker_nodes.pop(node_id, None)
+        if ws_node:
+            for eng in ws_node.supported_engines:
+                if eng == "voicevox":
+                    self.voicevox_pool.remove_node(node_id)
+                elif eng == "coeiroink":
+                    self.coeiroink_pool.remove_node(node_id)
+                elif eng == "sharevox":
+                    self.sharevox_pool.remove_node(node_id)
+            logger.info(f"🔌 [TTSManager] WS Worker '{node_id}' unregistered from pools.")
 
     def _get_voice_config(self, speaker_id: str) -> VoiceConfig:
         """話者IDからボイス定義を取得"""

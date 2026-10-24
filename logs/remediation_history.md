@@ -1,5 +1,25 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] 分散ボランティア型TTS通信基盤 (Phase 1) & 多段チャンキング・30文字ハードキャップ (Phase 2.1) の本番配備
+- **概要**:
+  - `docs/DISTRIBUTED_VOLUNTEER_ARCHITECTURE_PLAN.md` に基づき、一般家庭PC等のNAT配下ノードがポート開放不要で参加できる「ボランティア型分散WebSocket通信基盤 (Phase 1)」および、句読点のない口語・長文を低遅延並列化する「多段チャンキング & 30文字ハードキャップ (Phase 2.1)」を本番環境へ無停止配備。
+- **実施内容**:
+  1. **句読点なし多段チャンキング & 30文字ハードキャップ (`src/utils/text_cleaner.py`)**:
+     - スペース区切り（英単語間スペース除外）、スラング境界（`w`, `草`, `パチパチ` 等の英単語誤分割防止ガード付き）、終助詞境界（`〜です`, `〜ます` 等）による多段分割を実装。
+     - 30文字ハードキャップ安全スライス（SudachiPy形態素自立語連動）を導入し、どんな超長文や句読点なし文でも30文字以内の複数チャンクへ安全にスライス。
+  2. **WebSocket 分散通信プロトコル (`src/tts/protocols/worker_protocol.py`)**:
+     - ゼロコピーバイナリフレーム仕様（`[32-byte req_id][4-byte chunk_idx][1-byte flags][raw audio]`）を定義。
+     - 登録（`register`/`register_ack`）、ハートビート（`heartbeat`/`heartbeat_ack`）、合成要求（`synthesize_request`）の型安全メッセージ構造を整備。
+  3. **WSWorkerNode アダプタ & ゲートウェイ強化 (`src/tts/ws_node_adapter.py`, `src/web/server.py`, `src/tts/manager.py`)**:
+     - `TTSNode` を継承する `WSWorkerNode` を実装し、従来の HTTP REST ノードと完全互換で `TTSNodePool` へ動的登録・安全離脱をサポート。
+     - `src/web/server.py` の `api_worker_ws` をアップグレードし、バイナリフレームによる音声受信・ディスパッチを統合。
+     - 各TTSクライアント（`voicevox_tts.py`, `coeiroink_tts.py`, `sharevox_tts.py`）に `WSWorkerNode` への透過ルーティング分岐を追加。
+  4. **単体配布用 Worker Agent (`worker/volunteer_worker.py`, `worker/README.md`)**:
+     - Windows/Mac/Linux で単体起動可能なボランティアエージェントを作成。ローカルエンジン（VOICEVOX, COEIROINK, SHAREVOX）の自動検出、WSS常時接続、指数バックオフ再接続を実装。
+  5. **テスト & 本番無停止デプロイ**:
+     - 安全サンドボックス（`./scripts/run_sandbox_test.sh`）でバイナリシリアライズ、ノードプール統合、多段チャンキングの単体テストを全件合格。
+     - 事前イメージビルド（2.2秒）および `docker compose --profile tunnel up -d`（1.3秒）により、本番無停止で新バイナリを反映。ヘルスチェック（200 OK）、全5台Botログイン、Gateway再接続を確認。
+
 ## [2026-10-24] scratch ディレクトリの Git 管理除外 (.gitignore 反映 & インデックス完全除去)
 - **概要**:
   - `scratch/` ディレクトリ配下のファイル（`memo.md`, `remaining.md`）が Git の追跡対象に入っていたため、管理対象外とする処置を実施。

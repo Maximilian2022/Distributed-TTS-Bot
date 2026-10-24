@@ -128,9 +128,19 @@ class VoicevoxTTSClient(BaseTTSClient):
                 raise TTSConnectionError("No available VOICEVOX node in pool (all busy or offline)")
             async with lease as node:
                 worker_timeout = float(os.getenv("EXTERNAL_WORKER_TIMEOUT_SECONDS", str(self.timeout_seconds))) if node.is_external else self.timeout_seconds
-                res = await self._synthesize_on_node(
-                    node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout
-                )
+                if getattr(node, "is_ws", False):
+                    res = await node.synthesize(
+                        engine="voicevox",
+                        text=text,
+                        voice_name=voice_name,
+                        pitch=pitch,
+                        speed=speed,
+                        timeout_seconds=worker_timeout
+                    )
+                else:
+                    res = await self._synthesize_on_node(
+                        node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout
+                    )
                 latency_ms = (time.time() - t0) * 1000.0
                 self.last_worker_label = node.summary_label
                 logger.info(

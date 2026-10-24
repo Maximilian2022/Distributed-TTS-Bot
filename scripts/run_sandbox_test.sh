@@ -27,7 +27,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 SANDBOX_ID="ttsbot-sandbox-$(date +%s)-$RANDOM"
-IMAGE="${IMAGE:-ttsbot-ttsbot-blue:latest}"
+IMAGE="${IMAGE:-ttsbot-app:latest}"
 TEMP_DATA_DIR="$(mktemp -d -t ttsbot-sandbox-data-XXXXXX)"
 
 cleanup() {
@@ -91,6 +91,7 @@ docker run \
   -e TZ=Asia/Tokyo \
   -e TTSBOT_STANDBY=1 \
   -v "${PROJECT_ROOT}/src:/app/src:ro" \
+  -v "${PROJECT_ROOT}/worker:/app/worker:ro" \
   -v "${PROJECT_ROOT}/scratch:/app/scratch:ro" \
   -v "${PROJECT_ROOT}/config.yaml:/app/config.yaml:ro" \
   -v "${PROJECT_ROOT}/openjtalk_voices:/app/openjtalk_voices:ro" \

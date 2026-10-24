@@ -64,6 +64,7 @@
   - 共通の自前 Redis サーバーに `ttsbot:leader:master` を TTL 10秒 でハートビート登録。
   - ロックを獲得した Master のみが Active となり、Discord Gateway 接続および VC 接続を保持。
   - Standby 側は接続を切断した状態で待機し、Active のハートビート途絶時に自律昇格。
+  - Standby 側のセットアップについても、ワンライナーで実行できるようにする
 - **データ同期 (PostgreSQL)**:
   - ギルド設定、単語辞書、NGワード、ノード登録情報 (`nodes` テーブル) を一元管理。
 - **Worker WebSocket Gateway (`/ws/worker`)**:

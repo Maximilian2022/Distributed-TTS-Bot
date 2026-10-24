@@ -4117,8 +4117,8 @@ class WebServer:
 
     async def api_worker_ws(self, request: web.Request) -> web.WebSocketResponse:
         """
-        リモートWorkerノード用 WebSocket リバースプロキシ
-        Worker (GPU PC等) が外向きにMasterへ常時接続し、Masterからの音声合成要求を双方向中継する
+        リモートボランティアWorkerノード用 WebSocket ゲートウェイ
+        Worker (外部PC/GPUノード等) が外向きにMasterへ常時接続し、Masterからの音声合成要求を双方向中継する
         """
         if not self._verify_worker_auth(request):
             raise web.HTTPUnauthorized(text="Unauthorized worker token")
@@ -4126,12 +4126,27 @@ class WebServer:
         ws = web.WebSocketResponse(heartbeat=20.0, max_msg_size=32 * 1024 * 1024)
         await ws.prepare(request)
 
+        ws_node: Optional[Any] = None
         worker_node_id: Optional[str] = None
         logger.info(f"🔌 [WorkerWS] New WebSocket connection from {request.remote}")
 
         try:
+            from src.tts.ws_node_adapter import WSWorkerNode
+            from src.tts.protocols.worker_protocol import (
+                unpack_binary_chunk,
+                HeartbeatMessage
+            )
+
             async for msg in ws:
-                if msg.type == web.WSMsgType.TEXT:
+                if msg.type == web.WSMsgType.BINARY:
+                    if ws_node is not None:
+                        try:
+                            req_id, chunk_index, is_final, payload = unpack_binary_chunk(msg.data)
+                            ws_node.on_binary_chunk(req_id, chunk_index, is_final, payload)
+                        except Exception as e:
+                            logger.warning(f"⚠️ [WorkerWS] Error handling binary chunk from {worker_node_id}: {e}")
+
+                elif msg.type == web.WSMsgType.TEXT:
                     try:
                         data = json.loads(msg.data)
                     except Exception:
@@ -4140,30 +4155,72 @@ class WebServer:
                     msg_type = data.get("type")
                     if msg_type == "register":
                         worker_node_id = data.get("node_id", f"ws_worker_{int(time.time())}")
+                        node_name = data.get("node_name", worker_node_id)
+                        supported_engines = data.get("supported_engines", ["voicevox"])
+                        capacity = int(data.get("capacity", 2))
+                        specs = data.get("specs", {})
+                        priority = int(data.get("priority", 50))
+
+                        # WSWorkerNode を生成して TTSManager のプール群へ登録
+                        ws_node = WSWorkerNode(
+                            node_id=worker_node_id,
+                            node_name=node_name,
+                            ws=ws,
+                            supported_engines=supported_engines,
+                            capacity=capacity,
+                            specs=specs,
+                            priority=priority
+                        )
+                        self.tts_manager.register_ws_worker_node(ws_node)
                         self.worker_ws_connections[worker_node_id] = ws
-                        await ws.send_json({"type": "registered", "node_id": worker_node_id, "status": "ok"})
-                        logger.info(f"✅ [WorkerWS] Worker registered: {worker_node_id} ({data.get('node_name', '')})")
+
+                        await ws.send_json({
+                            "type": "register_ack",
+                            "status": "ok",
+                            "node_id": worker_node_id,
+                            "heartbeat_interval_sec": 10.0
+                        })
+                        logger.info(f"✅ [WorkerWS] Volunteer Worker successfully registered: {worker_node_id} ({node_name}) - Engines: {supported_engines}")
 
                     elif msg_type == "heartbeat":
-                        await ws.send_json({"type": "heartbeat_ack", "timestamp": time.time()})
+                        if ws_node is not None:
+                            hb = HeartbeatMessage(
+                                node_id=worker_node_id or "",
+                                active_tasks=int(data.get("active_tasks", 0)),
+                                cpu_percent=float(data.get("cpu_percent", 0.0)),
+                                memory_percent=float(data.get("memory_percent", 0.0)),
+                                engine_status=data.get("engine_status", {}),
+                                uptime_sec=float(data.get("uptime_sec", 0.0))
+                            )
+                            ws_node.update_from_heartbeat(hb)
+                        await ws.send_json({"type": "heartbeat_ack", "server_time": time.time()})
+
+                    elif msg_type == "synthesize_error":
+                        if ws_node is not None:
+                            req_id = data.get("req_id", "")
+                            err_msg = data.get("error_message", "Unknown worker error")
+                            ws_node.on_error(req_id, err_msg)
 
                     elif msg_type == "synthesize_response":
+                        # 後方互換性: Base64フォールバック
                         req_id = data.get("req_id")
-                        fut = self.worker_ws_pending_requests.pop(req_id, None)
-                        if fut and not fut.done():
+                        if ws_node is not None and req_id:
                             if data.get("error"):
-                                fut.set_exception(Exception(data["error"]))
+                                ws_node.on_error(req_id, data["error"])
                             else:
                                 import base64
                                 audio_bytes = base64.b64decode(data.get("audio_b64", ""))
-                                fut.set_result(audio_bytes)
+                                ws_node.on_binary_chunk(req_id, 0, True, audio_bytes)
 
                 elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
                     break
         finally:
+            if ws_node is not None:
+                await ws_node.close()
+                self.tts_manager.unregister_ws_worker_node(ws_node.id)
             if worker_node_id:
                 self.worker_ws_connections.pop(worker_node_id, None)
-                logger.info(f"🔌 [WorkerWS] Worker disconnected: {worker_node_id}")
+                logger.info(f"🔌 [WorkerWS] Volunteer Worker disconnected: {worker_node_id}")
 
         return ws
 

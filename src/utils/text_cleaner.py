@@ -40,6 +40,13 @@ _RE_HAS_QUES = re.compile(r'[?？]')
 _RE_BEEP_TAG = re.compile(r'<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::(\d+))?(?:__)?>>')
 _RE_BEEP_SPLIT = re.compile(r'(<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::\d+)?(?:__)?>>)')
 
+# 句読点なし多段チャンキング & 30文字ハードキャップ用の事前コンパイル定数 (PERF-3)
+_MAX_CHUNK_CHARS = 30
+_MIN_PART_CHARS = 5
+_RE_SPLIT_SPACE = re.compile(r'(?<![a-zA-Z0-9])[\s\u3000]+(?![a-zA-Z0-9])')
+_RE_SPLIT_SLANG_DELIM = re.compile(r'((?:(?<![a-zA-Z0-9])[wｗW]+(?![a-zA-Z0-9])|草+|パチパチ))[\s\u3000]*')
+_RE_SPLIT_ENDING = re.compile(r'((?:です|ます|でした|ました|ですね|ですよ|ですよね|だよね|じゃん|だし)(?:よ|ね|な)?)(?=[^\s、。！？\d])')
+
 _janome_tokenizer = None
 _janome_failed = False
 _janome_lock = threading.Lock()
@@ -540,10 +547,77 @@ class TextCleaner:
         return [(sentence, delim)]
 
     @staticmethod
+    def _split_by_slang_boundary(text: str, delim: str = "") -> List[Tuple[str, str]]:
+        """スラング・笑い表現（w, 草, パチパチ）の直後でパーツ分割"""
+        raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', text))
+        if raw_len <= 14:
+            return [(text, delim)]
+
+        parts = _RE_SPLIT_SLANG_DELIM.split(text)
+        if len(parts) <= 1:
+            return [(text, delim)]
+
+        chunks: List[Tuple[str, str]] = []
+        for i in range(0, len(parts), 2):
+            p = parts[i]
+            d = parts[i + 1] if i + 1 < len(parts) else ""
+            full = (p + d).strip()
+            if full:
+                chunks.append((full, "slang" if (i + 1 < len(parts)) else delim))
+
+        # 最低文字数ガード (短すぎるパーツはマージ)
+        merged: List[Tuple[str, str]] = []
+        for c_text, c_delim in chunks:
+            if merged and len(_RE_STRIP_PUNCT_SPACES.sub('', c_text)) < _MIN_PART_CHARS:
+                prev_text, prev_delim = merged.pop()
+                merged.append((prev_text + " " + c_text, c_delim))
+            else:
+                merged.append((c_text, c_delim))
+        return merged if len(merged) > 1 else [(text, delim)]
+
+    @staticmethod
+    def _hardcap_slice_30(text: str, delim: str = "") -> List[Tuple[str, str]]:
+        """30文字を超える塊を、形態素自立語境界または強制スライスで30文字以内に安全分割"""
+        raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', text))
+        if raw_len <= _MAX_CHUNK_CHARS:
+            return [(text, delim)]
+
+        tokenizer, split_mode = get_sudachi_tokenizer()
+        slices: List[Tuple[str, str]] = []
+
+        if tokenizer is not None and split_mode is not None:
+            try:
+                tokens = list(tokenizer.tokenize(text, split_mode))
+                cur_slice = ""
+                for tok in tokens:
+                    s = tok.surface()
+                    if len(cur_slice) + len(s) > _MAX_CHUNK_CHARS and len(cur_slice) >= _MIN_PART_CHARS:
+                        slices.append((cur_slice.strip(), "hardcap"))
+                        cur_slice = s
+                    else:
+                        cur_slice += s
+                if cur_slice.strip():
+                    slices.append((cur_slice.strip(), delim))
+                if len(slices) > 1:
+                    return slices
+            except Exception as e:
+                logger.debug(f"Sudachi hardcap tokenization error: {e}")
+
+        # フォールバック: 強制30文字ハードスライス
+        cur = 0
+        while cur < len(text):
+            end = min(cur + _MAX_CHUNK_CHARS, len(text))
+            part = text[cur:end].strip()
+            if part:
+                slices.append((part, "hardcap" if end < len(text) else delim))
+            cur = end
+        return slices if slices else [(text, delim)]
+
+    @staticmethod
     def split_into_chunks(text: str, author_prefix: Optional[str] = None) -> List['TextChunk']:
         """
-        テキストを発言者名プレフィックスおよび自然な文境界（句点・読点・形態素接続詞）でパーツ分割する。
-        各パーツには自然な間（pause_after_ms）を付与。
+        テキストを発言者名プレフィックスおよび多段文境界（句点・読点・スペース・スラング・終助詞・形態素・30文字ハードキャップ）で超低遅延パーツ分割する。
+        各パーツには音響ストリーミングに最適な間（pause_after_ms）を付与。
         """
         t_start = time.time()
         chunks: List[TextChunk] = []
@@ -611,17 +685,74 @@ class TextCleaner:
             else:
                 comma_refined.append((sentence, delim))
 
-        # 4. 長文に対する形態素（Janome / 接続助詞・接続詞）での分割 (18文字超)
-        final_sentences: List[Tuple[str, str]] = []
+        # 4. スペース（空白）境界分割 (新設: 14文字超、英単語間スペース保護)
+        space_refined: List[Tuple[str, str]] = []
         for sentence, delim in comma_refined:
+            raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
+            if raw_len > 14:
+                s_parts = _RE_SPLIT_SPACE.split(sentence)
+                if len(s_parts) > 1 and all(len(_RE_STRIP_PUNCT_SPACES.sub('', p)) >= _MIN_PART_CHARS for p in s_parts):
+                    for p_idx, p in enumerate(s_parts):
+                        p_delim = delim if p_idx == len(s_parts) - 1 else "space"
+                        space_refined.append((p.strip(), p_delim))
+                else:
+                    space_refined.append((sentence, delim))
+            else:
+                space_refined.append((sentence, delim))
+
+        # 5. スラング・笑い境界分割 (新設: 14文字超)
+        slang_refined: List[Tuple[str, str]] = []
+        for sentence, delim in space_refined:
+            raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
+            if raw_len > 14:
+                slang_pieces = TextCleaner._split_by_slang_boundary(sentence, delim)
+                slang_refined.extend(slang_pieces)
+            else:
+                slang_refined.append((sentence, delim))
+
+        # 6. 語尾・終助詞・丁寧語終止形境界 (新設: 16文字超、句読点なし文)
+        ending_refined: List[Tuple[str, str]] = []
+        for sentence, delim in slang_refined:
+            raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
+            if raw_len > 16:
+                end_parts = _RE_SPLIT_ENDING.split(sentence)
+                if len(end_parts) > 1:
+                    e_buf = ""
+                    e_pieces: List[Tuple[str, str]] = []
+                    for e_idx, e_p in enumerate(end_parts):
+                        e_buf += e_p
+                        if e_idx % 2 == 1: # キャプチャされた語尾
+                            if len(e_buf) >= 6 and (len(sentence) - len("".join(end_parts[:e_idx+1]))) >= 6:
+                                e_pieces.append((e_buf.strip(), "ending"))
+                                e_buf = ""
+                    if e_buf.strip():
+                        e_pieces.append((e_buf.strip(), delim))
+                    if len(e_pieces) > 1:
+                        ending_refined.extend(e_pieces)
+                    else:
+                        ending_refined.append((sentence, delim))
+                else:
+                    ending_refined.append((sentence, delim))
+            else:
+                ending_refined.append((sentence, delim))
+
+        # 7. 長文に対する形態素（SudachiPy / Janome / 接続助詞・接続詞）での分割 (18文字超)
+        morph_refined: List[Tuple[str, str]] = []
+        for sentence, delim in ending_refined:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
             if raw_len >= 18:
                 m_pieces = TextCleaner._split_long_sentence_morphological(sentence, delim)
-                final_sentences.extend(m_pieces)
+                morph_refined.extend(m_pieces)
             else:
-                final_sentences.append((sentence, delim))
+                morph_refined.append((sentence, delim))
 
-        # TextChunk の構築
+        # 8. 30文字ハードキャップ安全スライス (新設: 最終防衛線)
+        final_sentences: List[Tuple[str, str]] = []
+        for sentence, delim in morph_refined:
+            hardcap_pieces = TextCleaner._hardcap_slice_30(sentence, delim)
+            final_sentences.extend(hardcap_pieces)
+
+        # 9. TextChunk の構築
         for idx, (sentence, delim) in enumerate(final_sentences):
             is_last = (idx == len(final_sentences) - 1)
             if is_last:
@@ -632,10 +763,18 @@ class TextCleaner:
                 pause_ms = 120
             elif '、' in delim:
                 pause_ms = 90
+            elif delim == 'space':
+                pause_ms = 75
+            elif delim == 'slang':
+                pause_ms = 70
+            elif delim == 'ending':
+                pause_ms = 80
             elif delim == 'conj':
                 pause_ms = 85
+            elif delim == 'hardcap':
+                pause_ms = 60
             else:
-                pause_ms = 100
+                pause_ms = 90
 
             # NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) を含む場合は前後でチャンク分割
             if '<<__BEEP' in sentence or '<<ピー音' in sentence:

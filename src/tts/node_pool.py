@@ -455,6 +455,29 @@ class TTSNodePool:
             pass
         return target
 
+    def add_node(self, node: TTSNode) -> None:
+        """ノードインスタンス（WSWorkerNode等）を直接プールに追加または既存置換"""
+        existing = next((n for n in self.nodes if n.id == node.id), None)
+        if existing:
+            self.nodes.remove(existing)
+            logger.info(f"🔄 [NodePool] Replaced existing node '{node.id}' in pool '{self.engine_name}'.")
+        self.nodes.append(node)
+        self.nodes.sort(key=lambda n: (n.priority, n.id))
+        try:
+            latency_profiler.get_or_create(node)
+        except Exception:
+            pass
+        logger.info(f"✨ [NodePool] Node '{node.id}' ({node.summary_label}) added to pool '{self.engine_name}'.")
+
+    def remove_node(self, node_id: str) -> Optional[TTSNode]:
+        """指定IDのノードをプールから安全に除外"""
+        target = next((n for n in self.nodes if n.id == node_id), None)
+        if target:
+            self.nodes.remove(target)
+            logger.info(f"🔌 [NodePool] Node '{node_id}' removed from pool '{self.engine_name}'.")
+            return target
+        return None
+
     def update_heartbeat(self, node_id: str) -> bool:
         """指定ノードのハートビートを更新"""
         for n in self.nodes:
