@@ -268,6 +268,22 @@ function Start-NativeCoeiroink([System.Windows.Forms.Label]$statusLabel = $null)
     return $false
 }
 
+function Get-GitHubLatestReleaseTag([string]$repo, [string]$fallbackTag) {
+    try {
+        $req = [System.Net.HttpWebRequest]::Create("https://github.com/$repo/releases/latest")
+        $req.AllowAutoRedirect = $false
+        $req.Timeout = 5000
+        $req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        $resp = $req.GetResponse()
+        $loc = $resp.GetResponseHeader("Location")
+        $resp.Close()
+        if ($loc -match "/tag/([^/]+)$") {
+            return $Matches[1].Trim()
+        }
+    } catch { }
+    return $fallbackTag
+}
+
 function Install-EngineFromUrl([string]$engineName, [string]$downloadUrl, [string]$fileName, [System.Windows.Forms.Label]$statusLabel) {
     $tempDir = [System.IO.Path]::GetTempPath()
     $destFile = Join-Path $tempDir $fileName
@@ -276,8 +292,13 @@ function Install-EngineFromUrl([string]$engineName, [string]$downloadUrl, [strin
     Write-Host "▶ $engineName インストーラーをダウンロード中: $downloadUrl" -ForegroundColor Cyan
     
     try {
-        $wc = New-Object System.Net.WebClient
-        $wc.DownloadFile($downloadUrl, $destFile)
+        if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+            & curl.exe -fL "$downloadUrl" -o "$destFile"
+        } else {
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            $wc.DownloadFile($downloadUrl, $destFile)
+        }
         
         if (Test-Path $destFile) {
             if ($statusLabel) { $statusLabel.Text = "[起動] インストーラーを起動しています..." }
@@ -652,7 +673,9 @@ $BtnSetupVv.Add_Click({
             $script:DetectedEngines = Scan-AllLocalEngines
             Update-EngineCheckboxTexts
         } else {
-            Show-EngineInstallOptionsDialog "VOICEVOX" "https://voicevox.hiroshiba.jp/" "https://github.com/VOICEVOX/voicevox/releases/download/0.21.1/VOICEVOX.Setup.0.21.1.Windows.exe" "VOICEVOX.Setup.exe" $LblEngineStatus $Form
+            $vvTag = Get-GitHubLatestReleaseTag "VOICEVOX/voicevox" "0.26.1"
+            $vvUrl = "https://github.com/VOICEVOX/voicevox/releases/download/$vvTag/VOICEVOX.Web.Setup.$vvTag.exe"
+            Show-EngineInstallOptionsDialog "VOICEVOX" "https://voicevox.hiroshiba.jp/" $vvUrl "VOICEVOX.Web.Setup.exe" $LblEngineStatus $Form
             Start-Sleep -Seconds 1
             $script:DetectedEngines = Scan-AllLocalEngines
             Update-EngineCheckboxTexts
@@ -711,7 +734,9 @@ $BtnSetupSv.Add_Click({
             $script:DetectedEngines = Scan-AllLocalEngines
             Update-EngineCheckboxTexts
         } else {
-            Show-EngineInstallOptionsDialog "SHAREVOX" "https://www.sharevox.net/" "https://github.com/SHAREVOX/sharevox/releases/download/0.2.3/SHAREVOX.Setup.0.2.3.exe" "SHAREVOX.Setup.exe" $LblEngineStatus $Form
+            $svTag = Get-GitHubLatestReleaseTag "SHAREVOX/sharevox" "0.2.1"
+            $svUrl = "https://github.com/SHAREVOX/sharevox/releases/download/$svTag/SHAREVOX.Web.Setup.$svTag.exe"
+            Show-EngineInstallOptionsDialog "SHAREVOX" "https://www.sharevox.net/" $svUrl "SHAREVOX.Web.Setup.exe" $LblEngineStatus $Form
             Start-Sleep -Seconds 1
             $script:DetectedEngines = Scan-AllLocalEngines
             Update-EngineCheckboxTexts
