@@ -39,5 +39,49 @@ class TestTextCleaner(unittest.TestCase):
         self.assertEqual(chunks[0].text, prefix)
         self.assertTrue(getattr(chunks[0], "is_name_prefix", False))
 
+    def test_ng_word_tag_protection_in_chunks(self):
+        # NGワード置換後のテキストで、BEEPタグが寸断されずBEEPチャンクと自然言語チャンクに分離されること
+        ng_words = ["ばか", "あほ"]
+        raw = "ゆばかはあほだからばかだあほ"
+        replaced, detected = TextCleaner.apply_ng_words(raw, ng_words)
+        self.assertEqual(len(detected), 2)
+        self.assertIn("<<__BEEP", replaced)
+
+        chunks = TextCleaner.split_into_chunks(replaced)
+        # BEEPタグの残骸がどのチャンクのテキストにも混入していないこと
+        for c in chunks:
+            self.assertNotIn("<<", c.text)
+            self.assertNotIn(">>", c.text)
+            self.assertNotIn("BEEP", c.text)
+
+        # BEEPチャンクが正しく含まれていること
+        beep_chunks = [c for c in chunks if getattr(c, "is_beep", False)]
+        self.assertGreaterEqual(len(beep_chunks), 1)
+
+    def test_consecutive_ng_words_merged(self):
+        # 連続したNGワードが1つの持続ピー音チャンクに綺麗に統合されること
+        ng_words = ["ばか", "あほ"]
+        raw = "ゆばかあほだから"
+        replaced, detected = TextCleaner.apply_ng_words(raw, ng_words)
+        chunks = TextCleaner.split_into_chunks(replaced)
+
+        # 構造: 「ゆ」 -> BEEP(マージ) -> 「だから」
+        non_beep = [c.text for c in chunks if not getattr(c, "is_beep", False)]
+        self.assertEqual(non_beep, ["ゆ", "だから"])
+
+        beep_chunks = [c for c in chunks if getattr(c, "is_beep", False)]
+        self.assertEqual(len(beep_chunks), 1)
+        # 2文字(0.34s) + 2文字(0.34s) = 0.68s
+        self.assertAlmostEqual(beep_chunks[0].beep_duration_sec, 0.68, places=2)
+
+    def test_smart_te_de_chunking(self):
+        # 接続助詞「て/で」の自立語接続スマートチャンキング
+        text = "最近コーヒー飲まなくなってアールグレイの紅茶よく飲んでる"
+        chunks = TextCleaner.split_into_chunks(text)
+        self.assertGreaterEqual(len(chunks), 2)
+        combined = [c.text for c in chunks]
+        self.assertTrue(any("最近コーヒー飲まなくなって" in t for t in combined))
+        self.assertTrue(any("アールグレイ" in t for t in combined))
+
 if __name__ == "__main__":
     unittest.main()

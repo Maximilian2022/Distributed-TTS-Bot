@@ -572,9 +572,6 @@ class CommandsCog(commands.Cog):
     @ng_group.command(name="add", description="NGワードをサーバーに登録します。発言時にピー音に置き換えられます。")
     @app_commands.describe(word="登録するNGワード")
     async def ng_add(self, interaction: discord.Interaction, word: str):
-        if not await self._check_admin_permission(interaction):
-            return
-
         w = word.strip()
         if not w:
             await interaction.response.send_message("❌ NGワードを正しく入力してください。", ephemeral=True)
@@ -602,9 +599,6 @@ class CommandsCog(commands.Cog):
     @ng_group.command(name="delete", description="NGワードをサーバーから削除します。")
     @app_commands.describe(word="削除するNGワード")
     async def ng_delete(self, interaction: discord.Interaction, word: str):
-        if not await self._check_admin_permission(interaction):
-            return
-
         w = word.strip()
         if not w:
             await interaction.response.send_message("❌ 削除するNGワードを指定してください。", ephemeral=True)
@@ -665,9 +659,6 @@ class CommandsCog(commands.Cog):
 
     @ng_group.command(name="preset", description="一般的な標準NGワードプリセット（差別用語・露骨な性的語句等）を一括登録します。")
     async def ng_preset(self, interaction: discord.Interaction):
-        if not await self._check_admin_permission(interaction):
-            return
-
         dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         count = await self.db.import_default_ng_words(interaction.guild_id)
         embed = discord.Embed(

@@ -715,7 +715,62 @@ class TextCleaner:
                 c.split_ms = split_ms
             return chunks
 
-        # 2. 本文の文境界分割 ([。！？]+)
+        # 2. 本文の処理: NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) の先行抽出
+        # BEEPタグは自然言語ではなく制御メタトークンであるため、自然言語処理（スペース・スラング・形態素・30文字ハードキャップ）
+        # に巻き込まれるとタグが途中で切断・破壊されてしまう。そのため最初に分離して保護する。
+        if '<<__BEEP' in text or '<<ピー音' in text:
+            raw_segments = _RE_BEEP_SPLIT.split(text)
+            for s_idx, seg in enumerate(raw_segments):
+                clean_s = seg.strip()
+                if not clean_s:
+                    continue
+
+                m = _RE_BEEP_TAG.match(clean_s)
+                if m:
+                    char_count = int(m.group(1)) if m.group(1) else 3
+                    from src.utils.streaming_audio import calc_beep_duration
+                    beep_sec = calc_beep_duration(char_count)
+                    # 連続するNGワードは1つの持続ピー音にマージして自然に発話
+                    if chunks and chunks[-1].is_beep:
+                        chunks[-1].beep_duration_sec = min(2.0, chunks[-1].beep_duration_sec + beep_sec)
+                    else:
+                        chunks.append(TextChunk(text="", pause_after_ms=40, is_beep=True, beep_duration_sec=beep_sec))
+                else:
+                    # 次の非空セグメントがBEEPタグかどうかを先読み
+                    next_is_beep = False
+                    for peek_idx in range(s_idx + 1, len(raw_segments)):
+                        peek_s = raw_segments[peek_idx].strip()
+                        if peek_s:
+                            next_is_beep = bool(_RE_BEEP_TAG.match(peek_s))
+                            break
+                    plain_chunks = TextCleaner._split_plain_text(clean_s, next_is_beep=next_is_beep)
+                    chunks.extend(plain_chunks)
+        else:
+            chunks.extend(TextCleaner._split_plain_text(text, next_is_beep=False))
+
+        # 分割結果が空なら全文を1パーツとして扱う
+        if not chunks and text.strip():
+            if '<<__BEEP' in text or '<<ピー音' in text:
+                chunks.append(TextChunk(text="", pause_after_ms=0, is_beep=True))
+            else:
+                chunks.append(TextChunk(text=text.strip(), pause_after_ms=0))
+
+        split_ms = round((time.time() - t_start) * 1000, 2)
+        for c in chunks:
+            c.split_ms = split_ms
+
+        return chunks
+
+    @staticmethod
+    def _split_plain_text(text: str, next_is_beep: bool = False) -> List['TextChunk']:
+        """
+        純粋な自然言語テキスト（メタタグを含まないプレーンテキスト）を、
+        句読点・読点・スペース・スラング・語尾・形態素・30文字ハードキャップで文分割する。
+        """
+        if not text or not text.strip():
+            return []
+
+        # 1. 本文の文境界分割 ([。！？]+)
         raw_parts = _RE_SPLIT_PUNCT.split(text)
         current_sentences: List[Tuple[str, str]] = []
         for i in range(0, len(raw_parts), 2):
@@ -725,7 +780,7 @@ class TextCleaner:
             if full:
                 current_sentences.append((full, delim))
 
-        # 3. 読点境界（「、」）での分割 (15文字超)
+        # 2. 読点境界（「、」）での分割 (15文字超)
         comma_refined: List[Tuple[str, str]] = []
         for sentence, delim in current_sentences:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
@@ -747,7 +802,7 @@ class TextCleaner:
             else:
                 comma_refined.append((sentence, delim))
 
-        # 4. スペース（空白）境界分割 (新設: 14文字超、英単語間スペース保護、O(N)スキャン)
+        # 3. スペース（空白）境界分割 (新設: 14文字超、英単語間スペース保護、O(N)スキャン)
         space_refined: List[Tuple[str, str]] = []
         for sentence, delim in comma_refined:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
@@ -762,7 +817,7 @@ class TextCleaner:
             else:
                 space_refined.append((sentence, delim))
 
-        # 5. スラング・笑い境界分割 (新設: 14文字超)
+        # 4. スラング・笑い境界分割 (新設: 14文字超)
         slang_refined: List[Tuple[str, str]] = []
         for sentence, delim in space_refined:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
@@ -772,7 +827,7 @@ class TextCleaner:
             else:
                 slang_refined.append((sentence, delim))
 
-        # 6. 語尾・終助詞・丁寧語終止形境界 (新設: 16文字超、句読点なし文)
+        # 5. 語尾・終助詞・丁寧語終止形境界 (新設: 16文字超、句読点なし文)
         ending_refined: List[Tuple[str, str]] = []
         for sentence, delim in slang_refined:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
@@ -798,7 +853,7 @@ class TextCleaner:
             else:
                 ending_refined.append((sentence, delim))
 
-        # 7. 長文に対する形態素（SudachiPy / Janome / 接続助詞・接続詞）での分割 (18文字超)
+        # 6. 長文に対する形態素（SudachiPy / Janome / 接続助詞・接続詞）での分割 (18文字超)
         morph_refined: List[Tuple[str, str]] = []
         for sentence, delim in ending_refined:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
@@ -808,17 +863,18 @@ class TextCleaner:
             else:
                 morph_refined.append((sentence, delim))
 
-        # 8. 30文字ハードキャップ安全スライス (新設: 最終防衛線)
+        # 7. 30文字ハードキャップ安全スライス (新設: 最終防衛線)
         final_sentences: List[Tuple[str, str]] = []
         for sentence, delim in morph_refined:
             hardcap_pieces = TextCleaner._hardcap_slice_30(sentence, delim)
             final_sentences.extend(hardcap_pieces)
 
-        # 9. TextChunk の構築
+        # 8. TextChunk の構築
+        chunks: List[TextChunk] = []
         for idx, (sentence, delim) in enumerate(final_sentences):
             is_last = (idx == len(final_sentences) - 1)
             if is_last:
-                pause_ms = 0
+                pause_ms = 20 if next_is_beep else 0
             elif '。' in delim:
                 pause_ms = 150
             elif '！' in delim or '？' in delim:
@@ -838,59 +894,23 @@ class TextCleaner:
             else:
                 pause_ms = 90
 
-            # NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) を含む場合は前後でチャンク分割
-            if '<<__BEEP' in sentence or '<<ピー音' in sentence:
-                parts = _RE_BEEP_SPLIT.split(sentence)
-                for p_idx, p in enumerate(parts):
-                    p_clean = p.strip()
-                    if not p_clean:
-                        continue
-                    m = _RE_BEEP_TAG.match(p_clean)
-                    if m:
-                        char_count = int(m.group(1)) if m.group(1) else 3
-                        from src.utils.streaming_audio import calc_beep_duration
-                        beep_sec = calc_beep_duration(char_count)
-                        chunks.append(TextChunk(text="", pause_after_ms=40, is_beep=True, beep_duration_sec=beep_sec))
-                    else:
-                        is_before_beep = (p_idx + 1 < len(parts) and bool(_RE_BEEP_TAG.match(parts[p_idx + 1].strip())))
-                        sub_pause = 20 if is_before_beep else (pause_ms if (is_last and p_idx == len(parts) - 1) else 60)
-                        chunks.append(TextChunk(text=p_clean, pause_after_ms=sub_pause, is_followed_by_beep=is_before_beep))
-            else:
-                chunks.append(TextChunk(text=sentence, pause_after_ms=pause_ms))
+            is_followed = (is_last and next_is_beep)
+            chunks.append(TextChunk(text=sentence, pause_after_ms=pause_ms, is_followed_by_beep=is_followed))
 
-        # 5. 記号のみチャンクの安全統合 (Azure/Edge-TTSの44byte空音声・発音不能エラー完全防止)
+        # 9. 記号のみチャンクの安全統合 (Azure/Edge-TTSの44byte空音声・発音不能エラー完全防止)
         cleaned_chunks: List[TextChunk] = []
         for c in chunks:
-            if c.is_name_prefix or c.is_beep:
-                cleaned_chunks.append(c)
-                continue
-            
             if _RE_HAS_READABLE.search(c.text):
                 cleaned_chunks.append(c)
             else:
-                # 記号のみチャンクの場合: 直前の本文チャンクがあれば結合 (直前がis_name_prefixまたはis_beepの場合は除外)
-                if cleaned_chunks and not cleaned_chunks[-1].is_name_prefix and not cleaned_chunks[-1].is_beep:
+                if cleaned_chunks:
                     cleaned_chunks[-1].text += c.text
                     cleaned_chunks[-1].pause_after_ms = max(cleaned_chunks[-1].pause_after_ms, c.pause_after_ms)
                     cleaned_chunks[-1].is_followed_by_beep = c.is_followed_by_beep
-                elif not cleaned_chunks or (len(cleaned_chunks) == 1 and cleaned_chunks[0].is_name_prefix):
-                    # 本文が記号のみで始まる場合はそのまま追加（後続本文があれば後で結合可能）
+                else:
                     cleaned_chunks.append(c)
 
-        chunks = cleaned_chunks
-
-        # 分割結果が空なら全文を1パーツとして扱う
-        if not chunks and text.strip():
-            if '<<__BEEP' in text or '<<ピー音' in text:
-                chunks.append(TextChunk(text="", pause_after_ms=0, is_beep=True))
-            else:
-                chunks.append(TextChunk(text=text.strip(), pause_after_ms=0))
-
-        split_ms = round((time.time() - t_start) * 1000, 2)
-        for c in chunks:
-            c.split_ms = split_ms
-
-        return chunks
+        return cleaned_chunks
 
     @staticmethod
     def normalize_cache_key_text(text: str) -> str:

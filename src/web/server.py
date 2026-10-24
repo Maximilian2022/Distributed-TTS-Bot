@@ -1850,11 +1850,6 @@ class WebServer:
         data = await request.json()
         guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
 
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({
-                "error": "Access denied. Administrator or assigned role required to add NG words."
-            }, status=403)
-
         word = data.get("word", "").strip()
         if not word:
             return web.json_response({"error": "Word is required"}, status=400)
@@ -1866,11 +1861,6 @@ class WebServer:
     async def api_delete_ng(self, request: web.Request) -> web.Response:
         word = request.match_info.get("word", "").strip()
         guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({
-                "error": "Access denied. Administrator or assigned role required to delete NG words."
-            }, status=403)
 
         if not word:
             return web.json_response({"error": "Word is required"}, status=400)
@@ -1884,11 +1874,6 @@ class WebServer:
     async def api_import_ng_preset(self, request: web.Request) -> web.Response:
         data = await request.json()
         guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
-
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({
-                "error": "Access denied. Administrator or assigned role required to import NG words."
-            }, status=403)
 
         count = await self.db.import_default_ng_words(guild.id)
         return web.json_response({"success": True, "imported_count": count})
@@ -2436,9 +2421,9 @@ class WebServer:
                         c0_audio_dur = round(dur0 * 1000, 1)
                         chunks_meta.append({
                             "chunk_index": 0,
-                            "text": first_chunk.text,
-                            "char_count": len(first_chunk.text),
-                            "role": "name" if getattr(first_chunk, "is_name_prefix", False) else "body",
+                            "text": first_chunk.text if not getattr(first_chunk, "is_beep", False) else "🚫 [自主規制ピー音]",
+                            "char_count": len(first_chunk.text) if not getattr(first_chunk, "is_beep", False) else 3,
+                            "role": "name" if getattr(first_chunk, "is_name_prefix", False) else ("beep" if getattr(first_chunk, "is_beep", False) else "body"),
                             "provider": c0_prov,
                             "worker": c0_worker,
                             "is_cached": c0_cached,
@@ -2486,9 +2471,9 @@ class WebServer:
                                 buf_rem_rounded = round(buffer_remaining_ms, 1)
                                 chunks_meta.append({
                                     "chunk_index": len(chunks_meta),
-                                    "text": ch.text,
-                                    "char_count": len(ch.text),
-                                    "role": "body",
+                                    "text": ch.text if not getattr(ch, "is_beep", False) else "🚫 [自主規制ピー音]",
+                                    "char_count": len(ch.text) if not getattr(ch, "is_beep", False) else 3,
+                                    "role": "beep" if getattr(ch, "is_beep", False) else "body",
                                     "provider": p,
                                     "worker": w,
                                     "is_cached": c,
