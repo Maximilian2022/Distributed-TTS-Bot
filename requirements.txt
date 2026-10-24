@@ -1,4 +1,4 @@
-discord.py[voice]>=2.4.0
+discord.py[voice]>=2.7.1
 azure-cognitiveservices-speech>=1.40.0
 google-cloud-texttospeech>=2.20.0
 aiosqlite>=0.20.0
