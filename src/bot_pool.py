@@ -314,16 +314,22 @@ class BotPoolManager:
                 masked_token = f"••••••••{raw_tok[-4:]}" if len(raw_tok) >= 8 else "••••••••"
 
             results.append({
+                "index": idx,
                 "bot_index": idx,
+                "is_configured": db_info is not None,
                 "is_registered": db_info is not None,
                 "is_enabled": bool(db_info.get("is_enabled", 1)) if db_info else False,
                 "label": db_info.get("label", "") if db_info else "",
+                "token_masked": masked_token,
                 "masked_token": masked_token,
                 "is_running": bot is not None,
                 "is_ready": bot.is_ready() if bot else False,
+                "ping_ms": round(bot.latency * 1000, 1) if (bot and hasattr(bot, "latency")) else 0.0,
                 "user": str(bot.user) if (bot and bot.user) else None,
                 "user_id": bot.user.id if (bot and bot.user) else None,
+                "guilds_count": len(bot.guilds) if (bot and bot.is_ready()) else 0,
                 "guild_count": len(bot.guilds) if (bot and bot.is_ready()) else 0,
+                "guilds": [{"id": g.id, "name": g.name} for g in bot.guilds] if (bot and bot.is_ready()) else [],
                 "connected_vcs": connected_vcs,
                 "is_busy": (len(connected_vcs) > 0 or self.is_bot_busy(bot)) if bot else False,
             })

@@ -6641,23 +6641,31 @@ async function loadBotSlots() {
   try {
     const res = await fetch("/api/system/bots");
     if (!res.ok) {
-      const err = await res.json();
-      grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Bot情報の取得に失敗しました: ${escapeHtml(err.error || res.statusText)}</div>`;
+      const raw = await res.text();
+      let err = {};
+      try { err = JSON.parse(raw); } catch(_) {}
+      grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Bot情報の取得に失敗しました: ${escapeHtml(err.error || res.statusText || raw.slice(0, 80))}</div>`;
       return;
     }
     const data = await res.json();
-    const slots = data.slots || [];
+    const slots = data.slots || data.bots || [];
 
     if (badge) {
-      badge.textContent = `稼働中: ${data.running_count} / ${data.enabled_count} 台 (全${data.total_slots}スロット)`;
-      badge.style.background = data.running_count > 0 ? "var(--primary, #5865f2)" : "rgba(255,255,255,0.15)";
+      const runningCnt = data.running_count !== undefined ? data.running_count : slots.filter(s => s.is_running || s.is_ready).length;
+      const enabledCnt = data.enabled_count !== undefined ? data.enabled_count : slots.filter(s => s.is_enabled).length;
+      const totalSlots = data.total_slots || slots.length || 10;
+      badge.textContent = `稼働中: ${runningCnt} / ${enabledCnt} 台 (全${totalSlots}スロット)`;
+      badge.style.background = runningCnt > 0 ? "var(--primary, #5865f2)" : "rgba(255,255,255,0.15)";
     }
 
     grid.innerHTML = slots.map(slot => {
-      const isConfigured = slot.is_configured;
-      const isRunning = slot.is_running;
-      const isEnabled = slot.is_enabled;
-      const isPrimary = slot.index === 1;
+      const idx = slot.index !== undefined ? slot.index : slot.bot_index;
+      const isConfigured = slot.is_configured !== undefined ? slot.is_configured : Boolean(slot.is_registered);
+      const isRunning = Boolean(slot.is_running);
+      const isEnabled = Boolean(slot.is_enabled);
+      const isPrimary = idx === 1;
+      const tokenMasked = slot.token_masked || slot.masked_token || 'トークン未設定';
+      const guildsCount = slot.guilds_count !== undefined ? slot.guilds_count : (slot.guild_count || 0);
 
       let statusBadge = "";
       let borderColor = "rgba(255,255,255,0.08)";
@@ -6681,7 +6689,7 @@ async function loadBotSlots() {
       if (slot.guilds && slot.guilds.length > 0) {
         guildsListHtml = `
           <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.05);font-size:11px;color:var(--text-muted);">
-            参加サーバー (${slot.guilds_count}件):
+            参加サーバー (${guildsCount}件):
             <div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:4px;">
               ${slot.guilds.map(g => `<span style="background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:4px;color:var(--text-light);">${escapeHtml(g.name)}</span>`).join("")}
             </div>
@@ -6695,7 +6703,7 @@ async function loadBotSlots() {
             <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;margin-bottom:8px;">
               <div>
                 <div style="font-weight:700;font-size:14px;color:var(--text-light);display:flex;align-items:center;gap:6px;">
-                  <span>${slot.index}号機</span>
+                  <span>${idx}号機</span>
                   ${roleBadge}
                 </div>
                 <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
@@ -6706,7 +6714,7 @@ async function loadBotSlots() {
             </div>
 
             <div style="font-size:11px;font-family:monospace;color:var(--text-dim);background:rgba(0,0,0,0.25);padding:4px 8px;border-radius:4px;margin:8px 0;word-break:break-all;">
-              ${slot.token_masked || 'トークン未設定'}
+              ${tokenMasked}
             </div>
 
             ${guildsListHtml}
@@ -6716,7 +6724,7 @@ async function loadBotSlots() {
             <div>
               ${isConfigured ? `
                 <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;color:var(--text-light);">
-                  <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleBotSlot(${slot.index}, this.checked)">
+                  <input type="checkbox" ${isEnabled ? 'checked' : ''} onchange="toggleBotSlot(${idx}, this.checked)">
                   <span>${isEnabled ? '有効' : '無効'}</span>
                 </label>
               ` : `
@@ -6724,11 +6732,11 @@ async function loadBotSlots() {
               `}
             </div>
             <div style="display:flex;gap:6px;">
-              <button type="button" class="btn btn-secondary btn-sm" onclick="openAddBotModal(${slot.index}, '${escapeHtml(slot.label || '')}')" style="padding:4px 8px;font-size:11px;">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="openAddBotModal(${idx}, '${escapeHtml(slot.label || '')}')" style="padding:4px 8px;font-size:11px;">
                 ${isConfigured ? '編集' : '＋ 設定'}
               </button>
               ${isConfigured ? `
-                <button type="button" class="btn btn-danger btn-sm" onclick="deleteBotSlot(${slot.index})" style="padding:4px 8px;font-size:11px;" title="トークンを削除">
+                <button type="button" class="btn btn-danger btn-sm" onclick="deleteBotSlot(${idx})" style="padding:4px 8px;font-size:11px;" title="トークンを削除">
                   🗑️
                 </button>
               ` : ''}
@@ -6795,8 +6803,16 @@ async function submitBotTokenForm(event) {
         is_enabled: enabled
       })
     });
-    const data = await res.json();
-    if (res.ok && data.status === "ok") {
+    const rawText = await res.text();
+    let data = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch (_) {
+      showToast(`サーバーエラー (${res.status}): ${rawText.slice(0, 100)}`, "error");
+      return;
+    }
+
+    if (res.ok && (data.status === "ok" || data.success)) {
       showToast(`${idx}号機トークンを設定しました 🚀`, "success");
       closeBotModal();
       loadBotSlots();
@@ -6818,8 +6834,16 @@ async function toggleBotSlot(idx, enabled) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ is_enabled: enabled })
     });
-    const data = await res.json();
-    if (res.ok && data.status === "ok") {
+    const rawText = await res.text();
+    let data = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch (_) {
+      showToast(`サーバーエラー (${res.status}): ${rawText.slice(0, 100)}`, "error");
+      return;
+    }
+
+    if (res.ok && (data.status === "ok" || data.success)) {
       showToast(enabled ? `${idx}号機の起動を開始しました` : `${idx}号機を停止しました`, "success");
       loadBotSlots();
     } else {
@@ -6841,8 +6865,16 @@ async function deleteBotSlot(idx) {
     const res = await fetch(`/api/system/bots/${idx}`, {
       method: "DELETE"
     });
-    const data = await res.json();
-    if (res.ok && data.status === "ok") {
+    const rawText = await res.text();
+    let data = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch (_) {
+      showToast(`サーバーエラー (${res.status}): ${rawText.slice(0, 100)}`, "error");
+      return;
+    }
+
+    if (res.ok && (data.status === "ok" || data.success)) {
       showToast(`${idx}号機を削除しました 🗑️`, "success");
       loadBotSlots();
     } else {

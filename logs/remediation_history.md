@@ -5877,6 +5877,27 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - 全Bot（#1〜#5）および各ノードが正常に再接続、ヘルスチェック Healthy を確認。
    - 本番 DB に提供された GCP サービスアカウント JSON が正常保存され、Google TTS が有効化（Available）されたことを確認。
 
+---
+
+## [2026-10-24 10:25] Discord Bot プール管理におけるトークン保存・スロット状態表示の不整合解消
+
+### 1. 課題と現象
+- **現象**:
+  - WebUIの「🤖 Discord Bot プール管理」タブにて、1〜10号機のスロットにTokenを入力して「保存して接続 🚀」を押しても「Bot設定の保存に失敗しました」と表示され保存が失敗する。
+- **真因の特定**:
+  1. `app.js` の `submitBotTokenForm`, `toggleBotSlot`, `deleteBotSlot` が `if (res.ok && data.status === "ok")` を判定していたが、バックエンド（`server.py` の `api_system_save_bot` 等）は `{"success": true}` のみを返し `status: "ok"` を含んでいなかったため、成功時でも毎回 `else` 節に入り失敗通知が出ていた。
+  2. `api_system_get_bots` と `app.js` の `loadBotSlots` において、プロパティ名に多数の不一致が存在していた（`slots` vs `bots`、`index` vs `bot_index`、`is_configured` vs `is_registered`、`token_masked` vs `masked_token`、`guilds_count` vs `guild_count`、`running_count`/`enabled_count`/`total_slots` の欠落）。
+
+### 2. 実施した恒久対策
+1. **バックエンド API のレスポンス両対応と堅牢化 (`src/web/server.py`, `src/bot_pool.py`)**:
+   - `get_full_pool_status`: フロントエンドが要求する全属性（`index`, `is_configured`, `token_masked`, `guilds_count`, `guilds`, `ping_ms`）を辞書に追加し完全両対応化。
+   - `api_system_get_bots`: `status: "ok"`, `slots`, `bots`, `running_count`, `enabled_count`, `total_slots` を返却するよう拡充。
+   - `api_system_save_bot`, `api_system_delete_bot`, `api_system_toggle_bot`: `status: "ok"` と `success: true` の両方を含め、エンドポイント全体を例外保護。
+2. **フロントエンド送受信の堅牢化 (`src/web/static/app.js`)**:
+   - `submitBotTokenForm`, `toggleBotSlot`, `deleteBotSlot` において、`res.text()` 経由で JSON パースを行い、成否判定を `(data.status === "ok" || data.success)` に柔軟化。
+   - `loadBotSlots` において、プロパティの安全フォールバック参照を実装。
+
+
 
 
 

@@ -3935,11 +3935,27 @@ class WebServer:
         """1〜10号機の全スロット状態を取得 (管理者のみ)"""
         await self._require_admin(request)
         if not self.bot_pool:
-            return web.json_response({"bots": [], "max_slots": 10})
+            return web.json_response({
+                "status": "ok",
+                "slots": [],
+                "bots": [],
+                "total_slots": 10,
+                "max_slots": 10,
+                "running_count": 0,
+                "enabled_count": 0,
+                "client_id": self.config.discord_client_id
+            })
         status_list = await self.bot_pool.get_full_pool_status()
+        running_count = sum(1 for s in status_list if s.get("is_running") or s.get("is_ready"))
+        enabled_count = sum(1 for s in status_list if s.get("is_enabled"))
         return web.json_response({
+            "status": "ok",
+            "slots": status_list,
             "bots": status_list,
+            "total_slots": len(status_list),
             "max_slots": 10,
+            "running_count": running_count,
+            "enabled_count": enabled_count,
             "client_id": self.config.discord_client_id
         })
 
@@ -3947,29 +3963,37 @@ class WebServer:
         """Botトークンの追加・更新・即時接続 (管理者のみ)"""
         await self._require_admin(request)
         try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"status": "error", "error": "リクエストJSONの形式が不正です"}, status=400)
 
-        bot_index = int(data.get("bot_index", 1))
-        token = str(data.get("token", "")).strip()
-        label = str(data.get("label", "")).strip()
-        is_enabled = bool(data.get("is_enabled", True))
+            bot_index = int(data.get("bot_index", 1))
+            token = str(data.get("token", "")).strip()
+            label = str(data.get("label", "")).strip()
+            is_enabled = bool(data.get("is_enabled", True))
 
-        if not (1 <= bot_index <= 10):
-            return web.json_response({"error": "bot_index は 1〜10 の範囲で指定してください。"}, status=400)
-        if not token:
-            return web.json_response({"error": "Botトークンは必須です。"}, status=400)
+            if not (1 <= bot_index <= 10):
+                return web.json_response({"status": "error", "error": "bot_index は 1〜10 の範囲で指定してください。"}, status=400)
+            if not token:
+                return web.json_response({"status": "error", "error": "Botトークンは必須です。"}, status=400)
 
-        if not self.bot_pool:
-            return web.json_response({"error": "BotPool is not initialized."}, status=500)
+            if not self.bot_pool:
+                return web.json_response({"status": "error", "error": "BotPool is not initialized."}, status=500)
 
-        success = await self.bot_pool.add_or_update_token(bot_index, token, label=label, is_enabled=is_enabled)
-        return web.json_response({
-            "success": success,
-            "bot_index": bot_index,
-            "message": f"Bot #{bot_index} のトークンを保存・接続開始しました。"
-        })
+            success = await self.bot_pool.add_or_update_token(bot_index, token, label=label, is_enabled=is_enabled)
+            return web.json_response({
+                "status": "ok",
+                "success": success,
+                "bot_index": bot_index,
+                "message": f"Bot #{bot_index} のトークンを保存・接続開始しました。"
+            })
+        except Exception as e:
+            logger.exception("Failed to save bot token")
+            return web.json_response({
+                "status": "error",
+                "error": f"Botトークン保存中にエラーが発生しました: {e}"
+            }, status=500)
 
     async def api_system_delete_bot(self, request: web.Request) -> web.Response:
         """Botトークンの削除および停止 (管理者のみ)"""
@@ -3978,17 +4002,25 @@ class WebServer:
         try:
             bot_index = int(idx_str)
         except (ValueError, TypeError):
-            return web.json_response({"error": "Invalid bot index"}, status=400)
+            return web.json_response({"status": "error", "error": "無効なBotインデックスです"}, status=400)
 
         if not self.bot_pool:
-            return web.json_response({"error": "BotPool is not initialized."}, status=500)
+            return web.json_response({"status": "error", "error": "BotPool is not initialized."}, status=500)
 
-        await self.bot_pool.delete_token(bot_index)
-        return web.json_response({
-            "success": True,
-            "bot_index": bot_index,
-            "message": f"Bot #{bot_index} を切断・削除しました。"
-        })
+        try:
+            await self.bot_pool.delete_token(bot_index)
+            return web.json_response({
+                "status": "ok",
+                "success": True,
+                "bot_index": bot_index,
+                "message": f"Bot #{bot_index} を切断・削除しました。"
+            })
+        except Exception as e:
+            logger.exception(f"Failed to delete bot #{bot_index}")
+            return web.json_response({
+                "status": "error",
+                "error": f"Bot削除中にエラーが発生しました: {e}"
+            }, status=500)
 
     async def api_system_toggle_bot(self, request: web.Request) -> web.Response:
         """Botの有効/無効切替 (管理者のみ)"""
@@ -3997,23 +4029,31 @@ class WebServer:
         try:
             bot_index = int(idx_str)
         except (ValueError, TypeError):
-            return web.json_response({"error": "Invalid bot index"}, status=400)
+            return web.json_response({"status": "error", "error": "無効なBotインデックスです"}, status=400)
 
         try:
             data = await request.json()
         except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+            return web.json_response({"status": "error", "error": "リクエストJSONの形式が不正です"}, status=400)
 
         is_enabled = bool(data.get("is_enabled", True))
         if not self.bot_pool:
-            return web.json_response({"error": "BotPool is not initialized."}, status=500)
+            return web.json_response({"status": "error", "error": "BotPool is not initialized."}, status=500)
 
-        success = await self.bot_pool.toggle_token(bot_index, is_enabled)
-        return web.json_response({
-            "success": success,
-            "bot_index": bot_index,
-            "is_enabled": is_enabled
-        })
+        try:
+            success = await self.bot_pool.toggle_token(bot_index, is_enabled)
+            return web.json_response({
+                "status": "ok",
+                "success": success,
+                "bot_index": bot_index,
+                "is_enabled": is_enabled
+            })
+        except Exception as e:
+            logger.exception(f"Failed to toggle bot #{bot_index}")
+            return web.json_response({
+                "status": "error",
+                "error": f"Bot状態変更中にエラーが発生しました: {e}"
+            }, status=500)
 
     async def api_system_get_credentials(self, request: web.Request) -> web.Response:
         """APIキー・設定情報の取得 (伏字表示, 管理者のみ)"""
