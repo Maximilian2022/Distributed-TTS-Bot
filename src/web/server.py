@@ -136,11 +136,35 @@ class WebServer:
         except Exception as e:
             logger.error(f"[HA] Failed to save ha_manager_nodes.json: {e}")
 
-    def _record_ha_slave_heartbeat(self, node_id: str, hostname: str, ip: str, is_sync: bool = False, user_agent: str = ""):
+    def _get_next_available_priority(self, exclude_node_id: str = "") -> int:
+        """未割り当ての最小 Priority (1, 2, 3...) を計算"""
+        used_priorities = {
+            s.get("priority") for nid, s in self.ha_slaves.items()
+            if nid != exclude_node_id and isinstance(s.get("priority"), int) and s.get("priority") > 0
+        }
+        p = 1
+        while p in used_priorities:
+            p += 1
+        return p
+
+    def _record_ha_slave_heartbeat(
+        self,
+        node_id: str,
+        hostname: str,
+        ip: str,
+        is_sync: bool = False,
+        user_agent: str = "",
+        cpu_cores: int = 1,
+        memory_gb: float = 0.0,
+        os_name: str = "",
+        requested_priority: Optional[int] = None
+    ):
         if not node_id:
             return
         now = time.time()
         if node_id not in self.ha_slaves:
+            # 参加順または指定値に基づいて空き Priority を自動採番
+            priority = requested_priority if (requested_priority and requested_priority > 0) else self._get_next_available_priority(node_id)
             self.ha_slaves[node_id] = {
                 "node_id": node_id,
                 "hostname": hostname,
@@ -149,7 +173,11 @@ class WebServer:
                 "last_seen": now,
                 "last_sync": now if is_sync else 0.0,
                 "status": "online",
-                "user_agent": user_agent
+                "user_agent": user_agent,
+                "priority": priority,
+                "cpu_cores": cpu_cores,
+                "memory_gb": memory_gb,
+                "os_name": os_name
             }
         else:
             entry = self.ha_slaves[node_id]
@@ -164,6 +192,15 @@ class WebServer:
                 entry["status"] = "online"
             if user_agent:
                 entry["user_agent"] = user_agent
+            # priority が未設定の場合は補正
+            if "priority" not in entry or not isinstance(entry["priority"], int) or entry["priority"] <= 0:
+                entry["priority"] = self._get_next_available_priority(node_id)
+            if cpu_cores > 0:
+                entry["cpu_cores"] = cpu_cores
+            if memory_gb > 0:
+                entry["memory_gb"] = memory_gb
+            if os_name:
+                entry["os_name"] = os_name
         self._save_ha_nodes()
 
     async def _get_or_fetch_member(self, guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
@@ -324,6 +361,7 @@ class WebServer:
         self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
         self.app.router.add_get("/api/ha/status", self.api_ha_status)
         self.app.router.add_get("/api/system/manager_nodes", self.api_system_get_manager_nodes)
+        self.app.router.add_post("/api/system/manager_nodes/priority", self.api_system_set_manager_nodes_priority)
         self.app.router.add_post("/api/system/manager_nodes/revoke", self.api_system_revoke_manager_node)
         self.app.router.add_delete("/api/system/manager_nodes/{node_id}", self.api_system_delete_manager_node)
         self.app.router.add_post("/api/worker/kick", self.api_worker_kick_node)
@@ -881,9 +919,23 @@ class WebServer:
         client_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "unknown"
         user_agent = request.headers.get("User-Agent", "")
 
+        p_raw = request.headers.get("X-HA-Priority", "").strip()
+        req_p = int(p_raw) if (p_raw and p_raw.isdigit()) else None
+        cores_raw = request.headers.get("X-HA-Cpu-Cores", "1").strip()
+        cpu_cores = int(cores_raw) if (cores_raw and cores_raw.isdigit()) else 1
+        mem_raw = request.headers.get("X-HA-Memory-Gb", "0.0").strip()
+        try:
+            mem_gb = float(mem_raw)
+        except ValueError:
+            mem_gb = 0.0
+        os_name = request.headers.get("X-HA-Os", "").strip()
+
         if node_id and (node_id in self.ha_revoked_nodes or self.ha_slaves.get(node_id, {}).get("status") == "revoked"):
             logger.warning(f"🛑 [HA] Status check from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
-            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=False, user_agent=user_agent)
+            self._record_ha_slave_heartbeat(
+                node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p
+            )
             return web.json_response({
                 "action": "terminate",
                 "error": "This Manager Slave node has been revoked and decommissioned by Master.",
@@ -892,7 +944,10 @@ class WebServer:
             }, status=410)
 
         if node_id:
-            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=False, user_agent=user_agent)
+            self._record_ha_slave_heartbeat(
+                node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p
+            )
 
         db_path = self.config.db_path
         db_size = os.path.getsize(db_path) if os.path.exists(db_path) else 0
@@ -902,11 +957,19 @@ class WebServer:
         if self.bot_pool and hasattr(self.bot_pool, "get_active_bot_count"):
             active_bots = self.bot_pool.get_active_bot_count()
 
+        slave_entry = self.ha_slaves.get(node_id, {})
+        assigned_p = slave_entry.get("priority", 1)
+        online_standbys = len([s for s in self.ha_slaves.values() if s.get("status") == "online"])
+
         return web.json_response({
             "status": "ok",
             "role": "master",
             "is_active": True,
             "active_bots": active_bots,
+            "assigned_priority": assigned_p,
+            "priority": assigned_p,
+            "total_standbys": online_standbys,
+            "recommended_standbys": 2,
             "db_size_bytes": db_size,
             "db_mtime": db_mtime,
             "timestamp": time.time(),
@@ -923,9 +986,21 @@ class WebServer:
         client_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "unknown"
         user_agent = request.headers.get("User-Agent", "")
 
+        cores_raw = request.headers.get("X-HA-Cpu-Cores", "1").strip()
+        cpu_cores = int(cores_raw) if (cores_raw and cores_raw.isdigit()) else 1
+        mem_raw = request.headers.get("X-HA-Memory-Gb", "0.0").strip()
+        try:
+            mem_gb = float(mem_raw)
+        except ValueError:
+            mem_gb = 0.0
+        os_name = request.headers.get("X-HA-Os", "").strip()
+
         if node_id and (node_id in self.ha_revoked_nodes or self.ha_slaves.get(node_id, {}).get("status") == "revoked"):
             logger.warning(f"🛑 [HA] Snapshot sync from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
-            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=False, user_agent=user_agent)
+            self._record_ha_slave_heartbeat(
+                node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name
+            )
             return web.json_response({
                 "action": "terminate",
                 "error": "This Manager Slave node has been revoked and decommissioned by Master.",
@@ -934,7 +1009,10 @@ class WebServer:
             }, status=410)
 
         if node_id:
-            self._record_ha_slave_heartbeat(node_id, hostname, client_ip, is_sync=True, user_agent=user_agent)
+            self._record_ha_slave_heartbeat(
+                node_id, hostname, client_ip, is_sync=True, user_agent=user_agent,
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name
+            )
 
         db_path = self.config.db_path
         if not os.path.exists(db_path):
@@ -1014,14 +1092,24 @@ class WebServer:
             is_revoked = node_id in self.ha_revoked_nodes or slave.get("status") == "revoked"
             # 60秒以上アクセスがなければ offline 判定
             is_online = (now - last_seen) < 60.0 and not is_revoked
-
             status = "revoked" if is_revoked else ("online" if is_online else "offline")
             status_display = "停止・除外済 (Revoked)" if is_revoked else ("待機中 (Standby)" if is_online else "切断 (Offline)")
+
+            priority = slave.get("priority", 1)
+            cpu_cores = slave.get("cpu_cores", 1)
+            memory_gb = slave.get("memory_gb", 0.0)
+            os_name = slave.get("os_name", "")
 
             slaves_list.append({
                 "node_id": node_id,
                 "hostname": slave.get("hostname", "unknown"),
                 "ip": slave.get("ip", "unknown"),
+                "priority": priority,
+                "priority_display": f"Priority {priority}" + (" (第1待機系・最速昇格)" if priority == 1 else f" (第{priority}待機系)"),
+                "cpu_cores": cpu_cores,
+                "memory_gb": memory_gb,
+                "os_name": os_name,
+                "spec_display": f"{cpu_cores} Cores / {memory_gb:.1f} GB RAM" if memory_gb > 0 else f"{cpu_cores} Cores",
                 "last_seen": last_seen,
                 "last_seen_ago": int(now - last_seen) if last_seen > 0 else -1,
                 "last_sync": slave.get("last_sync", 0),
@@ -1031,15 +1119,73 @@ class WebServer:
                 "user_agent": slave.get("user_agent", "")
             })
 
-        slaves_list.sort(key=lambda s: (0 if s["status"] == "online" else (1 if s["status"] == "offline" else 2), -s["last_seen"]))
+        # オンライン優先、その中で Priority 昇順 (1, 2, 3...)
+        slaves_list.sort(key=lambda s: (
+            0 if s["status"] == "online" else (1 if s["status"] == "offline" else 2),
+            s["priority"],
+            -s["last_seen"]
+        ))
 
         return web.json_response({
             "status": "ok",
             "master": master_info,
             "slaves": slaves_list,
             "ha_secret_configured": bool(self.config.ha_secret),
-            "total_nodes": 1 + len(slaves_list)
+            "total_nodes": 1 + len(slaves_list),
+            "recommended_standbys": 2
         })
+
+    async def api_system_set_manager_nodes_priority(self, request: web.Request) -> web.Response:
+        """Manager Slave ノードの Priority (昇格優先度) を更新・整列 (管理者のみ)"""
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        action = data.get("action", "")
+        if action == "auto_spec":
+            # スペック順に自動整列 (RAM大 > CPUコア大 > 先着順)
+            valid_slaves = [
+                (nid, s) for nid, s in self.ha_slaves.items()
+                if nid not in self.ha_revoked_nodes and s.get("status") != "revoked"
+            ]
+            valid_slaves.sort(key=lambda item: (
+                -(item[1].get("memory_gb") or 0.0),
+                -(item[1].get("cpu_cores") or 1),
+                item[1].get("first_seen") or 0.0
+            ))
+            for idx, (nid, s) in enumerate(valid_slaves, start=1):
+                s["priority"] = idx
+            self._save_ha_nodes()
+            return web.json_response({
+                "status": "ok",
+                "message": "スペック順 (RAM・CPU大) に優先度を自動整列しました。"
+            })
+
+        # 一括指定
+        node_priorities = data.get("node_priorities")
+        if node_priorities and isinstance(node_priorities, list):
+            for item in node_priorities:
+                nid = str(item.get("node_id", "")).strip()
+                p = item.get("priority")
+                if nid in self.ha_slaves and isinstance(p, int) and p > 0:
+                    self.ha_slaves[nid]["priority"] = p
+            self._save_ha_nodes()
+            return web.json_response({"status": "ok", "message": "優先度を更新しました。"})
+
+        # 単一指定
+        node_id = str(data.get("node_id", "")).strip()
+        priority = data.get("priority")
+        if node_id and node_id in self.ha_slaves and isinstance(priority, int) and priority > 0:
+            self.ha_slaves[node_id]["priority"] = priority
+            self._save_ha_nodes()
+            return web.json_response({
+                "status": "ok",
+                "message": f"ノード '{node_id}' の優先度を Priority {priority} に更新しました。"
+            })
+
+        return web.json_response({"error": "node_id and valid priority (positive integer) or action is required"}, status=400)
 
     async def api_system_revoke_manager_node(self, request: web.Request) -> web.Response:
         """指定した Slave Node を除外・自律停止対象に登録 (管理者のみ)"""

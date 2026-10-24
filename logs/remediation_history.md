@@ -1,6 +1,44 @@
 # 修正・作業履歴 (Remediation History)
 
-## [2026-10-24] Standby (Slave) セットアップスクリプトへの Master URL / HA Secret 動的自動埋め込み配信（ゼロ対話化）
+## [2026-10-24] Slave セットアップの Dockerfile 不在エラー解消 & 複数台待機 (推奨2台) カスケード Priority 制御の実装
+- **ユーザーフィードバック & 課題**:
+  1. `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` 実行時に `open Dockerfile: no such file or directory` が発生し、セットアップが途中で停止する不具合の報告。
+  2. 1:1 冗長化を基本としつつ、多様な利用環境に対応するため待機系を「推奨2台」構成とし、複数台 Slave が接続された場合の優先度（Priority: 参加順またはハイスペック順）に基づく安全なフェイルオーバー制御（方針②）の実装要求。
+- **真因の究明**:
+  - `setup-standby.sh` において `git clone ... .` を実行する直前に `mkdir -p data logs` を実行していたため、対象ディレクトリが非空（non-empty）となり `git clone .` が失敗（`destination path '.' already exists and is not an empty directory`）していた。
+  - エラーが標準エラー抑制されていたため、フォールバックで `docker-compose.yml` のみがダウンロードされ、`Dockerfile` やソースコードが存在しない状態で `docker compose up` のビルドが走って `no such file or directory` となっていた。
+- **抜本的改善内容**:
+  1. **セットアップスクリプトの完全堅牢化 (`src/web/static/setup-standby.sh` & `.ps1`)**:
+     - 非空ディレクトリ（すでに `data` や中途半端なファイルが存在する環境）でも確実にリポジトリ全体を展開できるよう、`git init` + `git remote add` + `git fetch --depth=1` + `git reset --hard` ロジックを導入。
+     - git コマンドが存在しない、またはネットワーク制限下でも動作するよう、GitHub 公式 tarball (`https://github.com/Maximilian2022/ttsbot-oss/archive/refs/heads/main.tar.gz`) を用いた直接展開フォールバックを完備。
+     - 展開後に `Dockerfile` の存在を検証するアサーションを配備。
+  2. **複数台 Slave カスケード Priority 制御 (`src/ha_watchdog.py`)**:
+     - システムスペック（CPU コア数、物理メモリ容量 GB、OS 名）の自動検出機能を実装。
+     - Master へのハートビート時に `X-HA-Priority`, `X-HA-Cpu-Cores`, `X-HA-Memory-Gb`, `X-HA-Os` を自動送信。
+     - Master から返される `assigned_priority` を動的に反映。
+     - カスケードフェイルオーバー閾値計算:
+       - `fail_threshold = 6 + (priority - 1) * 3`
+       - Priority 1 (第1待機系): 約30秒で最速自律昇格。
+       - Priority 2 (第2待機系): 約45秒で待機昇格。
+     - **二重昇格・多重スプリットブレイン防止ガード**:
+       - Priority > 1 のノードは、閾値（45秒等）到達時に昇格する直前、再度 Master URL（または上位ノードの昇格状況）を確認。上位ノードが無事昇格または Master が復旧していれば自律昇格を安全に抑制し、Standby を維持。
+  3. **Master 側オーケストレーション & Priority API (`src/web/server.py`)**:
+     - `_record_ha_slave_heartbeat`: 新規 Slave の初回接続時に参加順（1, 2...）で空いている最小 Priority を自動採番。スペック情報を永続化。
+     - `/api/ha/status`: レスポンスに `assigned_priority`, `total_standbys`, `recommended_standbys: 2` を含め Slave へネゴシエーション。
+     - `GET /api/system/manager_nodes`: 各ノードの `priority`、スペック表示（`X Cores / Y.Y GB RAM`）、OS名、ステータスを返し、Priority 昇順でソート。
+     - 新設API `POST /api/system/manager_nodes/priority`:
+       - 管理者権限でノードの優先度を直接変更可能。
+       - `action: "auto_spec"` によるハイスペック順（RAM降順 > CPUコア降順 > 参加順）自動整列機能を実装。
+  4. **ダッシュボード UI の刷新 (`src/web/templates/index.html` & `src/web/static/app.js`)**:
+     - クラスタ管理バッジに「推奨待機: 2台」および達成状況（`🟢 冗長化 完了 (推奨2台達成)` / `🟡 最小冗長化 (1台待機中)` / `⚪ 待機ノードなし`）を表示。
+     - Slave カード内に「★ Priority X」バッジとスペック情報（CPU / RAM / OS）を表示。
+     - 各 Slave カードに優先度変更セレクトボックス（Priority 1〜5）を配備。
+     - 「⚡ スペック順に優先度整列」ボタンを配置し、ワンクリックで高性能サーバーを最優先待機系（Priority 1）に再設定可能に。
+- **実機検証**:
+  - 非空ディレクトリ（`mkdir -p data logs` 済み環境）に対するクローン・展開テストを実施し、`Dockerfile` および全ソースコードが確実に展開されることを確認。
+  - Tarball 展開テストも正常完了。
+  - フロントエンドおよびバックエンドの Lint エラー 0 件を確認。
+
 - **ユーザーフィードバック & 課題**:
   - `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` でスクリプトを主系（Master）自身からダウンロードしているにもかかわらず、スクリプト実行時に対話プロンプト「Master (主系) サーバーのベースURLを入力してください:」が表示されるのは二度手間で不自然という指摘。
 - **抜本的改善内容**:

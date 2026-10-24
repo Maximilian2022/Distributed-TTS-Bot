@@ -98,8 +98,10 @@ class DockerSocketClient:
         return status in (204, 304)
 
 
+import platform
+
 class HAWatchdog:
-    """Master-Slave HA 監視・同期・調停マネージャー"""
+    """Master-Slave HA 監視・同期・調停マネージャー (複数台カスケード Priority 制御対応)"""
 
     def __init__(self):
         self.master_url = os.getenv("TTSBOT_MASTER_URL", "").strip().rstrip("/")
@@ -110,7 +112,9 @@ class HAWatchdog:
 
         self.ha_secret = os.getenv("TTSBOT_HA_SECRET", os.getenv("HA_SECRET", "")).strip()
         self.check_interval = float(os.getenv("TTSBOT_CHECK_INTERVAL", "5.0"))
-        self.fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "6"))  # 約30秒連続無応答で昇格
+        self.base_fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "6"))  # 基本: 6回 (約30秒)
+        self.priority = int(os.getenv("TTSBOT_HA_PRIORITY", "1"))  # 優先度 (1=最速昇格、2=待機昇格)
+        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 3
         self.sync_interval = float(os.getenv("TTSBOT_SYNC_INTERVAL", "60.0"))  # 1分周期でDB同期
         self.db_path = Path(os.getenv("TTSBOT_LOCAL_DB_PATH", "/app/data/bot.db"))
         self.docker = DockerSocketClient(os.getenv("TTSBOT_DOCKER_SOCKET", "/var/run/docker.sock"))
@@ -118,13 +122,41 @@ class HAWatchdog:
         self.hostname = socket.gethostname()
         self.node_id = self._init_node_id()
 
+        # システムスペックの自動検出 (Master での Priority 自動提案・表示用)
+        self.cpu_cores = os.cpu_count() or 1
+        self.memory_gb = self._detect_memory_gb()
+        self.os_name = platform.system()
+
         self.current_state = "standby"  # "standby" or "active"
         self.fail_count = 0
         self.last_sync_time = 0.0
         self.last_db_hash: Optional[str] = None
         self.running = True
 
-        logger.info(f"🆔 HA Watchdog initialized. Node ID: {self.node_id} (Host: {self.hostname})")
+        logger.info(
+            f"🆔 HA Watchdog initialized. Node ID: {self.node_id} (Host: {self.hostname}, "
+            f"Spec: {self.cpu_cores} cores / {self.memory_gb} GB RAM / {self.os_name}, "
+            f"Priority: {self.priority}, Failover threshold: {self.fail_threshold} checks = {self.fail_threshold * self.check_interval:.0f}s)"
+        )
+
+    def _detect_memory_gb(self) -> float:
+        """システム物理メモリ (GB) の検出"""
+        try:
+            if hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
+                total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+                return round(total_bytes / (1024 ** 3), 1)
+        except Exception:
+            pass
+        try:
+            meminfo = Path("/proc/meminfo")
+            if meminfo.exists():
+                for line in meminfo.read_text().splitlines():
+                    if line.startswith("MemTotal:"):
+                        kb = int(line.split()[1])
+                        return round(kb / (1024 * 1024), 1)
+        except Exception:
+            pass
+        return 0.0
 
     def _init_node_id(self) -> str:
         """永続的な Node ID を初期化または取得"""
@@ -146,11 +178,15 @@ class HAWatchdog:
             return f"slave_{self.hostname}_{uuid.uuid4().hex[:8]}"
 
     def _get_common_headers(self) -> dict:
-        """Master 送信用の認証・ノード識別ヘッダー"""
+        """Master 送信用の認証・ノード識別・スペック・Priority ヘッダー"""
         headers = {
             "User-Agent": f"TTSBot-HA-Watchdog/{self.node_id}",
             "X-HA-Node-ID": self.node_id,
             "X-HA-Hostname": self.hostname,
+            "X-HA-Priority": str(self.priority),
+            "X-HA-Cpu-Cores": str(self.cpu_cores),
+            "X-HA-Memory-Gb": str(self.memory_gb),
+            "X-HA-Os": self.os_name,
         }
         if self.ha_secret:
             headers["Authorization"] = f"Bearer {self.ha_secret}"
@@ -180,6 +216,12 @@ class HAWatchdog:
             with urllib.request.urlopen(req, timeout=4.0) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
+                    assigned_p = data.get("assigned_priority") or data.get("priority")
+                    if assigned_p and isinstance(assigned_p, int) and assigned_p != self.priority:
+                        logger.info(f"🔄 [Priority] Master assigned new Priority: {self.priority} -> {assigned_p}")
+                        self.priority = assigned_p
+                        self.fail_threshold = self.base_fail_threshold + (self.priority - 1) * 3
+                        logger.info(f"⏱️ [Failover] New failover threshold: {self.fail_threshold} checks ({self.fail_threshold * self.check_interval:.0f}s)")
                     return data.get("is_active", True)
                 elif resp.status == 410:
                     self._handle_revocation()
@@ -399,13 +441,29 @@ class HAWatchdog:
                     if self.fail_count >= self.fail_threshold and self.current_state == "standby":
                         # 外向きインターネット疎通の二重確認
                         has_net = await loop.run_in_executor(None, self.check_internet_connectivity)
-                        if has_net:
-                            await self.promote_to_active()
-                        else:
+                        if not has_net:
                             logger.error(
                                 "🚫 Outbound internet connectivity check failed on Slave. "
                                 "Suppressing promotion to avoid false failover during local network outage."
                             )
+                            continue
+
+                        # Priority > 1 (第2待機系以降) の場合、昇格直前に上位ノードや Master が稼働・復旧していないか最終確認
+                        if self.priority > 1:
+                            logger.info(
+                                f"🔍 [Priority {self.priority} Standby] Pre-promotion verification: "
+                                "Checking if higher-priority node or Master is active..."
+                            )
+                            is_active_somewhere = await loop.run_in_executor(None, self.is_master_healthy)
+                            if is_active_somewhere:
+                                logger.info(
+                                    "🛡️ [Split-Brain Guard] Master or higher-priority node is active! "
+                                    "Suppressing promotion to keep this node in standby."
+                                )
+                                self.fail_count = 0
+                                continue
+
+                        await self.promote_to_active()
 
             except Exception as e:
                 logger.error(f"Unexpected error in Watchdog loop: {e}", exc_info=True)

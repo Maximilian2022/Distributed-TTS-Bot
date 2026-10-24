@@ -96,18 +96,44 @@ Write-Host "`n[3/4] Slave 設定・ディレクトリのセットアップ ($Ins
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
-New-Item -ItemType Directory -Path (Join-Path $InstallDir "data") -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $InstallDir "logs") -Force | Out-Null
-
 Set-Location $InstallDir
 
-# リポジトリの取得
-if (-not (Test-Path (Join-Path $InstallDir "docker-compose.yml"))) {
+# リポジトリ全体 (Dockerfile やソースコード一式) の確実な取得
+if (-not (Test-Path (Join-Path $InstallDir "Dockerfile"))) {
+    $cloned = $false
     $gitCmd = Get-Command git -ErrorAction SilentlyContinue
     if ($gitCmd) {
-        Write-Host "  リポジトリを取得中 (git clone)..."
-        git clone https://github.com/Maximilian2022/ttsbot-oss.git . 2>$null
+        Write-Host "  リポジトリを取得中 (git)..."
+        try {
+            if (-not (Test-Path (Join-Path $InstallDir ".git"))) {
+                git clone https://github.com/Maximilian2022/ttsbot-oss.git . 2>$null
+                if (Test-Path (Join-Path $InstallDir "Dockerfile")) { $cloned = $true }
+            } else {
+                git fetch --depth=1 origin main 2>$null
+                git reset --hard origin/main 2>$null
+                if (Test-Path (Join-Path $InstallDir "Dockerfile")) { $cloned = $true }
+            }
+        } catch {}
     }
+
+    if (-not $cloned -and -not (Test-Path (Join-Path $InstallDir "Dockerfile"))) {
+        Write-Host "  GitHub からソースコード一式 (zip) を取得・展開中..."
+        try {
+            $zipPath = Join-Path $env:TEMP "ttsbot-main.zip"
+            $extractPath = Join-Path $env:TEMP "ttsbot-extract"
+            Invoke-WebRequest -Uri "https://github.com/Maximilian2022/ttsbot-oss/archive/refs/heads/main.zip" -OutFile $zipPath -TimeoutSec 30
+            if (Test-Path $extractPath) { Remove-Item -Path $extractPath -Recurse -Force -ErrorAction SilentlyContinue }
+            Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+            $innerDir = Join-Path $extractPath "ttsbot-oss-main"
+            if (Test-Path $innerDir) {
+                Copy-Item -Path "$innerDir\*" -Destination $InstallDir -Recurse -Force
+                $cloned = $true
+            }
+            Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+        } catch {}
+    }
+
     if (-not (Test-Path (Join-Path $InstallDir "docker-compose.yml"))) {
         Write-Host "  Master から docker-compose.yml を取得中..."
         try {
@@ -115,6 +141,14 @@ if (-not (Test-Path (Join-Path $InstallDir "docker-compose.yml"))) {
         } catch {}
     }
 }
+
+if (-not (Test-Path (Join-Path $InstallDir "Dockerfile"))) {
+    Write-Host "❌ エラー: Dockerfile を取得できませんでした。GitHub へのアクセスを確認してください。" -ForegroundColor Red
+    exit 1
+}
+
+New-Item -ItemType Directory -Path (Join-Path $InstallDir "data") -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $InstallDir "logs") -Force | Out-Null
 
 # .env ファイルの生成
 $EnvFile = Join-Path $InstallDir ".env"

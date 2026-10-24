@@ -6709,8 +6709,9 @@ async function loadManagerNodes() {
 
     if (badge) {
       const activeSlaves = slaves.filter(s => s.status === "online").length;
-      badge.textContent = `Active 1台 / Standby ${activeSlaves}台 (計${1 + slaves.length}ノード)`;
-      badge.style.background = activeSlaves > 0 ? "#3ba55c" : "var(--primary, #5865f2)";
+      const targetBadge = activeSlaves >= 2 ? "🟢 冗長化 完了 (推奨2台達成)" : (activeSlaves === 1 ? "🟡 最小冗長化 (1台待機中 / 推奨2台)" : "⚪ 待機ノードなし (推奨2台)");
+      badge.textContent = `主系 1台 / 待機 ${activeSlaves}台 [${targetBadge}]`;
+      badge.style.background = activeSlaves >= 2 ? "#3ba55c" : (activeSlaves === 1 ? "#faa81a" : "var(--primary, #5865f2)");
     }
 
     // 現在のオリジンURLを案内ボックスに反映
@@ -6734,6 +6735,7 @@ async function loadManagerNodes() {
           <div>
             <div style="font-size:12px;color:#7289da;font-weight:700;display:flex;align-items:center;gap:6px;">
               <span>👑 主系ノード (Primary Master)</span>
+              <span class="badge" style="background:rgba(88,101,242,0.25);color:#7289da;border:1px solid rgba(88,101,242,0.5);font-weight:700;">★ Priority 0 (最優先本尊)</span>
             </div>
             <h4 style="margin:4px 0 0;font-size:16px;color:var(--text-normal);display:flex;align-items:center;gap:8px;">
               <span>${escapeHtml(master.hostname || "Master Node")}</span>
@@ -6761,9 +6763,9 @@ async function loadManagerNodes() {
       cardsHtml += `
         <div class="card" style="padding:20px;background:rgba(0,0,0,0.15);border:1px dashed rgba(255,255,255,0.12);border-radius:10px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;">
           <div style="font-size:28px;margin-bottom:8px;">🛡️</div>
-          <div style="font-weight:600;font-size:14px;color:var(--text-muted);">Standby (Slave) ノード未登録</div>
-          <div style="font-size:12px;color:var(--text-dim);margin-top:4px;max-width:320px;">
-            副系サーバーを用意し、下のワンライナーを実行することで無停止フェイルオーバー対応のHAクラスタを組むことができます。
+          <div style="font-weight:600;font-size:14px;color:var(--text-muted);">Standby (Slave) ノード未登録 (推奨: 2台)</div>
+          <div style="font-size:12px;color:var(--text-dim);margin-top:4px;max-width:340px;">
+            副系サーバーを用意し、下のワンライナーを実行することで無停止フェイルオーバー対応のHAクラスタ（推奨2台待機構成）を組むことができます。
           </div>
         </div>
       `;
@@ -6781,6 +6783,14 @@ async function loadManagerNodes() {
           statusBadge = `<span class="badge" style="background:rgba(241,196,15,0.2);color:#f1c40f;border:1px solid rgba(241,196,15,0.4);font-weight:700;">⚪ 切断 (${slave.last_seen_ago >= 0 ? slave.last_seen_ago + '秒前' : '未交信'})</span>`;
           borderCol = "rgba(241,196,15,0.25)";
         }
+
+        const prio = slave.priority || 1;
+        const failoverSec = 30 + (prio - 1) * 15;
+        const priorityBadge = `
+          <span class="badge" style="background:${prio === 1 ? 'rgba(88,101,242,0.25)' : 'rgba(155,89,182,0.25)'};color:${prio === 1 ? '#7289da' : '#bb86fc'};border:1px solid ${prio === 1 ? 'rgba(88,101,242,0.5)' : 'rgba(155,89,182,0.5)'};font-weight:700;">
+            ★ Priority ${prio} (${prio === 1 ? '最速昇格 約30秒' : `待機昇格 約${failoverSec}秒`})
+          </span>
+        `;
 
         const lastSyncText = slave.last_sync_ago >= 0 ? `${slave.last_sync_ago}秒前` : (slave.last_sync > 0 ? new Date(slave.last_sync * 1000).toLocaleTimeString() : "未同期");
         const lastSeenText = slave.last_seen_ago >= 0 ? `${slave.last_seen_ago}秒前` : (slave.last_seen > 0 ? new Date(slave.last_seen * 1000).toLocaleTimeString() : "未交信");
@@ -6802,10 +6812,11 @@ async function loadManagerNodes() {
 
         cardsHtml += `
           <div class="card" style="background:rgba(0,0,0,0.2);border:1px solid ${borderCol};padding:16px;border-radius:10px;">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
               <div>
-                <div style="font-size:12px;color:var(--text-muted);font-weight:700;display:flex;align-items:center;gap:6px;">
-                  <span>🛡️ 副系ノード (Standby Slave)</span>
+                <div style="font-size:12px;color:var(--text-muted);font-weight:700;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                  <span>🛡️ 待機ノード (Standby Slave)</span>
+                  ${priorityBadge}
                 </div>
                 <h4 style="margin:4px 0 0;font-size:15px;color:var(--text-normal);">
                   ${escapeHtml(slave.hostname || "Slave Node")}
@@ -6819,12 +6830,18 @@ async function loadManagerNodes() {
 
             <div style="font-size:12px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,0.25);padding:10px;border-radius:6px;margin-bottom:12px;">
               <div>IP: <strong style="color:var(--text-normal);">${escapeHtml(slave.ip || "-")}</strong></div>
+              <div>スペック: <strong style="color:var(--text-normal);">${escapeHtml(slave.spec_display || "-")}</strong></div>
               <div>最終ハートビート: <strong style="color:var(--text-normal);">${lastSeenText}</strong></div>
-              <div style="grid-column:1/-1;">最終DB同期: <strong style="color:#50e6ff;">${lastSyncText}</strong></div>
+              <div>最終DB同期: <strong style="color:#50e6ff;">${lastSyncText}</strong></div>
             </div>
 
-            <div style="display:flex;justify-content:space-between;align-items:center;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);">
-              <span style="font-size:11px;color:var(--text-dim);">${slave.status === 'revoked' ? '除外済（再アクセス時に停止指令）' : '自動同期待機中'}</span>
+            <div style="display:flex;justify-content:space-between;align-items:center;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);flex-wrap:wrap;gap:8px;">
+              <div style="display:flex;align-items:center;gap:6px;font-size:12px;">
+                <span style="color:var(--text-muted);">昇格優先度:</span>
+                <select onchange="setManagerSlavePriority('${escapeHtml(slave.node_id)}', parseInt(this.value, 10))" style="background:#2b2d31;color:#fff;border:1px solid rgba(255,255,255,0.2);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer;">
+                  ${[1, 2, 3, 4, 5].map(p => `<option value="${p}" ${p === prio ? 'selected' : ''}>Priority ${p} (${30 + (p-1)*15}s昇格)</option>`).join('')}
+                </select>
+              </div>
               <div>${actionBtnHtml}</div>
             </div>
           </div>
@@ -6838,7 +6855,48 @@ async function loadManagerNodes() {
     grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Manager Node情報の取得中にエラーが発生しました: ${escapeHtml(err.message)}</div>`;
   }
 }
-window.loadManagerNodes = loadManagerNodes;
+
+async function setManagerSlavePriority(nodeId, priority) {
+  try {
+    const res = await fetch("/api/system/manager_nodes/priority", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId, priority: priority })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      loadManagerNodes();
+    } else {
+      alert("優先度の変更に失敗しました: " + (data.error || res.statusText));
+    }
+  } catch (err) {
+    alert("通信エラー: " + err.message);
+  }
+}
+window.setManagerSlavePriority = setManagerSlavePriority;
+
+async function autoSortManagerPriorityBySpec() {
+  if (!confirm("接続されている待機 (Slave) ノードの RAM 容量・CPU コア数を自動判定し、ハイスペック順に Priority 1, 2... を割り当てますか？")) {
+    return;
+  }
+  try {
+    const res = await fetch("/api/system/manager_nodes/priority", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "auto_spec" })
+    });
+    const data = await res.json();
+    if (res.ok && data.status === "ok") {
+      alert(data.message || "スペック順に優先度を再割り当てしました。");
+      loadManagerNodes();
+    } else {
+      alert("スペック整列に失敗しました: " + (data.error || res.statusText));
+    }
+  } catch (err) {
+    alert("通信エラー: " + err.message);
+  }
+}
+window.autoSortManagerPriorityBySpec = autoSortManagerPriorityBySpec;
 
 async function revokeManagerSlave(nodeId) {
   if (!confirm(`⚠️ Manager Slave [${nodeId}] を除外・自律停止しますか？\n\n次回アクセス時に自律停止指令 (HTTP 410 Gone) が送出され、誤昇格（スプリットブレイン）を起こすことなく安全にプロセスが停止します。`)) {

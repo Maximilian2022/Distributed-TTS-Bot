@@ -110,22 +110,55 @@ fi
 # 5. インストール先ディレクトリの準備
 INSTALL_DIR="${HOME}/ttsbot-slave"
 echo -e "\n${BOLD}[3/4] Slave 設定・ディレクトリのセットアップ (${INSTALL_DIR})...${RESET}"
-mkdir -p "${INSTALL_DIR}/data" "${INSTALL_DIR}/logs"
-
+mkdir -p "${INSTALL_DIR}"
 cd "${INSTALL_DIR}"
 
-# リポジトリが未存在なら clone または Master から直接取得
-if [ ! -f "docker-compose.yml" ]; then
+# リポジトリ全体 (Dockerfile やソースコード一式) を確実に取得・展開
+if [ ! -f "Dockerfile" ]; then
+    echo "  リポジトリを取得中..."
+    CLONED=false
+
+    # A. Git による取得 (既存ディレクトリ・非空ディレクトリにも対応)
     if command -v git &> /dev/null; then
-        echo "  リポジトリを取得中 (git clone)..."
-        git clone https://github.com/Maximilian2022/ttsbot-oss.git . 2>/dev/null || true
+        if [ ! -d ".git" ]; then
+            if git clone https://github.com/Maximilian2022/ttsbot-oss.git . 2>/dev/null; then
+                CLONED=true
+            else
+                # ディレクトリが空でなく git clone . が失敗した場合の確実な取得
+                git init -q 2>/dev/null || true
+                git remote add origin https://github.com/Maximilian2022/ttsbot-oss.git 2>/dev/null || git remote set-url origin https://github.com/Maximilian2022/ttsbot-oss.git 2>/dev/null || true
+                if git fetch --depth=1 origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null; then
+                    CLONED=true
+                fi
+            fi
+        else
+            if git fetch --depth=1 origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null; then
+                CLONED=true
+            fi
+        fi
     fi
-    # git clone が失敗または未インストールの場合は Master から直接ダウンロード補完
+
+    # B. Git が利用不可または失敗した場合は GitHub Tarball アーカイブから完全展開
+    if [ "$CLONED" != "true" ] && [ ! -f "Dockerfile" ]; then
+        echo "  GitHub からソースコード一式 (tarball) を取得・展開中..."
+        if curl -sSL --connect-timeout 10 --max-time 30 "https://github.com/Maximilian2022/ttsbot-oss/archive/refs/heads/main.tar.gz" 2>/dev/null | tar -xz --strip-components=1 2>/dev/null; then
+            CLONED=true
+        fi
+    fi
+
+    # C. 万が一 GitHub に接続できない場合の Master サーバーからの docker-compose.yml 取得
     if [ ! -f "docker-compose.yml" ]; then
         echo "  Master から docker-compose.yml を取得中..."
         curl -sSL --connect-timeout 5 --max-time 15 "${MASTER_URL}/docker-compose.yml" -o docker-compose.yml 2>/dev/null || true
     fi
 fi
+
+if [ ! -f "Dockerfile" ]; then
+    echo -e "${RED}エラー: Dockerfile を取得できませんでした。ネットワーク接続または GitHub へのアクセスを確認してください。${RESET}"
+    exit 1
+fi
+
+mkdir -p "${INSTALL_DIR}/data" "${INSTALL_DIR}/logs"
 
 # .env ファイルの生成 / 更新
 ENV_FILE="${INSTALL_DIR}/.env"
