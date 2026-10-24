@@ -42,6 +42,8 @@ class SQLitePool:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA synchronous=NORMAL;")
         await conn.execute("PRAGMA busy_timeout=30000;")
+        await conn.execute("PRAGMA mmap_size=268435456;")
+        await conn.execute("PRAGMA temp_store=MEMORY;")
         conn._last_used_at = time.monotonic()
         return conn
 
@@ -1593,6 +1595,17 @@ class Database:
             ) as cur:
                 rows = await cur.fetchall()
                 return [dict(r) for r in rows]
+
+    async def get_ai_suggestion(self, suggestion_id: int) -> Optional[Dict[str, Any]]:
+        """指定IDのAI提案単語を取得"""
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM ai_suggested_words WHERE id = ?",
+                (suggestion_id,)
+            ) as cur:
+                item = await cur.fetchone()
+                return dict(item) if item else None
 
     async def approve_ai_suggestion(self, suggestion_id: int) -> Optional[Dict[str, Any]]:
         """AI提案を承認し、本辞書 (guild_dictionary) へ登録"""

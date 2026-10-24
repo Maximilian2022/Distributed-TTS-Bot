@@ -92,6 +92,7 @@ class WebServer:
         # WebUI API レート制限用スライディングバッファ
         self._rate_limits: Dict[str, deque] = {}
         self._rate_limit_cleanup_counter = 0
+        self._failed_password_attempts: Dict[str, List[float]] = {}
         # Worker ノード別時系列メトリクス履歴 (nodeKey -> deque[dict])
         self.workers_metrics_history: Dict[str, deque] = {}
         self.workers_latest_resources: Dict[str, Dict[str, Any]] = {}
@@ -1754,7 +1755,12 @@ class WebServer:
 
     async def api_add_dict(self, request: web.Request) -> web.Response:
         data = await request.json()
-        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to add dictionary words."
+            }, status=403)
 
         word = data.get("word", "").strip()
         reading = data.get("reading", "").strip()
@@ -1768,7 +1774,12 @@ class WebServer:
 
     async def api_delete_dict(self, request: web.Request) -> web.Response:
         word = request.match_info.get("word", "").strip()
-        guild, _ = await self._get_guild_and_perms(request, request.query.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to delete dictionary words."
+            }, status=403)
 
         if not word:
             return web.json_response({"error": "Word is required"}, status=400)
@@ -1781,7 +1792,12 @@ class WebServer:
 
     async def api_update_dict(self, request: web.Request) -> web.Response:
         data = await request.json()
-        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to update dictionary words."
+            }, status=403)
 
         old_word = data.get("old_word", "").strip()
         new_word = data.get("new_word", "").strip()
@@ -1808,7 +1824,12 @@ class WebServer:
 
     async def api_add_ng(self, request: web.Request) -> web.Response:
         data = await request.json()
-        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to add NG words."
+            }, status=403)
 
         word = data.get("word", "").strip()
         if not word:
@@ -1820,7 +1841,12 @@ class WebServer:
 
     async def api_delete_ng(self, request: web.Request) -> web.Response:
         word = request.match_info.get("word", "").strip()
-        guild, _ = await self._get_guild_and_perms(request, request.query.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to delete NG words."
+            }, status=403)
 
         if not word:
             return web.json_response({"error": "Word is required"}, status=400)
@@ -1833,12 +1859,19 @@ class WebServer:
 
     async def api_import_ng_preset(self, request: web.Request) -> web.Response:
         data = await request.json()
-        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to import NG words."
+            }, status=403)
+
         count = await self.db.import_default_ng_words(guild.id)
         return web.json_response({"success": True, "imported_count": count})
 
     async def api_get_ai_suggestions(self, request: web.Request) -> web.Response:
-        """AI提案単語リストを取得"""
+        """AI提案単語リストを取得 (認証必須)"""
+        user = self._require_auth(request)
         guild, _ = await self._get_guild_and_perms(request, request.query.get("guild_id"))
         status = request.query.get("status", "pending")
         suggestions = await self.db.get_ai_suggestions(guild.id, status=status)
@@ -1848,11 +1881,22 @@ class WebServer:
         })
 
     async def api_approve_ai_suggestion(self, request: web.Request) -> web.Response:
-        """AI提案を承認して本辞書へ登録"""
+        """AI提案を承認して本辞書へ登録 (管理者または担当ロールのみ)"""
+        user = self._require_auth(request)
         try:
             s_id = int(request.match_info.get("id", 0))
         except ValueError:
             return web.json_response({"error": "Invalid suggestion ID"}, status=400)
+
+        item = await self.db.get_ai_suggestion(s_id)
+        if not item:
+            return web.json_response({"error": "Suggestion not found"}, status=404)
+
+        guild, perms = await self._get_guild_and_perms(request, str(item["guild_id"]))
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to approve AI suggestions."
+            }, status=403)
 
         approved = await self.db.approve_ai_suggestion(s_id)
         if approved:
@@ -1861,21 +1905,43 @@ class WebServer:
         return web.json_response({"error": "Suggestion not found"}, status=404)
 
     async def api_reject_ai_suggestion(self, request: web.Request) -> web.Response:
-        """AI提案を却下"""
+        """AI提案を却下 (管理者または担当ロールのみ)"""
+        user = self._require_auth(request)
         try:
             s_id = int(request.match_info.get("id", 0))
         except ValueError:
             return web.json_response({"error": "Invalid suggestion ID"}, status=400)
+
+        item = await self.db.get_ai_suggestion(s_id)
+        if not item:
+            return web.json_response({"error": "Suggestion not found"}, status=404)
+
+        guild, perms = await self._get_guild_and_perms(request, str(item["guild_id"]))
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to reject AI suggestions."
+            }, status=403)
 
         rejected = await self.db.reject_ai_suggestion(s_id)
         return web.json_response({"success": rejected})
 
     async def api_delete_ai_suggestion(self, request: web.Request) -> web.Response:
-        """AI提案を物理削除"""
+        """AI提案を物理削除 (管理者または担当ロールのみ)"""
+        user = self._require_auth(request)
         try:
             s_id = int(request.match_info.get("id", 0))
         except ValueError:
             return web.json_response({"error": "Invalid suggestion ID"}, status=400)
+
+        item = await self.db.get_ai_suggestion(s_id)
+        if not item:
+            return web.json_response({"error": "Suggestion not found"}, status=404)
+
+        guild, perms = await self._get_guild_and_perms(request, str(item["guild_id"]))
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to delete AI suggestions."
+            }, status=403)
 
         deleted = await self.db.delete_ai_suggestion(s_id)
         return web.json_response({"success": deleted})
@@ -1884,9 +1950,14 @@ class WebServer:
         """ユーザー名（サーバー表示名）を単語辞書にインポート"""
         user = self._require_auth(request)
         data = await request.json()
-        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
 
         scope = data.get("scope", "me")  # "me" または "all"
+        if scope == "all" and not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to import all users."
+            }, status=403)
+
         names_to_import: List[str] = []
 
         if scope == "me":
@@ -1915,7 +1986,12 @@ class WebServer:
         """単語辞書テキスト一括インポート (単語:読み方リスト)"""
         user = self._require_auth(request)
         data = await request.json()
-        guild, _ = await self._get_guild_and_perms(request, data.get("guild_id"))
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to batch import dictionary words."
+            }, status=403)
 
         items = data.get("items", [])
         if not isinstance(items, list):
@@ -4543,7 +4619,7 @@ class WebServer:
                     remaining = content_length
                     while remaining > 0:
                         chunk_size = min(remaining, 256 * 1024)
-                        chunk = f.read(chunk_size)
+                        chunk = await asyncio.to_thread(f.read, chunk_size)
                         if not chunk:
                             break
                         await response.write(chunk)
@@ -4564,7 +4640,10 @@ class WebServer:
         )
         await response.prepare(request)
         with open(target_file, "rb") as f:
-            while chunk := f.read(256 * 1024):
+            while True:
+                chunk = await asyncio.to_thread(f.read, 256 * 1024)
+                if not chunk:
+                    break
                 await response.write(chunk)
         await response.write_eof()
         return response
@@ -4630,7 +4709,28 @@ class WebServer:
     # --- OSS 動的Bot管理 & クレデンシャル & WebSocket API ---
 
     async def api_auth_login_password(self, request: web.Request) -> web.Response:
-        """管理者パスワードによるWebUIログイン (Discord未連携時対応)"""
+        """管理者パスワードによるWebUIログイン (Discord未連携時対応 & ブルートフォース防御)"""
+        # クライアントIP特定
+        client_ip = (
+            request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.remote
+            or "unknown"
+        )
+        now = time.time()
+        # 直近300秒以内の失敗試行をフィルタ
+        attempts = [t for t in self._failed_password_attempts.get(client_ip, []) if now - t < 300]
+        self._failed_password_attempts[client_ip] = attempts
+
+        # 5回以上連続失敗で5分間ロックアウト (429 Too Many Requests)
+        if len(attempts) >= 5:
+            retry_after = int(300 - (now - attempts[0]))
+            return web.json_response(
+                {"error": f"パスワード試行回数の上限を超えました。{max(1, retry_after)}秒後に再試行してください。"},
+                status=429,
+                headers={"Retry-After": str(max(1, retry_after))}
+            )
+
         try:
             data = await request.json()
         except Exception:
@@ -4646,7 +4746,14 @@ class WebServer:
 
         import hmac
         if not hmac.compare_digest(password, expected):
+            attempts.append(now)
+            self._failed_password_attempts[client_ip] = attempts
+            # ブルートフォース総当たり対策のバックオフ遅延 (1.0秒)
+            await asyncio.sleep(1.0)
             return web.json_response({"error": "パスワードが正しくありません。"}, status=401)
+
+        # ログイン成功時は失敗履歴クリア
+        self._failed_password_attempts.pop(client_ip, None)
 
         user_data = {
             "id": 0,

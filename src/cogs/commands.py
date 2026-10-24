@@ -145,7 +145,7 @@ class CommandsCog(commands.Cog):
             if self.bot_pool and interaction.guild_id:
                 self.bot_pool.clear_vc_manual_disconnect(interaction.guild_id, voice_channel.id)
 
-            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
             bot_label = f" (Bot {assigned_bot_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
             embed = discord.Embed(
                 title=f"🔊 ボイスチャンネル接続完了{bot_label}",
@@ -345,7 +345,7 @@ class CommandsCog(commands.Cog):
         current_speaker_id = settings["speaker_id"]
         speaker_info = self.config.voices.get(current_speaker_id)
         speaker_name = speaker_info.name if speaker_info else current_speaker_id
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         vol_pct = int(round(settings.get("volume", 0.8) * 100))
 
         embed = discord.Embed(
@@ -467,7 +467,7 @@ class CommandsCog(commands.Cog):
         await self.db.add_dictionary_word(interaction.guild_id, w, r)
         # 単語辞書更新時は当該単語を含むキャッシュのみを選択的パージ
         purged = await self.cache_manager.purge_by_word(w)
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
 
         embed = discord.Embed(
             title="📖 辞書登録完了",
@@ -494,7 +494,7 @@ class CommandsCog(commands.Cog):
             await interaction.response.send_message("❌ 削除する単語を指定してください。", ephemeral=True)
             return
 
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         deleted = await self.db.delete_dictionary_word(interaction.guild_id, w)
         if deleted:
             # 該当単語を含むキャッシュのみを選択的パージ
@@ -524,7 +524,7 @@ class CommandsCog(commands.Cog):
             await interaction.response.send_message("❌ 辞書コマンドはDiscordサーバー内で実行してください。", ephemeral=True)
             return
 
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         words = await self.db.get_dictionary_words(interaction.guild_id)
         if not words:
             await interaction.response.send_message(
@@ -569,7 +569,7 @@ class CommandsCog(commands.Cog):
         await self.db.add_ng_word(interaction.guild_id, w)
         # NGワード登録時も当該単語を含むキャッシュを選択的パージ
         purged = await self.cache_manager.purge_by_word(w)
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
 
         embed = discord.Embed(
             title="🚫 NGワード登録完了",
@@ -597,7 +597,7 @@ class CommandsCog(commands.Cog):
             await interaction.response.send_message("❌ 削除するNGワードを指定してください。", ephemeral=True)
             return
 
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         deleted = await self.db.delete_ng_word(interaction.guild_id, w)
         if deleted:
             purged = await self.cache_manager.purge_by_word(w)
@@ -625,7 +625,7 @@ class CommandsCog(commands.Cog):
             await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
             return
 
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         words = await self.db.get_ng_words(interaction.guild_id)
         if not words:
             await interaction.response.send_message(
@@ -656,7 +656,7 @@ class CommandsCog(commands.Cog):
             await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
             return
 
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         count = await self.db.import_default_ng_words(interaction.guild_id)
         embed = discord.Embed(
             title="📋 標準NGワードプリセット適用完了",
@@ -671,7 +671,7 @@ class CommandsCog(commands.Cog):
     @app_commands.command(name="info", description="Botの情報、搭載エンジン、各音声モデルの利用規約・クレジット表記を表示します。")
     async def info(self, interaction: discord.Interaction):
         """Bot情報および各TTSモデルのライセンス・規約・クレジット表記を表示"""
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
 
         embed = discord.Embed(
             title="ℹ️ Distributed TTS Discord Bot 情報 & 利用規約・クレジット",
@@ -870,7 +870,7 @@ class CommandsCog(commands.Cog):
 
         settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
         prefixes = settings.get("ignore_prefixes", [";", "；"])
-        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
 
         embed = discord.Embed(
             title="🚫 読み上げ除外プレフィックス設定状況",

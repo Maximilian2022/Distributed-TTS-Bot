@@ -70,11 +70,11 @@ _buf_handler = BufferLogHandler()
 _buf_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s]: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(_buf_handler)
 
-# Multi-Master URL候補リスト (カンマ区切り対応。未指定時は localhost:8080)
-_raw_master_urls = os.getenv("MASTER_URLS", os.getenv("MASTER_URL", "http://localhost:8080"))
+# Multi-Master URL候補リスト (カンマ区切り対応。未指定時は localhost:8088)
+_raw_master_urls = os.getenv("MASTER_URLS", os.getenv("MASTER_URL", "http://localhost:8088"))
 MASTER_CANDIDATE_URLS: List[str] = [u.strip().rstrip("/") for u in _raw_master_urls.split(",") if u.strip()]
 if not MASTER_CANDIDATE_URLS:
-    MASTER_CANDIDATE_URLS = ["http://localhost:8080"]
+    MASTER_CANDIDATE_URLS = ["http://localhost:8088"]
 _current_master_idx: int = 0
 
 def get_master_url() -> str:
@@ -2035,8 +2035,52 @@ hosts allow = *
                     pass
             return False
 
+    async def _parallel_range_download(
+        self,
+        url: str,
+        staging_file: str,
+        total_size: int,
+        headers: dict,
+        connections: int = 4
+    ) -> bool:
+        """aiohttp を用いて Range リクエストを並列実行し、大容量ファイルを高速分割ダウンロード"""
+        try:
+            session = await self.get_session()
+            chunk_len = total_size // connections
+            tasks = []
+
+            # 事前に空ファイルを期待サイズで確保
+            with open(staging_file, "wb") as f:
+                f.truncate(total_size)
+
+            async def _download_part(part_idx: int, start_byte: int, end_byte: int):
+                part_headers = dict(headers)
+                part_headers["Range"] = f"bytes={start_byte}-{end_byte}"
+                async with session.get(
+                    url,
+                    headers=part_headers,
+                    timeout=aiohttp.ClientTimeout(total=None, sock_connect=20.0, sock_read=60.0)
+                ) as resp:
+                    if resp.status not in (200, 206):
+                        raise RuntimeError(f"Part {part_idx} download failed HTTP {resp.status}")
+                    with open(staging_file, "r+b") as f:
+                        f.seek(start_byte)
+                        async for chunk in resp.content.iter_chunked(256 * 1024):
+                            f.write(chunk)
+
+            for i in range(connections):
+                s = i * chunk_len
+                e = total_size - 1 if i == connections - 1 else (i + 1) * chunk_len - 1
+                tasks.append(_download_part(i, s, e))
+
+            await asyncio.gather(*tasks)
+            return True
+        except Exception as err:
+            logger.debug(f"並列Rangeダウンロード例外 ({err}) -> 通常DLへフォールバック")
+            return False
+
     async def _download_single_model_file(self, folder_name: str, file_info: dict, target_dir: str) -> bool:
-        """単一ファイルを差分取得し、SHA-256を検証して安全に配置"""
+        """単一ファイルを差分取得し、SHA-256を検証して安全に配置 (aria2c / 並列Range分割DL対応)"""
         rel_path = file_info.get("path", "")
         expected_sha256 = file_info.get("sha256", "")
         expected_size = file_info.get("size", 0)
@@ -2046,16 +2090,61 @@ hosts allow = *
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
         url = f"{get_master_url()}/api/worker/models/file/{folder_name}/{rel_path}"
+        headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
         session = await self.get_session()
 
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=None, sock_connect=20.0, sock_read=60.0)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"⚠️ ファイル取得失敗 ({rel_path}): HTTP {resp.status}")
-                    return False
-                with open(staging_file, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(256 * 1024):
-                        f.write(chunk)
+            download_success = False
+
+            # 1. 大容量ファイル (5MB以上) かつ aria2c が利用可能な場合、多重ダウンロードを実行
+            if expected_size >= 5 * 1024 * 1024 and shutil.which("aria2c"):
+                try:
+                    aria2_cmd = [
+                        "aria2c",
+                        "-s", "4",
+                        "-x", "4",
+                        "-k", "1M",
+                        "--allow-overwrite=true",
+                        "--auto-file-renaming=false",
+                        "--summary-interval=0",
+                        "-d", os.path.dirname(staging_file),
+                        "-o", os.path.basename(staging_file),
+                    ]
+                    if WORKER_TOKEN:
+                        aria2_cmd.append(f"--header=X-Worker-Token: {WORKER_TOKEN}")
+                    aria2_cmd.append(url)
+                    proc = await asyncio.create_subprocess_exec(
+                        *aria2_cmd,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode == 0 and os.path.exists(staging_file) and os.path.getsize(staging_file) == expected_size:
+                        download_success = True
+                    else:
+                        logger.debug(f"aria2c ダウンロード未完了 (rc={proc.returncode}): {stderr.decode(errors='replace')[:200]}")
+                except Exception as aria_err:
+                    logger.debug(f"aria2c 実行例外: {aria_err}")
+
+            # 2. aria2c 未導入または失敗時で、10MB以上の場合は Python 並列 Range 分割ダウンロード
+            if not download_success and expected_size >= 10 * 1024 * 1024:
+                download_success = await self._parallel_range_download(
+                    url, staging_file, expected_size, headers, connections=4
+                )
+
+            # 3. 通常の aiohttp ストリーミング (フォールバック または 小容量ファイル)
+            if not download_success:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=None, sock_connect=20.0, sock_read=60.0)
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"⚠️ ファイル取得失敗 ({rel_path}): HTTP {resp.status}")
+                        return False
+                    with open(staging_file, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(256 * 1024):
+                            f.write(chunk)
 
             # サイズとハッシュの検証
             if os.path.getsize(staging_file) != expected_size:

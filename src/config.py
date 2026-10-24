@@ -105,8 +105,8 @@ class AppConfig:
     web_port: int = 8080
     discord_client_id: str = ""
     discord_client_secret: str = ""
-    discord_redirect_uri: str = "http://localhost:8080/callback"
-    web_dashboard_url: str = "http://localhost:8080"
+    discord_redirect_uri: str = "http://localhost:8088/callback"
+    web_dashboard_url: str = "http://localhost:8088"
     web_session_secret: str = ""
     worker_shared_secret: str = ""
 
@@ -350,7 +350,8 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     if not base_url:
         base_url = os.getenv("WEB_DASHBOARD_URL", "").strip().rstrip("/")
     if not base_url:
-        base_url = f"http://localhost:{cfg.web_port}"
+        public_port = os.getenv("HOST_WEB_PORT", "8088")
+        base_url = f"http://localhost:{public_port}"
     cfg.web_dashboard_url = base_url
     cfg.discord_redirect_uri = os.getenv("DISCORD_REDIRECT_URI", f"{base_url}/callback").strip()
 

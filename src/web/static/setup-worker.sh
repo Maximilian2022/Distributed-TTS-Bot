@@ -23,7 +23,7 @@ C_YELLOW="\033[33m"
 C_RED="\033[31m"
 C_CYAN="\033[36m"
 
-MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"
+MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8088}"
 MASTER_WS_URL="${TTSBOT_MASTER_WS_URL:-}"
 WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"
 WORK_DIR="${TTSBOT_WORK_DIR:-${HOME}/ttsbot-worker}"
@@ -55,7 +55,7 @@ while [ $# -gt 0 ]; do
 done
 
 # MASTER_WS_URL が渡された場合、未指定の MASTER_URL を自動補完
-if [ -n "${MASTER_WS_URL}" ] && [ "${MASTER_URL}" = "http://localhost:8080" ]; then
+if [ -n "${MASTER_WS_URL}" ] && [ "${MASTER_URL}" = "http://localhost:8088" ]; then
     DERIVED_HTTP=$(echo "${MASTER_WS_URL}" | sed -E 's|^ws://|http://|' | sed -E 's|^wss://|https://|' | sed -E 's|/api/worker/ws.*||')
     if [ -n "${DERIVED_HTTP}" ]; then
         MASTER_URL="${DERIVED_HTTP}"

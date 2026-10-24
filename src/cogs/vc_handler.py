@@ -2009,7 +2009,7 @@ class VCHandlerCog(commands.Cog):
                                     logger.error(f"[AutoJoinReconcile] Failed to join VC '{bot_vc.name}' with Bot #{assigned_idx}: {e}")
                                     continue
 
-                            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+                            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
                             bot_label = f" (Bot {assigned_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
                             embed = discord.Embed(
                                 title=f"🔊 ボイスチャンネル自動接続完了{bot_label}",
@@ -2213,7 +2213,7 @@ class VCHandlerCog(commands.Cog):
                                         )
                                         return
 
-                                dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8080") or "http://localhost:8080"
+                                dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
                                 bot_label = f" (Bot {assigned_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
                                 embed = discord.Embed(
                                     title=f"🔊 ボイスチャンネル自動接続完了{bot_label}",
