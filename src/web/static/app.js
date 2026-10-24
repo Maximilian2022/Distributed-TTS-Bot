@@ -55,9 +55,110 @@ function showToast(message, type = "success") {
   }, 3500);
 }
 
-// --- タブ切り替え ---
+// --- タブ＆サブタブ切り替え ---
+const SUBTAB_MAPPING = {
+  // 旧タブ名/サブタブ名 -> { parent: 親タブID, subtab: サブタブID }
+  "dict": { parent: "words", subtab: "dict" },
+  "ng": { parent: "words", subtab: "ng" },
+  "words": { parent: "words", subtab: "dict" },
+  "config": { parent: "server", subtab: "config" },
+  "member-voices": { parent: "server", subtab: "member-voices" },
+  "server": { parent: "server", subtab: "config" },
+  "bots": { parent: "infrastructure", subtab: "bots" },
+  "system": { parent: "infrastructure", subtab: "system" },
+  "credentials": { parent: "infrastructure", subtab: "credentials" },
+  "infrastructure": { parent: "infrastructure", subtab: "bots" },
+  "voice": { parent: "voice", subtab: null },
+  "volunteer": { parent: "volunteer", subtab: null },
+  "help": { parent: "help", subtab: null }
+};
+
+function triggerTabDataLoad(activeSubOrTab) {
+  if (activeSubOrTab === "bots") {
+    if (typeof loadManagerNodes === "function") loadManagerNodes();
+    loadBotSlots();
+    if (typeof loadWorkerNodes === "function") loadWorkerNodes();
+    if (typeof loadTierRouting === "function") loadTierRouting();
+  }
+  if (activeSubOrTab === "credentials") {
+    loadCredentials();
+  }
+  if (activeSubOrTab === "system") {
+    loadStats(currentGuildId);
+    if (currentGuildId) {
+      loadCacheExplorerFiles();
+      loadCacheStatsSummary();
+      checkModelsStatus();
+      loadMyCoeiroinkList(1);
+    }
+    startSystemMetricsPolling();
+    loadLogs();
+    loadWorkerLogs(false);
+  } else {
+    stopSystemMetricsPolling();
+    if (typeof workerLogInterval !== "undefined" && workerLogInterval) {
+      clearInterval(workerLogInterval);
+      workerLogInterval = null;
+      const chk = document.getElementById("worker-log-auto-refresh");
+      if (chk) chk.checked = false;
+    }
+  }
+  if (activeSubOrTab === "dict") {
+    if (currentGuildId) loadDictionary(currentGuildId);
+  }
+  if (activeSubOrTab === "ng") {
+    if (currentGuildId) loadNgWords(currentGuildId);
+  }
+  if (activeSubOrTab === "config") {
+    if (currentGuildId) loadBotConfig(currentGuildId);
+  }
+  if (activeSubOrTab === "member-voices") {
+    if (currentGuildId) loadMemberVoices(currentGuildId);
+  }
+  if (activeSubOrTab === "volunteer") {
+    updateVolunteerOneliner();
+  }
+  if (activeSubOrTab === "help") {
+    renderCharacterTermsTable();
+  }
+}
+
+function switchSubtab(parentTabId, subtabId) {
+  const parentPane = document.getElementById(`tab-${parentTabId}`);
+  if (!parentPane) return;
+
+  const subBtns = parentPane.querySelectorAll(".sub-tab-btn");
+  const subPanes = parentPane.querySelectorAll(".sub-tab-pane");
+
+  subBtns.forEach(btn => {
+    if (btn.dataset.subtab === subtabId) {
+      btn.classList.add("active");
+    } else {
+      btn.classList.remove("active");
+    }
+  });
+
+  subPanes.forEach(pane => {
+    if (pane.id === `subtab-${subtabId}`) {
+      pane.classList.add("active");
+    } else {
+      pane.classList.remove("active");
+    }
+  });
+
+  // URLハッシュ・ローカルストレージ更新
+  try {
+    localStorage.setItem("ttsbot_active_tab", subtabId);
+    if (history.replaceState) {
+      history.replaceState(null, null, '#' + subtabId);
+    }
+  } catch (e) {}
+
+  triggerTabDataLoad(subtabId);
+}
+
 function setupTabs() {
-  const tabButtons = document.querySelectorAll(".tab-btn");
+  const tabButtons = document.querySelectorAll(".tabs-nav .tab-btn");
   const tabPanes = document.querySelectorAll(".tab-pane");
 
   tabButtons.forEach(btn => {
@@ -66,7 +167,7 @@ function setupTabs() {
 
       // 権限チェック
       const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin || (window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
-      if ((tabId === "config" || tabId === "system" || tabId === "member-voices" || tabId === "bots" || tabId === "credentials") && !hasAccess) {
+      if ((tabId === "server" || tabId === "infrastructure" || tabId === "config" || tabId === "system" || tabId === "member-voices" || tabId === "bots" || tabId === "credentials") && !hasAccess) {
         showToast("このタブを閲覧する権限がありません（管理者または指定ロールのみ）", "error");
         return;
       }
@@ -78,80 +179,52 @@ function setupTabs() {
       const targetPane = document.getElementById(`tab-${tabId}`);
       if (targetPane) targetPane.classList.add("active");
 
-      // リロード時に元のタブへ戻れるようローカルストレージとURLハッシュに保存
-      try {
-        localStorage.setItem("ttsbot_active_tab", tabId);
-        if (history.replaceState) {
-          history.replaceState(null, null, '#' + tabId);
-        }
-      } catch (e) {}
-
-      // タブごとのロード
-      if (tabId === "bots") {
-        if (typeof loadManagerNodes === "function") loadManagerNodes();
-        loadBotSlots();
-        if (typeof loadWorkerNodes === "function") loadWorkerNodes();
-        if (typeof loadTierRouting === "function") loadTierRouting();
-      }
-      if (tabId === "credentials") {
-        loadCredentials();
-      }
-      if (tabId === "system") {
-        loadStats(currentGuildId);
-        if (currentGuildId) {
-          loadCacheExplorerFiles();
-          loadCacheStatsSummary();
-          checkModelsStatus();
-          loadMyCoeiroinkList(1);
-        }
-        startSystemMetricsPolling();
-        loadLogs();
-        loadWorkerLogs(false);
+      // サブタブがある場合、現在アクティブなサブタブまたはデフォルトサブタブをロード
+      if (SUBTAB_MAPPING[tabId] && SUBTAB_MAPPING[tabId].subtab) {
+        let activeSubBtn = targetPane ? targetPane.querySelector(".sub-tab-btn.active") : null;
+        let subtabId = activeSubBtn ? activeSubBtn.dataset.subtab : SUBTAB_MAPPING[tabId].subtab;
+        switchSubtab(tabId, subtabId);
       } else {
-        stopSystemMetricsPolling();
-        if (typeof workerLogInterval !== "undefined" && workerLogInterval) {
-          clearInterval(workerLogInterval);
-          workerLogInterval = null;
-          const chk = document.getElementById("worker-log-auto-refresh");
-          if (chk) chk.checked = false;
-        }
-      }
-      if (tabId === "dict") {
-        if (currentGuildId) loadDictionary(currentGuildId);
-      }
-      if (tabId === "ng") {
-        if (currentGuildId) loadNgWords(currentGuildId);
-      }
-      if (tabId === "config") {
-        if (currentGuildId) loadBotConfig(currentGuildId);
-      }
-      if (tabId === "member-voices") {
-        if (currentGuildId) loadMemberVoices(currentGuildId);
-      }
-      if (tabId === "volunteer") {
-        updateVolunteerOneliner();
-      }
-      if (tabId === "help") {
-        renderCharacterTermsTable();
+        try {
+          localStorage.setItem("ttsbot_active_tab", tabId);
+          if (history.replaceState) {
+            history.replaceState(null, null, '#' + tabId);
+          }
+        } catch (e) {}
+        triggerTabDataLoad(tabId);
       }
     });
   });
 
-  // 初回ロード時に保存されたタブを復元 (loadGuilds完了後に実行するためここでは呼ばない)
+  // サブタブボタンのクリックリスナー登録
+  document.querySelectorAll(".sub-tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const parentPane = btn.closest(".tab-pane");
+      if (!parentPane) return;
+      const parentTabId = parentPane.id.replace("tab-", "");
+      const subtabId = btn.dataset.subtab;
+      switchSubtab(parentTabId, subtabId);
+    });
+  });
 }
 
 function restoreActiveTab() {
   const hash = window.location.hash ? window.location.hash.replace('#', '') : null;
-  const savedTab = hash || localStorage.getItem("ttsbot_active_tab");
-  if (savedTab && savedTab !== "voice") {
-    const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin;
-    // 権限が必要なタブで未所持の場合はトーストエラーを出さずに初期タブ (voice) のまま維持
-    if ((savedTab === "config" || savedTab === "system" || savedTab === "member-voices") && !hasAccess) {
-      return;
-    }
-    const btn = document.querySelector(`.tab-btn[data-tab='${savedTab}']`);
-    if (btn) {
-      btn.click();
+  const savedKey = hash || localStorage.getItem("ttsbot_active_tab");
+  if (!savedKey || savedKey === "voice") return;
+
+  const mapping = SUBTAB_MAPPING[savedKey] || { parent: savedKey, subtab: null };
+  const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin || (window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+
+  if ((mapping.parent === "server" || mapping.parent === "infrastructure") && !hasAccess) {
+    return;
+  }
+
+  const parentBtn = document.querySelector(`.tabs-nav .tab-btn[data-tab='${mapping.parent}']`);
+  if (parentBtn) {
+    parentBtn.click();
+    if (mapping.subtab) {
+      switchSubtab(mapping.parent, mapping.subtab);
     }
   }
 }
@@ -245,6 +318,8 @@ async function switchGuild(guildId) {
 }
 
 function updatePermissionsUI() {
+  const btnServer = document.getElementById("tab-btn-server");
+  const btnInfra = document.getElementById("tab-btn-infrastructure");
   const btnConfig = document.getElementById("tab-btn-config");
   const btnSystem = document.getElementById("tab-btn-system");
   const btnMemberVoices = document.getElementById("tab-btn-member-voices");
@@ -260,6 +335,13 @@ function updatePermissionsUI() {
   const btnCreds = document.getElementById("tab-btn-credentials");
 
   const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin || (window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+
+  if (btnServer) {
+    btnServer.style.display = hasAccess ? "inline-block" : "none";
+  }
+  if (btnInfra) {
+    btnInfra.style.display = hasAccess ? "inline-block" : "none";
+  }
 
   if (btnBots) {
     btnBots.style.display = hasAccess ? "inline-block" : "none";
@@ -311,7 +393,7 @@ function updatePermissionsUI() {
   const activeTabBtn = document.querySelector(".tab-btn.active");
   if (activeTabBtn) {
     const tabName = activeTabBtn.dataset.tab;
-    if ((tabName === "config" || tabName === "system" || tabName === "member-voices" || tabName === "bots" || tabName === "credentials") && !hasAccess) {
+    if ((tabName === "config" || tabName === "system" || tabName === "member-voices" || tabName === "bots" || tabName === "credentials" || tabName === "server" || tabName === "infrastructure") && !hasAccess) {
       const voiceBtn = document.querySelector(".tab-btn[data-tab='voice']");
       if (voiceBtn) voiceBtn.click();
     }

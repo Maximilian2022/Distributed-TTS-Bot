@@ -336,17 +336,29 @@ if ! python3 -c "import aiohttp" &>/dev/null; then
     pip3 install aiohttp || python3 -m pip install aiohttp || true
 fi
 
-# 5. Worker Agent スクリプトの存在確認 & 自動ダウンロード (ワンライナー対応)
+# 5. Worker Agent スクリプトの自動同期 (起動時に常に最新版をチェック・更新)
 AGENT_FILE="${SCRIPT_DIR}/volunteer_worker.py"
+RAW_SERVER_URL=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('server_url', ''))" 2>/dev/null || echo "${SERVER_URL}")
+HTTP_BASE=$(echo "${RAW_SERVER_URL}" | sed -E 's|^wss://|https://|' | sed -E 's|^ws://|http://|' | sed -E 's|/api/worker/ws/?$||' | sed -E 's|/+$||')
+if [ -n "${HTTP_BASE}" ]; then
+    echo -e "${C_CYAN}🔄 ボランティアエージェントの最新版を同期中...${C_RESET}"
+    TARGET_FILE="${AGENT_FILE}"
+    [ -f "${SCRIPT_DIR}/volunteer_worker.py" ] || TARGET_FILE="${WORK_DIR}/volunteer_worker.py"
+    TMP_FILE="${TARGET_FILE}.tmp"
+    if curl -sSL --connect-timeout 5 --max-time 15 "${HTTP_BASE}/volunteer/volunteer_worker.py" -o "${TMP_FILE}" 2>/dev/null && [ -s "${TMP_FILE}" ]; then
+        mv "${TMP_FILE}" "${TARGET_FILE}"
+        AGENT_FILE="${TARGET_FILE}"
+        echo -e "${C_GREEN}✓ 最新のエージェントスクリプトを確認・同期しました。${C_RESET}"
+    else
+        rm -f "${TMP_FILE}"
+        if [ -f "${AGENT_FILE}" ] || [ -f "${WORK_DIR}/volunteer_worker.py" ]; then
+            echo -e "${C_YELLOW}⚠️ 最新版の取得に失敗したため、ローカルの既存エージェントで起動します。${C_RESET}"
+        fi
+    fi
+fi
+
 if [ ! -f "${AGENT_FILE}" ]; then
     AGENT_FILE="${WORK_DIR}/volunteer_worker.py"
-    if [ ! -f "${AGENT_FILE}" ]; then
-        echo -e "${C_CYAN}▶ ボランティアエージェント本体 (volunteer_worker.py) をダウンロード中...${C_RESET}"
-        # WebSocket URL から HTTP ベースURLを導出
-        RAW_SERVER_URL=$(python3 -c "import json; cfg=json.load(open('${CONFIG_FILE}')); print(cfg.get('server_url', ''))" 2>/dev/null || echo "${SERVER_URL}")
-        HTTP_BASE=$(echo "${RAW_SERVER_URL}" | sed -E 's|^wss://|https://|' | sed -E 's|^ws://|http://|' | sed -E 's|/api/worker/ws/?$||' | sed -E 's|/+$||')
-        curl -sSL --connect-timeout 10 --max-time 30 "${HTTP_BASE}/volunteer/volunteer_worker.py" -o "${AGENT_FILE}" || true
-    fi
 fi
 
 if [ ! -f "${AGENT_FILE}" ]; then

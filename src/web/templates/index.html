@@ -112,17 +112,13 @@
         `);
       } else {
         document.write(`
-          <!-- タブナビゲーション -->
+          <!-- タブナビゲーション (6大カテゴリ統合・横幅最適化) -->
           <nav class="tabs-nav">
             <button class="tab-btn active" data-tab="voice">🎙️ マイ音声設定</button>
-            <button class="tab-btn" data-tab="dict">📖 単語辞書</button>
-            <button class="tab-btn" data-tab="ng">🚫 NGワード</button>
+            <button class="tab-btn" data-tab="words">📖 辞書 & NGルール</button>
             <button class="tab-btn" id="tab-btn-volunteer" data-tab="volunteer">🤝 ボランティア参加</button>
-            <button class="tab-btn" id="tab-btn-member-voices" data-tab="member-voices" style="display:none;">👥 メンバー音声</button>
-            <button class="tab-btn" id="tab-btn-config" data-tab="config" style="display:none;">⚙️ ボット設定</button>
-            <button class="tab-btn" id="tab-btn-bots" data-tab="bots" style="display:none;">🤖 Bot & ノード管理</button>
-            <button class="tab-btn" id="tab-btn-credentials" data-tab="credentials" style="display:none;">🔑 API・連携設定</button>
-            <button class="tab-btn" id="tab-btn-system" data-tab="system" style="display:none;">📊 システム & キャッシュ</button>
+            <button class="tab-btn" id="tab-btn-server" data-tab="server" style="display:none;">⚙️ サーバー管理 🔒</button>
+            <button class="tab-btn" id="tab-btn-infrastructure" data-tab="infrastructure" style="display:none;">🛠️ システム統制 🔒</button>
             <button class="tab-btn" id="tab-btn-help" data-tab="help">ℹ️ ヘルプ</button>
           </nav>
 
@@ -207,10 +203,17 @@
             </div>
           </section>
 
-          <!-- 2. 単語辞書タブ -->
-          <section id="tab-dict" class="tab-pane">
-            <div class="section-title">📖 単語辞書管理</div>
-            <div class="section-desc">読み間違えやすい単語や略語、ネットスラングの読み方をサーバーごとに設定します。辞書変更時はキャッシュが自動最新化されます。</div>
+          <!-- 2. 辞書 & NGルールタブ -->
+          <section id="tab-words" class="tab-pane">
+            <div class="sub-tabs-nav">
+              <button class="sub-tab-btn active" data-subtab="dict">📖 単語辞書</button>
+              <button class="sub-tab-btn" data-subtab="ng">🚫 NGワード</button>
+            </div>
+
+            <!-- サブタブ1: 単語辞書 -->
+            <div id="subtab-dict" class="sub-tab-pane active">
+              <div class="section-title">📖 単語辞書管理</div>
+              <div class="section-desc">読み間違えやすい単語や略語、ネットスラングの読み方をサーバーごとに設定します。辞書変更時はキャッシュが自動最新化されます。</div>
 
             <!-- AI学習・提案候補セクション -->
             <div class="card" id="ai-dict-card" style="border: 1px solid rgba(88, 101, 242, 0.3); background: linear-gradient(135deg, rgba(88, 101, 242, 0.05) 0%, rgba(35, 165, 90, 0.03) 100%);">
@@ -271,14 +274,14 @@
                 </table>
               </div>
             </div>
-          </section>
+            </div> <!-- end #subtab-dict -->
 
-          <!-- 2-2. NGワードタブ -->
-          <section id="tab-ng" class="tab-pane">
-            <div class="section-title">🚫 NGワード管理 (自主規制・ピー音)</div>
-            <div class="section-desc">
-              登録されたNGワードが使われた際、音声を電子的な自主規制ピー音（1000Hz）に置き換えて読み上げ、Discord発言に🤫リアクションを付与します。
-            </div>
+            <!-- サブタブ2: NGワード -->
+            <div id="subtab-ng" class="sub-tab-pane">
+              <div class="section-title">🚫 NGワード管理 (自主規制・ピー音)</div>
+              <div class="section-desc">
+                登録されたNGワードが使われた際、音声を電子的な自主規制ピー音（1000Hz）に置き換えて読み上げ、Discord発言に🤫リアクションを付与します。
+              </div>
 
             <div class="card">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
@@ -312,162 +315,9 @@
                 </table>
               </div>
             </div>
-          </section>
+            </div> <!-- end #subtab-ng -->
+          </section> <!-- end #tab-words -->
 
-          <!-- 3. メンバー音声設定タブ (管理者専用) -->
-          <section id="tab-member-voices" class="tab-pane">
-            <div class="section-title">👥 メンバー音声設定管理 (管理者専用)</div>
-            <div class="section-desc">このサーバーで個人設定（声質・ピッチ・速度・音量）をカスタマイズしたメンバーの一覧を閲覧し、直接編集・リセットできます。</div>
-
-            <div id="member-voices-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
-              <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
-              <p style="color:var(--text-muted);font-size:14px;">このページはサーバー管理者、または管理ロールを保持するメンバーのみ閲覧・操作できます。</p>
-            </div>
-
-            <div id="member-voices-content-area">
-              <!-- コントロールバー -->
-              <div class="card" style="padding:14px 18px;margin-bottom:16px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
-                  <div style="display:flex;align-items:center;gap:10px;">
-                    <span id="member-voices-count-badge" class="badge" style="background:#5865f2;color:white;font-size:13px;padding:4px 10px;">
-                      👥 設定済みメンバー: 0名
-                    </span>
-                    <span style="font-size:12px;color:var(--text-muted);">
-                      ※ 個人設定が保存されているメンバーのみ表示されます。
-                    </span>
-                  </div>
-                  <div style="display:flex;align-items:center;gap:8px;">
-                    <div style="position:relative;width:260px;">
-                      <input type="text" id="member-voices-search-input" class="form-input" placeholder="🔍 ユーザー名・声質で検索..." oninput="onMemberVoiceSearchInput(this.value)" style="padding-left:12px;font-size:13px;" />
-                    </div>
-                    <button type="button" class="btn btn-secondary btn-sm" onclick="loadMemberVoices(currentGuildId)" title="再読み込み">
-                      🔄 更新
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <!-- メンバー設定一覧テーブル -->
-              <div class="card" style="padding:0;overflow:hidden;">
-                <div class="table-container" style="max-height:650px;overflow-y:auto;">
-                  <table class="data-table" style="width:100%;margin-bottom:0;">
-                    <thead style="position:sticky;top:0;background:var(--card-bg);z-index:2;">
-                      <tr>
-                        <th style="width:26%;">メンバー</th>
-                        <th style="width:26%;">設定中の声質 (話者)</th>
-                        <th style="width:12%;">速度</th>
-                        <th style="width:10%;">ピッチ</th>
-                        <th style="width:10%;">音量</th>
-                        <th style="width:16%;text-align:right;">アクション</th>
-                      </tr>
-                    </thead>
-                    <tbody id="member-voices-table-body">
-                      <!-- 動的レンダリング -->
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-
-            <!-- メンバー設定 編集モーダル -->
-            <div id="member-voice-edit-modal" class="modal-overlay" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;backdrop-filter:blur(4px);">
-              <div class="modal-content" style="max-width:540px;width:95%;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,0.5);overflow:hidden;">
-                <div class="modal-header" style="padding:16px 20px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
-                  <h3 id="member-edit-modal-title" style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
-                    <span>✏️ メンバー音声設定の編集</span>
-                  </h3>
-                  <button type="button" class="modal-close-btn" onclick="closeMemberVoiceModal()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-muted);">&times;</button>
-                </div>
-                <div class="modal-body" style="padding:18px 20px;">
-                  <!-- 対象ユーザー情報 -->
-                  <div style="display:flex;align-items:center;gap:12px;background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;margin-bottom:16px;">
-                    <div style="position:relative;width:44px;height:44px;flex-shrink:0;">
-                      <img id="member-edit-avatar-img" src="" alt="Avatar" style="width:44px;height:44px;border-radius:50%;border:2px solid var(--border-color);object-fit:cover;display:none;" onerror="this.style.display='none';document.getElementById('member-edit-avatar-fallback').style.display='flex';" />
-                      <div id="member-edit-avatar-fallback" style="width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,0.08);border:2px solid var(--border-color);display:flex;align-items:center;justify-content:center;font-size:22px;">👤</div>
-                    </div>
-                    <div>
-                      <div id="member-edit-name" style="font-weight:700;font-size:15px;color:var(--text-light);">ユーザー名</div>
-                      <div id="member-edit-id" style="font-size:11px;color:var(--text-muted);font-family:monospace;">ID: 000000000000</div>
-                    </div>
-                  </div>
-
-                  <input type="hidden" id="member-edit-user-id" value="" />
-
-                  <!-- 声質選択 (プロバイダーフィルター + ドロップダウン) -->
-                  <div class="form-group" style="margin-bottom:14px;">
-                    <label class="form-label" style="font-weight:600;font-size:13px;">声質（話者）</label>
-                    <select id="member-edit-speaker" class="form-input" style="font-size:13px;width:100%;">
-                      <!-- JSで全話者を追加 -->
-                    </select>
-                  </div>
-
-                  <!-- 速度スライダー -->
-                  <div class="form-group" style="margin-bottom:14px;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                      <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">読み上げ速度</label>
-                      <span id="member-edit-speed-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">1.00x</span>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:10px;">
-                      <input type="range" id="member-edit-speed" min="0.5" max="2.0" step="0.05" value="1.0" class="form-range" style="flex:1;" oninput="updateMemberEditSpeed(this.value)" />
-                      <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditSpeed(1.0)" style="padding:4px 8px;font-size:11px;">1.0x</button>
-                    </div>
-                  </div>
-
-                  <!-- ピッチスライダー -->
-                  <div class="form-group" style="margin-bottom:14px;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                      <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">声の高さ (ピッチ)</label>
-                      <span id="member-edit-pitch-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">0%</span>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:10px;">
-                      <input type="range" id="member-edit-pitch" min="-20" max="20" step="1" value="0" class="form-range" style="flex:1;" oninput="updateMemberEditPitch(this.value)" />
-                      <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditPitch(0)" style="padding:4px 8px;font-size:11px;">0%</button>
-                    </div>
-                  </div>
-
-                  <!-- 音量スライダー -->
-                  <div class="form-group" style="margin-bottom:14px;">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                      <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">音量 (ボリューム)</label>
-                      <span id="member-edit-volume-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">80%</span>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:10px;">
-                      <input type="range" id="member-edit-volume" min="0" max="200" step="5" value="80" class="form-range" style="flex:1;" oninput="updateMemberEditVolume(this.value)" />
-                      <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditVolume(80)" style="padding:4px 8px;font-size:11px;">80%</button>
-                    </div>
-                  </div>
-
-                  <!-- 括弧除去トグル -->
-                  <div class="form-group" style="margin-bottom:16px;">
-                    <label class="checkbox-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;">
-                      <input type="checkbox" id="member-edit-brackets" class="form-checkbox" checked />
-                      <span>名前読み上げ時に名前末尾の【】や（）等の括弧を除去する</span>
-                    </label>
-                  </div>
-
-                  <!-- 試聴ボタン -->
-                  <div style="display:flex;justify-content:flex-start;margin-bottom:10px;">
-                    <button type="button" id="member-edit-preview-btn" class="btn btn-secondary btn-sm" onclick="previewMemberVoiceInModal()" style="display:flex;align-items:center;gap:6px;">
-                      <span>🔊 設定内容を試聴</span>
-                    </button>
-                    <audio id="member-edit-audio" style="display:none;"></audio>
-                  </div>
-                </div>
-
-                <div class="modal-footer" style="padding:14px 20px;border-top:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,0.15);">
-                  <button type="button" class="btn btn-danger btn-sm" onclick="deleteMemberVoiceFromModal()" style="background:#ed4245;color:white;border:none;padding:7px 14px;">
-                    🗑️ 設定リセット
-                  </button>
-                  <div style="display:flex;gap:8px;">
-                    <button type="button" class="btn btn-secondary btn-sm" onclick="closeMemberVoiceModal()" style="padding:7px 14px;">キャンセル</button>
-                    <button type="button" id="member-edit-save-btn" class="btn btn-primary btn-sm" onclick="saveMemberVoiceFromModal()" style="padding:7px 16px;">
-                      💾 設定を保存
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </section>
 
           <!-- 3.5. 🤝 ボランティア参加タブ (一般ユーザー全公開) -->
           <section id="tab-volunteer" class="tab-pane">
@@ -605,10 +455,17 @@
             </div>
           </section>
 
-          <!-- 4. ボット設定タブ -->
-          <section id="tab-config" class="tab-pane">
-            <div class="section-title">⚙️ ボット設定 (サーバー固有)</div>
-            <div class="section-desc">読み上げの制限文字数や重複抑制、VC自動参加などの設定をサーバーごとに保持します。</div>
+          <!-- 4. サーバー管理タブ (管理者専用) -->
+          <section id="tab-server" class="tab-pane">
+            <div class="sub-tabs-nav">
+              <button class="sub-tab-btn active" id="tab-btn-config" data-subtab="config">⚙️ ボット設定 (自動参加/防災)</button>
+              <button class="sub-tab-btn" id="tab-btn-member-voices" data-subtab="member-voices">👥 メンバー音声設定一覧</button>
+            </div>
+
+            <!-- サブタブ1: ボット設定 -->
+            <div id="subtab-config" class="sub-tab-pane active">
+              <div class="section-title">⚙️ ボット設定 (サーバー固有)</div>
+              <div class="section-desc">読み上げの制限文字数や重複抑制、VC自動参加などの設定をサーバーごとに保持します。</div>
 
             <div id="config-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
               <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
@@ -906,12 +763,176 @@
                 <span>スクリプトを実行すると対話形式で Master URL と HA シークレットの確認・設定、コンテナ起動が自動で行われます。</span>
               </div>
             </div>
-          </section>
+            </div> <!-- end #subtab-config -->
 
-          <!-- 5. Discord Bot & ノード管理タブ (Manager / Botスロット / Worker) -->
-          <section id="tab-bots" class="tab-pane">
-            <div class="section-title">🤖 Bot & ノード管理 (インフラ統制)</div>
-            <div class="section-desc">Manager Node (Master-Slave HAクラスタ)、Discord Botアカウントプール（1〜10号機）、推論オフロード用Worker Nodeを一元管理・監視します。</div>
+            <!-- サブタブ2: メンバー音声設定一覧 -->
+            <div id="subtab-member-voices" class="sub-tab-pane">
+              <div class="section-title">👥 メンバー音声設定管理 (管理者専用)</div>
+              <div class="section-desc">このサーバーで個人設定（声質・ピッチ・速度・音量）をカスタマイズしたメンバーの一覧を閲覧し、直接編集・リセットできます。</div>
+
+              <div id="member-voices-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
+                <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
+                <p style="color:var(--text-muted);font-size:14px;">このページはサーバー管理者、または管理ロールを保持するメンバーのみ閲覧・操作できます。</p>
+              </div>
+
+              <div id="member-voices-content-area">
+                <!-- コントロールバー -->
+                <div class="card" style="padding:14px 18px;margin-bottom:16px;">
+                  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                      <span id="member-voices-count-badge" class="badge" style="background:#5865f2;color:white;font-size:13px;padding:4px 10px;">
+                        👥 設定済みメンバー: 0名
+                      </span>
+                      <span style="font-size:12px;color:var(--text-muted);">
+                        ※ 個人設定が保存されているメンバーのみ表示されます。
+                      </span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;">
+                      <div style="position:relative;width:260px;">
+                        <input type="text" id="member-voices-search-input" class="form-input" placeholder="🔍 ユーザー名・声質で検索..." oninput="onMemberVoiceSearchInput(this.value)" style="padding-left:12px;font-size:13px;" />
+                      </div>
+                      <button type="button" class="btn btn-secondary btn-sm" onclick="loadMemberVoices(currentGuildId)" title="再読み込み">
+                        🔄 更新
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- メンバー設定一覧テーブル -->
+                <div class="card" style="padding:0;overflow:hidden;">
+                  <div class="table-container" style="max-height:650px;overflow-y:auto;">
+                    <table class="data-table" style="width:100%;margin-bottom:0;">
+                      <thead style="position:sticky;top:0;background:var(--card-bg);z-index:2;">
+                        <tr>
+                          <th style="width:26%;">メンバー</th>
+                          <th style="width:26%;">設定中の声質 (話者)</th>
+                          <th style="width:12%;">速度</th>
+                          <th style="width:10%;">ピッチ</th>
+                          <th style="width:10%;">音量</th>
+                          <th style="width:16%;text-align:right;">アクション</th>
+                        </tr>
+                      </thead>
+                      <tbody id="member-voices-table-body">
+                        <!-- 動的レンダリング -->
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
+              <!-- メンバー設定 編集モーダル -->
+              <div id="member-voice-edit-modal" class="modal-overlay" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;backdrop-filter:blur(4px);">
+                <div class="modal-content" style="max-width:540px;width:95%;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,0.5);overflow:hidden;">
+                  <div class="modal-header" style="padding:16px 20px;border-bottom:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;">
+                    <h3 id="member-edit-modal-title" style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+                      <span>✏️ メンバー音声設定の編集</span>
+                    </h3>
+                    <button type="button" class="modal-close-btn" onclick="closeMemberVoiceModal()" style="background:none;border:none;font-size:22px;cursor:pointer;color:var(--text-muted);">&times;</button>
+                  </div>
+                  <div class="modal-body" style="padding:18px 20px;">
+                    <!-- 対象ユーザー情報 -->
+                    <div style="display:flex;align-items:center;gap:12px;background:rgba(0,0,0,0.25);padding:12px 14px;border-radius:8px;margin-bottom:16px;">
+                      <div style="position:relative;width:44px;height:44px;flex-shrink:0;">
+                        <img id="member-edit-avatar-img" src="" alt="Avatar" style="width:44px;height:44px;border-radius:50%;border:2px solid var(--border-color);object-fit:cover;display:none;" onerror="this.style.display='none';document.getElementById('member-edit-avatar-fallback').style.display='flex';" />
+                        <div id="member-edit-avatar-fallback" style="width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,0.08);border:2px solid var(--border-color);display:flex;align-items:center;justify-content:center;font-size:22px;">👤</div>
+                      </div>
+                      <div>
+                        <div id="member-edit-name" style="font-weight:700;font-size:15px;color:var(--text-light);">ユーザー名</div>
+                        <div id="member-edit-id" style="font-size:11px;color:var(--text-muted);font-family:monospace;">ID: 000000000000</div>
+                      </div>
+                    </div>
+
+                    <input type="hidden" id="member-edit-user-id" value="" />
+
+                    <!-- 声質選択 (プロバイダーフィルター + ドロップダウン) -->
+                    <div class="form-group" style="margin-bottom:14px;">
+                      <label class="form-label" style="font-weight:600;font-size:13px;">声質（話者）</label>
+                      <select id="member-edit-speaker" class="form-input" style="font-size:13px;width:100%;">
+                        <!-- JSで全話者を追加 -->
+                      </select>
+                    </div>
+
+                    <!-- 速度スライダー -->
+                    <div class="form-group" style="margin-bottom:14px;">
+                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                        <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">読み上げ速度</label>
+                        <span id="member-edit-speed-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">1.00x</span>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:10px;">
+                        <input type="range" id="member-edit-speed" min="0.5" max="2.0" step="0.05" value="1.0" class="form-range" style="flex:1;" oninput="updateMemberEditSpeed(this.value)" />
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditSpeed(1.0)" style="padding:4px 8px;font-size:11px;">1.0x</button>
+                      </div>
+                    </div>
+
+                    <!-- ピッチスライダー -->
+                    <div class="form-group" style="margin-bottom:14px;">
+                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                        <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">声の高さ (ピッチ)</label>
+                        <span id="member-edit-pitch-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">0%</span>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:10px;">
+                        <input type="range" id="member-edit-pitch" min="-20" max="20" step="1" value="0" class="form-range" style="flex:1;" oninput="updateMemberEditPitch(this.value)" />
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditPitch(0)" style="padding:4px 8px;font-size:11px;">0%</button>
+                      </div>
+                    </div>
+
+                    <!-- 音量スライダー -->
+                    <div class="form-group" style="margin-bottom:14px;">
+                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                        <label class="form-label" style="font-weight:600;font-size:13px;margin:0;">音量 (ボリューム)</label>
+                        <span id="member-edit-volume-val" class="badge" style="background:#5865f2;color:white;font-size:12px;">80%</span>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:10px;">
+                        <input type="range" id="member-edit-volume" min="0" max="200" step="5" value="80" class="form-range" style="flex:1;" oninput="updateMemberEditVolume(this.value)" />
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="setMemberEditVolume(80)" style="padding:4px 8px;font-size:11px;">80%</button>
+                      </div>
+                    </div>
+
+                    <!-- 括弧除去トグル -->
+                    <div class="form-group" style="margin-bottom:16px;">
+                      <label class="checkbox-label" style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;">
+                        <input type="checkbox" id="member-edit-brackets" class="form-checkbox" checked />
+                        <span>名前読み上げ時に名前末尾の【】や（）等の括弧を除去する</span>
+                      </label>
+                    </div>
+
+                    <!-- 試聴ボタン -->
+                    <div style="display:flex;justify-content:flex-start;margin-bottom:10px;">
+                      <button type="button" id="member-edit-preview-btn" class="btn btn-secondary btn-sm" onclick="previewMemberVoiceInModal()" style="display:flex;align-items:center;gap:6px;">
+                        <span>🔊 設定内容を試聴</span>
+                      </button>
+                      <audio id="member-edit-audio" style="display:none;"></audio>
+                    </div>
+                  </div>
+
+                  <div class="modal-footer" style="padding:14px 20px;border-top:1px solid var(--border-color);display:flex;justify-content:space-between;align-items:center;background:rgba(0,0,0,0.15);">
+                    <button type="button" class="btn btn-danger btn-sm" onclick="deleteMemberVoiceFromModal()" style="background:#ed4245;color:white;border:none;padding:7px 14px;">
+                      🗑️ 設定リセット
+                    </button>
+                    <div style="display:flex;gap:8px;">
+                      <button type="button" class="btn btn-secondary btn-sm" onclick="closeMemberVoiceModal()" style="padding:7px 14px;">キャンセル</button>
+                      <button type="button" id="member-edit-save-btn" class="btn btn-primary btn-sm" onclick="saveMemberVoiceFromModal()" style="padding:7px 16px;">
+                        💾 設定を保存
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div> <!-- end #subtab-member-voices -->
+          </section> <!-- end #tab-server -->
+
+          <!-- 5. システム統制タブ (管理者専用) -->
+          <section id="tab-infrastructure" class="tab-pane">
+            <div class="sub-tabs-nav">
+              <button class="sub-tab-btn active" id="tab-btn-bots" data-subtab="bots">🤖 Bot & ノード管理</button>
+              <button class="sub-tab-btn" id="tab-btn-system" data-subtab="system">📊 システム監視 & ログ</button>
+              <button class="sub-tab-btn" id="tab-btn-credentials" data-subtab="credentials">🔑 API・連携設定</button>
+            </div>
+
+            <!-- サブタブ1: Bot & ノード管理 -->
+            <div id="subtab-bots" class="sub-tab-pane active">
+              <div class="section-title">🤖 Bot & ノード管理 (インフラ統制)</div>
+              <div class="section-desc">Manager Node (Master-Slave HAクラスタ)、Discord Botアカウントプール（1〜10号機）、推論オフロード用Worker Nodeを一元管理・監視します。</div>
 
             <!-- 1. 🏢 Manager Node 管理 (Active / Standby HA クラスタ) -->
             <div class="card" id="manager-nodes-card" style="margin-bottom:20px;padding:20px;">
@@ -1120,12 +1141,12 @@
                 自環境のハードウェアリソースやGPU負荷傾向に合わせて、エンジン毎に自由に▲/▼ボタンで順序を組み替え可能です。
               </div>
             </div>
-          </section>
+            </div> <!-- end #subtab-bots -->
 
-          <!-- 6. API・クレデンシャル設定タブ -->
-          <section id="tab-credentials" class="tab-pane">
-            <div class="section-title">🔑 API・外部サービス連携設定</div>
-            <div class="section-desc">クラウド音声合成API（Azure / Google）のAPIキー設定や、自宅PC（Workerノード）との通信用秘密鍵、公開URLを設定します。保存すると再起動なしで即座に反映されます。</div>
+            <!-- サブタブ3: API・連携設定 -->
+            <div id="subtab-credentials" class="sub-tab-pane">
+              <div class="section-title">🔑 API・外部サービス連携設定</div>
+              <div class="section-desc">クラウド音声合成API（Azure / Google）のAPIキー設定や、自宅PC（Workerノード）との通信用秘密鍵、公開URLを設定します。保存すると再起動なしで即座に反映されます。</div>
 
             <form id="credentials-form" onsubmit="saveCredentials(event)">
               <!-- Azure Speech 設定 -->
@@ -1277,12 +1298,12 @@
                 <button type="submit" class="btn btn-primary" style="padding:12px 32px;">設定を保存してホットリロード 💾</button>
               </div>
             </form>
-          </section>
+            </div> <!-- end #subtab-credentials -->
 
-          <!-- 4. システム & キャッシュ状況タブ -->
-          <section id="tab-system" class="tab-pane">
-            <div class="section-title">📊 システム & キャッシュ状況</div>
-            <div class="section-desc">ホストリソース消費モニタリング、クラウドTTS利用状況、キャッシュ使用量、ボット接続状況とログを確認できます。</div>
+            <!-- サブタブ2: システム監視 & ログ -->
+            <div id="subtab-system" class="sub-tab-pane">
+              <div class="section-title">📊 システム & キャッシュ状況</div>
+              <div class="section-desc">ホストリソース消費モニタリング、クラウドTTS利用状況、キャッシュ使用量、ボット接続状況とログを確認できます。</div>
 
             <div id="system-forbidden-card" class="card" style="display:none;background:rgba(255,71,87,0.1);border-color:rgba(255,71,87,0.3);text-align:center;padding:32px;">
               <h3 style="color:#ff4757;margin-top:0;">🔒 アクセス権限がありません</h3>
@@ -2050,7 +2071,8 @@
                 <div id="worker-log-terminal" class="log-terminal" style="max-height:360px;min-height:180px;font-family:Consolas, 'Courier New', monospace;font-size:11px;line-height:1.45;background:#0d1117;color:#c9d1d9;padding:12px;border-radius:6px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">ワーカーログを読み込み中...</div>
               </div>
             </div>
-          </section>
+            </div> <!-- end #subtab-system -->
+          </section> <!-- end #tab-infrastructure -->
 
           <!-- 5. ヘルプ・利用規約タブ -->
           <section id="tab-help" class="tab-pane">

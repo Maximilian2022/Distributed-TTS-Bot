@@ -321,6 +321,11 @@ class HAWatchdog:
                         self.cluster_nodes = peers
                         self._save_cluster_nodes()
 
+                    # Master が計画アップデート中の場合、フェイルオーバー判定を一時猶予（fail_count をリセット）
+                    if data.get("is_updating") or data.get("updating"):
+                        logger.info("⏸️ [HA Watchdog] Master が計画アップデート中 (updating: true) です。フェイルオーバーを猶予待機します。")
+                        self.fail_count = 0
+
                     return data.get("is_active", True)
                 elif resp.status == 410:
                     self._handle_revocation()

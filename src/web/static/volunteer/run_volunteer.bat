@@ -59,6 +59,35 @@ if %errorlevel% neq 0 (
     pip install aiohttp
 )
 
+REM 3.5. volunteer_worker.py の自動最新同期
+python -c "
+import json, os, urllib.request, re
+cfg_path = r'%CONFIG_FILE%'
+worker_path = r'%SCRIPT_DIR%volunteer_worker.py'
+if os.path.exists(cfg_path):
+    try:
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        s_url = cfg.get('server_url', '')
+        http_base = re.sub(r'^wss://', 'https://', s_url)
+        http_base = re.sub(r'^ws://', 'http://', http_base)
+        http_base = re.sub(r'/api/worker/ws.*$', '', http_base).rstrip('/')
+        if http_base:
+            dl_url = http_base + '/volunteer/volunteer_worker.py'
+            req = urllib.request.Request(dl_url, headers={'User-Agent': 'TTSBot-Volunteer-Updater'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    data = resp.read()
+                    if len(data) > 1000 and b'class VolunteerWorker' in data:
+                        tmp_path = worker_path + '.tmp'
+                        with open(tmp_path, 'wb') as wf:
+                            wf.write(data)
+                        os.replace(tmp_path, worker_path)
+                        print('[同期] 最新のエージェントスクリプトを確認・更新しました。')
+    except Exception:
+        pass
+"
+
 REM 4. config.json の読み込みと起動引数生成 (Pythonで安全に展開)
 python -c "
 import json, sys, subprocess, os

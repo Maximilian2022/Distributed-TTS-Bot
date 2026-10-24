@@ -264,6 +264,7 @@ class WebServer:
         self.app.router.add_get("/setup-worker.ps1", self.handle_setup_worker_ps1)
         self.app.router.add_get("/setup-standby.sh", self.handle_setup_standby_sh)
         self.app.router.add_get("/setup-standby.ps1", self.handle_setup_standby_ps1)
+        self.app.router.add_get("/update.sh", self.handle_update_sh)
         self.app.router.add_get("/docker-compose.yml", self.handle_docker_compose_yml)
         self.app.router.add_get("/docker-compose.slave.yml", self.handle_docker_compose_slave_yml)
         self.app.router.add_get("/portainer-stack.yml", self.handle_portainer_stack_yml)
@@ -372,6 +373,7 @@ class WebServer:
         self.app.router.add_post("/api/system/manager_nodes/revoke", self.api_system_revoke_manager_node)
         self.app.router.add_delete("/api/system/manager_nodes/{node_id}", self.api_system_delete_manager_node)
         self.app.router.add_post("/api/worker/kick", self.api_worker_kick_node)
+        self.app.router.add_post("/api/worker/broadcast_update", self.api_worker_broadcast_update)
 
         # テスト・シミュレーション API (ローカルまたは管理者用)
         self.app.router.add_post("/api/test/simulate", self.api_test_simulate)
@@ -875,6 +877,20 @@ class WebServer:
         content = content.replace("__DEFAULT_HA_SECRET__", ha_secret)
         return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
+    async def handle_update_sh(self, request: web.Request) -> web.Response:
+        """ワンライナー自動アップデートスクリプト update.sh を配信"""
+        candidates = [
+            Path(__file__).resolve().parent / "static" / "update.sh",
+            Path("/app/update.sh"),
+            Path("update.sh"),
+            Path(__file__).resolve().parent.parent.parent / "update.sh",
+            Path("/root/ttsbot/update.sh"),
+        ]
+        for p in candidates:
+            if p.exists() and p.is_file():
+                return web.Response(text=p.read_text(encoding="utf-8"), content_type="text/x-shellscript", charset="utf-8")
+        return web.Response(text="#!/bin/bash\necho 'Error: update.sh not found'\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
+
     async def handle_docker_compose_yml(self, request: web.Request) -> web.Response:
         """Standby/Worker 用 docker-compose.yml を配信"""
         candidates = [
@@ -1060,10 +1076,16 @@ class WebServer:
                     "priority": s.get("priority", 1)
                 })
 
+        # 更新中フラグ (.ha_updating) の確認 (HA 相手ノードの誤昇格を防止)
+        updating_flag = Path(self.config.data_dir) / ".ha_updating"
+        is_updating = updating_flag.exists()
+
         return web.json_response({
             "status": "ok",
             "role": "master",
             "is_active": True,
+            "is_updating": is_updating,
+            "updating": is_updating,
             "active_bots": active_bots,
             "assigned_priority": assigned_p,
             "priority": assigned_p,
@@ -3968,6 +3990,27 @@ class WebServer:
             "target": target_name,
             "message": f"Worker ノード '{target_name}' を切断・除外しました。"
         })
+
+    async def api_worker_broadcast_update(self, request: web.Request) -> web.Response:
+        """接続中の全 Volunteer Worker ノードへ自己アップデート命令を一斉ブロードキャスト (管理者専用)"""
+        await self._require_admin(request)
+        count = 0
+        failed = 0
+        for node_id, ws in list(self.worker_ws_connections.items()):
+            try:
+                if hasattr(ws, "send_json") and not ws.closed:
+                    await ws.send_json({
+                        "type": "update",
+                        "action": "update",
+                        "timestamp": time.time(),
+                        "message": "Update triggered by administrator"
+                    })
+                    count += 1
+            except Exception as e:
+                logger.warning(f"Failed to send update signal to volunteer worker {node_id}: {e}")
+                failed += 1
+        logger.info(f"📢 [Worker Update] Broadcasted update signal to {count} volunteer worker(s) (failed: {failed})")
+        return web.json_response({"status": "ok", "broadcast_count": count, "failed_count": failed})
 
     async def api_worker_trigger_update(self, request: web.Request) -> web.Response:
         """指定ノードまたは全ノードの Worker Agent に自己アップデート・完全再構成を指示する (管理者権限必須)"""

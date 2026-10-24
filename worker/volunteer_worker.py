@@ -26,6 +26,7 @@ import asyncio
 import logging
 import subprocess
 import urllib.parse
+import re
 from typing import Dict, Any, List, Optional, Set
 
 try:
@@ -469,12 +470,16 @@ class VolunteerWorker:
                             except Exception:
                                 continue
 
-                            m_type = data.get("type")
+                            m_type = data.get("type") or data.get("action")
                             if m_type == "register_ack":
                                 logger.info(f"🎉 サーバーにワーカーとして登録されました (Priority: {data.get('assigned_priority', self.priority)})")
 
                             elif m_type == "synthesize_request":
                                 asyncio.create_task(self._handle_synthesize(ws, data))
+
+                            elif m_type in ("update", "update_request"):
+                                logger.info("🔄 [Update] サーバーからリモート自己アップデート指示を受信しました。最新版の取得を開始します...")
+                                asyncio.create_task(self._handle_self_update())
 
                             elif m_type == "heartbeat_ack":
                                 pass
@@ -619,6 +624,38 @@ class VolunteerWorker:
                 return await s_resp.read()
 
         raise ValueError(f"Unknown engine: {engine}")
+
+    async def _handle_self_update(self):
+        """Master から最新の volunteer_worker.py を取得して自プロセスを再起動 (os.execv)"""
+        try:
+            raw_url = self.server_url
+            http_base = re.sub(r'^wss://', 'https://', raw_url)
+            http_base = re.sub(r'^ws://', 'http://', http_base)
+            http_base = re.sub(r'/api/worker/ws.*$', '', http_base).rstrip('/')
+            update_url = f"{http_base}/volunteer/volunteer_worker.py"
+
+            my_script = os.path.abspath(__file__)
+            logger.info(f"📥 [Update] 最新コードをダウンロード中: {update_url}")
+
+            timeout = aiohttp.ClientTimeout(total=15.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(update_url) as resp:
+                    if resp.status == 200:
+                        new_code = await resp.read()
+                        if len(new_code) > 1000 and b"class VolunteerWorker" in new_code:
+                            tmp_path = my_script + ".tmp"
+                            with open(tmp_path, "wb") as f:
+                                f.write(new_code)
+                            os.replace(tmp_path, my_script)
+                            logger.info("✨ [Update] 最新コードの保存完了！プロセスを即座に再起動します...")
+                            await asyncio.sleep(0.5)
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                        else:
+                            logger.warning("⚠️ [Update] 取得したファイルが不正なサイズまたは内容のため、更新を中止しました。")
+                    else:
+                        logger.warning(f"⚠️ [Update] ダウンロード失敗 (HTTP {resp.status})")
+        except Exception as e:
+            logger.error(f"❌ [Update] 自己アップデート中にエラーが発生しました: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="TTSBot Volunteer Worker Agent")

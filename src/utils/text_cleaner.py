@@ -453,15 +453,28 @@ class TextCleaner:
                 tokens = list(tokenizer.tokenize(raw_text, split_mode))
                 split_indices = []
                 cur_len = 0
-                for tok in tokens:
+                for i, tok in enumerate(tokens):
                     surface = tok.surface()
                     cur_len += len(surface)
                     pos = tok.part_of_speech()
                     # 接続助詞の直後で分割 (前が7文字以上、後が6文字以上残っていること)
-                    if pos[0] == '助詞' and pos[1] == '接続助詞' and surface in {'ので', 'から', 'けど', 'けれど', 'たら', 'なら', 'が'}:
-                        remaining_chars = len(raw_text) - cur_len
-                        if cur_len >= 7 and remaining_chars >= 6:
-                            split_indices.append((cur_len, 'conj_particle'))
+                    if pos[0] == '助詞' and pos[1] == '接続助詞':
+                        is_split_target = False
+                        if surface in {'ので', 'から', 'けど', 'けれど', 'たら', 'なら', 'が'}:
+                            is_split_target = True
+                        elif surface in {'て', 'で'}:
+                            # 「て/で」の接続: 直後が補助動詞（非自立動詞: いる、みる、おく、しまう等）や助詞（てから、ては等）は除外
+                            # 自立語（名詞・副詞・形容詞・一般動詞など）が後続する場合のみ自然な文節境界として分割
+                            if i + 1 < len(tokens):
+                                next_tok = tokens[i + 1]
+                                n_pos = next_tok.part_of_speech()
+                                is_aux = (n_pos[0] == '動詞' and any('非自立' in p for p in n_pos)) or (n_pos[0] == '助詞')
+                                if not is_aux:
+                                    is_split_target = True
+                        if is_split_target:
+                            remaining_chars = len(raw_text) - cur_len
+                            if cur_len >= 7 and remaining_chars >= 6:
+                                split_indices.append((cur_len, 'conj_particle'))
                     # 接続詞の直前で分割
                     elif pos[0] == '接続詞' and surface in {'しかし', 'そして', 'また', 'だから', 'なお', 'ただ', 'あるいは', 'それに'}:
                         split_pos = cur_len - len(surface)
@@ -494,17 +507,28 @@ class TextCleaner:
         if tokenizer is not None:
             try:
                 tokens = list(tokenizer.tokenize(raw_text))
-                # 接続助詞（ので、から、けど、けれど、たら、なら、が）または接続詞（しかし、そして、また、だから）を探す
+                # 接続助詞（ので、から、けど、けれど、たら、なら、が、自立接続のて/で）または接続詞を探す
                 split_indices = []
                 cur_len = 0
                 for i, tok in enumerate(tokens):
                     cur_len += len(tok.surface)
                     pos = tok.part_of_speech.split(',')
                     # 接続助詞の直後で分割 (前が7文字以上、後が6文字以上残っていること)
-                    if pos[0] == '助詞' and pos[1] == '接続助詞' and tok.surface in {'ので', 'から', 'けど', 'けれど', 'たら', 'なら', 'が'}:
-                        remaining_chars = len(raw_text) - cur_len
-                        if cur_len >= 7 and remaining_chars >= 6:
-                            split_indices.append((cur_len, 'conj_particle'))
+                    if pos[0] == '助詞' and pos[1] == '接続助詞':
+                        is_split_target = False
+                        if tok.surface in {'ので', 'から', 'けど', 'けれど', 'たら', 'なら', 'が'}:
+                            is_split_target = True
+                        elif tok.surface in {'て', 'で'}:
+                            if i + 1 < len(tokens):
+                                next_tok = tokens[i + 1]
+                                n_pos = next_tok.part_of_speech.split(',')
+                                is_aux = (n_pos[0] == '動詞' and any('非自立' in p for p in n_pos)) or (n_pos[0] == '助詞')
+                                if not is_aux:
+                                    is_split_target = True
+                        if is_split_target:
+                            remaining_chars = len(raw_text) - cur_len
+                            if cur_len >= 7 and remaining_chars >= 6:
+                                split_indices.append((cur_len, 'conj_particle'))
                     # 接続詞の直前で分割
                     elif pos[0] == '接続詞' and tok.surface in {'しかし', 'そして', 'また', 'だから', 'なお', 'ただ', 'あるいは'}:
                         split_pos = cur_len - len(tok.surface)

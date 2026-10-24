@@ -79,6 +79,12 @@ Automatically profiles connected worker hardware specs (GPU presence, RAMDisk re
 ### 6. 🎛️ Comprehensive Web Management Dashboard
 - Built-in responsive WebUI for guild settings, custom user dictionaries, live metrics, multi-bot pool scaling (Bots #1–#10), and one-click copyable worker setup commands.
 
+### 7. 🚫 Robust NG Words & Streamer Incident Prevention (Moderation)
+- **Real-Time Masking**: Instantly masks abusive, offensive, or sensitive terms into `＊＊＊` within milliseconds before synthesis.
+- **Longest-Match Algorithm & Zero Overhead**: Scans terms ordered by length to prevent partial-match false positives. Fast in-memory caching ensures zero latency impact on speech.
+- **Default Spam/Troll Preset**: Import standard moderation wordlists with a single click or command.
+- **Dual Support (Slash Commands & WebUI)**: Full management available via Discord chat (`/ng add`, `/ng remove`, `/ng list`, `/ng import_default`) and the web GUI dashboard.
+
 ---
 
 ## 🚀 Quick Start
@@ -118,7 +124,40 @@ Once started, open your web browser and navigate to `http://localhost:8080` (or 
 | `/dict add <word> <reading>` | Registers a word in the guild-wide reading dictionary |
 | `/dict delete <word>` | Removes a word from the dictionary |
 | `/userdict` | Configures personal reading dictionary entries |
+| `/ng add <word>` | Registers an NG word (automatically masked with `＊＊＊`) |
+| `/ng remove <word>` | Removes a word from the NG word list |
+| `/ng list` | Displays the server's registered NG words |
+| `/ng import_default` | Imports the default recommended troll/abuse protection preset |
 | `/help` | Displays a detailed list of commands and troubleshooting tips |
+
+---
+
+## 🔄 Safe Zero-Downtime Update Guide
+
+To keep Discord voice channels connected without interruption, an automated safe update script is included with **pre-downloading** and **HA failover guard**.
+
+### Recommended: One-Liner or Script Execution (~2s Downtime)
+
+```bash
+# Run local script in repo (fastest & recommended)
+./update.sh
+
+# Or run via web one-liner
+curl -sSL "https://<YOUR_DOMAIN>/update.sh" | sudo bash
+```
+
+### Safety Features
+- ⚡ **Pre-Pulling (~2s Downtime)**: Pulls the latest Docker Hub image in the background *before* touching the running container, reducing switchover pause to ~2 seconds.
+- 🛡️ **HA Split-Brain Guard**: Emits a maintenance signal (`data/.ha_updating`) so standby slave nodes gracefully delay failover decisions during master upgrades.
+- 🤖 **Volunteer Worker Auto-Update**: Once master boots the new version, it automatically broadcasts an update signal to all connected volunteer workers via WebSocket, triggering immediate restart to latest code.
+- 💾 **Automatic Database Backup**: Backs up SQLite databases and config files (`data/*.db`, `data/*.json`) into `data_backup/` before proceeding.
+
+#### Command-Line Options:
+```bash
+./update.sh --build       # Build locally from Dockerfile instead of Docker Hub
+./update.sh --clean       # Prune obsolete dangling images after update
+./update.sh --no-cache    # Completely discard build cache (use with --build)
+```
 
 ---
 
