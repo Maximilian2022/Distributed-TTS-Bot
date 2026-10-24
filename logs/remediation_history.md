@@ -1,5 +1,13 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] scratch ディレクトリの Git 管理除外 (.gitignore 反映 & インデックス完全除去)
+- **概要**:
+  - `scratch/` ディレクトリ配下のファイル（`memo.md`, `remaining.md`）が Git の追跡対象に入っていたため、管理対象外とする処置を実施。
+- **実施内容**:
+  1. `.gitignore` 内の例外指定（`!scratch/memo.md`, `!scratch/remaining.md`）を撤廃し、`scratch/` 全体を一括除外するルールに統一。
+  2. `git rm -r --cached scratch` により、ローカル作業ファイル（`scratch/memo.md` 等）は手元に保持したまま、Git インデックス（追跡状態）からのみ安全に削除。
+  3. 新環境（`ttsbot-oss.git`）および旧環境アーカイブ（`ttsbot.git`）の双方でコミット＆プッシュを実行し、リモートリポジトリから `scratch/` を完全除去。
+
 ## [2026-10-24] 本番 Side-by-Side 移行完遂・ディレクトリ再編・GitHub同期先入替 (ttsbot-oss)
 - **概要**:
   - 独立開発環境（`ttsbot-oss`）で構築・検証完了した新アーキテクチャ（Edge-TTSファースト、動的Botプール、WebUIクレデンシャル管理、NAT越えWorkerプロキシ等）を本番環境へ正式カットオーバー（Side-by-Side切替）。
