@@ -1,61 +1,62 @@
-# Security Policy
+# セキュリティポリシー (Security Policy)
 
-[日本語版 (Japanese Version)](SECURITY.ja.md)
+[日本語版](SECURITY.md) | [English Version](SECURITY.en.md)
 
-The maintainers of **Distributed-TTS-Bot** take the security of our project and the privacy of our users seriously. We appreciate your efforts to responsibly disclose vulnerabilities to help us keep the community safe.
-
----
-
-## Supported Versions
-
-Only the latest release and the current `main` branch receive active security updates.
-
-| Version | Supported          |
-| ------- | ------------------ |
-| `main`  | :white_check_mark: |
-| Latest  | :white_check_mark: |
-| Older   | :x:                |
-
-We strongly recommend always running the latest version of the container images.
+**Distributed-TTS-Bot** プロジェクトは、ソフトウェアのセキュリティとユーザーのプライバシー保護を最重要事項として取り組んでいます。コミュニティの安全を守るため、責任ある脆弱性の報告にご協力いただきありがとうございます。
 
 ---
 
-## Reporting a Vulnerability
+## サポート対象バージョン
 
-**Please DO NOT report security vulnerabilities via public GitHub Issues, discussions, or Discord channels.**
+最新の公式リリース、および現在の `main` ブランチのみがセキュリティアップデートの対象となります。
 
-If you discover a security vulnerability, please report it privately:
+| バージョン | サポート状況       |
+| ---------- | ------------------ |
+| `main`     | :white_check_mark: |
+| 最新リリース| :white_check_mark: |
+| 過去の旧版  | :x:                |
 
-1. **GitHub Private Vulnerability Reporting (Preferred)**:
-   - Navigate to the [Security tab](https://github.com/Maximilian2022/Distributed-TTS-Bot/security) of the repository.
-   - Click on **"Report a vulnerability"** to submit a private draft advisory.
-2. **Direct Contact**:
-   - If GitHub Advisory is unavailable, please contact the project maintainer directly through the profile contacts or private channels.
-
-### Information to Include in Your Report
-
-To help us investigate and resolve the issue quickly, please provide as much information as possible:
-- Type of vulnerability (e.g., Remote Code Execution, Authentication Bypass, XSS, SSRF, Information Disclosure)
-- Step-by-step instructions or Proof of Concept (PoC) to reproduce the issue
-- Affected components (e.g., WebUI dashboard, WebSocket Worker API, Discord slash commands)
-- Potential impact and severity
-- Any suggested fixes or remediations if known
+常に最新版のコンテナイメージで運用していただくことを強く推奨します。
 
 ---
 
-## Our Response Process
+## 脆弱性の報告方法
 
-1. **Acknowledgment**: We will acknowledge receipt of your vulnerability report within **48 hours**.
-2. **Investigation & Triage**: We will confirm the issue, determine its severity, and keep you informed of our progress.
-3. **Patch & Release**: A fix will be developed, tested, and merged into `main`. A new release will be published.
-4. **Public Disclosure**: Once the patch is available to users, we will coordinate public disclosure and credit you for the responsible reporting (unless you prefer to remain anonymous).
+**公開の GitHub Issues、Discussions、または一般的な Discord チャンネルには脆弱性情報を絶対に投稿しないでください。**
+
+セキュリティ上の脆弱性を発見された場合は、以下の非公開ルートを通じてご連絡をお願いいたします：
+
+1. **GitHub 非公開脆弱性レポート (推奨)**:
+   - リポジトリの [Security タブ](https://github.com/Maximilian2022/Distributed-TTS-Bot/security) を開きます。
+   - **"Report a vulnerability"** ボタンをクリックし、非公開のアドバイザリを作成してください。
+2. **メンテナーへの直接連絡**:
+   - 上記が利用できない場合は、リポジトリメンテナーの GitHub プロフィール等に記載された非公開連絡先まで直接ご連絡ください。
+
+### レポートに記載いただきたい情報
+
+調査と修正を迅速に行うため、可能な限り以下の情報を含めてください：
+- 脆弱性の種類（例: リモートコード実行、認証回避、XSS、SSRF、情報漏洩等）
+- 再現手順または再現コード（PoC）
+- 影響を受けるコンポーネント（例: WebUI ダッシュボード、Worker WebSocket API、Discord スラッシュコマンド等）
+- 潜在的な影響度と深刻度
+- 修正案や緩和策（もしあれば）
 
 ---
 
-## Security Best Practices for Operators
+## 対応プロセス
 
-When deploying Distributed-TTS-Bot in production or exposing it to the Internet:
-- **Set a Strong Admin Password**: Never leave `ADMIN_PASSWORD` as the default.
-- **Use Cloudflare Tunnel or Reverse Proxy**: Always enforce HTTPS/TLS when exposing the WebUI or Worker WebSocket endpoints.
-- **Configure Worker Shared Token**: Always set `TTSBOT_WORKER_SHARED_SECRET` in `.env` to protect the `/api/worker/ws` cluster from unauthorized compute nodes.
-- **Restrict WAN Access**: By default, sensitive internal APIs are restricted to local LAN access. Keep this boundary intact.
+1. **受領確認**: 報告をいただいてから **48 時間以内** に受領確認のご連絡を差し上げます。
+2. **調査と検証**: 脆弱性を検証し、深刻度を評価して進捗を報告者様と共有します。
+3. **パッチ作成とリリース**: 修正パッチを開発・検証し、`main` ブランチへのマージと新バージョンリリースを実施します。
+4. **公開**: 修正版が公開された後、セキュリティアドバイザリを公開し、報告者様のお名前をクレジットとして掲載させていただきます（匿名希望の場合は配慮いたします）。
+
+---
+
+## 運用者向けのセキュリティ・ベストプラクティス
+
+Distributed-TTS-Bot を本番環境やインターネット（WAN）へ公開する際は、以下の対策を必ず講じてください：
+
+- **強固な管理者パスワード**: `ADMIN_PASSWORD` をデフォルトのまま運用しないでください。
+- **HTTPS / TLS の強制**: Cloudflare Tunnel やリバースプロキシを活用し、WebUI や WebSocket 通信を必ず暗号化してください。
+- **ワーカー共有トークンの設定**: `.env` で `TTSBOT_WORKER_SHARED_SECRET` を設定し、不正な Worker ノードがクラスタへ勝手に接続するのを防いでください。
+- **WAN セキュリティ境界の維持**: 内部管理用 API は LAN 専用に保護されています。ファイアウォールやアクセス制限を適切に維持してください。

@@ -7,38 +7,38 @@
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)
 ![Discord](https://img.shields.io/badge/Discord-pycord-5865F2.svg)
 
-**Next-Generation Distributed Compute & Ultra-Low-Latency Streaming TTS Bot for Discord**
+**分散コンピュート・超低遅延ストリーミング対応の次世代 Discord 音声合成（TTS）Bot**
 
-[English Documentation](README.md) | [日本語ドキュメント (Japanese)](README.ja.md)
+[日本語ドキュメント](README.md) | [English Documentation](README.en.md)
 
 </div>
 
 ---
 
-## 📖 Overview
+## 📖 概要
 
-**Distributed-TTS-Bot** is an ultra-low-latency Japanese text-to-speech (TTS) Discord bot engineered for real-time natural voice playback in voice channels.
+**Distributed-TTS-Bot** は、自然な日本語音声でテキストチャットを高速読み上げする、Discord 専用の超低遅延音声合成 Bot です。
 
-Designed to scale effortlessly from personal friend servers to massive community guilds, it features **distributed compute clustering**, **NAT-traversing volunteer worker nodes**, **dynamic bot slot scaling** for concurrent voice channels, and **high-availability (HA) master/slave failover** with split-brain protection.
+単一サーバーでの個人利用はもちろん、複数台の PC や GPU マシンを束ねる**分散コンピュート・クラスタリング**、参加者のゲーミング PC を活用する**ボランティア Worker**、複数ボイスチャンネルを同時にカバーする**動的 Bot スロット**、さらに Master/Slave の**無停止 HA 冗長化機構**を備えています。
 
 ```mermaid
 graph TD
-    User["Discord User<br>(Chat Message)"] --> Discord["Discord Gateway / VC"]
-    Discord --> Bot["<b>Distributed-TTS-Bot (Master)</b><br>・Ahead-of-Time 20ms Streaming<br>・Smart Chunking (30-char hard cap)<br>・Speculative Parallel Synthesis"]
+    User["Discord ユーザー<br>(テキストチャット)"] --> Discord["Discord Gateway / VC"]
+    Discord --> Bot["<b>Distributed-TTS-Bot (Master)</b><br>・先行ストリーミング制御<br>・スマート文分割 (30文字)<br>・投機的並列合成"]
 
-    subgraph "Distributed Compute Pool"
-        RAM["Master RAMDisk (Tier 1)<br>Instant Inference (0ms Disk I/O)"]
-        GPU1["OMEN 2022 (Tier 2/3)<br>RTX 3090 GPU Worker"]
-        WorkerVol["Volunteer Worker (NAT/WAN)<br>Outbound WebSocket / Zero Open Ports"]
-        Cloud["Cloud Fallback Engine<br>Edge-TTS / GCP / Azure"]
+    subgraph "分散コンピュート・ノードプール"
+        RAM["Master RAMDisk (Tier 1)<br>即時推論 (0ms I/O)"]
+        GPU1["OMEN 2022 (Tier 2/3)<br>RTX 3090 GPU 推論"]
+        WorkerVol["ボランティア Worker<br>WebSocket (WSS) / ポート開放不要"]
+        Cloud["クラウド TTS フォールバック<br>Edge-TTS / GCP / Azure"]
     end
 
-    Bot -->|Pinpoint Model Routing| RAM
-    Bot -->|On-Demand Wakeup| GPU1
-    Bot -->|Matched Speaker UUID| WorkerVol
-    Bot -.->|Latency Timeout Fallback| Cloud
+    Bot -->|ピンポイントルーティング| RAM
+    Bot -->|オンデマンド遠隔起動| GPU1
+    Bot -->|モデル保有合致| WorkerVol
+    Bot -.->|遅延タイムアウト時即時切替| Cloud
 
-    RAM --> Stream["20ms Opus Audio Frames<br>Real-time Stream"]
+    RAM --> Stream["20ms Opus フレーム<br>リアルタイム再生"]
     GPU1 --> Stream
     WorkerVol --> Stream
     Cloud --> Stream
@@ -47,86 +47,86 @@ graph TD
 
 ---
 
-## ✨ Key Features
+## ✨ 主な機能
 
-### 1. ⚡ Ultra-Low-Latency & Speculative Streaming
-- **Smart Chunking with 30-Character Hard Cap**: Intelligently identifies conversational pauses, slang (`w`, `草`), punctuation, and sentence particles. Even long continuous text is sliced into manageable micro-chunks for early speculative synthesis.
-- **20ms Frame Streaming**: Starts playing audio in the Discord voice channel the millisecond the first 20ms Opus frame arrives, completely eliminating initial playback buffering lag.
+### 1. ⚡ 超低遅延・先行ストリーミング再生
+- **多段チャンキング & 30文字ハードキャップ**: 口語文、スペース区切り、ネットスラング（`w`, `草`）、終助詞境界をミリ秒単位で賢く識別。句読点のない長文チャットでも 30 文字以内で安全にスライスして先行並列合成。
+- **20ms フレーム直接送出**: 合成完了を待たずに生成された最初の音声チャンクから即座に Discord VC へストリーミング再生を開始し、発言から再生開始までの待機時間を極限まで削減。
 
-### 2. 🖥️ Distributed Compute & Volunteer Workers
-- **NAT-Traversing Outbound WebSocket (WSS)**: Community members can contribute their gaming PCs or inference servers without opening router ports or exposing static IPs.
-- **Smart Model Pinpoint Routing**: Automatically detects which speech models (e.g., specific COEIROINK characters or MYCOEIROINK UUIDs) each node owns, routing inference tasks exclusively to nodes that have the requested model ready.
-- **Game-Friendly Low Resource Mode**: Features low process priority on Windows, automatic idle container sleep (releasing VRAM/RAM to the OS), and on-demand container waking.
+### 2. 🖥️ 分散コンピュート & ボランティア Worker
+- **ポート開放不要のアウトバウンド接続**: 一般メンバーの Windows/Linux PC から、WebSocket（WSS）経由で手軽にコンピュートノードとしてクラスタに参加可能。
+- **スマート・モデルルーティング**: ボランティア機が保有しているモデル（COEIROINK の MYCOEIROINK や公式話者）を自動検知し、該当モデルのリクエストのみをピンポイントで振り分け。
+- **ゲーム連動低負荷モード**: ゲーミング PC の邪魔にならない低プロセスピリオティ設定、無通信時の自動コンテナ停止（メモリ返却）に対応。
 
-### 3. 🎯 4-Tier RAMDisk & GPU Optimization
-Automatically benchmarks and prioritizes compute resources according to hardware capabilities:
-- **Tier 1 (CPU + RAMDisk)**: Instantaneous memory-resident models with zero disk latency.
-- **Tier 2 (GPU + RAMDisk)**: Ultra-fast GPU inference paired with pre-loaded RAM disk assets.
-- **Tier 3 (GPU + NVMe)**: High-throughput GPU inference for large model collections.
-- **Tier 4 (CPU + SSD)**: Reliable fallback compute.
+### 3. 🎯 4段階 RAMDisk Tier ルーティング
+COEIROINK や VOICEVOX のモデル常駐先とハードウェア性能をプロファイルし、最適なノードへ自動割り当て：
+- **Tier 1 (CPU + RAMDisk)**: メモリ常駐でディスク I/O ゼロの最速応答。
+- **Tier 2 (GPU + RAMDisk)**: GPU 爆速推論と RAM 常駐の組み合わせ。
+- **Tier 3 (GPU + SSD)**: 大規模モデルの GPU 高速処理。
+- **Tier 4 (CPU + SSD)**: 最下位フォールバック。
 
-### 4. ☁️ Multi-Engine Cloud Fallback (Edge-TTS First)
-- **Zero Configuration Required**: Works right out of the box using high-quality **Edge-TTS** and **Open JTalk** without needing proprietary GPU hardware or paid API keys.
-- **Seamless Cloud Scalability**: Optional integration with Azure Cognitive Services Speech and Google Cloud Text-to-Speech.
-- **Instant Fallback**: If a local GPU worker stalls or hits a network timeout, the request speculatively falls back to cloud TTS in parallel, ensuring conversations never stall.
+### 4. ☁️ 多段クラウドフェイルオーバー（Edge-TTS ファースト）
+- **初期設定不要**: 高価な GPU や API キーがなくても、無料の **Edge-TTS** または **Open JTalk** ですぐに高品質な音声合成が動作。
+- **自動フォールバック**: ローカルエンジンや Worker に高負荷・障害が発生した場合、瞬時にクラウド API（Edge-TTS / Azure / GCP）へフォールバックし、通話を一切途切れさせません。
 
-### 5. 🛡️ High-Availability (HA) & Redundancy
-- **Master/Slave Auto-Promotion**: Standby nodes monitor master health continuously and promote themselves automatically upon failure.
-- **Split-Brain Mitigation**: Isolated master instances autonomously step down (`HTTP 410 Gone`) upon detecting a new active primary.
+### 5. 🛡️ 完全無停止 HA（高可用性）冗長化
+- **Master/Slave 自動昇格**: 主系（Master）の死活を常時監視。障害検知時に副系（Slave）が自動昇格して通話を継続。
+- **Split-Brain 防護**: 分断された旧 Master からの自律降格（HTTP 410 Gone 自律停止）により多重稼働事故を完全防止。
 
-### 6. 🎛️ Comprehensive Web Management Dashboard
-- Built-in responsive WebUI for guild settings, custom user dictionaries, live metrics, multi-bot pool scaling (Bots #1–#10), and one-click copyable worker setup commands.
+### 6. 🎛️ 直感的な WebUI 管理ダッシュボード
+- ブラウザからギルドごとの読み上げ設定、ユーザー個別辞書、Bot 稼働スロット（1〜10号機）、分散 Worker の稼働状態を一元管理。
+- クラスタ追加用のワンライナー（PowerShell / Bash）を画面からワンクリックでコピー可能。
 
 ---
 
-## 🚀 Quick Start
+## 🚀 クイックスタート
 
-### Prerequisites
-- **Docker & Docker Compose** (Linux, macOS, or Windows WSL2 / Docker Desktop)
-- **Discord Bot Token** (obtainable from the [Discord Developer Portal](https://discord.com/developers/applications))
+### 1. 必要要件
+- **Docker / Docker Compose**（Linux / macOS / Windows Docker Desktop）
+- **Discord Bot Token**（[Discord Developer Portal](https://discord.com/developers/applications) から取得）
 
-### Installation Steps
+### 2. インストール手順
 
 ```bash
-# 1. Clone the repository
+# 1. リポジトリのクローン
 git clone https://github.com/Maximilian2022/Distributed-TTS-Bot.git
 cd Distributed-TTS-Bot
 
-# 2. Copy the environment configuration template
+# 2. 環境設定ファイルの準備
 cp .env.example .env
 
-# 3. Edit .env (configure your Discord Bot Token and WebUI admin password)
+# 3. .env の編集 (Bot Token や管理者パスワードを設定)
 nano .env
 
-# 4. Build and start the containers
+# 4. コンテナのビルドと起動
 docker compose up -d --build
 ```
 
-Once started, open your web browser and navigate to `http://localhost:8080` (or your server's IP address) to access the management dashboard.
+起動後、ブラウザで `http://localhost:8080`（またはサーバーのホスト名・IP）にアクセスすると管理ダッシュボードが開きます。
 
 ---
 
-## 💬 Essential Discord Slash Commands
+## 💬 主な Discord スラッシュコマンド
 
-| Command | Description |
+| コマンド | 説明 |
 | :--- | :--- |
-| `/join` | Summons the bot to your current voice channel |
-| `/leave` | Disconnects the bot from the voice channel |
-| `/voice` | Opens the interactive menu to select speakers, adjust speed, and tune pitch |
-| `/dict add <word> <reading>` | Registers a word in the guild-wide reading dictionary |
-| `/dict delete <word>` | Removes a word from the dictionary |
-| `/userdict` | Configures personal reading dictionary entries |
-| `/help` | Displays a detailed list of commands and troubleshooting tips |
+| `/join` | コマンドを実行したボイスチャンネルに Bot を呼び出します |
+| `/leave` | Bot をボイスチャンネルから退出させます |
+| `/voice` | 声色（話者）・読み上げ速度・ピッチ（音高）の変更メニューを表示します |
+| `/dict add <単語> <読み>` | サーバー共通の単語辞書に新しい読みを登録します |
+| `/dict delete <単語>` | 登録済みの単語を辞書から削除します |
+| `/userdict` | ユーザー個人の専用単語辞書を設定します |
+| `/help` | コマンド一覧と詳しい使い方を表示します |
 
 ---
 
-## 🖥️ Connecting Worker Nodes
+## 🖥️ Worker ノードの追加方法
 
-From the WebUI **"Bot & Node Management"** tab, you can easily copy one-liner scripts to expand your compute cluster:
+WebUI ダッシュボードの「Bot & ノード管理」タブから、専用のワンライナーを取得して簡単に Worker を追加できます：
 
-### 1. Dedicated Inference Server Worker (Docker)
+### 1. 常時稼働クラスタ用 Worker (Docker)
 ```powershell
-# Windows (Docker Desktop / Administrator PowerShell)
+# Windows (Docker Desktop / 管理者 PowerShell)
 irm "https://<YOUR_DOMAIN>/setup-worker.ps1" | iex
 ```
 ```bash
@@ -134,20 +134,20 @@ irm "https://<YOUR_DOMAIN>/setup-worker.ps1" | iex
 curl -sSL "https://<YOUR_DOMAIN>/setup-worker.sh" | sudo bash
 ```
 
-### 2. Volunteer Worker (Gaming PC / No Port Forwarding Required)
+### 2. ボランティア Worker (個人 PC / ポート開放不要)
 ```powershell
-# Windows Native GUI Launcher
+# Windows ネイティブ GUI ランチャー
 $env:TTSBOT_SERVER_URL="wss://<YOUR_DOMAIN>/api/worker/ws"; $env:TTSBOT_WORKER_TOKEN="<YOUR_TOKEN>"; irm "https://<YOUR_DOMAIN>/volunteer/run_volunteer_gui.ps1" | iex
 ```
 
 ---
 
-## 📜 License & Disclaimers
+## 📜 ライセンス & 免責事項
 
-Distributed-TTS-Bot is open-source software licensed under the **[Apache License, Version 2.0](LICENSE)**.
+本ソフトウェアは **[Apache License, Version 2.0](LICENSE)** のもとで公開されています。
 
-For third-party software attributions, embedded voice models (MMDAgent Mei/Takumi), and voice engine (VOICEVOX, COEIROINK, SHAREVOX) character usage guidelines and disclaimers, please refer to **[NOTICE.md](NOTICE.md)**.
+サードパーティ製ライブラリの帰属表示、同梱モデル（MMDAgent Mei/Takumi）、および音声合成エンジン（VOICEVOX, COEIROINK, SHAREVOX）のキャラクター利用ガイドラインに関する免責事項については、**[NOTICE.md](NOTICE.md)** をご確認ください。
 
-- [Code of Conduct](CODE_OF_CONDUCT.md) ([日本語](CODE_OF_CONDUCT.ja.md))
-- [Contributing Guide](CONTRIBUTING.md) ([日本語](CONTRIBUTING.ja.md))
-- [Security Policy](SECURITY.md) ([日本語](SECURITY.ja.md))
+- [行動規範 (Code of Conduct)](CODE_OF_CONDUCT.md) ([English](CODE_OF_CONDUCT.en.md))
+- [コントリビューションガイド (Contributing Guide)](CONTRIBUTING.md) ([English](CONTRIBUTING.en.md))
+- [セキュリティポリシー (Security Policy)](SECURITY.md) ([English](SECURITY.en.md))

@@ -1,92 +1,93 @@
-# Contributing to Distributed-TTS-Bot
+# Distributed-TTS-Bot への貢献ガイド (Contributing Guide)
 
-[日本語版 (Japanese Version)](CONTRIBUTING.ja.md)
+[日本語版](CONTRIBUTING.md) | [English Version](CONTRIBUTING.en.md)
 
-Thank you for your interest in contributing to **Distributed-TTS-Bot**! We welcome bug reports, feature requests, documentation improvements, and code contributions from everyone.
-
----
-
-## Code of Conduct
-
-This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code.
+**Distributed-TTS-Bot** への貢献をご検討いただき、ありがとうございます！  
+バグ報告、新機能の提案、ドキュメントの改善、コードのプルリクエストなど、皆様からの貢献を心より歓迎します。
 
 ---
 
-## How Can I Contribute?
+## 行動規範 (Code of Conduct)
 
-### 1. Reporting Bugs
+本プロジェクトは [行動規範 (Code of Conduct)](CODE_OF_CONDUCT.md) ([English](CODE_OF_CONDUCT.en.md)) に準拠します。参加される際は、本規範の遵守をお願いいたします。
 
-Before creating a bug report, please check existing [Issues](https://github.com/Maximilian2022/Distributed-TTS-Bot/issues) to see if the issue has already been reported.
+---
 
-When creating an issue, please provide:
-- A clear and descriptive title
-- Steps to reproduce the bug
-- Expected vs. actual behavior
-- Environment details (OS, Docker version, Python version, GPU model if applicable)
-- Relevant log snippets (make sure to sanitize private Discord tokens, passwords, and API keys)
+## 貢献の方法
 
-### 2. Suggesting Enhancements
+### 1. バグの報告 (Reporting Bugs)
 
-We are always looking for ways to improve latency, voice engine support, UI/UX, and reliability.
-- Open a feature request Issue detailing the proposed feature and rationale.
-- Discuss the design with maintainers before submitting large PRs.
+不具合を発見した場合は、まず既存の [Issues](https://github.com/Maximilian2022/Distributed-TTS-Bot/issues) に同一の報告がないか検索してください。
 
-### 3. Submitting Pull Requests
+新しい Issue を作成する際は、以下の情報を含めてください：
+- 簡潔でわかりやすいタイトル
+- 不具合の再現手順
+- 期待されていた動作と、実際の挙動
+- 実行環境（OS、Docker バージョン、Python バージョン、GPU の有無・型番など）
+- 関連するログ抜粋（※Discord Bot Token やパスワード、API キーなどの秘密情報は必ず伏字にしてください）
 
-1. **Fork the Repository**: Fork the repository to your own GitHub account.
-2. **Create a Feature Branch**:
+### 2. 機能改善・提案 (Suggesting Enhancements)
+
+超低遅延化、音声合成エンジンの追加、WebUI の操作性向上、信頼性の強化など、あらゆる提案を歓迎します。
+- GitHub Issues に機能リクエストを起票し、機能の目的やユースケースをご説明ください。
+- 大規模な機能追加や破壊的変更を伴う場合は、Pull Request を作成する前に Issue でディスカッションを行うことを推奨します。
+
+### 3. プルリクエスト (Pull Requests) の作成手順
+
+1. **リポジトリをフォーク**: ご自身の GitHub アカウントに本リポジトリをフォークします。
+2. **作業用ブランチを作成**:
    ```bash
    git checkout -b feat/your-feature-name
-   # or for bug fixes:
+   # バグ修正の場合:
    git checkout -b fix/issue-description
    ```
-3. **Set Up Local Development**:
-   - Clone your fork:
+3. **ローカル開発環境のセットアップ**:
+   - リポジトリをクローン:
      ```bash
      git clone https://github.com/<your-username>/Distributed-TTS-Bot.git
      cd Distributed-TTS-Bot
      ```
-   - Copy configuration:
+   - 設定ファイルの準備:
      ```bash
      cp .env.example .env
      ```
-   - Start development containers:
+   - 開発コンテナのビルド・起動:
      ```bash
      docker compose up -d --build
      ```
-4. **Make Your Changes**:
-   - Follow clean code practices and preserve existing comments/docstrings.
-   - Keep asynchronous code non-blocking (avoid long synchronous operations on the event loop).
-5. **Test Your Changes**:
-   - Verify that your changes compile and pass tests:
+4. **コードの変更**:
+   - 既存のコメントや Docstring を尊重し、可読性の高いコードを心がけてください。
+   - 非同期処理（`asyncio`）のイベントループをブロックしないよう注意してください（重い CPU 処理やファイル I/O は別スレッドへ逃がす等）。
+5. **動作確認・テスト**:
+   - 構文エラーがないことを検証:
      ```bash
      docker compose exec app python -m py_compile src/main.py
      ```
-   - Verify WebUI and Discord bot functionality.
-6. **Commit with Conventional Commits**:
-   - `feat: add support for new TTS engine`
-   - `fix: resolve websocket reconnection timeout`
-   - `docs: update setup instructions`
-   - `perf: optimize audio chunk caching`
-7. **Submit a Pull Request**:
-   - Push your branch to GitHub:
+   - WebUI および Discord Bot が正常に動作することを確認してください。
+6. **コミットメッセージ (Conventional Commits 推奨)**:
+   - `feat: 新しい音声合成エンジンのサポート追加`
+   - `fix: WebSocket 再接続時のタイムアウト不具合を修正`
+   - `docs: セットアップ手順の更新`
+   - `perf: 音声チャンクのキャッシュ処理を最適化`
+7. **Pull Request を送信**:
+   - フォークしたリモートブランチへ push:
      ```bash
      git push origin feat/your-feature-name
      ```
-   - Open a PR against the `main` branch.
-   - Fill out the PR description template clearly explaining what changed and why.
+   - `main` ブランチに対して Pull Request を作成します。
+   - 変更の意図、動作確認した内容をテンプレートに沿って記述してください。
 
 ---
 
-## Coding Guidelines
+## コーディング規約・注意事項
 
-- **Python 3.10+ & Asyncio**: This project is built on modern Python `asyncio`. Always prefer async non-blocking patterns.
-- **Zero-BOM UTF-8**: Ensure all source files and scripts (.py, .ps1, .sh) are saved as UTF-8 without BOM.
-- **No Hardcoded Secrets**: Never commit real Discord tokens, encryption secrets, or API keys. Always use `.env` and environment variables.
-- **Audio Latency Consideration**: Audio chunking and streaming are optimized for sub-second playback. Avoid introducing buffering delays or CPU-bound tasks in the main thread.
+- **Python 3.10+ / asyncio**: 本プロジェクトは最新の非同期 Python アーキテクチャで構築されています。ブロッキング I/O を避け、非同期パターンを維持してください。
+- **BOM なし UTF-8**: スクリプト（.py, .ps1, .sh）やドキュメントはすべて UTF-8（BOM なし）で保存してください。
+- **機密情報のコミット禁止**: Discord Token や暗号化キー、API キーを絶対にコード内にハードコードしないでください。環境変数（`.env`）から取得してください。
+- **音声レイテンシへの配慮**: 本 Bot は 0.x 秒単位のリアルタイム読み上げを最優先設計としています。合成や再生パイプラインに不要なバッファ遅延を生じさせないよう配慮をお願いします。
 
 ---
 
-## Licensing of Contributions
+## コントリビューションのライセンス
 
-By submitting a Pull Request to Distributed-TTS-Bot, you agree that your contributions will be licensed under the [Apache License, Version 2.0](LICENSE).
+Distributed-TTS-Bot に提出されたすべての Pull Request およびコントリビューションは、[Apache License, Version 2.0](LICENSE) のもとで提供されることに同意したものとみなされます。
