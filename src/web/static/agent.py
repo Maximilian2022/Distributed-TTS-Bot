@@ -29,6 +29,7 @@ import json
 import collections
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List
+from pathlib import Path
 import aiohttp
 from aiohttp import web
 
@@ -1790,7 +1791,8 @@ hosts allow = *
                 }
             }
             try:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+                headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
+                async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
                     if resp.status == 404:
                         # 未登録の場合は再登録を試行
                         ok = await self.register_to_master()

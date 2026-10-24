@@ -730,9 +730,9 @@ class TTSNodePool:
                 ordered_nodes.extend(buckets.get(tier_key, []))
 
             tier_names_log = " | ".join(f"{k}={[n.machine_name for n in buckets[k]]}" for k in current_order)
-            logger.info(
+            logger.debug(
                 f"🎯 [{self.engine_name} Dynamic Routing] model={model_name or 'any'} | {tier_names_log} | "
-                f"Selected => {ordered_nodes[0].machine_name if ordered_nodes else 'None'}"
+                f"Candidate => {ordered_nodes[0].machine_name if ordered_nodes else 'None'}"
             )
 
             # 1. 即座に空いているノードを最優先で確保

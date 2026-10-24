@@ -3471,6 +3471,7 @@ function stopSystemMetricsPolling() {
 }
 
 async function fetchSystemMetrics() {
+  if (document.hidden) return;
   if (!currentGuildId) return;
   try {
     const res = await fetch(`/api/system/metrics?guild_id=${encodeURIComponent(currentGuildId)}`, { cache: "no-store" });
@@ -5715,6 +5716,7 @@ async function scanCacheIntegrity() {
 // --- ログビューア ---
 
 async function loadLogs() {
+  if (document.hidden) return;
   try {
     const sel = document.getElementById("log-type-select");
     const logType = sel ? sel.value : "bot";
@@ -5769,6 +5771,7 @@ async function syncWorkerLogNodes() {
 }
 
 async function loadWorkerLogs(forceRefresh = false) {
+  if (document.hidden && !forceRefresh) return;
   syncWorkerLogNodes();
   const selNode = document.getElementById("worker-log-node-select");
   const terminal = document.getElementById("worker-log-terminal");
@@ -7930,4 +7933,21 @@ window.moveTierItem = moveTierItem;
 window.resetTierRoutingCurrent = resetTierRoutingCurrent;
 window.applyTierRoutingToAllEngines = applyTierRoutingToAllEngines;
 window.saveCurrentTierRouting = saveCurrentTierRouting;
+
+// タブ非アクティブ時の省電力制御 & フォアグラウンド復帰時の即時同期
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    if (systemMetricsTimer && typeof fetchSystemMetrics === "function") {
+      fetchSystemMetrics();
+    }
+    const logCheck = document.getElementById("log-auto-refresh-check");
+    if (logCheck && logCheck.checked && typeof loadLogs === "function") {
+      loadLogs();
+    }
+    const workerLogCheck = document.getElementById("worker-log-auto-refresh-check");
+    if (workerLogCheck && workerLogCheck.checked && typeof loadWorkerLogs === "function") {
+      loadWorkerLogs(true);
+    }
+  }
+});
 

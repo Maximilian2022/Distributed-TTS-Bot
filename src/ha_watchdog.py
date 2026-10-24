@@ -90,6 +90,25 @@ class DockerSocketClient:
         except Exception:
             return []
 
+    def find_app_containers(self) -> list:
+        """フェイルオーバー昇格対象の本体 (app) コンテナを確実に特定 (watchdog/tunnel等の補助コンテナは除外)"""
+        status, body = self._send_request("GET", "/containers/json?all=1")
+        if status != 200:
+            return []
+        try:
+            containers = json.loads(body.decode("utf-8"))
+            results = []
+            for c in containers:
+                names = [n.lstrip("/") for n in c.get("Names", [])]
+                for n in names:
+                    # ttsbot-app, app, ttsbot-slave-app 等にマッチし、自身(watchdog)やtunnel等は除外
+                    if ("app" in n.lower() or "ttsbot" in n.lower()) and not any(ex in n.lower() for ex in ("watchdog", "tunnel", "nginx", "proxy", "agent", "worker")):
+                        results.append(c)
+                        break
+            return results
+        except Exception:
+            return []
+
     def start_container(self, container_id: str) -> bool:
         status, _ = self._send_request("POST", f"/containers/{container_id}/start")
         return status in (204, 304)
@@ -430,7 +449,7 @@ class HAWatchdog:
 
         # 2. Unix Socket による直接起動 (CLI が無い環境のフォールバック)
         if not promoted and self.docker.is_available():
-            containers = self.docker.find_containers_by_prefix("ttsbot-app")
+            containers = self.docker.find_app_containers()
             for c in containers:
                 c_id = c.get("Id", "")
                 if self.docker.start_container(c_id):
@@ -464,7 +483,7 @@ class HAWatchdog:
 
         # 2. Unix Socket による直接停止
         if not demoted and self.docker.is_available():
-            containers = self.docker.find_containers_by_prefix("ttsbot-app")
+            containers = self.docker.find_app_containers()
             for c in containers:
                 c_id = c.get("Id", "")
                 if self.docker.stop_container(c_id, timeout_sec=5):

@@ -91,6 +91,7 @@ docker run \
   -e TZ=Asia/Tokyo \
   -e TTSBOT_STANDBY=1 \
   -v "${PROJECT_ROOT}/src:/app/src:ro" \
+  -v "${PROJECT_ROOT}/tests:/app/tests:ro" \
   -v "${PROJECT_ROOT}/worker:/app/worker:ro" \
   -v "${PROJECT_ROOT}/scratch:/app/scratch:ro" \
   -v "${PROJECT_ROOT}/config.yaml:/app/config.yaml:ro" \

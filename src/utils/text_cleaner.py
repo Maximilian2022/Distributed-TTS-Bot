@@ -63,7 +63,10 @@ def get_sudachi_tokenizer():
             try:
                 import sudachipy
                 dict_obj = sudachipy.Dictionary()
-                _sudachi_tokenizer = dict_obj.create()
+                if hasattr(dict_obj, "tokenizer"):
+                    _sudachi_tokenizer = dict_obj.tokenizer()
+                else:
+                    _sudachi_tokenizer = dict_obj.create()
                 _sudachi_split_mode = sudachipy.SplitMode.C
                 logger.info("✨ [TextCleaner] 高性能形態素解析エンジン SudachiPy (Mode C) をロードしました。")
             except Exception as e:

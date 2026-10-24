@@ -434,6 +434,8 @@ class WebServer:
             resp.headers.setdefault("X-Frame-Options", "DENY")
             resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
             resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+            if request.path.startswith("/static/"):
+                resp.headers.setdefault("Cache-Control", "public, max-age=86400")
         return resp
 
     async def _execute_security_and_rate_limit(self, request: web.Request, handler):
@@ -505,7 +507,10 @@ class WebServer:
                     except Exception:
                         pass
 
-            if (origin or referer) and not valid_csrf:
+            if not (origin or referer):
+                logger.warning(f"🚫 [CSRF] Blocked WAN request missing Origin and Referer headers to '{path}'")
+                return web.json_response({"error": "Missing Origin or Referer header for cross-site verification."}, status=403)
+            elif not valid_csrf:
                 logger.warning(f"🚫 [CSRF] Blocked cross-origin request to '{path}' from Origin='{origin}', Referer='{referer}'")
                 return web.json_response({"error": "Cross-Origin request forbidden."}, status=403)
 
@@ -2238,12 +2243,8 @@ class WebServer:
             return web.json_response({"success": False, "error": str(e)}, status=500)
 
     async def api_test_simulate(self, request: web.Request) -> web.Response:
-        """10名30発言の連続会話シミュレーションテストを実行（Discord検知フルパイプライン）"""
-        # LAN・ローカル直接接続は許可、WAN経由は認証チェック
-        if self._is_wan_request(request):
-            user = self.auth.get_current_user(request)
-            if not user:
-                return web.json_response({"error": "Unauthorized"}, status=401)
+        """10名30発言の連続会話シミュレーションテストを実行（Discord検知フルパイプライン、管理者のみ）"""
+        await self._require_admin(request)
 
         try:
             body = await request.json()
@@ -2584,9 +2585,8 @@ class WebServer:
         return web.json_response({"incidents": incidents, "count": len(incidents)})
 
     async def api_purge_cache(self, request: web.Request) -> web.Response:
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """システム全体のキャッシュ消去（管理者のみ）"""
+        await self._require_admin(request)
 
         target = request.query.get("target", "all")
         count = await self.cache_manager.purge_all(target=target)
@@ -2869,8 +2869,8 @@ class WebServer:
         return web.json_response({"character": char})
 
     async def api_install_auto_mycoeiroink(self, request: web.Request) -> web.Response:
-        """MYCOEIROINK 配布音声の自動導入を試行"""
-        self._require_auth(request)
+        """MYCOEIROINK 配布音声の自動導入を試行（管理者のみ）"""
+        await self._require_admin(request)
         try:
             data = await request.json()
         except Exception:
@@ -2888,8 +2888,8 @@ class WebServer:
         return web.json_response(res)
 
     async def api_upload_mycoeiroink_zip(self, request: web.Request) -> web.Response:
-        """ユーザーが手動ダウンロードしたZIPファイルをWebUI経由で安全にアップロード・配置"""
-        self._require_auth(request)
+        """ユーザーが手動ダウンロードしたZIPファイルをWebUI経由で安全にアップロード・配置（管理者のみ）"""
+        await self._require_admin(request)
         try:
             reader = await request.multipart()
             field = await reader.next()
@@ -2934,10 +2934,10 @@ class WebServer:
 
     async def api_upload_mycoeiroink_chunk(self, request: web.Request) -> web.Response:
         """
-        Cloudflare の 100MB 制限を突破するためのチャンク分割アップロードAPI。
+        Cloudflare の 100MB 制限を突破するためのチャンク分割アップロードAPI（管理者のみ）。
         ブラウザから 20MB 単位で分割送信されたバイナリを一時保存し、最終チャンクで結合・安全展開を実行。
         """
-        self._require_auth(request)
+        await self._require_admin(request)
         chunk_dir = None
         try:
             reader = await request.multipart()
@@ -3116,9 +3116,8 @@ class WebServer:
 
 
     async def api_get_logs(self, request: web.Request) -> web.Response:
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """システム全体のログ取得（管理者のみ）"""
+        await self._require_admin(request)
 
         log_type = request.query.get("type", "bot")
         if log_type == "web":
@@ -4657,6 +4656,12 @@ class WebServer:
         }
         token = self.auth.create_session_token(user_data, is_admin=True)
 
+        is_https = (
+            request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            or "https" in request.headers.get("CF-Visitor", "").lower()
+            or request.scheme == "https"
+            or self._is_wan_request(request)
+        )
         resp = web.json_response({"success": True, "status": "ok", "message": "管理者としてログインしました。"})
         resp.set_cookie(
             "ttsbot_session",
@@ -4664,7 +4669,8 @@ class WebServer:
             max_age=86400 * 7,
             path="/",
             httponly=True,
-            samesite="Lax"
+            samesite="Lax",
+            secure=is_https
         )
         return resp
 

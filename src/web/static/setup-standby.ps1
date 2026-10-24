@@ -191,6 +191,11 @@ Write-Host "`n[4/4] Slave Standby Watchdog を起動中..." -ForegroundColor Yel
 Write-Host "  Docker Hub から最新イメージを確認・取得中..."
 docker compose --profile standby pull standby-watchdog 2>$null
 
+# フェイルオーバー昇格用の app コンテナを停止状態で事前生成 (ゼロ遅延フェイルオーバーの保証)
+Write-Host "  フェイルオーバー昇格用コンテナ (app) を事前生成中..."
+docker compose pull app 2>$null
+docker compose --profile active create app 2>$null; if (-not $?) { docker compose create app 2>$null }
+
 docker compose --profile standby up -d standby-watchdog
 
 Write-Host "`n======================================================" -ForegroundColor Green

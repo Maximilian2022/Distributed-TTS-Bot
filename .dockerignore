@@ -1,0 +1,52 @@
+# Git & Agent metadata
+.git
+.gitignore
+.agents
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+gcp-key.json
+
+# Persistent application data & databases
+data/
+data/*
+
+# Logs & monitoring archives
+logs/
+logs/*
+
+# TTS caches & dynamic models (Gigabyte-scale)
+cache/
+cache/*
+cache_voicevox/
+cache_voicevox/*
+coeiroink_models/
+coeiroink_models/*
+
+# Scratch, temporary files & IDE data
+scratch/
+scratch/*
+.vscode/
+.idea/
+
+# Python byte code & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local admin & development tools
+WorkerAccess/
+WorkerAccess/*
+skills-lock.json
+
+# Docker and CI files
+Dockerfile
+docker-compose*.yml
+portainer-stack.yml
+.github/

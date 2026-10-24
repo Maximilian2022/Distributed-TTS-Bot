@@ -202,6 +202,11 @@ echo -e "\n${BOLD}[4/4] Slave Standby Watchdog を起動中...${RESET}"
 echo "  Docker Hub から最新イメージを確認・取得中..."
 ${DOCKER_COMPOSE_CMD} --profile standby pull standby-watchdog 2>/dev/null || true
 
+# フェイルオーバー昇格用の app コンテナを停止状態で事前生成 (ゼロ遅延フェイルオーバーの保証)
+echo "  フェイルオーバー昇格用コンテナ (app) を事前生成中..."
+${DOCKER_COMPOSE_CMD} pull app 2>/dev/null || true
+${DOCKER_COMPOSE_CMD} --profile active create app 2>/dev/null || ${DOCKER_COMPOSE_CMD} create app 2>/dev/null || true
+
 ${DOCKER_COMPOSE_CMD} --profile standby up -d standby-watchdog
 
 echo -e "\n${BOLD}${GREEN}======================================================${RESET}"
