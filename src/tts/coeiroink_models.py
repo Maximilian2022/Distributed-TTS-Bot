@@ -55,7 +55,8 @@ class CoeiroinkModelManager:
         COEIROINK公式サイトのヘルプページから最新の公認キャラクター定義をフェッチ (同期)
         過剰アクセスを完全に防ぐため、前回の取得から30日 (月1回) 以上経過していない場合はローカル定義を返却。
         """
-        check_file = Path("/app/data/coeiroink_last_check.json")
+        data_dir = Path("/app/data") if Path("/app/data").exists() else Path("data")
+        check_file = data_dir / "coeiroink_last_check.json"
         now = time.time()
         if not force and check_file.exists():
             try:

@@ -39,7 +39,7 @@ class TTSManager:
     - クラウド用 (10GB) と ローカル専用 (20GB) の完全分離キャッシュ管理
     """
 
-    VOICES_CACHE_FILE = "/app/data/voices_cache.json"
+    VOICES_CACHE_FILE = os.getenv("VOICES_CACHE_FILE", "/app/data/voices_cache.json" if os.path.exists("/app/data") else "data/voices_cache.json")
 
     def __init__(self, config: AppConfig, cache_manager: CacheManager, database=None, resource_manager=None):
         self.config = config

@@ -94,6 +94,21 @@ class CommandsCog(commands.Cog):
         self.bot_pool = bot_pool
         self.disaster_service = disaster_service
 
+    async def _check_admin_permission(self, interaction: discord.Interaction) -> bool:
+        """ギルド管理者または管理者ロール保持者であるかを判定。権限なし時はephemeralエラーを返答"""
+        if not interaction.guild_id or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
+            return False
+
+        settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
+        admin_role_id = int(settings.get("admin_role_id", 0) or 0)
+        has_admin_role = any(r.id == admin_role_id for r in getattr(interaction.user, "roles", [])) if admin_role_id > 0 else False
+        is_admin = interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or has_admin_role
+        if not is_admin:
+            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限（または管理者ロール）が必要です。", ephemeral=True)
+            return False
+        return True
+
     # --- VC制御コマンド ---
 
     @app_commands.command(name="join", description="実行者が参加しているVCに接続し、このチャンネルを読み上げ対象にします。")
@@ -557,8 +572,7 @@ class CommandsCog(commands.Cog):
     @ng_group.command(name="add", description="NGワードをサーバーに登録します。発言時にピー音に置き換えられます。")
     @app_commands.describe(word="登録するNGワード")
     async def ng_add(self, interaction: discord.Interaction, word: str):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+        if not await self._check_admin_permission(interaction):
             return
 
         w = word.strip()
@@ -588,8 +602,7 @@ class CommandsCog(commands.Cog):
     @ng_group.command(name="delete", description="NGワードをサーバーから削除します。")
     @app_commands.describe(word="削除するNGワード")
     async def ng_delete(self, interaction: discord.Interaction, word: str):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+        if not await self._check_admin_permission(interaction):
             return
 
         w = word.strip()
@@ -652,8 +665,7 @@ class CommandsCog(commands.Cog):
 
     @ng_group.command(name="preset", description="一般的な標準NGワードプリセット（差別用語・露骨な性的語句等）を一括登録します。")
     async def ng_preset(self, interaction: discord.Interaction):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ NGワードコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+        if not await self._check_admin_permission(interaction):
             return
 
         dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"

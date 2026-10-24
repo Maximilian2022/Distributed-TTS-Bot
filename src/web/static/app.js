@@ -116,6 +116,9 @@ function setupTabs() {
           if (chk) chk.checked = false;
         }
       }
+      if (tabId === "dict") {
+        if (currentGuildId) loadDictionary(currentGuildId);
+      }
       if (tabId === "ng") {
         if (currentGuildId) loadNgWords(currentGuildId);
       }

@@ -3217,14 +3217,16 @@ async def handle_sync_models(request: web.Request) -> web.Response:
     work_dir = resolve_work_dir()
     clean_model = request.query.get("clean_model")
     if clean_model:
-        # パストラバーサル防止 (CWE-22): 英数字識別子チェックおよびベースディレクトリ検証
+        # パストラバーサル防止 (CWE-22): 英数字識別子チェックおよび実在ディレクトリホワイトリスト照合
         if not re.match(r'^[a-zA-Z0-9_\-]+$', clean_model):
             return web.Response(text="Invalid clean_model identifier", status=400)
         models_base = (Path(work_dir) / "coeiroink_models").resolve()
-        target_dir = (models_base / clean_model).resolve()
-        if target_dir.is_relative_to(models_base) and target_dir.exists() and target_dir.is_dir():
-            shutil.rmtree(target_dir, ignore_errors=True)
-            logger.info(f"🗑️ 指定モデル '{clean_model}' をクリーン削除しました: {target_dir}")
+        if models_base.exists() and models_base.is_dir():
+            valid_dirs = {p.name: p for p in models_base.iterdir() if p.is_dir()}
+            if clean_model in valid_dirs:
+                target_dir = valid_dirs[clean_model]
+                shutil.rmtree(target_dir, ignore_errors=True)
+                logger.info(f"🗑️ 指定モデル '{clean_model}' をクリーン削除しました: {target_dir}")
     asyncio.create_task(agent.sync_coeiroink_models(work_dir))
     return web.json_response({"success": True, "message": f"COEIROINK モデル同期を開始しました (clean_model={clean_model})。"})
 

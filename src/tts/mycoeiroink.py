@@ -20,7 +20,7 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-CACHE_FILE_PATH = "/app/data/mycoeiroink_cache.json"
+CACHE_FILE_PATH = os.getenv("MYCOEIROINK_CACHE_FILE", "/app/data/mycoeiroink_cache.json" if os.path.exists("/app/data") else "data/mycoeiroink_cache.json")
 BASE_URL = "https://coeiroink.com"
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500MB
 MAX_EXTRACT_SIZE = 1500 * 1024 * 1024  # 1500MB (1.5GB)

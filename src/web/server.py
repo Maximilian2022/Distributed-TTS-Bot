@@ -93,6 +93,8 @@ class WebServer:
         self._rate_limits: Dict[str, deque] = {}
         self._rate_limit_cleanup_counter = 0
         self._failed_password_attempts: Dict[str, List[float]] = {}
+        self._cached_stats_data: Optional[Dict[str, Any]] = None
+        self._cached_stats_time: float = 0.0
         # Worker ノード別時系列メトリクス履歴 (nodeKey -> deque[dict])
         self.workers_metrics_history: Dict[str, deque] = {}
         self.workers_latest_resources: Dict[str, Dict[str, Any]] = {}
@@ -2166,9 +2168,7 @@ class WebServer:
 
     async def api_reload_config(self, request: web.Request) -> web.Response:
         """設定ファイル (config.yaml) および環境変数 (.env) をホットリロード"""
-        user = self.auth.get_current_user(request)
-        if not user and not self._is_local_request(request):
-            return web.json_response({"error": "Authentication required"}, status=401)
+        await self._require_admin(request)
 
         try:
             from src.config import reload_config
@@ -2205,6 +2205,17 @@ class WebServer:
                 status=403
             )
 
+        # 直近2秒以内のキャッシュがあれば返却（高頻度ポーリングによる負荷軽減）
+        now = time.time()
+        if self._cached_stats_data and (now - self._cached_stats_time) < 2.0:
+            cached_resp = dict(self._cached_stats_data)
+            cached_resp["permissions"] = perms
+            return web.json_response(cached_resp, headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0"
+            })
+
         # 1. 音声キャッシュ状況 (Cloud 10GB と VOICEVOX 20GB を分離取得)
         stats = self.cache_manager.get_stats()
         cloud_s = stats["cloud"]
@@ -2224,7 +2235,7 @@ class WebServer:
         # 3. TTS利用状況 (Azure 50万文字/月, Google 100万文字/月, VOICEVOX)
         tts_usage = await self.db.get_monthly_tts_usage()
 
-        return web.json_response({
+        data_to_cache = {
             "cache": {
                 "used_bytes": cloud_s["size_bytes"],
                 "used_mb": round(cloud_s["size_bytes"] / (1024 * 1024), 2),
@@ -2250,9 +2261,14 @@ class WebServer:
             "bot_pool": self.bot_pool.get_pool_status() if self.bot_pool else [],
             "nodes": self.tts_manager.get_node_status() if hasattr(self.tts_manager, "get_node_status") else {},
             "tts_usage": tts_usage,
-            "permissions": perms,
             "latest_agent_version": AGENT_VERSION
-        }, headers={
+        }
+        self._cached_stats_data = data_to_cache
+        self._cached_stats_time = now
+
+        resp_with_perms = dict(data_to_cache)
+        resp_with_perms["permissions"] = perms
+        return web.json_response(resp_with_perms, headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0"

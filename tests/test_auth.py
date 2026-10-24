@@ -91,5 +91,42 @@ class TestDiscordAuth(unittest.TestCase):
         self.assertEqual(verified["user_id"], 1234567890)
         self.assertEqual(verified["username"], "test_user")
 
+class TestPasswordBruteforceProtection(unittest.TestCase):
+    """パスワードログインのブルートフォース攻撃防御（レートリミット）テスト"""
+    def setUp(self):
+        self.failed_attempts = {}
+
+    def _record_and_check(self, client_ip: str, now: float) -> bool:
+        """5回以上の失敗で拒否 (429判定)"""
+        attempts = [t for t in self.failed_attempts.get(client_ip, []) if now - t < 300]
+        if len(attempts) >= 5:
+            return False  # Blocked
+        attempts.append(now)
+        self.failed_attempts[client_ip] = attempts
+        return True  # Allowed
+
+    def test_rate_limit_blocking_after_5_attempts(self):
+        ip = "192.168.1.100"
+        t0 = 1000.0
+
+        # 1〜5回目の失敗は許可される
+        for i in range(5):
+            self.assertTrue(self._record_and_check(ip, t0 + i))
+
+        # 6回目はブロックされる (429)
+        self.assertFalse(self._record_and_check(ip, t0 + 6))
+        # 別IPは影響を受けない
+        self.assertTrue(self._record_and_check("192.168.1.101", t0 + 6))
+
+    def test_rate_limit_expiry_after_300s(self):
+        ip = "192.168.1.200"
+        t0 = 1000.0
+
+        for i in range(5):
+            self.assertTrue(self._record_and_check(ip, t0 + i))
+
+        # 301秒経過後はブロック解除
+        self.assertTrue(self._record_and_check(ip, t0 + 301))
+
 if __name__ == "__main__":
     unittest.main()

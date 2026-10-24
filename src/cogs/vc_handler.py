@@ -70,10 +70,14 @@ class SafeAsyncQueue:
 
     def get_items(self) -> List[Any]:
         """内部デックの安全なリストスナップショット"""
+        if not self._deque:
+            return []
         return list(self._deque)
 
     def snapshot(self) -> List[Any]:
         """get_items のエイリアス"""
+        if not self._deque:
+            return []
         return list(self._deque)
 
     def clear(self) -> List[Any]:
