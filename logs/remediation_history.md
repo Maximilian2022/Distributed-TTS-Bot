@@ -1,5 +1,33 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] Windows 向けボランティア GUI ランチャー (run_volunteer_gui.ps1) の PowerShell ワンライナー (iex) 実行時 Join-Path エラー解消 & 自己完結自動セットアップ対応
+- **ユーザーフィードバック & 課題**:
+  - WebUI「🤝 ボランティア参加」タブに表示されている PowerShell ワンライナー (`irm "https://.../run_volunteer_gui.ps1" | iex`) を実行した際、以下のエラーが発生して起動できない不具合の報告：
+    ```
+    Join-Path: パラメーター 'Path' は空の文字列であるため、引数をバインドできません。
+    Test-Path: Value cannot be null. (Parameter '指定された Path 引数が null 値または空のコレクションでした。')
+    ```
+- **真因の究明**:
+  - スクリプトが `Invoke-Expression` (`iex`) を介してメモリ上で直接実行される場合、PowerShell の組み込み変数 `$PSScriptRoot` はスクリプトファイルが存在しないため空文字列 (`""`) となる。
+  - 行 20 の `$ConfigPath = Join-Path $PSScriptRoot "config.json"` で第一引数が空文字列となり例外がスローされ、未初期化の `$ConfigPath` により `Test-Path` も引数不正で失敗していた。
+  - また、仮にパスが解決できても、ワンライナー実行環境ではローカルに `volunteer_worker.py` や `run_volunteer.bat` が存在せず、GUI で「起動する 🚀」を押してもエージェントが起動しない問題があった。
+- **抜本的改善内容**:
+  1. **実行元ディレクトリの安全解決 (`worker/run_volunteer_gui.ps1` & `src/web/static/volunteer/run_volunteer_gui.ps1`)**:
+     - `$WorkerDir = if ($PSScriptRoot) { $PSScriptRoot } else { Join-Path $env:USERPROFILE ".ttsbot-worker" }` を導入。
+     - `$PSScriptRoot` が空文字列の場合は、自動的に `C:\Users\<user>\.ttsbot-worker` を作業ディレクトリとして作成・利用。
+     - `$ConfigPath` およびスタートアップショートカット生成時のパスをすべて `$WorkerDir` に統一し、例外を完全解消。
+  2. **iex ワンライナー実行時の完全自己完結エージェント自動セットアップ & 起動**:
+     - 呼び出し元が `run_volunteer.bat` 経由かワンライナー直接実行かを判定。
+     - ワンライナー実行時、GUI で「起動する 🚀」を押した際に：
+       1. 接続先サーバーから必要なスクリプト (`volunteer_worker.py`, `run_volunteer.bat`, `run_volunteer_gui.ps1`) を `~/.ttsbot-worker` に自動ダウンロード。
+       2. Python 実行環境の存在確認。
+       3. 依存ライブラリ (`aiohttp`) の存在確認と未導入時の自動 `pip install`。
+       4. 設定パラメータ（サーバーURL、ノード名、並列数、エンジンURL、ゲーム優先度等）を安全に展開して `volunteer_worker.py` を直接起動。
+  3. **バッチ側呼び出し元の明示 (`worker/run_volunteer.bat`)**:
+     - `set TTSBOT_WORKER_INVOKED_BY_BAT=1` を付与し、bat 経由とワンライナー経由の判別を100%確実化。
+- **検証**:
+  - HTTP 配信エンドポイント (`curl -s http://localhost:8088/volunteer/run_volunteer_gui.ps1`) で更新内容が正常に配信されていることを確認。
+
 ## [2026-10-24] GitHub Actions による Docker Hub 自動 Push ＆ GitHub Release 連動、および Master/Slave 両対応 Docker Compose の整備
 - **ユーザーフィードバック & 課題**:
   1. GitHub Actions で Docker Hub イメージをビルド・Push する際、同時に GitHub Release（リリース発行・タグ付け）も自動で行う要求。

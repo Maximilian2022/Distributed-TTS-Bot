@@ -17,7 +17,18 @@ param(
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$ConfigPath = Join-Path $PSScriptRoot "config.json"
+# 実行元ディレクトリの解決 (iex パイプライン実行時は ~/.ttsbot-worker へフォールバック)
+$WorkerDir = if ($PSScriptRoot) {
+    $PSScriptRoot
+} else {
+    $defaultDir = Join-Path $env:USERPROFILE ".ttsbot-worker"
+    if (-not (Test-Path $defaultDir)) {
+        New-Item -ItemType Directory -Path $defaultDir -Force | Out-Null
+    }
+    $defaultDir
+}
+
+$ConfigPath = Join-Path $WorkerDir "config.json"
 $Config = @{}
 
 if (Test-Path $ConfigPath) {
@@ -581,8 +592,8 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
         try {
             $WScriptShell = New-Object -ComObject WScript.Shell
             $Shortcut = $WScriptShell.CreateShortcut($ShortcutPath)
-            $Shortcut.TargetPath = Join-Path $PSScriptRoot "run_volunteer.bat"
-            $Shortcut.WorkingDirectory = $PSScriptRoot
+            $Shortcut.TargetPath = Join-Path $WorkerDir "run_volunteer.bat"
+            $Shortcut.WorkingDirectory = $WorkerDir
             $Shortcut.WindowStyle = 7 # 7 = Minimized (最小化)
             $Shortcut.Description = "TTSBot Volunteer Worker Agent"
             $Shortcut.Save()
@@ -594,6 +605,85 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
         if (Test-Path $ShortcutPath) {
             Remove-Item $ShortcutPath -Force -ErrorAction SilentlyContinue
             Write-Host "ℹ️ スタートアップ登録を解除しました。" -ForegroundColor Yellow
+        }
+    }
+
+    # 呼び出し元が run_volunteer.bat 経由かどうかを判定
+    $InvokedFromBat = ($MyInvocation.Line -match "run_volunteer\.bat") -or ($env:TTSBOT_WORKER_INVOKED_BY_BAT -eq "1")
+
+    if (-not $InvokedFromBat -and -not $PSScriptRoot) {
+        # ワンライナー (irm ... | iex) 等から直接 PowerShell で実行された場合:
+        # 必要なエージェントファイルを ~/.ttsbot-worker に自動展開し、直接起動する
+        Write-Host "`n🚀 ボランティア Worker エージェントの準備中..." -ForegroundColor Green
+
+        # 1. サーバーURLから HTTP ベースURLを特定
+        $serverUrl = $NewConfig.server_url
+        $httpBase = $serverUrl -replace '^wss://', 'https://' -replace '^ws://', 'http://' -replace '/api/worker/ws/?$', '' -replace '/+$', ''
+
+        # 2. 必要なスクリプト (volunteer_worker.py, run_volunteer.bat) の自動取得
+        foreach ($file in @("volunteer_worker.py", "run_volunteer.bat", "run_volunteer_gui.ps1")) {
+            $destPath = Join-Path $WorkerDir $file
+            if (-not (Test-Path $destPath)) {
+                $downloadUrl = "$httpBase/volunteer/$file"
+                try {
+                    Write-Host "  取得中: $file ..." -ForegroundColor Cyan
+                    Invoke-RestMethod -Uri $downloadUrl -OutFile $destPath -TimeoutSec 15
+                } catch {
+                    Write-Warning "ファイルの取得に失敗しました ($downloadUrl): $_"
+                }
+            }
+        }
+
+        # 3. Python の存在確認
+        $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+        if (-not $pythonCmd) {
+            $pythonCmd = Get-Command python3 -ErrorAction SilentlyContinue
+        }
+        if (-not $pythonCmd) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Python が見つかりませんでした。`nPython 3.9 以上をインストールし、『Add Python to PATH』にチェックを入れてください。`n`nダウンロード: https://www.python.org/downloads/",
+                "TTSBot Volunteer Worker",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+            Write-Host "❌ Python が見つかりませんでした。Python 3.9 以上をインストールしてください。" -ForegroundColor Red
+            exit 1
+        }
+
+        # 4. aiohttp の存在確認 & インストール
+        & $pythonCmd.Source -c "import aiohttp" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "▶ 必要なライブラリ (aiohttp) をインストール中..." -ForegroundColor Cyan
+            & $pythonCmd.Source -m pip install aiohttp
+        }
+
+        # 5. volunteer_worker.py の起動
+        $workerScript = Join-Path $WorkerDir "volunteer_worker.py"
+        if (Test-Path $workerScript) {
+            $pyArgs = @($workerScript, "--server-url", $NewConfig.server_url)
+            if ($NewConfig.token) { $pyArgs += @("--token", $NewConfig.token) }
+            if ($NewConfig.node_name) { $pyArgs += @("--name", $NewConfig.node_name) }
+            if ($NewConfig.capacity) { $pyArgs += @("--capacity", [string]$NewConfig.capacity) }
+            if ($NewConfig.exclusive_guild_id) { $pyArgs += @("--exclusive-guild-id", $NewConfig.exclusive_guild_id) }
+            if ($NewConfig.game_priority) { $pyArgs += @("--game-priority") }
+
+            $engineUrls = $NewConfig.engine_urls
+            if ($engineUrls.voicevox) { $pyArgs += @("--voicevox-url", $engineUrls.voicevox) }
+            if ($engineUrls.coeiroink) { $pyArgs += @("--coeiroink-url", $engineUrls.coeiroink) }
+            if ($engineUrls.sharevox) { $pyArgs += @("--sharevox-url", $engineUrls.sharevox) }
+
+            Write-Host "`n======================================================" -ForegroundColor Cyan
+            Write-Host "  🎙️ TTSBot Volunteer Worker 起動完了" -ForegroundColor Cyan
+            Write-Host "======================================================" -ForegroundColor Cyan
+            Write-Host "▶ サーバー      : $($NewConfig.server_url)" -ForegroundColor White
+            Write-Host "▶ ノード名      : $($NewConfig.node_name)" -ForegroundColor White
+            Write-Host "▶ キャパシティ  : $($NewConfig.capacity) 並列" -ForegroundColor White
+            Write-Host "▶ プロセス優先度: $(if($NewConfig.game_priority){'ゲーム優先モード (BelowNormal)'}else{'通常 (Normal)'})" -ForegroundColor White
+            Write-Host "`n✨ ボランティアエージェントが接続を開始しました (終了するには Ctrl+C を押してください)...`n" -ForegroundColor Green
+
+            & $pythonCmd.Source $pyArgs
+        } else {
+            Write-Host "❌ volunteer_worker.py が見つかりませんでした。" -ForegroundColor Red
         }
     }
 

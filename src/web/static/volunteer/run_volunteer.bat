@@ -29,6 +29,7 @@ if not exist "%CONFIG_FILE%" set OPEN_CONFIG=1
 
 if "%OPEN_CONFIG%"=="1" (
     echo ▶ 初回設定 GUI を起動しています...
+    set TTSBOT_WORKER_INVOKED_BY_BAT=1
     powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%run_volunteer_gui.ps1" -DefaultServerUrl "%~1" -DefaultToken "%~2"
     if not exist "%CONFIG_FILE%" (
         echo 設定がキャンセルされました。
