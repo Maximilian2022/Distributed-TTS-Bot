@@ -1,5 +1,15 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] 一般ユーザー（非権限者）に対するアクセス不可タブの完全非表示化（統一）
+- **概要**:
+  - これまで「⚙️ ボット設定」および「📊 システム & ワーカー状況」タブが非管理者に対して半透明の 🔒 表示となっていたが、他の管理者タブ（Bot管理、API設定、メンバー音声）と同様に `style.display = "none"` で最初から完全に非表示となるよう統一。
+- **実施内容**:
+  1. `src/web/templates/index.html`: 初期レンダリング時の `tab-btn-config` および `tab-btn-system` に `style="display:none;"` を追加（FOUCチラつき防止）。
+  2. `src/web/static/app.js`:
+     - `updatePermissionsUI()` において、`hasAccess` が False の場合は `btnConfig` と `btnSystem` を `display: none` で完全に非表示化。
+     - URLハッシュ等による不正遷移ガードのフォールバック対象に `bots` と `credentials` を網羅追加。
+  3. 一般ユーザーには自分が利用可能なタブ（マイ音声、辞書、NGワード、ヘルプ、新設予定のボランティア参加）のみがすっきり表示されることを確認。
+
 ## [2026-10-24] WebUI「ボット設定 (サーバー固有)」タブへの高可用性 Standby (Slave) ワンライナー案内追加
 - **概要**:
   - 管理者・Owner限定の「ボット設定 (サーバー固有)」タブ内に、Master障害時に自律フェイルオーバーするSlave (Standby) 待機ノードを 1 コマンドで起動できるワンライナー案内カードを追加。

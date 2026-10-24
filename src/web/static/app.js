@@ -265,12 +265,10 @@ function updatePermissionsUI() {
   }
 
   if (btnConfig) {
-    btnConfig.style.opacity = hasAccess ? "1" : "0.5";
-    btnConfig.innerHTML = hasAccess ? "⚙️ ボット設定" : "🔒 ボット設定";
+    btnConfig.style.display = hasAccess ? "inline-block" : "none";
   }
   if (btnSystem) {
-    btnSystem.style.opacity = hasAccess ? "1" : "0.5";
-    btnSystem.innerHTML = hasAccess ? "📊 システム & ワーカー状況" : "🔒 システム & ワーカー状況";
+    btnSystem.style.display = hasAccess ? "inline-block" : "none";
   }
 
   if (cardConfigForbidden && cardConfigForm) {
@@ -300,7 +298,7 @@ function updatePermissionsUI() {
   const activeTabBtn = document.querySelector(".tab-btn.active");
   if (activeTabBtn) {
     const tabName = activeTabBtn.dataset.tab;
-    if ((tabName === "config" || tabName === "system" || tabName === "member-voices") && !hasAccess) {
+    if ((tabName === "config" || tabName === "system" || tabName === "member-voices" || tabName === "bots" || tabName === "credentials") && !hasAccess) {
       const voiceBtn = document.querySelector(".tab-btn[data-tab='voice']");
       if (voiceBtn) voiceBtn.click();
     }
