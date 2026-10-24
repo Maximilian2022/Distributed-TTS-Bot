@@ -78,6 +78,12 @@ WorkerAccess/
 id_rsa
 id_rsa.pub
 
+# Legacy directories & migration artifacts
+docker/
+ttsbot-oss/
+cache_voicevox/
+coeiroink_models/
+
 # Agent configurations and skills
 .agents/
 
