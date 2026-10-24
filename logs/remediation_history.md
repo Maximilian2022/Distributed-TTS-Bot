@@ -5829,6 +5829,54 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - サンドボックス検証にて `['カス', 'ピー', 'ぴー']` 存在時の非破壊置換テストに合格。
    - `./scripts/rolling_update.sh` により無停止で `ttsbot-green` へ即座に反映完了。
 
+---
+
+## [2026-10-24 10:10] WebUI「🔑 API・連携設定」における GCP TTS サービスアカウント JSON 保存エラーの根本解消
+
+### 1. 課題と現象
+- **現象**:
+  - WebUIの「🔑 API・外部サービス連携設定」タブにて、Google Cloud Text-to-Speech (GCP) のサービスアカウントキー JSON を入力して保存しようとすると以下のエラーが発生し、設定が保存できなかった。
+  - `通信エラー: Unexpected non-whitespace character after JSON at position 4 (line 1 column 5)`
+- **真因の特定**:
+  1. **引数不一致による 500 エラー (`TypeError`)**:
+     - `src/web/server.py` の `api_system_save_credentials` 内で、暗号化/マスクフラグとして `await self.db.set_credential(..., is_secret=True)` を呼び出していたが、`src/database.py` の `set_credential(self, key: str, value: str)` のシグネチャに `is_secret` 引数が定義されておらず、`TypeError: Database.set_credential() got an unexpected keyword argument 'is_secret'` が発生していた。
+     - これにより、リクエスト時に aiohttp がデフォルトのプレーンテキスト `500: Internal Server Error` を返却していた。
+  2. **フロントエンドの非JSONレスポンス解析クラッシュ**:
+     - `src/web/static/app.js` の `saveCredentials` で `await res.json()` を呼んでいたため、サーバーが返したテキスト `500: Internal Server Error`（先頭が数値500、4文字目がコロン）をブラウザの `JSON.parse` が解釈しようとして `Unexpected non-whitespace character after JSON at position 4 (line 1 column 5)` をスローしていた。
+  3. **フィールド名およびステータス判定の不一致**:
+     - `app.js` は `payload.google_service_account_json` で送信していたが、`server.py` は `google_credentials_json` を参照していたためキーが不整合だった。
+     - `server.py` は `{"success": True}` を返していたが、`app.js` は `data.status === "ok"` を判定していた。
+     - `api_system_test_credentials` も `data.status === "ok"` を期待していたが `success` のみを返していた。
+
+### 2. 実施した恒久対策
+1. **データベース層のシグネチャ拡張 (`src/database.py`)**:
+   - `set_credential(self, key: str, value: str, is_secret: bool = False) -> None:` にシグネチャを拡張。予期しないキーワード引数例外を完全に根絶。
+2. **バックエンド API の堅牢化 (`src/web/server.py`, `src/tts/manager.py`)**:
+   - `api_system_save_credentials`:
+     - `google_credentials_json` と `google_service_account_json` の両方のキーを自動フォールバック解釈。
+     - サービスアカウント JSON の構文検証（`json.loads`）および必須属性（`project_id`, `private_key`, `client_email`）のバリデーションを導入。
+     - 正規化 JSON として DB に保存し、ファイルシステム上の `gcp-key.json` / `/app/gcp-key.json` にも同期書き込み。
+     - エンドポイント全体を `try...except` で保護し、予期しない例外でも必ず JSON 形式のエラーレスポンスを返却。
+     - レスポンスに `status: "ok"` と `success: True` の両方を含め、互換性を確保。
+   - `api_system_get_credentials`:
+     - `google_configured`, `google_tts_configured`, `has_google_json`, `status: "ok"` を返却し、画面上の「🟢 JSONキー設定済」バッジが即座に正しく点灯するように対応。
+   - `api_system_test_credentials` & `test_synthesis`:
+     - `TTSManager.test_synthesis` の戻り値に音声バイナリ `wav_bytes` を追加（`Tuple[bool, str, float, Optional[bytes]]`）。
+     - API 側で base64 エンコードして `audio_base64` と `format: "wav"`, `status: "ok"` を返却。
+3. **フロントエンド送受信の堅牢化 (`src/web/static/app.js`)**:
+   - `res.text()` を経由して JSON パースを行い、万が一非 JSON やサーバーエラーが返った場合でも生のエラー内容を正確にトースト通知するようガード。
+   - `payload` に `google_credentials_json` と `google_service_account_json` の両方を設定。
+   - レスポンス判定を `(data.status === "ok" || data.success)` に柔軟化。
+   - 疎通テスト成功時に Web ブラウザ上でテスト音声が直接再生されるよう連動。
+
+### 3. 検証と本番反映結果
+1. **一時サンドボックス検証 (`./scripts/run_sandbox_test.sh`)**:
+   - ユーザー提供の GCP サービスアカウント JSON を用いた DB 保存、ホットリロード、`test_synthesis` による実音声合成（116,542バイト生成・遅延524ms）のユニットテストを実行し、全件合格（ゼロフットプリント自動破棄）。
+2. **本番環境への安全反映**:
+   - `docker compose restart app` により瞬断（数秒）で安全に再読み込み。
+   - 全Bot（#1〜#5）および各ノードが正常に再接続、ヘルスチェック Healthy を確認。
+   - 本番 DB に提供された GCP サービスアカウント JSON が正常保存され、Google TTS が有効化（Available）されたことを確認。
+
 
 
 

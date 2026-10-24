@@ -2620,7 +2620,7 @@ class Database:
                 row = await cur.fetchone()
                 return str(row[0]) if row else default
 
-    async def set_credential(self, key: str, value: str) -> None:
+    async def set_credential(self, key: str, value: str, is_secret: bool = False) -> None:
         """システム設定・認証情報値を保存・更新"""
         async with self.get_connection() as db:
             await db.execute("""

@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from collections import deque
 from dataclasses import asdict
 import aiosqlite
+import base64
 from datetime import datetime
 from aiohttp import web
 import discord
@@ -4025,11 +4026,27 @@ class WebServer:
                 return "••••••••"
             return f"{'•' * (len(val) - keep_tail)}{val[-keep_tail:]}"
 
+        has_gcp_json = bool(
+            self.config.google_credentials_json or
+            (self.config.google_application_credentials and os.path.exists(self.config.google_application_credentials)) or
+            os.path.exists("gcp-key.json") or
+            os.path.exists("/app/gcp-key.json")
+        )
+        is_google_configured = bool(
+            has_gcp_json or
+            self.config.google_api_key or
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        )
+
         return web.json_response({
+            "status": "ok",
             "azure_speech_key": _mask(self.config.azure_speech_key),
             "azure_speech_key_configured": bool(self.config.azure_speech_key),
+            "azure_speech_configured": bool(self.config.azure_speech_key),
             "azure_speech_region": self.config.azure_speech_region or "japaneast",
-            "google_configured": bool(self.config.google_credentials_json or self.config.google_api_key or self.config.google_application_credentials),
+            "google_configured": is_google_configured,
+            "google_tts_configured": is_google_configured,
+            "has_google_json": has_gcp_json,
             "google_api_key": _mask(self.config.google_api_key),
             "worker_shared_secret": self.config.worker_shared_secret,
             "web_base_url": self.config.web_dashboard_url,
@@ -4040,60 +4057,120 @@ class WebServer:
         """APIキー・設定の保存＆ホットリロード (管理者のみ)"""
         await self._require_admin(request)
         try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+            try:
+                data = await request.json()
+            except Exception:
+                return web.json_response({"status": "error", "error": "リクエストJSONの形式が不正です"}, status=400)
 
-        if "azure_speech_key" in data and not str(data["azure_speech_key"]).startswith("•"):
-            k = str(data["azure_speech_key"]).strip()
-            await self.db.set_credential("azure_speech_key", k, is_secret=True)
-            self.config.azure_speech_key = k
+            # 1. Azure Speech Key
+            if "azure_speech_key" in data and not str(data["azure_speech_key"]).startswith("•"):
+                k = str(data["azure_speech_key"]).strip()
+                await self.db.set_credential("azure_speech_key", k, is_secret=True)
+                self.config.azure_speech_key = k
 
-        if "azure_speech_region" in data:
-            reg = str(data["azure_speech_region"]).strip() or "japaneast"
-            await self.db.set_credential("azure_speech_region", reg)
-            self.config.azure_speech_region = reg
+            # 2. Azure Speech Region
+            if "azure_speech_region" in data:
+                reg = str(data["azure_speech_region"]).strip() or "japaneast"
+                await self.db.set_credential("azure_speech_region", reg)
+                self.config.azure_speech_region = reg
 
-        if "google_credentials_json" in data and not str(data["google_credentials_json"]).startswith("•"):
-            g_json = str(data["google_credentials_json"]).strip()
-            if g_json:
-                await self.db.set_credential("google_credentials_json", g_json, is_secret=True)
-                self.config.google_credentials_json = g_json
+            # 3. Google Service Account JSON (google_credentials_json or google_service_account_json)
+            raw_g_json = None
+            if "google_credentials_json" in data:
+                raw_g_json = data["google_credentials_json"]
+            elif "google_service_account_json" in data:
+                raw_g_json = data["google_service_account_json"]
 
-        if "google_api_key" in data and not str(data["google_api_key"]).startswith("•"):
-            g_key = str(data["google_api_key"]).strip()
-            if g_key:
-                await self.db.set_credential("google_api_key", g_key, is_secret=True)
-                self.config.google_api_key = g_key
+            if raw_g_json is not None and not str(raw_g_json).startswith("•"):
+                g_json = str(raw_g_json).strip()
+                if g_json:
+                    # JSON構文および必須フィールドのバリデーション
+                    try:
+                        parsed_sa = json.loads(g_json)
+                    except Exception as e:
+                        return web.json_response({
+                            "status": "error",
+                            "error": f"サービスアカウントJSONの形式が不正です (JSON構文エラー: {e})"
+                        }, status=400)
 
-        if "worker_shared_secret" in data:
-            w_sec = str(data["worker_shared_secret"]).strip()
-            if w_sec:
-                await self.db.set_credential("worker_shared_secret", w_sec, is_secret=True)
-                self.config.worker_shared_secret = w_sec
+                    if not isinstance(parsed_sa, dict):
+                        return web.json_response({
+                            "status": "error",
+                            "error": "サービスアカウントJSONはオブジェクト形式である必要があります"
+                        }, status=400)
 
-        if "web_base_url" in data:
-            b_url = str(data["web_base_url"]).strip().rstrip("/")
-            if b_url:
-                await self.db.set_credential("web_base_url", b_url)
-                self.config.web_dashboard_url = b_url
-                self.config.discord_redirect_uri = f"{b_url}/callback"
+                    required_fields = ["project_id", "private_key", "client_email"]
+                    missing = [f for f in required_fields if not parsed_sa.get(f)]
+                    if missing:
+                        return web.json_response({
+                            "status": "error",
+                            "error": f"サービスアカウントJSONに必要な項目が不足しています: {', '.join(missing)}"
+                        }, status=400)
 
-        if "admin_password" in data:
-            new_pwd = str(data["admin_password"]).strip()
-            if new_pwd:
-                await self.db.set_credential("admin_password", new_pwd, is_secret=True)
-                self.config.admin_password = new_pwd
+                    # 正規化されたJSON文字列として保存
+                    normalized_json = json.dumps(parsed_sa, indent=2, ensure_ascii=False)
+                    await self.db.set_credential("google_credentials_json", normalized_json, is_secret=True)
+                    self.config.google_credentials_json = normalized_json
 
-        if self.tts_manager:
-            self.tts_manager.reload_cloud_credentials(
-                azure_key=self.config.azure_speech_key,
-                azure_region=self.config.azure_speech_region,
-                google_json=self.config.google_credentials_json,
-                google_api_key=self.config.google_api_key
-            )
+                    # ホスト/コンテナ内の gcp-key.json ファイルにも同期保存
+                    for path in ["gcp-key.json", "/app/gcp-key.json"]:
+                        try:
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(normalized_json)
+                            logger.info(f"💾 Synchronized GCP service account JSON to {path}")
+                            break
+                        except Exception as e:
+                            logger.debug(f"Could not write to {path}: {e}")
 
-        return web.json_response({"success": True, "message": "設定を保存し、ホットリロードしました。"})
+            # 4. Google API Key
+            if "google_api_key" in data and not str(data["google_api_key"]).startswith("•"):
+                g_key = str(data["google_api_key"]).strip()
+                if g_key:
+                    await self.db.set_credential("google_api_key", g_key, is_secret=True)
+                    self.config.google_api_key = g_key
+
+            # 5. Worker Shared Secret
+            if "worker_shared_secret" in data:
+                w_sec = str(data["worker_shared_secret"]).strip()
+                if w_sec:
+                    await self.db.set_credential("worker_shared_secret", w_sec, is_secret=True)
+                    self.config.worker_shared_secret = w_sec
+
+            # 6. Web Base URL
+            if "web_base_url" in data:
+                b_url = str(data["web_base_url"]).strip().rstrip("/")
+                if b_url:
+                    await self.db.set_credential("web_base_url", b_url)
+                    self.config.web_dashboard_url = b_url
+                    self.config.discord_redirect_uri = f"{b_url}/callback"
+
+            # 7. Admin Password
+            if "admin_password" in data:
+                new_pwd = str(data["admin_password"]).strip()
+                if new_pwd:
+                    await self.db.set_credential("admin_password", new_pwd, is_secret=True)
+                    self.config.admin_password = new_pwd
+
+            # ホットリロード
+            if self.tts_manager:
+                self.tts_manager.reload_cloud_credentials(
+                    azure_key=self.config.azure_speech_key,
+                    azure_region=self.config.azure_speech_region,
+                    google_json=self.config.google_credentials_json,
+                    google_api_key=self.config.google_api_key
+                )
+
+            return web.json_response({
+                "status": "ok",
+                "success": True,
+                "message": "設定を保存し、ホットリロードしました。"
+            })
+        except Exception as e:
+            logger.exception("Failed to save credentials")
+            return web.json_response({
+                "status": "error",
+                "error": f"設定保存中にエラーが発生しました: {e}"
+            }, status=500)
 
     async def api_system_test_credentials(self, request: web.Request) -> web.Response:
         """指定TTSプロバイダの即時疎通・音声合成テスト (管理者のみ)"""
@@ -4101,20 +4178,32 @@ class WebServer:
         try:
             data = await request.json()
         except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+            return web.json_response({"status": "error", "error": "Invalid JSON"}, status=400)
 
         provider = str(data.get("provider", "azure")).strip()
         voice_name = str(data.get("voice_name", "")).strip()
 
         if not self.tts_manager:
-            return web.json_response({"success": False, "error": "TTSManager is not initialized."}, status=500)
+            return web.json_response({
+                "status": "error",
+                "success": False,
+                "error": "TTSManager is not initialized."
+            }, status=500)
 
-        success, message, elapsed_ms = await self.tts_manager.test_synthesis(provider, voice_name)
+        success, message, elapsed_ms, wav_bytes = await self.tts_manager.test_synthesis(provider, voice_name)
+        audio_b64 = None
+        if success and wav_bytes:
+            audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+
         return web.json_response({
+            "status": "ok" if success else "error",
             "success": success,
             "provider": provider,
             "message": message,
-            "latency_ms": elapsed_ms
+            "latency_ms": elapsed_ms,
+            "format": "wav",
+            "audio_base64": audio_b64,
+            "error": message if not success else None
         })
 
     async def api_worker_ws(self, request: web.Request) -> web.WebSocketResponse:

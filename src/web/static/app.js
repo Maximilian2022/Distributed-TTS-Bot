@@ -6911,7 +6911,7 @@ async function loadCredentials() {
     }
 
     if (googleBadge) {
-      const gOk = data.google_tts_configured;
+      const gOk = data.google_tts_configured || data.google_configured;
       googleBadge.textContent = gOk ? (data.has_google_json ? "🟢 JSONキー設定済" : "🟢 APIキー設定済") : "⚪ 未設定";
       googleBadge.style.background = gOk ? "rgba(46,204,113,0.2)" : "rgba(255,255,255,0.06)";
       googleBadge.style.color = gOk ? "#2ecc71" : "var(--text-dim)";
@@ -6992,7 +6992,10 @@ async function saveCredentials(event) {
     web_base_url: webBaseUrl
   };
   if (azureKey) payload.azure_speech_key = azureKey;
-  if (googleJson) payload.google_service_account_json = googleJson;
+  if (googleJson) {
+    payload.google_credentials_json = googleJson;
+    payload.google_service_account_json = googleJson;
+  }
   if (googleKey) payload.google_api_key = googleKey;
   if (adminPassword) payload.admin_password = adminPassword;
 
@@ -7002,8 +7005,16 @@ async function saveCredentials(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const data = await res.json();
-    if (res.ok && data.status === "ok") {
+    const rawText = await res.text();
+    let data = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch (_) {
+      showToast(`サーバーエラー (${res.status}): ${rawText.slice(0, 120)}`, "error");
+      return;
+    }
+
+    if (res.ok && (data.status === "ok" || data.success)) {
       showToast("設定を保存し、ホットリロードを完了しました 💾", "success");
       const k1 = document.getElementById("cred-azure-key");
       const k2 = document.getElementById("cred-google-json");
@@ -7031,15 +7042,23 @@ async function testCredential(provider) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider: provider })
     });
-    const data = await res.json();
-    if (res.ok && data.status === "ok") {
+    const rawText = await res.text();
+    let data = {};
+    try {
+      data = JSON.parse(rawText);
+    } catch (_) {
+      showToast(`サーバーエラー (${res.status}): ${rawText.slice(0, 120)}`, "error");
+      return;
+    }
+
+    if (res.ok && (data.status === "ok" || data.success)) {
       showToast(`✅ ${provider.toUpperCase()} 疎通成功！ (遅延: ${data.latency_ms}ms, 形式: ${data.format})`, "success");
       if (data.audio_base64) {
         const audio = new Audio(`data:audio/${data.format};base64,${data.audio_base64}`);
         audio.play().catch(e => console.warn("Audio play prevented:", e));
       }
     } else {
-      showToast(`❌ ${provider.toUpperCase()} テスト失敗: ${data.error || res.statusText}`, "error");
+      showToast(`❌ ${provider.toUpperCase()} テスト失敗: ${data.error || data.message || res.statusText}`, "error");
     }
   } catch (err) {
     showToast(`通信エラー: ${err.message}`, "error");

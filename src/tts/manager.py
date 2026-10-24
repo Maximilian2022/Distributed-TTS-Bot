@@ -149,8 +149,8 @@ class TTSManager:
             f"Google={'Available' if self.google_client.is_available() else 'Disabled'}"
         )
 
-    async def test_synthesis(self, provider: str, voice_name: str = "") -> Tuple[bool, str, float]:
-        """指定プロバイダの疎通・音声合成テストを実施 (成否, メッセージ, 所要ミリ秒)"""
+    async def test_synthesis(self, provider: str, voice_name: str = "") -> Tuple[bool, str, float, Optional[bytes]]:
+        """指定プロバイダの疎通・音声合成テストを実施 (成否, メッセージ, 所要ミリ秒, WAVバイト列)"""
         start_ts = time.time()
         test_text = "こんにちは、テスト音声です。"
         prov = provider.lower().strip()
@@ -158,12 +158,12 @@ class TTSManager:
         try:
             if prov == "azure":
                 if not self.azure_client.is_available():
-                    return False, "Azure Speech API key is not configured.", 0.0
+                    return False, "Azure Speech API key is not configured.", 0.0, None
                 v = voice_name or "ja-JP-NanamiNeural"
                 wav = await self.azure_client.synthesize(test_text, v)
             elif prov == "google":
                 if not self.google_client.is_available():
-                    return False, "Google Cloud credentials are not configured.", 0.0
+                    return False, "Google Cloud credentials are not configured.", 0.0, None
                 v = voice_name or "ja-JP-Neural2-B"
                 wav = await self.google_client.synthesize(test_text, v)
             elif prov == "edge":
@@ -173,17 +173,17 @@ class TTSManager:
                 v = voice_name or "ojt_mei_normal"
                 wav = await self.openjtalk_client.synthesize(test_text, v)
             else:
-                return False, f"Unsupported provider for testing: {prov}", 0.0
+                return False, f"Unsupported provider for testing: {prov}", 0.0, None
 
             elapsed_ms = round((time.time() - start_ts) * 1000, 1)
             if wav and len(wav) > 44:
-                return True, f"Success ({len(wav)} bytes generated)", elapsed_ms
+                return True, f"Success ({len(wav)} bytes generated)", elapsed_ms, wav
             else:
-                return False, "Empty or invalid WAV returned", elapsed_ms
+                return False, "Empty or invalid WAV returned", elapsed_ms, None
         except Exception as e:
             elapsed_ms = round((time.time() - start_ts) * 1000, 1)
             logger.warning(f"Test synthesis failed for {prov}: {e}")
-            return False, str(e), elapsed_ms
+            return False, str(e), elapsed_ms, None
 
     def load_cached_voices(self) -> int:
         """保存された voices_cache.json からローカルエンジンモデルを config.voices に復元"""
