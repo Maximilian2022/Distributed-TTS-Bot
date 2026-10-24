@@ -615,8 +615,10 @@ class WebServer:
 
         # 静的アセットキャッシュバスター (ファイルのmtimeを付与してCloudflare等のエッジキャッシュを強制バイパス)
         app_js_path = Path(__file__).resolve().parent / "static" / "app.js"
-        js_mtime = int(app_js_path.stat().st_mtime) if app_js_path.exists() else int(time.time())
-        asset_v = f"{BUILD_VERSION}-{js_mtime}"
+        style_css_path = Path(__file__).resolve().parent / "static" / "style.css"
+        js_mtime = int(app_js_path.stat().st_mtime) if app_js_path.exists() else 0
+        css_mtime = int(style_css_path.stat().st_mtime) if style_css_path.exists() else 0
+        asset_v = f"{BUILD_VERSION}-{max(js_mtime, css_mtime)}"
 
         html = html.replace("{{IS_LOGGED_IN}}", is_logged_in)
         html = html.replace("{{CLIENT_CONFIGURED}}", client_configured)
