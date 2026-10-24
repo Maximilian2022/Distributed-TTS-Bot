@@ -21,6 +21,8 @@
 
 Designed to scale effortlessly from personal friend servers to massive community guilds, it features **distributed compute clustering**, **NAT-traversing volunteer worker nodes**, **dynamic bot slot scaling** for concurrent voice channels, and **high-availability (HA) master/slave failover** with split-brain protection.
 
+This Project is made with the help of AI for my own purposes. So it might not be perfect.
+
 ```mermaid
 graph TD
     User["Discord User<br>(Chat Message)"] --> Discord["Discord Gateway / VC"]
