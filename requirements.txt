@@ -10,4 +10,3 @@ zstandard>=0.23.0
 janome>=0.5.0
 sudachipy>=0.6.8
 sudachidict_core>=20240109
-alkana>=0.0.3

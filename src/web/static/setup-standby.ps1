@@ -106,7 +106,7 @@ if (-not (Test-Path (Join-Path $InstallDir "Dockerfile"))) {
         Write-Host "  リポジトリを取得中 (git)..."
         try {
             if (-not (Test-Path (Join-Path $InstallDir ".git"))) {
-                git clone https://github.com/Maximilian2022/ttsbot-oss.git . 2>$null
+                git clone https://github.com/Maximilian2022/Distributed-TTS-Bot.git . 2>$null
                 if (Test-Path (Join-Path $InstallDir "Dockerfile")) { $cloned = $true }
             } else {
                 git fetch --depth=1 origin main 2>$null
@@ -121,10 +121,10 @@ if (-not (Test-Path (Join-Path $InstallDir "Dockerfile"))) {
         try {
             $zipPath = Join-Path $env:TEMP "ttsbot-main.zip"
             $extractPath = Join-Path $env:TEMP "ttsbot-extract"
-            Invoke-WebRequest -Uri "https://github.com/Maximilian2022/ttsbot-oss/archive/refs/heads/main.zip" -OutFile $zipPath -TimeoutSec 30
+            Invoke-WebRequest -Uri "https://github.com/Maximilian2022/Distributed-TTS-Bot/archive/refs/heads/main.zip" -OutFile $zipPath -TimeoutSec 30
             if (Test-Path $extractPath) { Remove-Item -Path $extractPath -Recurse -Force -ErrorAction SilentlyContinue }
             Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-            $innerDir = Join-Path $extractPath "ttsbot-oss-main"
+            $innerDir = Join-Path $extractPath "Distributed-TTS-Bot-main"
             if (Test-Path $innerDir) {
                 Copy-Item -Path "$innerDir\*" -Destination $InstallDir -Recurse -Force
                 $cloned = $true

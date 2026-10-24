@@ -20,9 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
-COPY requirements.txt .
-# --prefix=/install に一括インストール
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+COPY requirements.txt requirements-optional.txt ./
+# --prefix=/install に一括インストール (コア依存 + オプショナル拡張)
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt -r requirements-optional.txt
 
 
 # --- Stage 2: Runtime ---

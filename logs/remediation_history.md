@@ -1,5 +1,28 @@
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-24] リポジトリ名改称 (Distributed-TTS-Bot) & GitHub コミュニティ標準文書 (日英) ・ライセンス体系の完全整備
+- **ユーザーフィードバック & 課題**:
+  1. プロジェクトおよび GitHub リポジトリ名称を `ttsbot-oss` から `Distributed-TTS-Bot`（`Maximilian2022/Distributed-TTS-Bot.git`）へ改称。
+  2. GitHub 公開に向けたコミュニティ標準文書（NOTICE、README、Code of Conduct、Contributing、Security Policy）を日本語・英語の双方で整備する。
+  3. `requirements.txt` 内の GPLv2 パッケージ（`alkana`）をオプショナル依存に分離し、プロジェクト全体の Apache License 2.0 の法的一貫性を確保する。
+- **抜本的改善内容**:
+  1. **リポジトリ名・リモート URL の変更**:
+     - git remote origin を `https://github.com/Maximilian2022/Distributed-TTS-Bot.git` へ切り替え。
+     - スクリプト・ドキュメント内のリポジトリ参照 URL をすべて新リポジトリ名へ更新。
+  2. **ライセンス体系および依存関係の法的整理**:
+     - `LICENSE`: Apache License 2.0 の著作権者行を `Copyright 2026 Maximilian2022 and Distributed-TTS-Bot Contributors` として適正化。
+     - `requirements.txt` から GPLv2 ライセンスの `alkana` を除外し、`requirements-optional.txt` へ分離。
+     - `Dockerfile`: `pip install -r requirements.txt -r requirements-optional.txt` により、Docker 実行環境では完全自動で全機能がインストールされる利便性を維持しつつ、ソースコードの Apache 2.0 の純粋性を両立。
+  3. **コミュニティ標準文書のバイリンガル整備（日本語・英語）**:
+     - **`NOTICE` / `NOTICE.md`**: Apache 2.0 に準拠した帰属表示。Open JTalk（MMDAgent Mei/Takumi）修正BSDライセンス、edge-tts（LGPLv3）、alkana（GPLv2）の帰属と、VOICEVOX / COEIROINK / SHAREVOX のキャラクター利用規約・免責条項を日英併記。
+     - **`README.md` & `README.ja.md`**: 国際向け英語版メイン README と、完全な日本語版 README.ja.md を作成。Mermaid アーキテクチャ図、主要機能（超低遅延ストリーミング、4段階RAMDiskルーティング、HA冗長化、ボランティアWorker）、クイックスタート、スラッシュコマンド一覧、Worker 参加手順を完備。
+     - **`CODE_OF_CONDUCT.md` & `CODE_OF_CONDUCT.ja.md`**: Contributor Covenant v2.1 に準拠した行動規範（英語・日本語）。
+     - **`CONTRIBUTING.md` & `CONTRIBUTING.ja.md`**: バグ報告、機能提案、PR作成手順、ローカル開発環境構築、コミット規約、ライセンス合意を明記した貢献ガイド（英語・日本語）。
+     - **`SECURITY.md` & `SECURITY.ja.md`**: サポートバージョン、GitHub Security Advisories を用いた非公開脆弱性報告手順、対応プロセス、運用者向けセキュリティベストプラクティスを網羅したセキュリティポリシー（英語・日本語）。
+- **検証**:
+  - `git remote -v` および `git fetch origin` の疎通確認。
+  - 各 Markdown ファイルの相互リンクおよびフォーマットの整合性を確認。
+
 ## [2026-10-24] クラスタ用 Worker セットアップスクリプト (`setup-worker.ps1` / `setup-worker.sh`) の WAN 403 解消 & URL・共有トークン自動注入
 - **ユーザーフィードバック & 課題**:
   - インターネット経由（Cloudflare Tunnel `https://ttsbot.kenko.land/`）からクラスタ用 Worker のセットアップワンライナー（`irm "https://ttsbot.kenko.land/setup-worker.ps1" | iex`）を実行したところ、`{"error": "Forbidden: This endpoint is restricted to local LAN access only."}` が返りブロックされた。

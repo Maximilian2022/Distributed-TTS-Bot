@@ -121,12 +121,12 @@ if [ ! -f "Dockerfile" ]; then
     # A. Git による取得 (既存ディレクトリ・非空ディレクトリにも対応)
     if command -v git &> /dev/null; then
         if [ ! -d ".git" ]; then
-            if git clone https://github.com/Maximilian2022/ttsbot-oss.git . 2>/dev/null; then
+            if git clone https://github.com/Maximilian2022/Distributed-TTS-Bot.git . 2>/dev/null; then
                 CLONED=true
             else
                 # ディレクトリが空でなく git clone . が失敗した場合の確実な取得
                 git init -q 2>/dev/null || true
-                git remote add origin https://github.com/Maximilian2022/ttsbot-oss.git 2>/dev/null || git remote set-url origin https://github.com/Maximilian2022/ttsbot-oss.git 2>/dev/null || true
+                git remote add origin https://github.com/Maximilian2022/Distributed-TTS-Bot.git 2>/dev/null || git remote set-url origin https://github.com/Maximilian2022/Distributed-TTS-Bot.git 2>/dev/null || true
                 if git fetch --depth=1 origin main 2>/dev/null && git reset --hard origin/main 2>/dev/null; then
                     CLONED=true
                 fi
@@ -141,7 +141,7 @@ if [ ! -f "Dockerfile" ]; then
     # B. Git が利用不可または失敗した場合は GitHub Tarball アーカイブから完全展開
     if [ "$CLONED" != "true" ] && [ ! -f "Dockerfile" ]; then
         echo "  GitHub からソースコード一式 (tarball) を取得・展開中..."
-        if curl -sSL --connect-timeout 10 --max-time 30 "https://github.com/Maximilian2022/ttsbot-oss/archive/refs/heads/main.tar.gz" 2>/dev/null | tar -xz --strip-components=1 2>/dev/null; then
+        if curl -sSL --connect-timeout 10 --max-time 30 "https://github.com/Maximilian2022/Distributed-TTS-Bot/archive/refs/heads/main.tar.gz" 2>/dev/null | tar -xz --strip-components=1 2>/dev/null; then
             CLONED=true
         fi
     fi
