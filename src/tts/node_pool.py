@@ -194,7 +194,7 @@ class TTSNode:
 
     @property
     def short_label(self) -> str:
-        """UI表示用のスマートバッジ文字列 (例: 'OMEN2022 (RTX 3090) / VOICEVOX')"""
+        """UI表示用のスマートバッジ文字列 (例: 'GPU-Worker (RTX 3090) / VOICEVOX')"""
         return f"{self.machine_name} / {self.engine_name}"
 
     @property
@@ -523,13 +523,12 @@ class TTSNodePool:
         guild_id: Optional[Any] = None
     ) -> Optional[NodeLease]:
         """
-        利用可能な最良のノードを取得（優先度順 ＆ セマフォ空き優先）
-        - COEIROINK: RAMDisk常駐を最重要視した4段階 Tier ルーティング
-          Tier 1: CPU + RAMDisk (高速&メモリ潤沢: MasterDebian/Ubuntu 優先でGPUを温存)
-          Tier 2: GPU + RAMDisk (最速: OMEN等のRAM常駐モデル)
-          Tier 3: GPU + SSD     (中速: 推論0.1s + ロード4s〜20s)
-          Tier 4: CPU + SSD     (低速: 推論0.6s + ロード25s〜35s)
-        - VOICEVOX / SHAREVOX: 常に GPU 最優先 (最強GPU長文ルーティング)
+        - COEIROINK: メモリ常駐とハードウェア性能に応じた4段階 Tier ルーティング
+          Tier 1: CPU + メモリ常駐 (高速&メモリ潤沢: メモリ常駐ノード優先でGPUを温存)
+          Tier 2: GPU + メモリ常駐 (最速: GPU搭載マシンのメモリ常駐モデル)
+          Tier 3: GPU + SSD     (中速: GPUの爆速推論)
+          Tier 4: CPU + SSD     (低速: 最下位フォールバック)
+        - VOICEVOX / SHAREVOX: 常に GPU 最優先 (GPU長文ルーティング)
         全ノードがビジーの場合は空くまで最大 timeout 秒待機
         """
         # オンデマンド遠隔起動のトリガー判定
@@ -593,8 +592,8 @@ class TTSNodePool:
                 continue
 
             # COEIROINK かつ model_name 指定ありの場合は 4段階 Tier ルーティング
-            # Tier 1: CPU + RAMDisk (高速&メモリ潤沢: MasterDebian/Ubuntu 優先でGPUを温存)
-            # Tier 2: GPU + RAMDisk (最速: OMEN等のRAM常駐モデル)
+            # Tier 1: CPU + メモリ常駐 (高速&メモリ潤沢: メモリ常駐ノード優先でGPUを温存)
+            # Tier 2: GPU + メモリ常駐 (最速: GPU搭載マシンのメモリ常駐モデル)
             # Tier 3: GPU + SSD     (中速: GPUの爆速推論)
             # Tier 4: CPU + SSD     (低速: 最下位フォールバック)
             if is_coeiroink and model_name:

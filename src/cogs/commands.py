@@ -1076,16 +1076,16 @@ class CommandsCog(commands.Cog):
                 "message": "これはWorkerノードエラー検知のテスト通知です。分散Workerマシンからのハートビート途絶やオフライン化、完全再構成失敗時に送信されます。",
                 "category": CATEGORY_WORKER,
                 "severity": SEVERITY_WARNING,
-                "node_name": "OMEN2022 (RTX 3090)",
+                "node_name": "GPU-Worker-01 (RTX 3090)",
                 "engine_name": "WorkerAgent",
-                "details": "HeartbeatTimeout: No heartbeat received from worker_OMEN2022 for 68.4s (> 65s)"
+                "details": "HeartbeatTimeout: No heartbeat received from worker_GPU-01 for 68.4s (> 65s)"
             },
             "worker_engine": {
                 "title": "[テスト] Workerエンジン障害・隔離の検知",
                 "message": "これはWorker上のTTSエンジン障害検知のテスト通知です。外部GPUノード上のVOICEVOX/SHAREVOX/COEIROINKの推論失敗時に送信されます。",
                 "category": CATEGORY_WORKER_ENGINE,
                 "severity": SEVERITY_ERROR,
-                "node_name": "OMEN2017 (GTX 1080 Ti)",
+                "node_name": "Compute-Worker-02",
                 "engine_name": "COEIROINK",
                 "details": "aiohttp.ClientResponseError: 500, message='Internal Server Error during inference query'"
             }

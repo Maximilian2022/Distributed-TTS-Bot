@@ -24,22 +24,22 @@ Designed to scale effortlessly from personal friend servers to massive community
 ```mermaid
 graph TD
     User["Discord User<br>(Chat Message)"] --> Discord["Discord Gateway / VC"]
-    Discord --> Bot["<b>Distributed-TTS-Bot (Master)</b><br>・Ahead-of-Time 20ms Streaming<br>・Smart Chunking (30-char hard cap)<br>・Speculative Parallel Synthesis"]
+    Discord --> Bot["<b>Distributed-TTS-Bot (Manager)</b><br>・Ahead-of-Time 20ms Streaming<br>・Smart Chunking (30-char hard cap)<br>・Speculative Parallel Synthesis & Caching"]
 
-    subgraph "Distributed Compute Pool"
-        RAM["Master RAMDisk (Tier 1)<br>Instant Inference (0ms Disk I/O)"]
-        GPU1["OMEN 2022 (Tier 2/3)<br>RTX 3090 GPU Worker"]
-        WorkerVol["Volunteer Worker (NAT/WAN)<br>Outbound WebSocket / Zero Open Ports"]
-        Cloud["Cloud Fallback Engine<br>Edge-TTS / GCP / Azure"]
+    subgraph "Distributed Compute Worker Pool"
+        LocalFast["Fast Local Engine<br>In-Memory Synthesis (Edge-TTS / Open JTalk)"]
+        GPUWorker["Dedicated GPU Worker<br>AI Voice Synthesis (VOICEVOX / COEIROINK)"]
+        WorkerVol["Volunteer Worker (Community PC)<br>Outbound WebSocket / Zero Open Ports"]
+        Cloud["Cloud Fallback Engine<br>Azure / GCP / Edge-TTS"]
     end
 
-    Bot -->|Pinpoint Model Routing| RAM
-    Bot -->|On-Demand Wakeup| GPU1
+    Bot -->|Instant Synthesis| LocalFast
+    Bot -->|Cluster Inference| GPUWorker
     Bot -->|Matched Speaker UUID| WorkerVol
-    Bot -.->|Latency Timeout Fallback| Cloud
+    Bot -.->|Latency Fallback| Cloud
 
-    RAM --> Stream["20ms Opus Audio Frames<br>Real-time Stream"]
-    GPU1 --> Stream
+    LocalFast --> Stream["20ms Opus Audio Frames<br>Real-time Stream"]
+    GPUWorker --> Stream
     WorkerVol --> Stream
     Cloud --> Stream
     Stream --> Discord
@@ -58,12 +58,12 @@ graph TD
 - **Smart Model Pinpoint Routing**: Automatically detects which speech models (e.g., specific COEIROINK characters or MYCOEIROINK UUIDs) each node owns, routing inference tasks exclusively to nodes that have the requested model ready.
 - **Game-Friendly Low Resource Mode**: Features low process priority on Windows, automatic idle container sleep (releasing VRAM/RAM to the OS), and on-demand container waking.
 
-### 3. 🎯 4-Tier RAMDisk & GPU Optimization
-Automatically benchmarks and prioritizes compute resources according to hardware capabilities:
-- **Tier 1 (CPU + RAMDisk)**: Instantaneous memory-resident models with zero disk latency.
-- **Tier 2 (GPU + RAMDisk)**: Ultra-fast GPU inference paired with pre-loaded RAM disk assets.
-- **Tier 3 (GPU + NVMe)**: High-throughput GPU inference for large model collections.
-- **Tier 4 (CPU + SSD)**: Reliable fallback compute.
+### 3. 🎯 Hardware-Adaptive Intelligent Routing
+Automatically profiles hardware capabilities (GPU availability, RAM size, storage performance) across connected nodes to dynamically dispatch synthesis tasks with minimal latency:
+- **In-Memory Ultra-Fast Inference**: Zero-disk latency using memory-cached models.
+- **GPU-Accelerated Inference**: High-throughput neural voice synthesis powered by dedicated GPU workers.
+- **Lightweight CPU Synthesis**: Instant local playback using Edge-TTS or Open JTalk.
+- **Cloud Failover**: Dynamic cloud offloading during heavy local load spikes.
 
 ### 4. ☁️ Multi-Engine Cloud Fallback (Edge-TTS First)
 - **Zero Configuration Required**: Works right out of the box using high-quality **Edge-TTS** and **Open JTalk** without needing proprietary GPU hardware or paid API keys.

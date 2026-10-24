@@ -92,7 +92,7 @@ class ChunkLatencyInfo:
     char_count: int              # 文字数
     role: str                    # "name" (発言者名) | "body" (本文)
     provider: str                # voicevox, coeiroink, etc.
-    worker_label: str            # MASTERSOMEN2022, local_master, etc.
+    worker_label: str            # GPU_Worker_01, local_manager, etc.
     synthesis_ms: float          # 生成時間 (ms)
     duration_ms: float           # 再生時間 (ms)
     deadline_ms: float = 0.0     # 再生目標時刻 (前のパーツ再生終了時刻)
@@ -114,7 +114,7 @@ class PlaybackLatencyRecord:
     char_count: int              # 文字数
     speaker_name: str            # 話者名
     provider: str                # 音声プロバイダー (voicevox, coeiroink, etc.)
-    worker_label: str            # 処理ノード名 (例: OMEN2022 (RTX 3090) / VOICEVOX)
+    worker_label: str            # 処理ノード名 (例: GPU-Worker (RTX 3090) / VOICEVOX)
     discord_latency_ms: float    # Discord Gateway配信遅延 (Bot受信 - Discord送信)
     queue_wait_ms: float         # 再生キュー待機時間 (取り出し - キュー投入)
     synthesis_ms: float          # TTS音声合成推論時間 (取得完了 - リクエスト開始)
@@ -130,7 +130,7 @@ class PlaybackLatencyRecord:
     underrun_ms: float = 0.0     # 音飛び・アンダーラン実時間 (0msなら完全シームレス)
     rtf: float = 0.0             # Real-Time Factor (推論時間 / 再生時間, <1.0でリアルタイム)
     split_ms: float = 0.0        # 形態素解析・文章分割所要時間 (ms)
-    worker_machine: str = ""     # 整形済みマシン名 (例: OMEN2022 (RTX 3090))
+    worker_machine: str = ""     # 整形済みマシン名 (例: GPU-Worker (RTX 3090))
     worker_engine: str = ""      # 整形済みエンジン名 (例: VOICEVOX)
     buffer_headroom_ms: float = 0.0 # 最小バッファ余裕度 (+: シームレス余裕, -: ギャップ遅延)
     gap_lag_ms: float = 0.0      # 音途切れ時間 (0msなら完全シームレス)

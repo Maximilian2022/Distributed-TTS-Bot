@@ -53,9 +53,9 @@ data/
 *.sqlite
 *.sqlite3
 
-# Logs (keep remediation_history.md only)
-logs/*
-!logs/remediation_history.md
+# Logs & Remediation history (ローカル運用履歴・非公開)
+logs/
+remediation_history.md
 
 # Temporary / Scratch files
 scratch/

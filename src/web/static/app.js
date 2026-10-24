@@ -3879,8 +3879,8 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
           isStrongest = true;
         } else if (strongestNodes[engKey] && (lbl.includes(strongestNodes[engKey]) || (nodeProf && nodeProf.node_id === strongestNodes[engKey]))) {
           isStrongest = true;
-        } else if (isGpu && (sw.machine.includes("3090") || sw.machine.includes("2022"))) {
-          // 最低限のフォールバック (RTX 3090 / OMEN2022 を最強GPUと認識)
+        } else if (isGpu && (sw.machine.includes("3090") || sw.machine.includes("4090") || sw.machine.includes("TITAN"))) {
+          // 最低限のフォールバック (RTX 3090 / 4090 等のフラグシップGPUを認識)
           isStrongest = true;
         }
 

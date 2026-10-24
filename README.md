@@ -24,22 +24,22 @@
 ```mermaid
 graph TD
     User["Discord ユーザー<br>(テキストチャット)"] --> Discord["Discord Gateway / VC"]
-    Discord --> Bot["<b>Distributed-TTS-Bot (Master)</b><br>・先行ストリーミング制御<br>・スマート文分割 (30文字)<br>・投機的並列合成"]
+    Discord --> Bot["<b>Distributed-TTS-Bot (Manager)</b><br>・先行ストリーミング制御 (20ms)<br>・スマート文分割 (30文字)<br>・投機的並列合成 & キャッシュ"]
 
-    subgraph "分散コンピュート・ノードプール"
-        RAM["Master RAMDisk (Tier 1)<br>即時推論 (0ms I/O)"]
-        GPU1["OMEN 2022 (Tier 2/3)<br>RTX 3090 GPU 推論"]
-        WorkerVol["ボランティア Worker<br>WebSocket (WSS) / ポート開放不要"]
-        Cloud["クラウド TTS フォールバック<br>Edge-TTS / GCP / Azure"]
+    subgraph "分散コンピュート・ワーカープール"
+        LocalFast["ローカル軽量エンジン<br>高速メモリ合成 (Edge-TTS / Open JTalk)"]
+        GPUWorker["GPU推論サーバー (クラスタ)<br>高品質AI音声 (VOICEVOX / COEIROINK)"]
+        WorkerVol["ボランティア Worker (参加者PC)<br>WebSocket接続 (ポート開放不要)"]
+        Cloud["クラウド多段フォールバック<br>Azure / GCP / Edge-TTS"]
     end
 
-    Bot -->|ピンポイントルーティング| RAM
-    Bot -->|オンデマンド遠隔起動| GPU1
-    Bot -->|モデル保有合致| WorkerVol
-    Bot -.->|遅延タイムアウト時即時切替| Cloud
+    Bot -->|即時合成| LocalFast
+    Bot -->|専用クラスタ連携| GPUWorker
+    Bot -->|話者モデル自動判定| WorkerVol
+    Bot -.->|遅延・タイムアウト時| Cloud
 
-    RAM --> Stream["20ms Opus フレーム<br>リアルタイム再生"]
-    GPU1 --> Stream
+    LocalFast --> Stream["20ms Opus フレーム<br>リアルタイム再生"]
+    GPUWorker --> Stream
     WorkerVol --> Stream
     Cloud --> Stream
     Stream --> Discord
@@ -58,12 +58,12 @@ graph TD
 - **スマート・モデルルーティング**: ボランティア機が保有しているモデル（COEIROINK の MYCOEIROINK や公式話者）を自動検知し、該当モデルのリクエストのみをピンポイントで振り分け。
 - **ゲーム連動低負荷モード**: ゲーミング PC の邪魔にならない低プロセスピリオティ設定、無通信時の自動コンテナ停止（メモリ返却）に対応。
 
-### 3. 🎯 4段階 RAMDisk Tier ルーティング
-COEIROINK や VOICEVOX のモデル常駐先とハードウェア性能をプロファイルし、最適なノードへ自動割り当て：
-- **Tier 1 (CPU + RAMDisk)**: メモリ常駐でディスク I/O ゼロの最速応答。
-- **Tier 2 (GPU + RAMDisk)**: GPU 爆速推論と RAM 常駐の組み合わせ。
-- **Tier 3 (GPU + SSD)**: 大規模モデルの GPU 高速処理。
-- **Tier 4 (CPU + SSD)**: 最下位フォールバック。
+### 3. 🎯 ハードウェア性能に応じたスマート多段ルーティング
+接続されているワーカーのハードウェア性能（GPUの有無、メモリ容量、ストレージ速度）と話者モデルを自動プロファイルし、最もレイテンシの低いノードへタスクを動的割り当て：
+- **メモリ高速推論 (最優先)**: キャッシュやメモリ常駐モデルによるディスク I/O ゼロの超低遅延応答。
+- **GPU 高速推論**: NVIDIA GPU を搭載したクラスタ機による高品質 AI 音声の高速処理。
+- **汎用 CPU 推論**: 軽量エンジン（Edge-TTS / Open JTalk）による負荷のない安定合成。
+- **クラウド自動フォールバック**: ローカルリソース混雑時のリアルタイム迂回。
 
 ### 4. ☁️ 多段クラウドフェイルオーバー（Edge-TTS ファースト）
 - **初期設定不要**: 高価な GPU や API キーがなくても、無料の **Edge-TTS** または **Open JTalk** ですぐに高品質な音声合成が動作。
