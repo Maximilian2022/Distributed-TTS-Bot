@@ -168,28 +168,64 @@ function Check-VoicevoxUpdate([string]$currentUrl = "http://127.0.0.1:50021") {
     } catch {}
 }
 
-# 4. エンジンの起動支援 (ネイティブ & 最小化起動)
+# 4. エンジンのインストール判定 & 起動・導入支援
+function Get-EngineInstallInfo {
+    $info = @{
+        voicevox  = $null
+        sharevox  = $null
+        coeiroink = $null
+    }
+
+    # VOICEVOX 探索
+    $vvPaths = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\VOICEVOX\VOICEVOX.exe"),
+        "C:\Program Files\VOICEVOX\VOICEVOX.exe",
+        "C:\Program Files (x86)\VOICEVOX\VOICEVOX.exe"
+    )
+    foreach ($p in $vvPaths) {
+        if (Test-Path $p) { $info["voicevox"] = $p; break }
+    }
+
+    # SHAREVOX 探索
+    $svPaths = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\SHAREVOX\SHAREVOX.exe"),
+        "C:\Program Files\SHAREVOX\SHAREVOX.exe",
+        "C:\Program Files (x86)\SHAREVOX\SHAREVOX.exe"
+    )
+    foreach ($p in $svPaths) {
+        if (Test-Path $p) { $info["sharevox"] = $p; break }
+    }
+
+    # COEIROINK 探索 (ポータブル / 各種配置先)
+    $ciPaths = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\COEIROINK\COEIROINKonv2.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\COEIROINK\COEIROINK.exe"),
+        (Join-Path $env:USERPROFILE "COEIROINK\COEIROINKonv2.exe"),
+        (Join-Path $env:USERPROFILE "COEIROINK\COEIROINK.exe"),
+        "C:\COEIROINK\COEIROINKonv2.exe",
+        "C:\COEIROINK\COEIROINK.exe"
+    )
+    foreach ($p in $ciPaths) {
+        if (Test-Path $p) { $info["coeiroink"] = $p; break }
+    }
+
+    return $info
+}
+
 function Start-NativeVoicevox([System.Windows.Forms.Label]$statusLabel = $null) {
     if (Test-PortOpen "127.0.0.1" 50021) {
         if ($statusLabel) { $statusLabel.Text = "[OK] VOICEVOX は既に起動しています (50021)" }
         return $true
     }
-
-    $PossiblePaths = @(
-        (Join-Path $env:LOCALAPPDATA "Programs\VOICEVOX\VOICEVOX.exe"),
-        "C:\Program Files\VOICEVOX\VOICEVOX.exe",
-        "C:\Program Files (x86)\VOICEVOX\VOICEVOX.exe"
-    )
-    foreach ($p in $PossiblePaths) {
-        if (Test-Path $p) {
-            if ($statusLabel) { $statusLabel.Text = "[起動中] VOICEVOX を最小化起動中..." }
-            Start-Process -FilePath $p -WindowStyle Minimized
-            for ($i = 0; $i -lt 15; $i++) {
-                Start-Sleep -Seconds 1
-                if (Test-PortOpen "127.0.0.1" 50021) {
-                    if ($statusLabel) { $statusLabel.Text = "[OK] VOICEVOX の起動を確認しました！" }
-                    return $true
-                }
+    $info = Get-EngineInstallInfo
+    if ($info["voicevox"] -and (Test-Path $info["voicevox"])) {
+        if ($statusLabel) { $statusLabel.Text = "[起動中] VOICEVOX を最小化起動中..." }
+        Start-Process -FilePath $info["voicevox"] -WindowStyle Minimized
+        for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-PortOpen "127.0.0.1" 50021) {
+                if ($statusLabel) { $statusLabel.Text = "[OK] VOICEVOX の起動を確認しました！" }
+                return $true
             }
         }
     }
@@ -200,23 +236,129 @@ function Start-NativeSharevox([System.Windows.Forms.Label]$statusLabel = $null) 
     if (Test-PortOpen "127.0.0.1" 50025 -or Test-PortOpen "127.0.0.1" 50021) {
         return $true
     }
-    $PossiblePaths = @(
-        (Join-Path $env:LOCALAPPDATA "Programs\SHAREVOX\SHAREVOX.exe"),
-        "C:\Program Files\SHAREVOX\SHAREVOX.exe"
-    )
-    foreach ($p in $PossiblePaths) {
-        if (Test-Path $p) {
-            if ($statusLabel) { $statusLabel.Text = "[起動中] SHAREVOX を最小化起動中..." }
-            Start-Process -FilePath $p -WindowStyle Minimized
-            for ($i = 0; $i -lt 15; $i++) {
-                Start-Sleep -Seconds 1
-                if (Test-PortOpen "127.0.0.1" 50025 -or Test-PortOpen "127.0.0.1" 50021) {
-                    return $true
-                }
+    $info = Get-EngineInstallInfo
+    if ($info["sharevox"] -and (Test-Path $info["sharevox"])) {
+        if ($statusLabel) { $statusLabel.Text = "[起動中] SHAREVOX を最小化起動中..." }
+        Start-Process -FilePath $info["sharevox"] -WindowStyle Minimized
+        for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-PortOpen "127.0.0.1" 50025 -or Test-PortOpen "127.0.0.1" 50021) {
+                return $true
             }
         }
     }
     return $false
+}
+
+function Start-NativeCoeiroink([System.Windows.Forms.Label]$statusLabel = $null) {
+    if (Test-PortOpen "127.0.0.1" 50031 -or Test-PortOpen "127.0.0.1" 50032) {
+        return $true
+    }
+    $info = Get-EngineInstallInfo
+    if ($info["coeiroink"] -and (Test-Path $info["coeiroink"])) {
+        if ($statusLabel) { $statusLabel.Text = "[起動中] COEIROINK を最小化起動中..." }
+        Start-Process -FilePath $info["coeiroink"] -WindowStyle Minimized
+        for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-PortOpen "127.0.0.1" 50031 -or Test-PortOpen "127.0.0.1" 50032) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Install-EngineFromUrl([string]$engineName, [string]$downloadUrl, [string]$fileName, [System.Windows.Forms.Label]$statusLabel) {
+    $tempDir = [System.IO.Path]::GetTempPath()
+    $destFile = Join-Path $tempDir $fileName
+
+    if ($statusLabel) { $statusLabel.Text = "[DL中] $engineName インストーラーをダウンロード中..." }
+    Write-Host "▶ $engineName インストーラーをダウンロード中: $downloadUrl" -ForegroundColor Cyan
+    
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.DownloadFile($downloadUrl, $destFile)
+        
+        if (Test-Path $destFile) {
+            if ($statusLabel) { $statusLabel.Text = "[起動] インストーラーを起動しています..." }
+            Write-Host "✓ ダウンロード完了: $destFile" -ForegroundColor Green
+            Write-Host "▶ インストーラーを起動中 (画面の指示に従って完了してください)..." -ForegroundColor Cyan
+            Start-Process -FilePath $destFile
+            return $true
+        }
+    } catch {
+        Write-Warning "ダウンロードに失敗しました: $_"
+        if ($statusLabel) { $statusLabel.Text = "[エラー] ダウンロード失敗。手動でお試しください" }
+    }
+    return $false
+}
+
+function Show-EngineInstallOptionsDialog([string]$engineName, [string]$websiteUrl, [string]$autoInstallerUrl, [string]$installerFileName, [System.Windows.Forms.Label]$statusLabel, [System.Windows.Forms.Form]$parentForm) {
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = "$engineName のセットアップ"
+    $dlg.Size = New-Object System.Drawing.Size(460, 240)
+    $dlg.StartPosition = "CenterParent"
+    $dlg.FormBorderStyle = "FixedDialog"
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.BackColor = [System.Drawing.Color]::FromArgb(47, 49, 54)
+    $dlg.ForeColor = [System.Drawing.Color]::White
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "$engineName がPCにインストールされていません。`nセットアップ方法を選択してください："
+    $lbl.Location = New-Object System.Drawing.Point(20, 20)
+    $lbl.Size = New-Object System.Drawing.Size(410, 40)
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 9.5, [System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($lbl)
+
+    $hasAuto = -not [string]::IsNullOrEmpty($autoInstallerUrl)
+
+    # 1. 自動スクリプトインストールボタン
+    $btnAuto = New-Object System.Windows.Forms.Button
+    $btnAuto.Text = if ($hasAuto) { "自動でダウンロードしてインストール (推奨)" } else { "自動ダウンロード非対応 (公式サイトへ)" }
+    $btnAuto.Location = New-Object System.Drawing.Point(20, 75)
+    $btnAuto.Size = New-Object System.Drawing.Size(400, 36)
+    $btnAuto.BackColor = if ($hasAuto) { [System.Drawing.Color]::FromArgb(88, 101, 242) } else { [System.Drawing.Color]::FromArgb(79, 84, 92) }
+    $btnAuto.ForeColor = [System.Drawing.Color]::White
+    $btnAuto.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnAuto.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $btnAuto.Enabled = $hasAuto
+    $btnAuto.Add_Click({
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $dlg.Close()
+        Install-EngineFromUrl $engineName $autoInstallerUrl $installerFileName $statusLabel
+    })
+    $dlg.Controls.Add($btnAuto)
+
+    # 2. 手動インストール (ブラウザを開く) ボタン
+    $btnManual = New-Object System.Windows.Forms.Button
+    $btnManual.Text = "手動でダウンロード (公式サイトを開く)"
+    $btnManual.Location = New-Object System.Drawing.Point(20, 120)
+    $btnManual.Size = New-Object System.Drawing.Size(400, 32)
+    $btnManual.BackColor = [System.Drawing.Color]::FromArgb(79, 84, 92)
+    $btnManual.ForeColor = [System.Drawing.Color]::White
+    $btnManual.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnManual.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $btnManual.Add_Click({
+        $dlg.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+        $dlg.Close()
+        Start-Process $websiteUrl
+    })
+    $dlg.Controls.Add($btnManual)
+
+    # 3. キャンセルボタン
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "キャンセル"
+    $btnCancel.Location = New-Object System.Drawing.Point(320, 162)
+    $btnCancel.Size = New-Object System.Drawing.Size(100, 26)
+    $btnCancel.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+    $btnCancel.ForeColor = [System.Drawing.Color]::White
+    $btnCancel.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnCancel.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.ShowDialog($parentForm) | Out-Null
 }
 
 function Start-DockerEngines([bool]$enableVv, [bool]$enableSv, [System.Windows.Forms.Label]$statusLabel = $null) {
@@ -345,6 +487,9 @@ $RadDocker.Location = New-Object System.Drawing.Point(15, 40)
 $RadDocker.Size = New-Object System.Drawing.Size(440, 20)
 $RadDocker.Checked = -not $RadNative.Checked
 
+$RadNative.Add_CheckedChanged({ Update-EngineCheckboxTexts })
+$RadDocker.Add_CheckedChanged({ Update-EngineCheckboxTexts })
+
 $GrpRuntime.Controls.Add($RadNative)
 $GrpRuntime.Controls.Add($RadDocker)
 $Form.Controls.Add($GrpRuntime)
@@ -404,71 +549,173 @@ $GrpEngines.Location = New-Object System.Drawing.Point(20, 320)
 $GrpEngines.Size = New-Object System.Drawing.Size(480, 160)
 
 function Update-EngineCheckboxTexts {
-    $vvInfo = $DetectedEngines["voicevox"]
-    $ciInfo = $DetectedEngines["coeiroink"]
-    $svInfo = $DetectedEngines["sharevox"]
+    $installInfo = Get-EngineInstallInfo
+    $isDocker = $RadDocker.Checked
 
-    $ChkVv.Text = "VOICEVOX (四国めたん・ずんだもん等) " + $(if($vvInfo){"[稼働中]"}else{"[未起動]"})
-    $ChkCi.Text = "COEIROINK (つくよみちゃん・クロワ等) " + $(if($ciInfo){"[稼働中]"}else{"[未起動]"})
-    $ChkSv.Text = "SHAREVOX (小春音アミ・つくよみちゃん等) " + $(if($svInfo){"[稼働中]"}else{"[未起動]"})
+    # VOICEVOX
+    $vvRunning = $DetectedEngines["voicevox"]
+    $vvInstalled = -not [string]::IsNullOrEmpty($installInfo["voicevox"])
+    if ($isDocker) {
+        $ChkVv.Text = "VOICEVOX (四国めたん等) " + $(if($vvRunning){"[稼働中]"}else{"[未起動]"})
+        $BtnSetupVv.Text = if ($vvRunning) { "稼働中" } else { "コンテナ起動" }
+        $BtnSetupVv.BackColor = if ($vvRunning) { [System.Drawing.Color]::FromArgb(59, 165, 93) } else { [System.Drawing.Color]::FromArgb(88, 101, 242) }
+        $BtnSetupVv.Enabled = -not $vvRunning
+    } else {
+        if ($vvRunning) {
+            $ChkVv.Text = "VOICEVOX (四国めたん等) [稼働中]"
+            $BtnSetupVv.Text = "稼働中"
+            $BtnSetupVv.BackColor = [System.Drawing.Color]::FromArgb(59, 165, 93)
+            $BtnSetupVv.Enabled = $false
+        } elseif ($vvInstalled) {
+            $ChkVv.Text = "VOICEVOX (四国めたん等) [導入済]"
+            $BtnSetupVv.Text = "起動する"
+            $BtnSetupVv.BackColor = [System.Drawing.Color]::FromArgb(88, 101, 242)
+            $BtnSetupVv.Enabled = $true
+        } else {
+            $ChkVv.Text = "VOICEVOX (四国めたん等) [未導入]"
+            $BtnSetupVv.Text = "セットアップ"
+            $BtnSetupVv.BackColor = [System.Drawing.Color]::FromArgb(230, 126, 34)
+            $BtnSetupVv.Enabled = $true
+        }
+    }
+
+    # COEIROINK
+    $ciRunning = $DetectedEngines["coeiroink"]
+    $ciInstalled = -not [string]::IsNullOrEmpty($installInfo["coeiroink"])
+    if ($ciRunning) {
+        $ChkCi.Text = "COEIROINK (つくよみちゃん等) [稼働中]"
+        $BtnSetupCi.Text = "稼働中"
+        $BtnSetupCi.BackColor = [System.Drawing.Color]::FromArgb(59, 165, 93)
+        $BtnSetupCi.Enabled = $false
+    } elseif ($ciInstalled) {
+        $ChkCi.Text = "COEIROINK (つくよみちゃん等) [導入済]"
+        $BtnSetupCi.Text = "起動する"
+        $BtnSetupCi.BackColor = [System.Drawing.Color]::FromArgb(88, 101, 242)
+        $BtnSetupCi.Enabled = $true
+    } else {
+        $ChkCi.Text = "COEIROINK (つくよみちゃん等) [未導入]"
+        $BtnSetupCi.Text = "セットアップ"
+        $BtnSetupCi.BackColor = [System.Drawing.Color]::FromArgb(230, 126, 34)
+        $BtnSetupCi.Enabled = $true
+    }
+
+    # SHAREVOX
+    $svRunning = $DetectedEngines["sharevox"]
+    $svInstalled = -not [string]::IsNullOrEmpty($installInfo["sharevox"])
+    if ($isDocker) {
+        $ChkSv.Text = "SHAREVOX (小春音アミ等) " + $(if($svRunning){"[稼働中]"}else{"[未起動]"})
+        $BtnSetupSv.Text = if ($svRunning) { "稼働中" } else { "コンテナ起動" }
+        $BtnSetupSv.BackColor = if ($svRunning) { [System.Drawing.Color]::FromArgb(59, 165, 93) } else { [System.Drawing.Color]::FromArgb(88, 101, 242) }
+        $BtnSetupSv.Enabled = -not $svRunning
+    } else {
+        if ($svRunning) {
+            $ChkSv.Text = "SHAREVOX (小春音アミ等) [稼働中]"
+            $BtnSetupSv.Text = "稼働中"
+            $BtnSetupSv.BackColor = [System.Drawing.Color]::FromArgb(59, 165, 93)
+            $BtnSetupSv.Enabled = $false
+        } elseif ($svInstalled) {
+            $ChkSv.Text = "SHAREVOX (小春音アミ等) [導入済]"
+            $BtnSetupSv.Text = "起動する"
+            $BtnSetupSv.BackColor = [System.Drawing.Color]::FromArgb(88, 101, 242)
+            $BtnSetupSv.Enabled = $true
+        } else {
+            $ChkSv.Text = "SHAREVOX (小春音アミ等) [未導入]"
+            $BtnSetupSv.Text = "セットアップ"
+            $BtnSetupSv.BackColor = [System.Drawing.Color]::FromArgb(230, 126, 34)
+            $BtnSetupSv.Enabled = $true
+        }
+    }
 }
 
 $ChkVv = New-Object System.Windows.Forms.CheckBox
 $ChkVv.Location = New-Object System.Drawing.Point(15, 20)
-$ChkVv.Size = New-Object System.Drawing.Size(350, 22)
+$ChkVv.Size = New-Object System.Drawing.Size(345, 22)
 $ChkVv.Checked = if ($Config.engines) { $Config.engines -contains "voicevox" } else { $true }
 
 $BtnSetupVv = New-Object System.Windows.Forms.Button
-$BtnSetupVv.Text = "入手"
 $BtnSetupVv.Font = $FontSmall
-$BtnSetupVv.Location = New-Object System.Drawing.Point(380, 18)
-$BtnSetupVv.Size = New-Object System.Drawing.Size(85, 24)
-$BtnSetupVv.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+$BtnSetupVv.Location = New-Object System.Drawing.Point(370, 18)
+$BtnSetupVv.Size = New-Object System.Drawing.Size(95, 24)
 $BtnSetupVv.ForeColor = [System.Drawing.Color]::White
 $BtnSetupVv.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
 $BtnSetupVv.Add_Click({
     if ($RadDocker.Checked) {
         Start-DockerEngines $true $false $LblEngineStatus
+        Start-Sleep -Seconds 1
+        $script:DetectedEngines = Scan-AllLocalEngines
+        Update-EngineCheckboxTexts
     } else {
-        Start-Process "https://voicevox.hiroshiba.jp/"
+        $info = Get-EngineInstallInfo
+        if ($info["voicevox"]) {
+            Start-NativeVoicevox $LblEngineStatus
+            Start-Sleep -Seconds 1
+            $script:DetectedEngines = Scan-AllLocalEngines
+            Update-EngineCheckboxTexts
+        } else {
+            Show-EngineInstallOptionsDialog "VOICEVOX" "https://voicevox.hiroshiba.jp/" "https://github.com/VOICEVOX/voicevox/releases/download/0.21.1/VOICEVOX.Setup.0.21.1.Windows.exe" "VOICEVOX.Setup.exe" $LblEngineStatus $Form
+            Start-Sleep -Seconds 1
+            $script:DetectedEngines = Scan-AllLocalEngines
+            Update-EngineCheckboxTexts
+        }
     }
 })
 
 $ChkCi = New-Object System.Windows.Forms.CheckBox
 $ChkCi.Location = New-Object System.Drawing.Point(15, 46)
-$ChkCi.Size = New-Object System.Drawing.Size(350, 22)
+$ChkCi.Size = New-Object System.Drawing.Size(345, 22)
 $ChkCi.Checked = if ($Config.engines) { $Config.engines -contains "coeiroink" } else { $false }
 
 $BtnSetupCi = New-Object System.Windows.Forms.Button
-$BtnSetupCi.Text = "入手"
 $BtnSetupCi.Font = $FontSmall
-$BtnSetupCi.Location = New-Object System.Drawing.Point(380, 44)
-$BtnSetupCi.Size = New-Object System.Drawing.Size(85, 24)
-$BtnSetupCi.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+$BtnSetupCi.Location = New-Object System.Drawing.Point(370, 44)
+$BtnSetupCi.Size = New-Object System.Drawing.Size(95, 24)
 $BtnSetupCi.ForeColor = [System.Drawing.Color]::White
 $BtnSetupCi.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
 $BtnSetupCi.Add_Click({
-    Start-Process "https://coeiroink.com/download"
+    $info = Get-EngineInstallInfo
+    if ($info["coeiroink"]) {
+        Start-NativeCoeiroink $LblEngineStatus
+        Start-Sleep -Seconds 1
+        $script:DetectedEngines = Scan-AllLocalEngines
+        Update-EngineCheckboxTexts
+    } else {
+        Show-EngineInstallOptionsDialog "COEIROINK" "https://coeiroink.com/download" "" "" $LblEngineStatus $Form
+        Start-Sleep -Seconds 1
+        $script:DetectedEngines = Scan-AllLocalEngines
+        Update-EngineCheckboxTexts
+    }
 })
 
 $ChkSv = New-Object System.Windows.Forms.CheckBox
 $ChkSv.Location = New-Object System.Drawing.Point(15, 72)
-$ChkSv.Size = New-Object System.Drawing.Size(350, 22)
+$ChkSv.Size = New-Object System.Drawing.Size(345, 22)
 $ChkSv.Checked = if ($Config.engines) { $Config.engines -contains "sharevox" } else { $false }
 
 $BtnSetupSv = New-Object System.Windows.Forms.Button
-$BtnSetupSv.Text = "入手"
 $BtnSetupSv.Font = $FontSmall
-$BtnSetupSv.Location = New-Object System.Drawing.Point(380, 70)
-$BtnSetupSv.Size = New-Object System.Drawing.Size(85, 24)
-$BtnSetupSv.BackColor = [System.Drawing.Color]::FromArgb(64, 68, 75)
+$BtnSetupSv.Location = New-Object System.Drawing.Point(370, 70)
+$BtnSetupSv.Size = New-Object System.Drawing.Size(95, 24)
 $BtnSetupSv.ForeColor = [System.Drawing.Color]::White
 $BtnSetupSv.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
 $BtnSetupSv.Add_Click({
     if ($RadDocker.Checked) {
         Start-DockerEngines $false $true $LblEngineStatus
+        Start-Sleep -Seconds 1
+        $script:DetectedEngines = Scan-AllLocalEngines
+        Update-EngineCheckboxTexts
     } else {
-        Start-Process "https://www.sharevox.net/"
+        $info = Get-EngineInstallInfo
+        if ($info["sharevox"]) {
+            Start-NativeSharevox $LblEngineStatus
+            Start-Sleep -Seconds 1
+            $script:DetectedEngines = Scan-AllLocalEngines
+            Update-EngineCheckboxTexts
+        } else {
+            Show-EngineInstallOptionsDialog "SHAREVOX" "https://www.sharevox.net/" "https://github.com/SHAREVOX/sharevox/releases/download/0.2.3/SHAREVOX.Setup.0.2.3.exe" "SHAREVOX.Setup.exe" $LblEngineStatus $Form
+            Start-Sleep -Seconds 1
+            $script:DetectedEngines = Scan-AllLocalEngines
+            Update-EngineCheckboxTexts
+        }
     }
 })
 
