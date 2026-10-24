@@ -6165,8 +6165,12 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - 検出された実際のポート番号付き URL（例: `http://127.0.0.1:50021`）を `config.json` の `engine_urls` に保存し、ワーカーへ正確に伝達。
 3. **WebUI および ドキュメントの更新 (`src/web/templates/index.html`, `worker/README.md`)**:
    - 参加手順を「事前にエンジンを手動起動しておく」記述から「VOICEVOX が入っていなくてもランチャーが自動検出・自動インストール・自動起動する」案内へ更新。
-4. **配信ファイル同期**:
+4. **複数エンジン同時選択・自動展開時のポート衝突回避**:
+   - VOICEVOX と SHAREVOX を両方選択して自動展開する場合、デフォルトポート `50021` の重複を防ぐため、SHAREVOX をホスト側ポート `50025` に自動分離マッピング（Docker: `127.0.0.1:50025:50021`）。
+   - GUI 上でも両方選択された際に「(同時提供: 50025自動分離)」と動的表示し、`config.json` の `engine_urls` にも 50025 を自動割り当て。
+5. **配信ファイル同期**:
    - `src/web/static/volunteer/` 配下の全ファイルを最新の `worker/` と同期。
+
 
 
 

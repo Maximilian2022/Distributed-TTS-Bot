@@ -337,7 +337,12 @@ function Update-EngineCheckboxTexts {
 
     $ChkVv.Text = "VOICEVOX (四国めたん・ずんだもん等) " + $(if($vvInfo){"🟢 稼働中 ($($vvInfo.port))"}else{"⚪ 未起動"})
     $ChkCi.Text = "COEIROINK (つくよみちゃん・クロワ等) " + $(if($ciInfo){"🟢 稼働中 ($($ciInfo.port))"}else{"⚪ 未起動"})
-    $ChkSv.Text = "SHAREVOX (小春音アミ等) " + $(if($svInfo){"🟢 稼働中 ($($svInfo.port))"}else{"⚪ 未起動"})
+    
+    $svText = "SHAREVOX (小春音アミ等) " + $(if($svInfo){"🟢 稼働中 ($($svInfo.port))"}else{"⚪ 未起動"})
+    if ($ChkVv.Checked -and $ChkSv.Checked -and (-not $svInfo -or $svInfo.port -eq 50021)) {
+        $svText += " (同時提供: 50025自動分離)"
+    }
+    $ChkSv.Text = $svText
 }
 
 $ChkVv = New-Object System.Windows.Forms.CheckBox
@@ -354,6 +359,9 @@ $ChkSv = New-Object System.Windows.Forms.CheckBox
 $ChkSv.Location = New-Object System.Drawing.Point(15, 64)
 $ChkSv.Size = New-Object System.Drawing.Size(430, 20)
 $ChkSv.Checked = if ($Config.engines) { $Config.engines -contains "sharevox" } else { [bool]$DetectedEngines["sharevox"] }
+
+$ChkVv.Add_CheckedChanged({ Update-EngineCheckboxTexts })
+$ChkSv.Add_CheckedChanged({ Update-EngineCheckboxTexts })
 
 Update-EngineCheckboxTexts
 
@@ -521,11 +529,25 @@ if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
     if ($ChkCi.Checked) { $EnginesList += "coeiroink" }
     if ($ChkSv.Checked) { $EnginesList += "sharevox" }
 
-    # 検出された実際の URL
+    # 検出された実際の URL (VOICEVOX と SHAREVOX のポート 50021 衝突を自動回避)
+    $vvUrl = if ($DetectedEngines["voicevox"]) { $DetectedEngines["voicevox"].url } else { "http://127.0.0.1:50021" }
+    $svUrl = if ($DetectedEngines["sharevox"]) {
+        # 既に 50025 または別ポートで動いていればそのポート、もし 50021 で VOICEVOX と被るなら 50025 を優先
+        if ($ChkVv.Checked -and $DetectedEngines["sharevox"].port -eq 50021 -and $DetectedEngines["voicevox"]) {
+            "http://127.0.0.1:50025"
+        } else {
+            $DetectedEngines["sharevox"].url
+        }
+    } else {
+        # VOICEVOX と同時選択の場合は 50025 に自動分離
+        if ($ChkVv.Checked) { "http://127.0.0.1:50025" } else { "http://127.0.0.1:50021" }
+    }
+    $ciUrl = if ($DetectedEngines["coeiroink"]) { $DetectedEngines["coeiroink"].url } else { "http://127.0.0.1:50031" }
+
     $EngineUrls = [ordered]@{
-        voicevox  = if ($DetectedEngines["voicevox"]) { $DetectedEngines["voicevox"].url } else { "http://127.0.0.1:50021" }
-        coeiroink = if ($DetectedEngines["coeiroink"]) { $DetectedEngines["coeiroink"].url } else { "http://127.0.0.1:50031" }
-        sharevox  = if ($DetectedEngines["sharevox"]) { $DetectedEngines["sharevox"].url } else { "http://127.0.0.1:50021" }
+        voicevox  = $vvUrl
+        coeiroink = $ciUrl
+        sharevox  = $svUrl
     }
 
     $SelectedCapacity = $CmbCapacity.SelectedIndex + 1

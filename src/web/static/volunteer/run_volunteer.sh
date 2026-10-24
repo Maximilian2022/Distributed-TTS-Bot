@@ -148,6 +148,11 @@ if [ "${USE_DOCKER}" -eq 1 ]; then
     cat <<EOF > "${COMPOSE_FILE}"
 version: '3.8'
 services:
+EOF
+
+    # VOICEVOX: ポート 50021
+    if echo "${ENGINES}" | grep -q "voicevox"; then
+        cat <<EOF >> "${COMPOSE_FILE}"
   voicevox:
     image: voicevox/voicevox_engine:cpu-latest
     container_name: ttsbot-worker-voicevox
@@ -155,9 +160,23 @@ services:
       - "127.0.0.1:50021:50021"
     restart: unless-stopped
 EOF
+    fi
+
+    # SHAREVOX: ポート衝突防止のためホスト側を 50025 にバインド
+    if echo "${ENGINES}" | grep -q "sharevox"; then
+        cat <<EOF >> "${COMPOSE_FILE}"
+  sharevox:
+    image: sharevox/sharevox_engine:cpu-latest
+    container_name: ttsbot-worker-sharevox
+    ports:
+      - "127.0.0.1:50025:50021"
+    restart: unless-stopped
+EOF
+    fi
+
     echo -e "${C_CYAN}▶ エンジンコンテナを起動中 (バックグラウンド)...${C_RESET}"
     (cd "${WORK_DIR}" && docker compose up -d) || true
-    echo -e "${C_GREEN}✓ 音声合成エンジン (VOICEVOX: 50021) が起動しました。${C_RESET}"
+    echo -e "${C_GREEN}✓ 音声合成エンジンコンテナが起動しました (VOICEVOX: 50021 / SHAREVOX: 50025 自動分離)${C_RESET}"
 fi
 
 # 4. Python 実行環境の確認 & ライブラリ導入
