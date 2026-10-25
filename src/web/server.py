@@ -14,6 +14,10 @@ import base64
 import secrets
 from datetime import datetime
 import socket
+import io
+import tarfile
+import hashlib
+import ipaddress
 import aiohttp
 from aiohttp import web
 import discord
@@ -115,6 +119,9 @@ class WebServer:
         self.ha_revoked_nodes: set = set()
         self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
         self._load_ha_nodes()
+        self.ha_force_update_time: float = 0.0
+        self._code_hash_cache = None
+        self._code_hash_cache_time = 0.0
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
         self._setup_routes()
@@ -261,7 +268,9 @@ class WebServer:
         self.app.router.add_get("/callback", self.handle_callback)
         self.app.router.add_get("/logout", self.handle_logout)
         self.app.router.add_get("/setup-worker.sh", self.handle_setup_worker_sh)
+        self.app.router.add_get("/static/setup-worker.sh", self.handle_setup_worker_sh)
         self.app.router.add_get("/setup-worker.ps1", self.handle_setup_worker_ps1)
+        self.app.router.add_get("/static/setup-worker.ps1", self.handle_setup_worker_ps1)
         self.app.router.add_get("/setup-standby.sh", self.handle_setup_standby_sh)
         self.app.router.add_get("/setup-standby.ps1", self.handle_setup_standby_ps1)
         self.app.router.add_get("/update.sh", self.handle_update_sh)
@@ -367,7 +376,9 @@ class WebServer:
 
         # HA (High Availability) & Standby 同期 API
         self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
+        self.app.router.add_get("/api/ha/code_snapshot", self.api_ha_code_snapshot)
         self.app.router.add_get("/api/ha/status", self.api_ha_status)
+        self.app.router.add_post("/api/ha/broadcast_update", self.api_ha_broadcast_update)
         self.app.router.add_get("/api/system/manager_nodes", self.api_system_get_manager_nodes)
         self.app.router.add_post("/api/system/manager_nodes/priority", self.api_system_set_manager_nodes_priority)
         self.app.router.add_post("/api/system/manager_nodes/revoke", self.api_system_revoke_manager_node)
@@ -797,9 +808,16 @@ class WebServer:
         content = script_path.read_text(encoding="utf-8").lstrip("\ufeff")
         master_url = self._get_master_base_url(request)
         token = getattr(self.config, "worker_shared_secret", "").strip()
+        # MASTER_URL を動的置換 (http://localhost:8080 / http://localhost:8088 等あらゆるデフォルト値に対応)
+        content = re.sub(r'MASTER_URL="\$\{TTSBOT_MASTER_URL:-[^}"]*\}"', f'MASTER_URL="${{TTSBOT_MASTER_URL:-{master_url}}}"', content)
+        content = re.sub(r'WORKER_SECRET="\$\{TTSBOT_WORKER_SECRET:-[^}"]*\}"', f'WORKER_SECRET="${{TTSBOT_WORKER_SECRET:-{token}}}"', content)
+        # 固定文字列置換も安全網として保持
         content = content.replace('MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"', f'MASTER_URL="${{TTSBOT_MASTER_URL:-{master_url}}}"')
+        content = content.replace('MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8088}"', f'MASTER_URL="${{TTSBOT_MASTER_URL:-{master_url}}}"')
         content = content.replace('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"', f'WORKER_SECRET="${{TTSBOT_WORKER_SECRET:-{token}}}"')
-        return web.Response(text=content, content_type="text/plain", charset="utf-8")
+        resp = web.Response(text=content, content_type="text/plain", charset="utf-8")
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp
 
     async def handle_setup_worker_ps1(self, request: web.Request) -> web.Response:
         """Windows GPU 用ワンライナー自動セットアップスクリプトを配信 (URL & トークン動的注入)"""
@@ -809,30 +827,42 @@ class WebServer:
         content = script_path.read_text(encoding="utf-8").lstrip("\ufeff")
         master_url = self._get_master_base_url(request)
         token = getattr(self.config, "worker_shared_secret", "").strip()
+        # $MasterUrl を動的置換 (8080 / 8088 等あらゆるデフォルト値に対応)
+        content = re.sub(r'\$MasterUrl\s*=\s*if\s*\(\$env:TTSBOT_MASTER_URL\)\s*\{\s*\$env:TTSBOT_MASTER_URL\s*\}\s*else\s*\{\s*"[^"]*"\s*\}',
+                         f'$MasterUrl  = if ($env:TTSBOT_MASTER_URL) {{ $env:TTSBOT_MASTER_URL }} else {{ "{master_url}" }}', content)
+        content = re.sub(r'\$WorkerSecret\s*=\s*if\s*\(\$env:TTSBOT_WORKER_SECRET\)\s*\{\s*\$env:TTSBOT_WORKER_SECRET\s*\}\s*else\s*\{\s*"[^"]*"\s*\}',
+                         f'$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) {{ $env:TTSBOT_WORKER_SECRET }} else {{ "{token}" }}', content)
+        # 固定文字列置換も安全網として保持
         content = content.replace('$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8080" }',
+                                  f'$MasterUrl  = if ($env:TTSBOT_MASTER_URL) {{ $env:TTSBOT_MASTER_URL }} else {{ "{master_url}" }}')
+        content = content.replace('$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8088" }',
                                   f'$MasterUrl  = if ($env:TTSBOT_MASTER_URL) {{ $env:TTSBOT_MASTER_URL }} else {{ "{master_url}" }}')
         content = content.replace('$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) { $env:TTSBOT_WORKER_SECRET } else { "" }',
                                   f'$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) {{ $env:TTSBOT_WORKER_SECRET }} else {{ "{token}" }}')
-        return web.Response(text=content, content_type="text/plain", charset="utf-8")
+        resp = web.Response(text=content, content_type="text/plain", charset="utf-8")
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return resp
 
     def _get_master_base_url(self, request: web.Request) -> str:
-        """アクセス元リクエストおよび設定から Master サーバーのベースURLを自動特定"""
+        """アクセス元リクエストおよび設定から Master サーバーのベースURLを自動特定 (WAN / LAN 自動判別)"""
+        # LAN内・ローカルからの直接アクセスの場合、リクエストされたHost/IPを最優先 (LAN直接通信・超低遅延化)
+        if not self._is_wan_request(request):
+            proto = request.headers.get("X-Forwarded-Proto") or request.scheme or "http"
+            host = request.headers.get("Host") or request.host or "localhost:8088"
+            return f"{proto}://{host}".rstrip("/")
+
+        # WAN経由 (Cloudflare / インターネット) の場合、設定された外部公開URL (web_dashboard_url) または X-Forwarded-Host を優先
         if self.config.web_dashboard_url and self.config.web_dashboard_url.startswith("http"):
             return self.config.web_dashboard_url.rstrip("/")
 
-        proto = request.headers.get("X-Forwarded-Proto") or request.headers.get("CF-Visitor", "")
-        if "https" in proto:
-            scheme = "https"
-        else:
-            scheme = request.scheme or "http"
-
+        proto = "https" if ("https" in (request.headers.get("X-Forwarded-Proto") or request.headers.get("CF-Visitor", ""))) else (request.scheme or "http")
         host = (
             request.headers.get("X-Forwarded-Host") or
             request.headers.get("Host") or
             request.host or
-            "localhost:8080"
+            "localhost:8088"
         )
-        return f"{scheme}://{host}".rstrip("/")
+        return f"{proto}://{host}".rstrip("/")
 
     async def _ensure_ha_secret(self) -> str:
         """HA共有認証シークレットの取得（未設定時は自動生成＆永続化）"""
@@ -1081,6 +1111,8 @@ class WebServer:
         updating_flag = Path(data_dir) / ".ha_updating"
         is_updating = updating_flag.exists()
 
+        code_hash = self._get_code_hash()
+
         return web.json_response({
             "status": "ok",
             "role": "master",
@@ -1096,8 +1128,35 @@ class WebServer:
             "db_size_bytes": db_size,
             "db_mtime": db_mtime,
             "timestamp": time.time(),
-            "version": AGENT_VERSION
+            "version": AGENT_VERSION,
+            "code_hash": code_hash,
+            "force_update": (now_ts - self.ha_force_update_time) < 120.0
         })
+
+    def _get_code_hash(self) -> str:
+        """src/ 配下の Python コードのハッシュ値を計算 (キャッシュ付き)"""
+        now = time.time()
+        if self._code_hash_cache and (now - self._code_hash_cache_time) < 10.0:
+            return self._code_hash_cache
+
+        try:
+            src_dir = Path(__file__).resolve().parent.parent  # /app/src
+            hasher = hashlib.sha256()
+            for p in sorted(src_dir.rglob("*.py")):
+                if "__pycache__" in str(p):
+                    continue
+                try:
+                    stat = p.stat()
+                    hasher.update(p.name.encode())
+                    hasher.update(str(stat.st_mtime).encode())
+                    hasher.update(str(stat.st_size).encode())
+                except Exception:
+                    pass
+            self._code_hash_cache = hasher.hexdigest()
+            self._code_hash_cache_time = now
+            return self._code_hash_cache
+        except Exception:
+            return "unknown_code_hash"
 
     async def api_ha_db_snapshot(self, request: web.Request) -> web.Response:
         """Slave 同期用 SQLite 完全整合性バックアップ (gzip 圧縮) 配信"""
@@ -1189,6 +1248,64 @@ class WebServer:
         except Exception as e:
             logger.error(f"[HA] Failed to generate DB snapshot: {e}", exc_info=True)
             return web.json_response({"error": f"Failed to generate DB snapshot: {str(e)}"}, status=500)
+
+    async def api_ha_code_snapshot(self, request: web.Request) -> web.Response:
+        """Slave 自動同期用 ソースコード完全アーカイブ (gzip tarball) 配信"""
+        if not self._verify_ha_auth(request):
+            return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
+
+        code_hash = self._get_code_hash()
+        if request.headers.get("If-None-Match", "").strip('"') == code_hash:
+            return web.Response(status=304, headers={"ETag": f'"{code_hash}"'})
+
+        loop = asyncio.get_running_loop()
+
+        def _generate_code_tarball():
+            src_dir = Path(__file__).resolve().parent.parent  # /app/src
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                def _filter(tarinfo):
+                    # __pycache__ や .pyc 等の一時・バイナリファイルを除外
+                    if "__pycache__" in tarinfo.name or tarinfo.name.endswith(".pyc") or tarinfo.name.endswith(".pyo"):
+                        return None
+                    return tarinfo
+                tar.add(str(src_dir), arcname="src", filter=_filter)
+            return buf.getvalue()
+
+        try:
+            tar_data = await loop.run_in_executor(None, _generate_code_tarball)
+            headers = {
+                "Content-Type": "application/x-gzip",
+                "Content-Disposition": 'attachment; filename="src_code.tar.gz"',
+                "ETag": f'"{code_hash}"',
+                "X-Code-Hash": code_hash,
+                "Cache-Control": "no-cache"
+            }
+            return web.Response(body=tar_data, headers=headers)
+        except Exception as e:
+            logger.error(f"[HA] Failed to generate code snapshot: {e}", exc_info=True)
+            return web.json_response({"error": f"Failed to generate code snapshot: {str(e)}"}, status=500)
+
+    async def api_ha_broadcast_update(self, request: web.Request) -> web.Response:
+        """Standby Slave ノードへ即時自己アップデートを指示する (HA Secret または 管理者権限 または プライベート/ローカルネットワーク専用)"""
+        authorized = False
+        if self._verify_ha_auth(request):
+            authorized = True
+        else:
+            remote_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or ""
+            try:
+                ip_obj = ipaddress.ip_address(remote_ip)
+                if ip_obj.is_private or ip_obj.is_loopback:
+                    authorized = True
+            except ValueError:
+                pass
+
+        if not authorized:
+            await self._require_admin(request)
+
+        self.ha_force_update_time = time.time()
+        logger.info("📢 [HA Update] Broadcasted auto-update signal to all HA Standby Slave nodes.")
+        return web.json_response({"status": "ok", "message": "HA Standby update broadcasted."})
 
     async def api_system_get_manager_nodes(self, request: web.Request) -> web.Response:
         """Master-Slave HA 構成のノード一覧と死活状況を取得 (管理者のみ)"""
@@ -5578,21 +5695,43 @@ class WebServer:
                         specs = data.get("specs", {})
                         priority = int(data.get("priority", 50))
                         exclusive_guild_id = data.get("exclusive_guild_id")
+                        is_cluster_worker = bool(data.get("is_cluster_worker") or str(worker_node_id).startswith("worker_"))
 
-                        # WSWorkerNode を生成して TTSManager のプール群へ登録
-                        ws_node = WSWorkerNode(
-                            node_id=worker_node_id,
-                            node_name=node_name,
-                            ws=ws,
-                            supported_engines=supported_engines,
-                            capacity=capacity,
-                            specs=specs,
-                            priority=priority,
-                            exclusive_guild_id=exclusive_guild_id,
-                            supported_models=supported_models
-                        )
-                        self.tts_manager.register_ws_worker_node(ws_node)
+                        # 既に常設 HTTP クラスタノードとしてプール内に登録されているかチェック
+                        has_active_http_node = False
+                        for p in (self.tts_manager.voicevox_pool, self.tts_manager.sharevox_pool, self.tts_manager.coeiroink_pool):
+                            if hasattr(p, "nodes"):
+                                for n in p.nodes:
+                                    nid = getattr(n, "id", "")
+                                    if (nid == worker_node_id or nid.startswith(f"{worker_node_id}_")) and not getattr(n, "is_ws", False):
+                                        has_active_http_node = True
+                                        break
+                            if has_active_http_node:
+                                break
+
+                        # WS 接続の保持
                         self.worker_ws_connections[worker_node_id] = ws
+
+                        if has_active_http_node:
+                            # 既に HTTP クラスタノードとして健全稼働中のため、重複するボランティアノードとしてのプール追加を抑止
+                            logger.info(f"ℹ️ [WorkerWS] Node '{worker_node_id}' already has active HTTP cluster engines. Skipping duplicate volunteer pool registration.")
+                        else:
+                            # WSWorkerNode を生成して TTSManager のプール群へ登録
+                            ws_node = WSWorkerNode(
+                                node_id=worker_node_id,
+                                node_name=node_name,
+                                ws=ws,
+                                supported_engines=supported_engines,
+                                capacity=capacity,
+                                specs=specs,
+                                priority=priority,
+                                exclusive_guild_id=exclusive_guild_id,
+                                supported_models=supported_models
+                            )
+                            # クラスタノードとして接続された場合は is_volunteer を False に設定
+                            if is_cluster_worker:
+                                ws_node.is_volunteer = False
+                            self.tts_manager.register_ws_worker_node(ws_node)
 
                         await ws.send_json({
                             "type": "register_ack",
@@ -5603,7 +5742,8 @@ class WebServer:
                         })
                         scope_desc = f" (Dedicated to Guild {exclusive_guild_id})" if exclusive_guild_id else " (Global Shared)"
                         models_desc = f" - Models: {list(supported_models.keys())}" if supported_models else ""
-                        logger.info(f"✅ [WorkerWS] Volunteer Worker successfully registered: {worker_node_id} ({node_name}){scope_desc} - Engines: {supported_engines}{models_desc}")
+                        node_type_desc = "Cluster Worker Tunnel" if is_cluster_worker else "Volunteer Worker"
+                        logger.info(f"✅ [WorkerWS] {node_type_desc} connected: {worker_node_id} ({node_name}){scope_desc} - Engines: {supported_engines}{models_desc}")
 
                     elif msg_type == "heartbeat":
                         if ws_node is not None:

@@ -2660,9 +2660,26 @@ function renderWorkerNodes(nodesData) {
         allNodes.push({ ...n, id: baseId, engines: [{ name: engine, ...n }] });
       } else {
         const idx = seenHostIds.get(baseId);
-        allNodes[idx].engines.push({ name: engine, ...n });
-        // specs/resourcesは最新のものを使う
-        if (n.specs && Object.keys(n.specs).length > 0) allNodes[idx].specs = n.specs;
+        // 同一エンジンがすでに存在するかチェック (HTTP直接接続クラスタノードを優先し、WS仮想重複を統合)
+        const existingEngineIdx = allNodes[idx].engines.findIndex(e => e.name === engine);
+        if (existingEngineIdx >= 0) {
+          if (n.url && !n.url.startsWith("ws://")) {
+            allNodes[idx].engines[existingEngineIdx] = { name: engine, ...n };
+          }
+        } else {
+          allNodes[idx].engines.push({ name: engine, ...n });
+        }
+        // specs/resourcesは有効なリソース情報を持つ方を優先マージ
+        if (n.specs && Object.keys(n.specs).length > 0) {
+          const prevSpecs = allNodes[idx].specs || {};
+          const prevRes = prevSpecs.resources || {};
+          const newRes = n.specs.resources || {};
+          allNodes[idx].specs = {
+            ...prevSpecs,
+            ...n.specs,
+            resources: (newRes.cpu_percent != null || newRes.mem_percent != null) ? newRes : prevRes
+          };
+        }
       }
     });
   }
@@ -2707,14 +2724,21 @@ function renderWorkerNodes(nodesData) {
       resolvedHostname = cleanId;
     }
 
-    const isVolunteer = Boolean(node.is_volunteer || (node.engines || []).some(e => e.is_volunteer) || cleanId.startsWith('volunteer_') || (node.url && node.url.startsWith('ws://')));
+    // クラスタWorker (HTTP直接ポートを持つノード) が存在する場合、ボランティア判定に優先
+    const hasClusterEngine = (node.engines || []).some(e => e.url && !e.url.startsWith('ws://') && !e.is_volunteer);
+    const isVolunteer = !hasClusterEngine && Boolean(
+      node.is_volunteer || 
+      (node.engines || []).every(e => e.is_volunteer) || 
+      cleanId.startsWith('volunteer_') || 
+      (node.url && node.url.startsWith('ws://'))
+    );
 
-    // アイコン
+    // アイコン & ボランティアバッジ (エスケープ分離)
     const icon = isMaster ? "🏢" : (isVolunteer ? "🤝" : (hasGpu ? "🎮" : "🖥️"));
-    let nodeName = isMaster ? "MasterDebian (自機)" : resolvedHostname;
-    if (isVolunteer) {
-      nodeName = `${resolvedHostname} <span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">🤝 ボランティア</span>`;
-    }
+    const nodeName = isMaster ? "MasterDebian (自機)" : resolvedHostname;
+    const volunteerBadge = isVolunteer
+      ? '<span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;margin-left:4px;">🤝 ボランティア</span>'
+      : '';
 
     // 1. Agent のオンライン/オフライン判定 (ハートビート疎通)
     const hbAgo = node.last_heartbeat_ago;
@@ -3010,7 +3034,7 @@ function renderWorkerNodes(nodesData) {
       <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
         <div style="font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;">
           <span>${icon}</span>
-          <span>${escapeHtml(nodeName)}</span>
+          <span>${escapeHtml(nodeName)}</span>${volunteerBadge}
           ${agentVersion ? `<span style="font-size:9px;color:var(--text-dim);background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:4px;">v${escapeHtml(agentVersion)}</span>` : ''}
         </div>
         <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
@@ -6673,9 +6697,16 @@ async function loadLatencyIncidents() {
         let color = "var(--text-light)";
         if (c === "SPECULATIVE_FALLBACK") { label = "⚡ 投機フォールバック (ローカル遅延)"; color = "#50e6ff"; bg = "rgba(0,176,244,0.15)"; }
         else if (c === "QUEUE_CONGESTION") { label = "⏳ 連投順番待ち (正常)"; color = "var(--text-muted)"; }
+        else if (c === "TEXT_SPLIT_OVERHEAD") { label = "📖 形態素・文分割遅延"; color = "#e67e22"; bg = "rgba(230,126,34,0.15)"; }
+        else if (c.startsWith("CLOUD_API_LATENCY_CHUNK_")) { label = `☁️ クラウドAPI遅延 (#${c.split('_').pop()})`; color = "#3498db"; bg = "rgba(52,152,219,0.15)"; }
+        else if (c === "SHORT_TEXT_RTF_SPIKE") { label = "⚡ 極短文RTFスパイク (正常)"; color = "var(--text-muted)"; bg = "rgba(255,255,255,0.06)"; }
+        else if (c === "PREROLL_WAIT_DOMINANT") { label = "⏳ プリロール待機上限"; color = "#f1c40f"; bg = "rgba(241,196,15,0.15)"; }
+        else if (c === "VOICE_PIPELINE_STALL") { label = "🔌 再生パイプライン待機"; color = "#e74c3c"; bg = "rgba(231,76,60,0.15)"; }
+        else if (c === "DISCORD_GATEWAY_DELAY") { label = "🌐 Discord通信ラグ"; color = "#9b59b6"; bg = "rgba(155,89,182,0.15)"; }
         else if (c.startsWith("UNDERRUN_CHUNK_")) { label = `⚠️ 途切れ (#${c.split('_').pop()})`; color = "#ff6b6b"; }
         else if (c.startsWith("WORKER_SLOW_CHUNK_")) { label = `🐢 処理遅延 (#${c.split('_').pop()})`; color = "#f1c40f"; }
         else if (c.startsWith("COEIROINK_COLD_LOAD_")) { label = `❄️ モデル初読込 (#${c.split('_').pop()})`; color = "#00b0f4"; }
+        else if (c === "UNCLASSIFIED") { label = "❓ 未分類"; color = "var(--text-dim)"; bg = "rgba(255,255,255,0.04)"; }
         return `<span class="badge" style="background:${bg};color:${color};font-size:10px;padding:2px 5px;margin-right:3px;">${escapeHtml(label)}</span>`;
       }).join("");
 
@@ -7360,7 +7391,7 @@ function updateWorkerOneliner(webBaseUrl, secret) {
     wsUrl = `${wsUrl}/api/worker/ws`;
   }
   const sec = secret || "your_worker_secret_here";
-  const cmd = `curl -sSL "${baseUrl}/static/setup-worker.sh" | bash -s -- --master-ws "${wsUrl}" --secret "${sec}"`;
+  const cmd = `curl -sSL "${baseUrl}/setup-worker.sh" | bash -s -- --master-ws "${wsUrl}" --secret "${sec}"`;
   pre.textContent = cmd;
 }
 

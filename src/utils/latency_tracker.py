@@ -270,19 +270,53 @@ class LatencyTracker:
             causes.append("QUEUE_CONGESTION")
         if not types:
             return types, causes
-        # チャンク単位のボトルネック推定
+
+        # 1. 形態素解析・文章分割遅延 (SudachiPy/Janome コールドロード・正規化オーバーヘッド)
+        split_ms = float(getattr(record, "split_ms", 0.0) or 0.0)
+        if split_ms >= 1000.0:
+            causes.append("TEXT_SPLIT_OVERHEAD")
+
+        # 2. チャンク単位のボトルネック推定
         for c in chunks:
             if c.get("is_cached"):
                 continue
             synth = float(c.get("synth_ms", c.get("synthesis_ms", 0.0)) or 0.0)
             dur = float(c.get("duration_ms", 0.0) or 0.0)
             idx = c.get("chunk_index")
-            if str(c.get("provider", "")).lower() == "coeiroink" and synth >= COLD_LOAD_SYNTH_MS:
+            prov = str(c.get("provider", "")).lower()
+
+            if prov in CLOUD_PROVIDERS:
+                if synth >= 1200.0:
+                    causes.append(f"CLOUD_API_LATENCY_CHUNK_{idx}")
+            elif prov == "coeiroink" and synth >= COLD_LOAD_SYNTH_MS:
                 causes.append(f"COEIROINK_COLD_LOAD_CHUNK_{idx}")
-            elif dur > 0 and synth > max(1500.0, dur * 2.0):
+            elif synth >= 1500.0 or (dur > 0 and synth > max(1200.0, dur * 1.5)):
                 causes.append(f"WORKER_SLOW_CHUNK_{idx}")
+
+        # 3. 極短文・短音声特有のRTFスパイク (1〜3文字や総再生800ms以下での正常往復オーバーヘッド)
+        char_count = int(getattr(record, "char_count", 0) or 0)
+        rtf = float(getattr(record, "rtf", 0.0) or 0.0)
+        dur_total = sum(float(c.get("duration_ms", 0.0) or 0.0) for c in chunks)
+        if rtf > INCIDENT_RTF and (char_count <= 3 or (dur_total > 0 and dur_total <= 800.0)):
+            causes.append("SHORT_TEXT_RTF_SPIKE")
+
+        # 4. プリロール待機が主因の場合
+        if record.preroll_wait_ms >= 1500.0:
+            causes.append("PREROLL_WAIT_DOMINANT")
+
+        # 5. Discord Gateway 配信遅延
         if record.discord_latency_ms >= INCIDENT_DISCORD_LAG_MS:
             causes.append("DISCORD_GATEWAY_DELAY")
+
+        # 6. 音声パイプライン・VC接続復旧待ち (未説明の内部待機が2秒以上)
+        sys_lat = float(getattr(record, "system_latency_ms", 0.0) or getattr(record, "turn_ttfs_ms", 0.0) or 0.0)
+        synth_total = float(getattr(record, "synthesis_ms", 0.0) or 0.0)
+        prep_ms = float(getattr(record, "play_prep_ms", 0.0) or 0.0)
+        q_wait = float(getattr(record, "queue_wait_ms", 0.0) or 0.0)
+        unexplained_ms = sys_lat - (synth_total + split_ms + record.preroll_wait_ms + q_wait + prep_ms)
+        if unexplained_ms >= 2000.0:
+            causes.append("VOICE_PIPELINE_STALL")
+
         if not causes:
             causes.append("UNCLASSIFIED")
         # 重複除去 (順序維持)

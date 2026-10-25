@@ -104,6 +104,32 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # ----------------------------------------------------------------------------
+  # 3. フェイルオーバー昇格用 Cloudflare Tunnel (Master障害時に自動起動)
+  # ----------------------------------------------------------------------------
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: ttsbot-slave-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - app
+    profiles:
+      - active
+      - tunnel
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   tts_cache:
   voicevox_cache:

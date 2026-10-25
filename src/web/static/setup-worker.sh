@@ -23,7 +23,7 @@ C_YELLOW="\033[33m"
 C_RED="\033[31m"
 C_CYAN="\033[36m"
 
-MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8088}"
+MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"
 MASTER_WS_URL="${TTSBOT_MASTER_WS_URL:-}"
 WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"
 WORK_DIR="${TTSBOT_WORK_DIR:-${HOME}/ttsbot-worker}"
@@ -54,8 +54,8 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# MASTER_WS_URL が渡された場合、未指定の MASTER_URL を自動補完
-if [ -n "${MASTER_WS_URL}" ] && [ "${MASTER_URL}" = "http://localhost:8088" ]; then
+# MASTER_WS_URL が渡された場合、未指定(デフォルトlocalhost)の MASTER_URL を自動補完
+if [ -n "${MASTER_WS_URL}" ] && ([ "${MASTER_URL}" = "http://localhost:8088" ] || [ "${MASTER_URL}" = "http://localhost:8080" ]); then
     DERIVED_HTTP=$(echo "${MASTER_WS_URL}" | sed -E 's|^ws://|http://|' | sed -E 's|^wss://|https://|' | sed -E 's|/api/worker/ws.*||')
     if [ -n "${DERIVED_HTTP}" ]; then
         MASTER_URL="${DERIVED_HTTP}"
@@ -457,12 +457,36 @@ exec "\$DIR/engine/engine"
 EOF
 chmod +x "${WORK_DIR}/docker/coeiroink/entrypoint.sh"
 
-# agent.py を Master から取得 (なければ警告のみ)
-echo -e "${C_BLUE}  📥 Worker Agent スクリプトを取得中...${C_RESET}"
-if curl -fsSL "${MASTER_URL}/static/agent.py" -o "${WORK_DIR}/docker/agent/agent.py" 2>/dev/null; then
-    echo -e "${C_GREEN}  ✅ agent.py を ${MASTER_URL} から取得しました。${C_RESET}"
-else
-    echo -e "${C_YELLOW}  ⚠️  agent.py の取得に失敗しました。${WORK_DIR}/docker/agent/agent.py を手動で配置してください。${C_RESET}"
+# agent.py を Master から取得 (最大3回リトライ + 既存ファイル再利用フォールバック)
+echo -e "${C_BLUE}  📥 Worker Agent スクリプトを取得中... (${MASTER_URL}/static/agent.py)${C_RESET}"
+AGENT_TARGET="${WORK_DIR}/docker/agent/agent.py"
+AGENT_FETCHED="false"
+CURL_ERR_OUT=""
+
+for retry in 1 2 3; do
+    if CURL_ERR_OUT=$(curl -fsSL --connect-timeout 10 --max-time 30 "${MASTER_URL}/static/agent.py" -o "${AGENT_TARGET}" 2>&1); then
+        if [ -s "${AGENT_TARGET}" ]; then
+            AGENT_FETCHED="true"
+            echo -e "${C_GREEN}  ✅ agent.py を ${MASTER_URL} から取得しました。${C_RESET}"
+            break
+        fi
+    fi
+    echo -e "${C_YELLOW}  ⚠️  agent.py 取得試行 [${retry}/3] に失敗しました。待機して再試行します...${C_RESET}"
+    sleep 2
+done
+
+if [ "${AGENT_FETCHED}" != "true" ]; then
+    if [ -s "${AGENT_TARGET}" ]; then
+        echo -e "${C_YELLOW}  ⚠️  Master からの最新 agent.py 取得に失敗しましたが、既存の ${AGENT_TARGET} を再利用します。${C_RESET}"
+    else
+        echo -e "${C_RED}  ❌ agent.py の取得に失敗しました。${C_RESET}"
+        if [ -n "${CURL_ERR_OUT}" ]; then
+            echo -e "${C_RED}     curl 詳細: ${CURL_ERR_OUT}${C_RESET}"
+        fi
+        echo -e "${C_YELLOW}     接続先: ${MASTER_URL}/static/agent.py${C_RESET}"
+        echo -e "${C_YELLOW}     ※ --master 引数で正しい Master サーバーURLを指定するか、${C_RESET}"
+        echo -e "${C_YELLOW}        手動で ${AGENT_TARGET} にスクリプトを配置してください。${C_RESET}"
+    fi
 fi
 
 echo -e "${C_GREEN}✅ 構成ファイルの展開が完了しました。${C_RESET}"

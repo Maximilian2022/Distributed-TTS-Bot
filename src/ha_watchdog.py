@@ -17,6 +17,8 @@ import logging
 import asyncio
 import hashlib
 import tempfile
+import io
+import tarfile
 import urllib.request
 import urllib.error
 import http.client
@@ -109,6 +111,25 @@ class DockerSocketClient:
         except Exception:
             return []
 
+    def find_tunnel_containers(self) -> list:
+        """フェイルオーバー昇格・降格対象の Cloudflare Tunnel コンテナを特定 (watchdog等は除外)"""
+        status, body = self._send_request("GET", "/containers/json?all=1")
+        if status != 200:
+            return []
+        try:
+            containers = json.loads(body.decode("utf-8"))
+            results = []
+            for c in containers:
+                names = [n.lstrip("/") for n in c.get("Names", [])]
+                for n in names:
+                    # ttsbot-slave-tunnel, ttsbot-tunnel, tunnel 等にマッチし、自身(watchdog)や他アプリは除外
+                    if "tunnel" in n.lower() and not any(ex in n.lower() for ex in ("watchdog", "nginx", "proxy", "agent", "worker")):
+                        results.append(c)
+                        break
+            return results
+        except Exception:
+            return []
+
     def start_container(self, container_id: str) -> bool:
         status, _ = self._send_request("POST", f"/containers/{container_id}/start")
         return status in (204, 304)
@@ -153,16 +174,22 @@ class HAWatchdog:
         self.memory_gb = self._detect_memory_gb()
         self.os_name = platform.system()
 
+        self.tunnel_token = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", os.getenv("TUNNEL_TOKEN", "")).strip()
+        self.has_tunnel = bool(self.tunnel_token)
+
         self.current_state = "standby"  # "standby" or "active"
         self.fail_count = 0
         self.last_sync_time = 0.0
         self.last_db_hash: Optional[str] = None
+        self.current_code_hash: Optional[str] = None
+        self.last_code_update_time = 0.0
         self.running = True
 
         logger.info(
             f"🆔 HA Watchdog initialized. Node ID: {self.node_id} (Host: {self.hostname}, "
             f"Spec: {self.cpu_cores} cores / {self.memory_gb} GB RAM / {self.os_name}, "
-            f"Priority: {self.priority}, Failover threshold: {self.fail_threshold} checks = {self.fail_threshold * self.check_interval:.0f}s)"
+            f"Priority: {self.priority}, Failover threshold: {self.fail_threshold} checks = {self.fail_threshold * self.check_interval:.0f}s, "
+            f"Tunnel Failover: {'ENABLED' if self.has_tunnel else 'DISABLED'})"
         )
 
     def _calc_fail_threshold(self, priority: int) -> int:
@@ -326,6 +353,16 @@ class HAWatchdog:
                         logger.info("⏸️ [HA Watchdog] Master が計画アップデート中 (updating: true) です。フェイルオーバーを猶予待機します。")
                         self.fail_count = 0
 
+                    # Master のコード更新検知 & 自律アップデート
+                    master_code_hash = data.get("code_hash")
+                    force_update = data.get("force_update", False)
+                    if master_code_hash and (self.current_code_hash is None or master_code_hash != self.current_code_hash or force_update):
+                        if self.current_code_hash is not None or force_update:
+                            logger.info(f"🔄 [HA Watchdog] Master code update detected ({self.current_code_hash[:10] if self.current_code_hash else 'initial'} -> {master_code_hash[:10]}). Triggering auto-update...")
+                            self.sync_code_snapshot(master_code_hash)
+                        else:
+                            self.current_code_hash = master_code_hash
+
                     return data.get("is_active", True)
                 elif resp.status == 410:
                     self._handle_revocation()
@@ -433,21 +470,103 @@ class HAWatchdog:
             logger.error(f"DB sync error: {e}")
         return False
 
+    def sync_code_snapshot(self, master_hash: str) -> bool:
+        """Master の /api/ha/code_snapshot から最新ソースコードをプルして自律再起動"""
+        if not self.master_url or not self.ha_secret:
+            return False
+
+        # 連続更新を防ぐためのクールダウン (30秒)
+        now = time.time()
+        if now - self.last_code_update_time < 30.0:
+            return False
+
+        sync_url = f"{self.master_url}/api/ha/code_snapshot"
+        headers = self._get_common_headers()
+        if self.current_code_hash:
+            headers["If-None-Match"] = f'"{self.current_code_hash}"'
+
+        req = urllib.request.Request(sync_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                if resp.status == 304:
+                    self.current_code_hash = master_hash
+                    return True
+
+                if resp.status != 200:
+                    logger.warning(f"Code snapshot sync failed with HTTP {resp.status}")
+                    return False
+
+                compressed = resp.read()
+                code_hash = resp.headers.get("X-Code-Hash", master_hash)
+
+                # 解凍先ディレクトリの決定 (コンテナ内 /app/src またはローカル src)
+                custom_src = os.getenv("TTSBOT_SRC_DIR", "").strip()
+                if custom_src:
+                    target_src = Path(custom_src)
+                else:
+                    target_src = Path(__file__).resolve().parent
+                    if target_src.name != "src":
+                        target_src = target_src.parent / "src"
+
+                target_src.mkdir(parents=True, exist_ok=True)
+                buf = io.BytesIO(compressed)
+                with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+                    for member in tar.getmembers():
+                        parts = Path(member.name).parts
+                        if parts and parts[0] == "src":
+                            rel_path = Path(*parts[1:])
+                        else:
+                            rel_path = Path(member.name)
+                        dest_path = target_src / rel_path
+                        if ".." in dest_path.parts:
+                            continue
+                        if member.isdir():
+                            dest_path.mkdir(parents=True, exist_ok=True)
+                        elif member.isfile():
+                            dest_path.parent.mkdir(parents=True, exist_ok=True)
+                            f = tar.extractfile(member)
+                            if f:
+                                dest_path.write_bytes(f.read())
+
+                self.current_code_hash = code_hash
+                self.last_code_update_time = now
+                logger.info(f"✨ [HA Watchdog] Source code synchronized successfully from Master! (Hash: {code_hash[:10]}...)")
+                logger.info("🔄 [HA Watchdog] Reloading watchdog process to apply latest code...")
+
+                # プロセス自律リロード (メモリ上書き再起動)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+                return True
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                self.current_code_hash = master_hash
+                self.last_code_update_time = now
+                logger.info("✓ [HA Watchdog] Source code is already up-to-date (304 Not Modified).")
+                return True
+            logger.error(f"Failed to synchronize code snapshot from Master (HTTP {e.code}): {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to synchronize code snapshot from Master: {e}")
+            return False
+
     async def promote_to_active(self):
-        """Slave を ACTIVE に昇格 (Docker で app コンテナを起動)"""
+        """Slave を ACTIVE に昇格 (Docker で app コンテナ、および設定時は tunnel コンテナを起動)"""
         logger.warning("🚨 [FAILOVER] Master outage detected! Promoting Slave to ACTIVE...")
 
         promoted = False
-        # 1. Docker CLI による起動
+        target_services = ["app"]
+        if self.has_tunnel:
+            target_services.append("tunnel")
+
+        # 1. Docker CLI による起動 (--profile active で app および tunnel を一括起動)
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker", "compose", "up", "-d", "app",
+                "docker", "compose", "--profile", "active", "up", "-d", *target_services,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await proc.communicate()
             if proc.returncode == 0:
-                logger.info("✓ [Docker Compose] 'app' container started successfully.")
+                logger.info(f"✓ [Docker Compose] {target_services} container(s) started successfully.")
                 promoted = True
         except Exception as e:
             logger.debug(f"Docker compose CLI exec failed: {e}")
@@ -455,33 +574,51 @@ class HAWatchdog:
         # 2. Unix Socket による直接起動 (CLI が無い環境のフォールバック)
         if not promoted and self.docker.is_available():
             containers = self.docker.find_app_containers()
+            started_app = False
             for c in containers:
                 c_id = c.get("Id", "")
                 if self.docker.start_container(c_id):
-                    logger.info(f"✓ [Docker Socket] Started container: {c_id[:12]}")
-                    promoted = True
+                    logger.info(f"✓ [Docker Socket] Started app container: {c_id[:12]}")
+                    started_app = True
+
+            if self.has_tunnel:
+                tunnel_containers = self.docker.find_tunnel_containers()
+                for c in tunnel_containers:
+                    c_id = c.get("Id", "")
+                    if self.docker.start_container(c_id):
+                        logger.info(f"✓ [Docker Socket] Started tunnel container: {c_id[:12]}")
+
+            if started_app:
+                promoted = True
 
         if promoted:
             self.current_state = "active"
-            logger.info("🎉 Slave is now ACTIVE! Discord Gateway and VC connections taken over.")
+            logger.info(
+                f"🎉 Slave is now ACTIVE! Discord Gateway and VC connections taken over "
+                f"(Tunnel: {'ENABLED' if self.has_tunnel else 'DISABLED'})."
+            )
         else:
-            logger.error("❌ Failed to start app container during promotion!")
+            logger.error("❌ Failed to start app/tunnel containers during promotion!")
 
     async def demote_to_standby(self):
-        """Slave を STANDBY に降格 (Master 復旧時の自動プリエンプト)"""
+        """Slave を STANDBY に降格 (Master 復旧時の自動プリエンプト: app および tunnel を停止)"""
         logger.info("✨ [PREEMPT] Master is healthy again (/health 200 OK)! Demoting Slave to STANDBY...")
 
         demoted = False
+        target_services = ["app"]
+        if self.has_tunnel:
+            target_services.append("tunnel")
+
         # 1. Docker CLI による停止
         try:
             proc = await asyncio.create_subprocess_exec(
-                "docker", "compose", "stop", "app",
+                "docker", "compose", "--profile", "active", "stop", *target_services,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await proc.communicate()
             if proc.returncode == 0:
-                logger.info("✓ [Docker Compose] 'app' container stopped successfully.")
+                logger.info(f"✓ [Docker Compose] {target_services} container(s) stopped successfully.")
                 demoted = True
         except Exception as e:
             logger.debug(f"Docker compose CLI stop failed: {e}")
@@ -489,6 +626,8 @@ class HAWatchdog:
         # 2. Unix Socket による直接停止
         if not demoted and self.docker.is_available():
             containers = self.docker.find_app_containers()
+            if self.has_tunnel:
+                containers.extend(self.docker.find_tunnel_containers())
             for c in containers:
                 c_id = c.get("Id", "")
                 if self.docker.stop_container(c_id, timeout_sec=5):

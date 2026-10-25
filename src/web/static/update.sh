@@ -178,16 +178,23 @@ else
   exit 1
 fi
 
-# 7. ボランティアワーカーへの最新化ブロードキャスト
-log_step "7. 接続中ボランティアワーカーへの自動更新通知"
+# 7. ボランティアワーカー & HA Standby Slave への最新化ブロードキャスト
+log_step "7. 接続中ボランティアワーカー & HA Standby Slave への自動更新通知"
 docker compose exec -T app python -c "
 import urllib.request, os
+p = os.getenv('WEB_PORT', '8080')
 try:
-    p = os.getenv('WEB_PORT', '8080')
     req = urllib.request.Request(f'http://127.0.0.1:{p}/api/worker/broadcast_update', data=b'{}', headers={'Content-Type': 'application/json', 'User-Agent': 'InternalUpdate'})
     urllib.request.urlopen(req, timeout=3)
     print('  [Worker Update] 接続中の全ボランティアワーカーへ更新通知を送信しました。')
-except Exception as e:
+except Exception:
+    pass
+
+try:
+    req_ha = urllib.request.Request(f'http://127.0.0.1:{p}/api/ha/broadcast_update', data=b'{}', headers={'Content-Type': 'application/json', 'User-Agent': 'InternalUpdate'})
+    urllib.request.urlopen(req_ha, timeout=3)
+    print('  [HA Update] 全 HA Standby Slave ノードへ即時自己アップデート通知を送信しました。')
+except Exception:
     pass
 " 2>/dev/null || true
 

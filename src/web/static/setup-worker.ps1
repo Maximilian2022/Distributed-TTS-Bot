@@ -12,7 +12,7 @@
 #   - 自己アップデート機能（WebUI から /update エンドポイント経由）
 # ==============================================================================
 
-$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8088" }
+$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8080" }
 $WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) { $env:TTSBOT_WORKER_SECRET } else { "" }
 $WorkDir    = if ($env:TTSBOT_WORK_DIR)   { $env:TTSBOT_WORK_DIR   } else { "$HOME\ttsbot-worker" }
 $WorkDirUnix = $WorkDir.Replace('\', '/')
@@ -450,13 +450,39 @@ try {
     }
 } catch { }
 
-# Agent スクリプト取得
-Write-Host "  📥 Worker Agent スクリプトを取得中..." -ForegroundColor Blue
-try {
-    Invoke-WebRequest -Uri "$MasterUrl/static/agent.py" -OutFile "$WorkDir\docker\agent\agent.py" -UseBasicParsing
-    Write-Host "  ✅ agent.py を取得しました。" -ForegroundColor Green
-} catch {
-    Write-Host "  ⚠️  agent.py の取得に失敗しました。手動で配置してください。" -ForegroundColor Yellow
+# Agent スクリプト取得 (最大3回リトライ + 既存ファイル再利用フォールバック)
+Write-Host "  📥 Worker Agent スクリプトを取得中... ($MasterUrl/static/agent.py)" -ForegroundColor Blue
+$AgentTarget = "$WorkDir\docker\agent\agent.py"
+$AgentFetched = $false
+$LastErr = ""
+
+for ($retry = 1; $retry -le 3; $retry++) {
+    try {
+        Invoke-WebRequest -Uri "$MasterUrl/static/agent.py" -OutFile $AgentTarget -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+        if ((Test-Path $AgentTarget) -and ((Get-Item $AgentTarget).Length -gt 0)) {
+            $AgentFetched = $true
+            Write-Host "  ✅ agent.py を $MasterUrl から取得しました。" -ForegroundColor Green
+            break
+        }
+    } catch {
+        $LastErr = $_.Exception.Message
+        Write-Host "  ⚠️  agent.py 取得試行 [$retry/3] に失敗しました。待機して再試行します..." -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
+    }
+}
+
+if (-not $AgentFetched) {
+    if ((Test-Path $AgentTarget) -and ((Get-Item $AgentTarget).Length -gt 0)) {
+        Write-Host "  ⚠️  Master からの最新 agent.py 取得に失敗しましたが、既存の agent.py を再利用します。" -ForegroundColor Yellow
+    } else {
+        Write-Host "  ❌ agent.py の取得に失敗しました。" -ForegroundColor Red
+        if ($LastErr) {
+            Write-Host "     詳細エラー: $LastErr" -ForegroundColor Red
+        }
+        Write-Host "     接続先: $MasterUrl/static/agent.py" -ForegroundColor Yellow
+        Write-Host "     ※ `$env:TTSBOT_MASTER_URL で正しい Master サーバーURLを指定するか、" -ForegroundColor Yellow
+        Write-Host "        手動で $AgentTarget にスクリプトを配置してください。" -ForegroundColor Yellow
+    }
 }
 
 Write-Host "✅ 構成ファイルの展開が完了しました。" -ForegroundColor Green
