@@ -1,16 +1,14 @@
-"""
-ボランティア型分散音声合成ワーカー用 WebSocket 通信プロトコル仕様
-- 高速バイナリフレーム転送 (ゼロコピー・Base64不要)
-- 双方向ストリーミング & ヘルスチェック
-- 型定義 & シリアライザ
-"""
+from __future__ import annotations
 
 import struct
 import time
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, Tuple
 
 PROTOCOL_VERSION = "2.0.0"
+
+# アンパック返却用型ヒント
+Tuple_BinaryChunk = Tuple[str, int, bool, bytes]
 
 # バイナリフレーム固定ヘッダーサイズ: 32 bytes (req_id hex) + 4 bytes (chunk_idx) + 1 byte (flags) = 37 bytes
 BINARY_HEADER_FORMAT = ">32sIB"
@@ -129,6 +127,3 @@ def unpack_binary_chunk(data: bytes) -> Tuple_BinaryChunk:
     payload = data[BINARY_HEADER_SIZE:]
     return req_id, chunk_index, is_final, payload
 
-# アンパック返却用型ヒント
-from typing import Tuple
-Tuple_BinaryChunk = Tuple[str, int, bool, bytes]
