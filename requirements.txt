@@ -1,5 +1,5 @@
 discord.py[voice]>=2.7.1
-azure-cognitiveservices-speech>=1.52.0
+azure-cognitiveservices-speech>=1.53.0
 google-cloud-texttospeech>=2.38.0
 aiosqlite>=0.22.1
 PyYAML>=6.0.3
