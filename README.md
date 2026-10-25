@@ -7,7 +7,7 @@
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED.svg)
 ![Discord](https://img.shields.io/badge/Discord-pycord-5865F2.svg)
 
-**分散コンピュート・超低遅延ストリーミング対応の次世代 Discord 音声合成（TTS）Bot**
+**分散コンピュート・超低遅延ストリーミング対応の Discord 音声合成（TTS）Bot**
 
 [日本語ドキュメント](README.md) | [English Documentation](README.en.md)
 
