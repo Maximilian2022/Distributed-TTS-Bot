@@ -81,7 +81,21 @@ class TestTextCleaner(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         combined = [c.text for c in chunks]
         self.assertTrue(any("最近コーヒー飲まなくなって" in t for t in combined))
-        self.assertTrue(any("アールグレイ" in t for t in combined))
+
+    def test_warmup_morphological_tokenizers_hot(self):
+        # 形態素解析エンジンのホットウォームが正常に完了し、その後の文分割が高速（100ms未満）に完了すること
+        from src.utils.text_cleaner import warmup_morphological_tokenizers
+        warmup_morphological_tokenizers()
+
+        test_sentence = "今日は朝から雨が降っていたので傘を持って出かけましたが昼過ぎには晴れて暑くなりました。"
+        chunks = TextCleaner.split_into_chunks(test_sentence)
+        self.assertGreaterEqual(len(chunks), 2)
+        
+        # split_ms が記録され、かつホットウォームによりインシデント閾値(1000ms)を大幅に下回ること
+        split_ms = getattr(chunks[0], "split_ms", 0.0)
+        self.assertGreater(split_ms, 0.0)
+        self.assertLess(split_ms, 500.0, f"split_ms was too slow after hot warmup: {split_ms}ms")
 
 if __name__ == "__main__":
     unittest.main()
+

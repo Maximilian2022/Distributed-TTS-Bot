@@ -93,9 +93,44 @@ def get_janome_tokenizer():
     return _janome_tokenizer
 
 def warmup_morphological_tokenizers():
-    """形態素解析エンジン（SudachiPy / Janome）を起動時・バックグラウンドで事前ロードし、イベントループブロッキングを根絶"""
-    get_sudachi_tokenizer()
-    get_janome_tokenizer()
+    """
+    形態素解析エンジン（SudachiPy / Janome）を起動時・バックグラウンドで完全事前ロード（ホットウォーム）し、
+    最初のリクエストや語彙初回出現時の辞書展開・mmapページフォールト（1.5s〜7.4sの遅延）を根絶する。
+    """
+    t_start = time.perf_counter()
+    warm_samples = [
+        "私は昨日、東京駅で美味しいご飯を食べたのでとても満足しました。しかし、明日は大雨が降るそうです。",
+        "ちゃんとdm受け取れるようにしとけやコラって書いてあるよ。ねえゆきくん閣下にもらったジェムの倍以上減ったから補填して！",
+        "【気象警報】新潟地方に大雨警報が発表されました。低い土地の浸水や河川の増水に警戒してください。"
+    ]
+
+    # 1. SudachiPy のホットウォーム
+    s_tok, s_mode = get_sudachi_tokenizer()
+    if s_tok is not None and s_mode is not None:
+        try:
+            for sample in warm_samples:
+                _ = list(s_tok.tokenize(sample, s_mode))
+        except Exception as e:
+            logger.debug(f"SudachiPy warm-up tokenize error: {e}")
+
+    # 2. Janome のホットウォーム (フォールバック用)
+    j_tok = get_janome_tokenizer()
+    if j_tok is not None:
+        try:
+            for sample in warm_samples:
+                _ = list(j_tok.tokenize(sample))
+        except Exception as e:
+            logger.debug(f"Janome warm-up tokenize error: {e}")
+
+    # 3. TextCleaner の文章分割パイプライン全体のホットウォーム
+    try:
+        for sample in warm_samples:
+            _ = TextCleaner.split_into_chunks(sample, author_prefix="テストユーザー")
+    except Exception as e:
+        logger.debug(f"TextCleaner warm-up error: {e}")
+
+    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+    logger.info(f"✨ [TextCleaner] 形態素解析エンジンのホットウォーム完了 (SudachiPy / Janome, 所要時間: {elapsed_ms:.1f}ms)")
 
 @dataclass
 class TextChunk:
