@@ -1150,10 +1150,22 @@ class WebServer:
         host_info = get_host_system_info()
         master_port = int(os.getenv("HOST_WEB_PORT", getattr(self.config, "web_port", 8088)) or 8088)
 
+        if not hasattr(self, "ha_slave_delivered_update_nodes"):
+            self.ha_slave_delivered_update_nodes = {}
+
         force_target = False
         if node_id and hasattr(self, "ha_slave_force_update_nodes"):
-            if (now_ts - self.ha_slave_force_update_nodes.get(node_id, 0.0)) < 120.0:
+            req_time = self.ha_slave_force_update_nodes.get(node_id, 0.0)
+            delivered_time = self.ha_slave_delivered_update_nodes.get(node_id, 0.0)
+            if (now_ts - req_time) < 120.0 and delivered_time < req_time:
                 force_target = True
+
+        broadcast_force = False
+        broadcast_time = getattr(self, "ha_force_update_time", 0.0)
+        if (now_ts - broadcast_time) < 120.0:
+            delivered_time = self.ha_slave_delivered_update_nodes.get(node_id, 0.0)
+            if delivered_time < broadcast_time:
+                broadcast_force = True
 
         return web.json_response({
             "status": "ok",
@@ -1179,7 +1191,7 @@ class WebServer:
             "timestamp": time.time(),
             "version": AGENT_VERSION,
             "code_hash": code_hash,
-            "force_update": ((now_ts - self.ha_force_update_time) < 120.0) or force_target
+            "force_update": force_target or broadcast_force
         })
 
     def _get_code_hash(self) -> str:
@@ -1348,6 +1360,12 @@ class WebServer:
                 "X-Code-Hash": code_hash,
                 "Cache-Control": "no-cache"
             }
+            if node_id:
+                if not hasattr(self, "ha_slave_delivered_update_nodes"):
+                    self.ha_slave_delivered_update_nodes = {}
+                self.ha_slave_delivered_update_nodes[node_id] = now_ts
+                logger.info(f"✓ [HA] Delivered code snapshot to node '{node_id}'. Force update flag consumed.")
+
             return web.Response(body=tar_data, headers=headers)
         except Exception as e:
             logger.error(f"[HA] Failed to generate code snapshot: {e}", exc_info=True)

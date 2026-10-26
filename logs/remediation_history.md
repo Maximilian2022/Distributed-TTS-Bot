@@ -1,6 +1,39 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-27] Standby自律更新無限リロードループ解消 & Cloudflare Tunnel復旧待ちフェイルオーバー閾値引き上げ (90秒化)
+- **ユーザーフィードバック & 課題**:
+  - WebUIから「Standbyを更新」ボタンを押下後、Standby Slaveでコード更新とプロセス再起動が無限ループ（2〜3秒おきにリロード）する事象が発生:
+    ```
+    [HA-Watchdog] 🔄 [HA Watchdog] Master code update detected (initial -> 67d96ee9dc). Triggering auto-update...
+    [HA-Watchdog] ✨ [HA Watchdog] Source code verified and synchronized successfully!
+    [HA-Watchdog] 🔄 [HA Watchdog] Reloading watchdog process to apply latest code...
+    [HA-Watchdog] 🆔 HA Watchdog initialized. Node ID: slave_f960592ba045_00af7ef3...
+    ```
+  - 「Masterコンテナの再作成時、Cloudflare Tunnelがオリジンとの接続を再確立して502が解消されるまでに30秒〜45秒程度かかる。Priority 1の閾値が30秒だったため復旧前に誤昇格してしまう設計ミスがあった。この部分の修正だけど、90秒まで待つ感じにしようか。」
+- **原因分析**:
+  1. **Standby自律更新無限ループ**:
+     - Master側がWebUIからの更新要求を受けた際、120秒間 `force_update: true` を返し続ける仕様だった。
+     - 一方、Slave側のWatchdogは `os.execv` による再起動でメモリ空間がリセットされるため、`current_code_hash` が初期化され、起動直後のヘルスチェックで再び Master から `force_update: true` を受信。
+     - これにより、コードダウンロード → 検証 → 再起動 → 受信 → 再起動… という無限ループに陥っていた。
+  2. **Cloudflare Tunnel復旧遅延と閾値の逆転**:
+     - MasterUbuntuでコンテナを再作成・ロールオーバーした際、Cloudflare Tunnelがオリジン接続を再確立してエッジ全体で502が解消されるまでに30秒〜45秒程度を要する。
+     - 従来のPriority 1閾値 `TTSBOT_FAIL_THRESHOLD=6`（6回 × 5秒 = 30秒）はトンネル復帰時間より短く、正常な再起動・再接続サイクル中に誤ってStandbyが昇格を試みてしまっていた。
+- **対応内容**:
+  1. **Master側 ワンショット消費フラグ導入 (`src/web/server.py`)**:
+     - `ha_slave_delivered_update_nodes` を新設。
+     - Slaveノードが `/api/ha/code_snapshot` をダウンロード完了した時点で配信済み時刻を記録し、次回以降そのノードに対する `force_update` を即時消費（無効化）。
+  2. **Slave側 ハッシュ・更新時刻永続化 & 60秒デバウンス (`src/ha_watchdog.py`)**:
+     - `ha_code_hash.txt` および `ha_code_update_time.txt` をディスクに永続化し、`os.execv` 後も直前の適用ハッシュと更新時刻を保持。
+     - `is_master_healthy()` および `sync_code_snapshot()` にて、直近のコード更新から60秒以内は再更新を行わないデバウンス（再起動ループ防止ガード）を組み込み。
+  3. **フェイルオーバー閾値の90秒（18 checks）引き上げ (`src/ha_watchdog.py`)**:
+     - `self.base_fail_threshold` のデフォルト値を `6`（30秒）から `18`（18 checks × 5秒 = 90秒）へ引き上げ。
+     - トンネル復旧待ち時間（30〜45秒）に対して十分な安全マージン（約2倍）を確保し、一時的なトンネル瞬断による誤昇格を根絶。
+     - カスケード待機設定: Priority 1 = 90秒（18回）、Priority 2 = 180秒（36回/3分）、Priority 3 = 300秒（60回/5分）。
+- **検証結果**:
+  - `python3 -m py_compile src/ha_watchdog.py src/web/server.py` 構文検査合格。
+
+
 ## [2026-10-26] HA Watchdog WAN/LAN多段死活確認 & 誤フェイルオーバー防止機構 (Split-Brain Guard) 実装
 - **ユーザーフィードバック & 課題**:
   - Standby側（MasterCentos）でヘルスチェックが連続失敗（502 Bad Gateway）し、フェイルオーバー誤昇格ループ（`Failed to start app/tunnel containers during promotion!`）が発生。

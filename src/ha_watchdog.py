@@ -155,9 +155,9 @@ class HAWatchdog:
 
         self.ha_secret = os.getenv("TTSBOT_HA_SECRET", os.getenv("HA_SECRET", "")).strip()
         self.check_interval = float(os.getenv("TTSBOT_CHECK_INTERVAL", "5.0"))
-        self.base_fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "6"))  # 基本: 6回 (約30秒)
+        self.base_fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "18"))  # 基本: 18回 (約90秒: Cloudflare Tunnel再確立遅延30〜45秒を確実に吸収)
         self.priority = int(os.getenv("TTSBOT_HA_PRIORITY", "1"))  # 優先度 (1=最速昇格、2=待機昇格)
-        # 待機時間を十分確保 (Priority 1: 30秒, Priority 2: 3分, Priority 3: 5分)
+        # 待機時間を十分確保 (Priority 1: 90秒, Priority 2: 3分, Priority 3: 5分)
         # Cloudflare Tunnel の切り替えや先行ノードの起動完了を待つため
         self.fail_threshold = self._calc_fail_threshold(self.priority)
         self.sync_interval = float(os.getenv("TTSBOT_SYNC_INTERVAL", "60.0"))  # 1分周期でDB同期
@@ -205,8 +205,10 @@ class HAWatchdog:
         self.fail_count = 0
         self.last_sync_time = 0.0
         self.last_db_hash: Optional[str] = None
-        self.current_code_hash: Optional[str] = None
-        self.last_code_update_time = 0.0
+        self.code_hash_file = self.db_path.parent / "ha_code_hash.txt"
+        self.code_update_time_file = self.db_path.parent / "ha_code_update_time.txt"
+        self.current_code_hash: Optional[str] = self._load_code_hash()
+        self.last_code_update_time = self._load_last_code_update_time()
         self.running = True
 
         logger.info(
@@ -220,7 +222,7 @@ class HAWatchdog:
     def _calc_fail_threshold(self, priority: int) -> int:
         """
         Priority ごとのフェイルオーバー無応答回数 (5秒/回) を算出。
-        - Priority 1: 6 回 = 30秒 (最速フェイルオーバー)
+        - Priority 1: 18 回 = 90秒 (Master再起動時のCloudflare Tunnel復旧遅延30〜45秒を確実に吸収)
         - Priority 2: 36 回 = 180秒 (約3分: 先行ノードの起動・Cloudflare Tunnel 切り替え完了を十分待機)
         - Priority 3: 60 回 = 300秒 (約5分)
         - Priority N: 36 + (priority - 2) * 24 回 (約5分 + 2分刻み)
@@ -274,6 +276,42 @@ class HAWatchdog:
         except Exception as e:
             logger.debug(f"Failed to save master cache: {e}")
 
+    def _load_code_hash(self) -> Optional[str]:
+        """直前に展開されたコードハッシュをファイルから復元"""
+        try:
+            if hasattr(self, "code_hash_file") and self.code_hash_file.exists():
+                val = self.code_hash_file.read_text(encoding="utf-8").strip()
+                return val if val else None
+        except Exception:
+            pass
+        return None
+
+    def _save_code_hash(self, code_hash: str):
+        """適用したコードハッシュをファイルに永続化"""
+        try:
+            if hasattr(self, "code_hash_file") and code_hash:
+                self.code_hash_file.parent.mkdir(parents=True, exist_ok=True)
+                self.code_hash_file.write_text(code_hash.strip(), encoding="utf-8")
+        except Exception as e:
+            logger.debug(f"Failed to save code hash: {e}")
+
+    def _load_last_code_update_time(self) -> float:
+        """直前にコード更新が行われた時刻を復元 (短時間での多重再起動ループ防止)"""
+        try:
+            if hasattr(self, "code_update_time_file") and self.code_update_time_file.exists():
+                return float(self.code_update_time_file.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+        return 0.0
+
+    def _save_last_code_update_time(self, ts: float):
+        """直近のコード更新時刻を保存"""
+        try:
+            if hasattr(self, "code_update_time_file"):
+                self.code_update_time_file.parent.mkdir(parents=True, exist_ok=True)
+                self.code_update_time_file.write_text(str(ts), encoding="utf-8")
+        except Exception as e:
+            logger.debug(f"Failed to save code update time: {e}")
 
     def is_higher_priority_active(self) -> bool:
         """
@@ -492,15 +530,19 @@ class HAWatchdog:
                             logger.info("⏸️ [HA Watchdog] Master が計画アップデート中 (updating: true) です。フェイルオーバーを猶予待機します。")
                             self.fail_count = 0
 
-                        # Master のコード更新検知 & 自律アップデート
+                        # Master のコード更新検知 & 自律アップデート (60秒クールダウン & ハッシュ永続化で再起動無限ループ防止)
+                        now_ts = time.time()
                         master_code_hash = data.get("code_hash")
                         force_update = data.get("force_update", False)
-                        if master_code_hash and (self.current_code_hash is None or master_code_hash != self.current_code_hash or force_update):
+                        if (now_ts - self.last_code_update_time) < 60.0:
+                            pass
+                        elif master_code_hash and (self.current_code_hash is None or master_code_hash != self.current_code_hash or force_update):
                             if self.current_code_hash is not None or force_update:
                                 logger.info(f"🔄 [HA Watchdog] Master code update detected ({self.current_code_hash[:10] if self.current_code_hash else 'initial'} -> {master_code_hash[:10]}). Triggering auto-update...")
                                 self.sync_code_snapshot(master_code_hash)
                             else:
                                 self.current_code_hash = master_code_hash
+                                self._save_code_hash(master_code_hash)
 
                         return data.get("is_active", True)
                     elif resp.status == 410:
@@ -631,9 +673,9 @@ class HAWatchdog:
         if not self.master_url or not self.ha_secret:
             return False
 
-        # 連続更新を防ぐためのクールダウン (30秒)
+        # 連続更新を防ぐためのクールダウン (60秒)
         now = time.time()
-        if now - self.last_code_update_time < 30.0:
+        if now - self.last_code_update_time < 60.0:
             return False
 
         sync_url = f"{self.master_url}/api/ha/code_snapshot"
@@ -711,6 +753,8 @@ class HAWatchdog:
 
                 self.current_code_hash = code_hash
                 self.last_code_update_time = now
+                self._save_code_hash(code_hash)
+                self._save_last_code_update_time(now)
                 logger.info(f"✨ [HA Watchdog] Source code verified and synchronized successfully! (Hash: {code_hash[:10]}...)")
                 logger.info("🔄 [HA Watchdog] Reloading watchdog process to apply latest code...")
 
@@ -721,6 +765,8 @@ class HAWatchdog:
             if e.code == 304:
                 self.current_code_hash = master_hash
                 self.last_code_update_time = now
+                self._save_code_hash(master_hash)
+                self._save_last_code_update_time(now)
                 logger.info("✓ [HA Watchdog] Source code is already up-to-date (304 Not Modified).")
                 return True
             logger.error(f"Failed to synchronize code snapshot from Master (HTTP {e.code}): {e}")
