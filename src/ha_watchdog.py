@@ -22,6 +22,8 @@ import tarfile
 import urllib.request
 import urllib.error
 import http.client
+import py_compile
+import shutil
 import socket
 import uuid
 import random
@@ -613,29 +615,54 @@ class HAWatchdog:
                     if target_src.name != "src":
                         target_src = target_src.parent / "src"
 
-                target_src.mkdir(parents=True, exist_ok=True)
-                buf = io.BytesIO(compressed)
-                with tarfile.open(fileobj=buf, mode="r:gz") as tar:
-                    for member in tar.getmembers():
-                        parts = Path(member.name).parts
-                        if parts and parts[0] == "src":
-                            rel_path = Path(*parts[1:])
-                        else:
-                            rel_path = Path(member.name)
-                        dest_path = target_src / rel_path
-                        if ".." in dest_path.parts:
-                            continue
-                        if member.isdir():
-                            dest_path.mkdir(parents=True, exist_ok=True)
-                        elif member.isfile():
-                            dest_path.parent.mkdir(parents=True, exist_ok=True)
-                            f = tar.extractfile(member)
-                            if f:
-                                dest_path.write_bytes(f.read())
+                # 壊れたコードによるクラッシュループを防ぐため、まず一時ディレクトリへ安全展開
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_src = Path(tmp_dir) / "src"
+                    tmp_src.mkdir(parents=True, exist_ok=True)
+                    buf = io.BytesIO(compressed)
+                    with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+                        for member in tar.getmembers():
+                            parts = Path(member.name).parts
+                            if parts and parts[0] == "src":
+                                rel_path = Path(*parts[1:])
+                            else:
+                                rel_path = Path(member.name)
+                            dest_path = tmp_src / rel_path
+                            if ".." in dest_path.parts:
+                                continue
+                            if member.isdir():
+                                dest_path.mkdir(parents=True, exist_ok=True)
+                            elif member.isfile():
+                                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                                f = tar.extractfile(member)
+                                if f:
+                                    dest_path.write_bytes(f.read())
+
+                    # 展開された全Pythonファイルの構文正当性を検証 (Gate 2)
+                    syntax_ok = True
+                    for py_f in tmp_src.rglob("*.py"):
+                        try:
+                            py_compile.compile(str(py_f), doraise=True)
+                        except py_compile.PyCompileError as pe:
+                            logger.error(f"❌ [HA Watchdog] Downloaded code contains syntax error in {py_f.name}: {pe}. Aborting reload to prevent crash loop!")
+                            syntax_ok = False
+                            break
+
+                    if not syntax_ok:
+                        return False
+
+                    # 構文検証合格: 本番ディレクトリへ配置
+                    target_src.mkdir(parents=True, exist_ok=True)
+                    for item in tmp_src.rglob("*"):
+                        if item.is_file():
+                            rel = item.relative_to(tmp_src)
+                            dest = target_src / rel
+                            dest.parent.mkdir(parents=True, exist_ok=True)
+                            dest.write_bytes(item.read_bytes())
 
                 self.current_code_hash = code_hash
                 self.last_code_update_time = now
-                logger.info(f"✨ [HA Watchdog] Source code synchronized successfully from Master! (Hash: {code_hash[:10]}...)")
+                logger.info(f"✨ [HA Watchdog] Source code verified and synchronized successfully! (Hash: {code_hash[:10]}...)")
                 logger.info("🔄 [HA Watchdog] Reloading watchdog process to apply latest code...")
 
                 # プロセス自律リロード (メモリ上書き再起動)

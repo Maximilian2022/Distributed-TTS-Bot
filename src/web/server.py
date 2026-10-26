@@ -19,6 +19,7 @@ import tarfile
 import hashlib
 import ipaddress
 import uuid
+import py_compile
 import aiohttp
 from aiohttp import web
 import discord
@@ -1310,6 +1311,17 @@ class WebServer:
 
         def _generate_code_tarball():
             src_dir = Path(__file__).resolve().parent.parent  # /app/src
+
+            # 配信前に全Pythonファイルの構文正当性を検証 (構文エラーがあるコードの配信を完全遮断)
+            for py_f in src_dir.rglob("*.py"):
+                if "__pycache__" in str(py_f):
+                    continue
+                try:
+                    py_compile.compile(str(py_f), doraise=True)
+                except py_compile.PyCompileError as pe:
+                    logger.error(f"[HA Code Snapshot] Syntax verification failed for {py_f}: {pe}")
+                    raise ValueError(f"Syntax verification failed for {py_f.name}: {pe}")
+
             buf = io.BytesIO()
             with tarfile.open(fileobj=buf, mode="w:gz") as tar:
                 def _filter(tarinfo):
