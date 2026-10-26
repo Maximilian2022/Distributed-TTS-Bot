@@ -1303,8 +1303,15 @@ class WebServer:
         if not self._verify_ha_auth(request):
             return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
 
+        now_ts = time.time()
+        is_force = (now_ts - getattr(self, "ha_force_update_time", 0.0)) < 120.0
+        node_id = request.headers.get("X-HA-Node-ID", "").strip()
+        if node_id and hasattr(self, "ha_slave_force_update_nodes"):
+            if (now_ts - self.ha_slave_force_update_nodes.get(node_id, 0.0)) < 120.0:
+                is_force = True
+
         code_hash = self._get_code_hash()
-        if request.headers.get("If-None-Match", "").strip('"') == code_hash:
+        if not is_force and request.headers.get("If-None-Match", "").strip('"') == code_hash:
             return web.Response(status=304, headers={"ETag": f'"{code_hash}"'})
 
         loop = asyncio.get_running_loop()
