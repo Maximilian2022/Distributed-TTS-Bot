@@ -188,11 +188,15 @@ class HAWatchdog:
         self.local_ips = self.host_info.get("local_ips", [])
         self.local_ip = next((ip for ip in self.local_ips if not ip.startswith("172.")), self.local_ips[0] if self.local_ips else "")
 
-        # ローカル直接接続 (Active Handshake) 検証状態
-        self.is_direct_verified = False
-        self.direct_master_url = ""
+        # ローカル直接接続 (Active Handshake) 検証状態 & キャッシュ永続化
+        self.master_cache_file = self.db_path.parent / "ha_master_cache.json"
+        master_cache = self._load_master_cache()
+        self.cached_master_local_ips: List[str] = master_cache.get("master_local_ips", [])
+        self.cached_master_port: int = master_cache.get("master_port", 8088)
+        self.master_instance_id: Optional[str] = master_cache.get("master_instance_id")
+        self.direct_master_url: str = master_cache.get("direct_master_url", "")
+        self.is_direct_verified: bool = bool(self.direct_master_url)
         self.last_direct_check_time = 0.0
-        self.master_instance_id: Optional[str] = None
 
         self.tunnel_token = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", os.getenv("TUNNEL_TOKEN", "")).strip()
         self.has_tunnel = bool(self.tunnel_token)
@@ -244,6 +248,32 @@ class HAWatchdog:
             self.cluster_nodes_file.write_text(json.dumps(self.cluster_nodes, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             logger.debug(f"Failed to save cluster nodes cache: {e}")
+
+    def _load_master_cache(self) -> Dict[str, Any]:
+        """前回の Master ローカルIP/ポート/instance_id キャッシュを読み込み (WAN障害時の即時直通確認用)"""
+        try:
+            if hasattr(self, "master_cache_file") and self.master_cache_file.exists():
+                return json.loads(self.master_cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _save_master_cache(self):
+        """Master ローカル情報を永続キャッシュに保存"""
+        try:
+            if hasattr(self, "master_cache_file"):
+                self.master_cache_file.parent.mkdir(parents=True, exist_ok=True)
+                data = {
+                    "master_local_ips": self.cached_master_local_ips,
+                    "master_port": self.cached_master_port,
+                    "master_instance_id": self.master_instance_id,
+                    "direct_master_url": self.direct_master_url,
+                    "updated_at": time.time(),
+                }
+                self.master_cache_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.debug(f"Failed to save master cache: {e}")
+
 
     def is_higher_priority_active(self) -> bool:
         """
@@ -384,6 +414,7 @@ class HAWatchdog:
                                 )
                             self.is_direct_verified = True
                             self.direct_master_url = candidate_url
+                            self._save_master_cache()
                             return True
                         else:
                             logger.warning(
@@ -412,86 +443,104 @@ class HAWatchdog:
         return False
 
     def is_master_healthy(self) -> bool:
-        """Master の死活確認 & ハートビート送信 (410 Gone で自律停止)"""
+        """Master の死活確認 & ハートビート送信 (410 Gone で自律停止) (WAN & LAN多段死活確認)"""
         if not self.master_url:
             return False
 
-        # まず /api/ha/status で認証付き死活確認 ＆ ハートビート送信
-        status_url = f"{self.master_url}/api/ha/status"
-        req = urllib.request.Request(status_url, headers=self._get_common_headers())
-        try:
-            with urllib.request.urlopen(req, timeout=4.0) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    assigned_p = data.get("assigned_priority") or data.get("priority")
-                    if assigned_p and isinstance(assigned_p, int) and assigned_p != self.priority:
-                        logger.info(f"🔄 [Priority] Master assigned new Priority: {self.priority} -> {assigned_p}")
-                        self.priority = assigned_p
-                        self.fail_threshold = self._calc_fail_threshold(self.priority)
-                        logger.info(f"⏱️ [Failover] New failover threshold: {self.fail_threshold} checks ({self.fail_threshold * self.check_interval:.0f}s)")
+        # 試行候補URLリスト:
+        # 1. WAN URL (self.master_url)
+        # 2. LAN直通検証済URL (self.direct_master_url) があれば即座に追加
+        candidate_urls = [self.master_url]
+        if self.is_direct_verified and self.direct_master_url and self.direct_master_url not in candidate_urls:
+            candidate_urls.append(self.direct_master_url)
 
-                    # Active Handshake: Master のローカルIPに対する暗号的・実体照合直接検証
-                    target_instance_id = data.get("master_instance_id")
-                    master_local_ips = data.get("master_local_ips", [])
-                    master_port = data.get("master_port", 8088)
-                    if target_instance_id and master_local_ips:
-                        self.master_instance_id = target_instance_id
-                        self.verify_master_local_direct(master_local_ips, master_port, target_instance_id)
+        headers = self._get_common_headers()
 
-                    # 他ノード (Peer Standbys) の最新情報をキャッシュ更新
-                    peers = data.get("cluster_nodes", [])
-                    if isinstance(peers, list):
-                        self.cluster_nodes = peers
-                        self._save_cluster_nodes()
+        for base_url in candidate_urls:
+            # まず /api/ha/status で認証付き死活確認 ＆ ハートビート送信
+            status_url = f"{base_url}/api/ha/status"
+            req = urllib.request.Request(status_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        assigned_p = data.get("assigned_priority") or data.get("priority")
+                        if assigned_p and isinstance(assigned_p, int) and assigned_p != self.priority:
+                            logger.info(f"🔄 [Priority] Master assigned new Priority: {self.priority} -> {assigned_p}")
+                            self.priority = assigned_p
+                            self.fail_threshold = self._calc_fail_threshold(self.priority)
+                            logger.info(f"⏱️ [Failover] New failover threshold: {self.fail_threshold} checks ({self.fail_threshold * self.check_interval:.0f}s)")
 
-                    # Master が計画アップデート中の場合、フェイルオーバー判定を一時猶予（fail_count をリセット）
-                    if data.get("is_updating") or data.get("updating"):
-                        logger.info("⏸️ [HA Watchdog] Master が計画アップデート中 (updating: true) です。フェイルオーバーを猶予待機します。")
-                        self.fail_count = 0
+                        # Active Handshake: Master のローカルIPに対する暗号的・実体照合直接検証
+                        target_instance_id = data.get("master_instance_id")
+                        master_local_ips = data.get("master_local_ips", [])
+                        master_port = data.get("master_port", 8088)
+                        if target_instance_id and master_local_ips:
+                            self.master_instance_id = target_instance_id
+                            self.cached_master_local_ips = master_local_ips
+                            self.cached_master_port = master_port
+                            self.verify_master_local_direct(master_local_ips, master_port, target_instance_id)
 
-                    # Master のコード更新検知 & 自律アップデート
-                    master_code_hash = data.get("code_hash")
-                    force_update = data.get("force_update", False)
-                    if master_code_hash and (self.current_code_hash is None or master_code_hash != self.current_code_hash or force_update):
-                        if self.current_code_hash is not None or force_update:
-                            logger.info(f"🔄 [HA Watchdog] Master code update detected ({self.current_code_hash[:10] if self.current_code_hash else 'initial'} -> {master_code_hash[:10]}). Triggering auto-update...")
-                            self.sync_code_snapshot(master_code_hash)
-                        else:
-                            self.current_code_hash = master_code_hash
+                        # 他ノード (Peer Standbys) の最新情報をキャッシュ更新
+                        peers = data.get("cluster_nodes", [])
+                        if isinstance(peers, list):
+                            self.cluster_nodes = peers
+                            self._save_cluster_nodes()
 
-                    return data.get("is_active", True)
-                elif resp.status == 410:
+                        # Master が計画アップデート中の場合、フェイルオーバー判定を一時猶予（fail_count をリセット）
+                        if data.get("is_updating") or data.get("updating"):
+                            logger.info("⏸️ [HA Watchdog] Master が計画アップデート中 (updating: true) です。フェイルオーバーを猶予待機します。")
+                            self.fail_count = 0
+
+                        # Master のコード更新検知 & 自律アップデート
+                        master_code_hash = data.get("code_hash")
+                        force_update = data.get("force_update", False)
+                        if master_code_hash and (self.current_code_hash is None or master_code_hash != self.current_code_hash or force_update):
+                            if self.current_code_hash is not None or force_update:
+                                logger.info(f"🔄 [HA Watchdog] Master code update detected ({self.current_code_hash[:10] if self.current_code_hash else 'initial'} -> {master_code_hash[:10]}). Triggering auto-update...")
+                                self.sync_code_snapshot(master_code_hash)
+                            else:
+                                self.current_code_hash = master_code_hash
+
+                        return data.get("is_active", True)
+                    elif resp.status == 410:
+                        self._handle_revocation()
+                        return False
+            except urllib.error.HTTPError as e:
+                if e.code == 410:
                     self._handle_revocation()
                     return False
-        except urllib.error.HTTPError as e:
-            if e.code == 410:
-                self._handle_revocation()
-                return False
-            logger.debug(f"Master HA status check HTTP {e.code}: {e.reason}")
-        except Exception as e:
-            logger.debug(f"Master HA status check failed: {e}")
+                logger.debug(f"Master HA status check HTTP {e.code} via {base_url}: {e.reason}")
+            except Exception as e:
+                logger.debug(f"Master HA status check failed via {base_url}: {e}")
 
-        # フォールバック: 通常の /health
-        health_url = f"{self.master_url}/health"
-        req_health = urllib.request.Request(health_url, headers=self._get_common_headers())
-        try:
-            with urllib.request.urlopen(req_health, timeout=4.0) as resp:
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    is_ok = data.get("status") == "ok"
-                    bot_ready = data.get("bot", {}).get("is_ready", False)
-                    return is_ok and bot_ready
-                elif resp.status == 410:
+            # フォールバック: 通常の /health
+            health_url = f"{base_url}/health"
+            req_health = urllib.request.Request(health_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req_health, timeout=4.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        is_ok = data.get("status") == "ok"
+                        bot_ready = data.get("bot", {}).get("is_ready", False)
+                        return is_ok and bot_ready
+                    elif resp.status == 410:
+                        self._handle_revocation()
+                        return False
+            except urllib.error.HTTPError as e:
+                if e.code == 410:
                     self._handle_revocation()
                     return False
-        except urllib.error.HTTPError as e:
-            if e.code == 410:
-                self._handle_revocation()
-                return False
-            logger.debug(f"Master health check failed: {e}")
-        except Exception as e:
-            logger.debug(f"Master health check failed: {e}")
-            return False
+                logger.debug(f"Master health check failed via {base_url}: {e}")
+            except Exception as e:
+                logger.debug(f"Master health check failed via {base_url}: {e}")
+
+        # もし WAN経由が失敗したが、キャッシュされた master_local_ips がある場合、直通検証をオンデマンド試行
+        if not self.is_direct_verified and self.cached_master_local_ips and self.master_instance_id:
+            if self.verify_master_local_direct(self.cached_master_local_ips, self.cached_master_port, self.master_instance_id):
+                logger.info("🟢 [HA Watchdog] Recovered direct connection to Master via cached LAN IPs!")
+                return True
+
         return False
 
     def _handle_revocation(self):
@@ -730,7 +779,8 @@ class HAWatchdog:
                 f"(Tunnel: {'ENABLED' if self.has_tunnel else 'DISABLED'})."
             )
         else:
-            logger.error("❌ Failed to start app/tunnel containers during promotion!")
+            logger.error("❌ Failed to start app/tunnel containers during promotion! Will retry monitoring Master.")
+            self.fail_count = 0
 
     async def demote_to_standby(self):
         """Slave を STANDBY に降格 (Master 復旧時の自動プリエンプト: app および tunnel を停止)"""
@@ -827,6 +877,18 @@ class HAWatchdog:
 
                     # 閾値到達 & 現在 Standby ならば昇格判定
                     if self.fail_count >= self.fail_threshold and self.current_state == "standby":
+                        # 0. 【LAN直通 Last-ditch 検証】WAN障害 (Cloudflare Tunnel瞬断/502 Bad Gateway) による誤昇格の完全防止
+                        if self.is_direct_verified and self.direct_master_url:
+                            logger.info(f"🔍 [Split-Brain Guard] Pre-promotion check: Verifying if Master is alive via LAN ({self.direct_master_url})...")
+                            is_master_lan_ok = await loop.run_in_executor(None, self.is_master_healthy)
+                            if is_master_lan_ok:
+                                logger.warning(
+                                    f"🛡️ [Split-Brain Guard] Master is responding via LAN direct connection ({self.direct_master_url})! "
+                                    "The outage is restricted to WAN/Tunnel. Suppressing promotion to prevent split-brain."
+                                )
+                                self.fail_count = 0
+                                continue
+
                         # 1. 外向きインターネット疎通の確認
                         has_net = await loop.run_in_executor(None, self.check_internet_connectivity)
                         if not has_net:
