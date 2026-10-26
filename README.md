@@ -9,7 +9,7 @@
 
 **分散コンピュート・超低遅延ストリーミング対応の Discord 音声合成（TTS）Bot**
 
-[日本語ドキュメント](README.md) | [English Documentation](README.en.md)
+[日本語ドキュメント](README.md) | [English Documentation](README.en.md) | [動作仕様詳細書 (MANUAL.md)](MANUAL.md)
 
 </div>
 
@@ -46,6 +46,9 @@ graph TD
     Cloud --> Stream
     Stream --> Discord
 ```
+
+> 📚 **システム設計・詳細仕様書**
+> アーキテクチャの内部構造、NAT越えWebSocket通信プロトコル、動的Botプール管理、データベース設計、およびフェイルオーバー・HA運用の詳細については、**[動作仕様詳細説明書 (MANUAL.md)](MANUAL.md)** をご覧ください。
 
 ---
 
@@ -191,6 +194,7 @@ $env:TTSBOT_SERVER_URL="wss://<YOUR_DOMAIN>/api/worker/ws"; $env:TTSBOT_WORKER_T
 
 サードパーティ製ライブラリの帰属表示、同梱モデル（MMDAgent Mei/Takumi）、および音声合成エンジン（VOICEVOX, COEIROINK, SHAREVOX）のキャラクター利用ガイドラインに関する免責事項については、**[NOTICE.md](NOTICE.md)** をご確認ください。
 
+- [動作仕様詳細説明書 (MANUAL)](MANUAL.md)
 - [行動規範 (Code of Conduct)](CODE_OF_CONDUCT.md) ([English](CODE_OF_CONDUCT.en.md))
 - [コントリビューションガイド (Contributing Guide)](CONTRIBUTING.md) ([English](CONTRIBUTING.en.md))
 - [セキュリティポリシー (Security Policy)](SECURITY.md) ([English](SECURITY.en.md))

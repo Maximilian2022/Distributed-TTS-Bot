@@ -9,7 +9,7 @@
 
 **Next-Generation Distributed Compute & Ultra-Low-Latency Streaming TTS Bot for Discord**
 
-[English Documentation](README.en.md) | [日本語ドキュメント (Japanese)](README.md)
+[English Documentation](README.en.md) | [日本語ドキュメント (Japanese)](README.md) | [Technical Manual (MANUAL.md)](MANUAL.md)
 
 </div>
 
@@ -46,6 +46,9 @@ graph TD
     Cloud --> Stream
     Stream --> Discord
 ```
+
+> 📚 **Technical Specifications & Architecture Manual**
+> For internal architecture details, NAT-traversing WebSocket protocols, dynamic bot pool scaling, database design, and HA failover procedures, please refer to the **[Technical Manual (MANUAL.md)](MANUAL.md)**.
 
 ---
 
@@ -191,6 +194,7 @@ Distributed-TTS-Bot is open-source software licensed under the **[Apache License
 
 For third-party software attributions, embedded voice models (MMDAgent Mei/Takumi), and voice engine (VOICEVOX, COEIROINK, SHAREVOX) character usage guidelines and disclaimers, please refer to **[NOTICE.md](NOTICE.md)**.
 
+- [Technical Manual (MANUAL.md)](MANUAL.md)
 - [Code of Conduct](CODE_OF_CONDUCT.en.md) ([日本語](CODE_OF_CONDUCT.md))
 - [Contributing Guide](CONTRIBUTING.en.md) ([日本語](CONTRIBUTING.md))
 - [Security Policy](SECURITY.en.md) ([日本語](SECURITY.md))
