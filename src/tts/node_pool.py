@@ -478,6 +478,29 @@ class TTSNode:
         engine_running = (self.engine_running is not False) and (self.specs.get("engine_running", True) is not False)
         engine_healthy = self.specs.get("engine_healthy", True) is not False
 
+        merged_specs = dict(self.specs)
+        # 自機マスターノード、または specs にホスト詳細が不足している場合の自動補完
+        if not self.is_external or not merged_specs.get("os_name") or not merged_specs.get("docker_version"):
+            try:
+                from src.utils.system_info import get_host_system_info
+                sys_info = get_host_system_info()
+                if not self.is_external:
+                    if not merged_specs.get("hostname") or merged_specs.get("hostname") == "local_master":
+                        merged_specs["hostname"] = sys_info.get("hostname", "MasterUbuntu")
+                        merged_specs["host_hostname"] = sys_info.get("hostname", "MasterUbuntu")
+                    if not merged_specs.get("os_name") or merged_specs.get("os_name") == "Linux":
+                        merged_specs["os_name"] = sys_info.get("os_name", "Linux")
+                        merged_specs["os"] = sys_info.get("os_name", "Linux")
+                    if not merged_specs.get("docker_version") or merged_specs.get("docker_version") == "N/A":
+                        merged_specs["docker_version"] = sys_info.get("docker_version", "N/A")
+                else:
+                    if not merged_specs.get("os_name") and merged_specs.get("os"):
+                        merged_specs["os_name"] = merged_specs["os"]
+            except Exception:
+                pass
+
+        resolved_host = merged_specs.get("host_hostname") or merged_specs.get("hostname") or self.hostname
+
         return {
             "id": self.id,
             "url": self.url,
@@ -491,8 +514,8 @@ class TTSNode:
             "engine_healthy": engine_healthy,
             "is_available": self.is_available,
             "is_healthy": self.is_available,  # 後方互換用
-            "hostname": self.hostname,
-            "specs": self.specs,
+            "hostname": resolved_host,
+            "specs": merged_specs,
             "last_heartbeat_ago": hb_ago,
             "total_requests": total,
             "failed_requests": failed,

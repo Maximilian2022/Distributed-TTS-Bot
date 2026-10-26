@@ -2707,21 +2707,43 @@ function renderWorkerNodes(nodesData) {
         }
       }
 
-    let resolvedHostname = rawHostname;
-    const cleanId = String(rawHostname || '').replace(/^worker_/, '').trim();
-    const isHexContainerId = /^[0-9a-f]{12}$/i.test(cleanId);
+    // ホスト名・マシン名の詳細解決
+    const hostCandidate = specs.host_hostname || specs.hostname || node.hostname || rawHostname || "";
+    const cleanCandidate = String(hostCandidate).replace(/^worker_/, '').trim();
+    const isHexHost = /^[0-9a-fA-F]{12}$/i.test(cleanCandidate);
 
-    if (isHexContainerId || cleanId.length === 12) {
-      if (specs.gpu_name) {
+    let workerHostDisplay = cleanCandidate;
+    if (isHexHost) {
+      if (isMaster) {
+        workerHostDisplay = "MasterUbuntu";
+      } else if (specs.gpu_name) {
         const cleanGpu = String(specs.gpu_name).replace(/NVIDIA (GeForce )?/i, '').trim();
-        resolvedHostname = `Worker (${cleanGpu})`;
-      } else if (specs.os) {
-        resolvedHostname = `Worker (${specs.os})`;
+        workerHostDisplay = `Worker (${cleanGpu})`;
+      } else if (specs.os_name || specs.os) {
+        workerHostDisplay = `Worker (${specs.os_name || specs.os})`;
       } else {
-        resolvedHostname = `Worker (${cleanId.substring(0, 6)})`;
+        workerHostDisplay = `Worker (${cleanCandidate.substring(0, 6)})`;
       }
-    } else if (cleanId) {
-      resolvedHostname = cleanId;
+    } else if (!cleanCandidate || cleanCandidate === "local_master") {
+      workerHostDisplay = isMaster ? "MasterUbuntu" : (nodeIp ? `Worker (${nodeIp})` : "Worker Node");
+    }
+
+    // OS種類の解決
+    let workerOsDisplay = specs.os_name || specs.os || specs.platform || "";
+    if (!workerOsDisplay) {
+      workerOsDisplay = isMaster ? "Ubuntu 26.04.1 LTS" : (isAgentOnline ? "検出中..." : "-");
+    }
+
+    // Docker version の解決
+    let workerDockerDisplay = "N/A";
+    if (specs.docker_version && specs.docker_version !== "N/A") {
+      workerDockerDisplay = specs.docker_version.startsWith("v") ? specs.docker_version : `v${specs.docker_version}`;
+    } else if (isVolunteer) {
+      workerDockerDisplay = "N/A (ボランティア)";
+    } else if (workerOsDisplay.includes("Windows") && !specs.docker_version) {
+      workerDockerDisplay = "N/A (Windows/WSL)";
+    } else if (isMaster) {
+      workerDockerDisplay = "v29.4.2";
     }
 
     // クラスタWorker (HTTP直接ポートを持つノード) が存在する場合、ボランティア判定に優先
@@ -2729,13 +2751,13 @@ function renderWorkerNodes(nodesData) {
     const isVolunteer = !hasClusterEngine && Boolean(
       node.is_volunteer || 
       (node.engines || []).every(e => e.is_volunteer) || 
-      cleanId.startsWith('volunteer_') || 
+      cleanCandidate.startsWith('volunteer_') || 
       (node.url && node.url.startsWith('ws://'))
     );
 
     // アイコン & ボランティアバッジ (エスケープ分離)
     const icon = isMaster ? "🏢" : (isVolunteer ? "🤝" : (hasGpu ? "🎮" : "🖥️"));
-    const nodeName = isMaster ? "MasterDebian (自機)" : resolvedHostname;
+    const nodeName = isMaster ? (workerHostDisplay.includes("Master") ? workerHostDisplay : `${workerHostDisplay} (Master)`) : workerHostDisplay;
     const volunteerBadge = isVolunteer
       ? '<span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;margin-left:4px;">🤝 ボランティア</span>'
       : '';
@@ -3043,7 +3065,13 @@ function renderWorkerNodes(nodesData) {
           ${actionButtons}
         </div>
       </div>
-      ${nodeIp ? `<div style="font-family:monospace;font-size:10px;color:var(--text-dim);background:rgba(0,0,0,0.2);padding:3px 8px;border-radius:4px;">${escapeHtml(node.url || '')}</div>` : ''}
+      <div style="font-size:11px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;background:rgba(0,0,0,0.22);padding:7px 10px;border-radius:6px;margin:2px 0;">
+        <div>ホスト: <strong style="color:var(--text-normal);">${escapeHtml(workerHostDisplay)}</strong></div>
+        <div>OS: <strong style="color:var(--text-normal);">${escapeHtml(workerOsDisplay)}</strong></div>
+        <div>Docker: <strong style="color:var(--text-normal);">${escapeHtml(workerDockerDisplay)}</strong></div>
+        <div>接続: <strong style="color:var(--text-normal);font-family:monospace;">${escapeHtml(nodeIp || '-')}</strong></div>
+      </div>
+      ${node.url ? `<div style="font-family:monospace;font-size:10px;color:var(--text-dim);background:rgba(0,0,0,0.15);padding:2px 8px;border-radius:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(node.url)}">${escapeHtml(node.url)}</div>` : ''}
       <div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--text-dim);">
         <span>優先度: ${priorityLabel}</span>
         ${semSlotLabel}
@@ -6937,8 +6965,14 @@ async function loadManagerNodes() {
         const lastSeenText = slave.last_seen_ago >= 0 ? `${slave.last_seen_ago}秒前` : (slave.last_seen > 0 ? new Date(slave.last_seen * 1000).toLocaleTimeString() : "未交信");
 
         let actionBtnHtml = "";
+        const updateBtn = `
+          <button class="btn btn-sm" onclick="triggerStandbyUpdate('${escapeHtml(slave.node_id)}', this)" style="background:rgba(88,101,242,0.15);border:1px solid rgba(88,101,242,0.4);color:#50e6ff;cursor:pointer;font-weight:600;padding:4px 10px;border-radius:6px;transition:all 0.2s;margin-right:6px;" title="このStandbyノードにMasterの最新コードを即時同期・自律アップデートさせます">
+            🔄 Standbyを更新
+          </button>
+        `;
         if (slave.status !== "revoked") {
           actionBtnHtml = `
+            ${updateBtn}
             <button class="btn btn-sm" onclick="revokeManagerSlave('${escapeHtml(slave.node_id)}')" style="background:rgba(231,76,60,0.15);border:1px solid rgba(231,76,60,0.4);color:#ff6b6b;cursor:pointer;font-weight:600;padding:4px 10px;border-radius:6px;transition:all 0.2s;" title="このSlaveノードを除外・停止します。次回アクセス時に410 Goneが送られ安全停止します。">
               🛑 登録解除 & 停止 (Revoke)
             </button>
@@ -7092,6 +7126,64 @@ async function deleteManagerSlave(nodeId) {
   }
 }
 window.deleteManagerSlave = deleteManagerSlave;
+
+async function triggerStandbyUpdate(nodeId, btn) {
+  if (!confirm(`Standbyノード [${nodeId}] に最新コードの同期と自律アップデートを指示しますか？\n（次のハートビート時に安全に自律更新・再起動されます）`)) return;
+  const originalText = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ 指示送信中..."; }
+  try {
+    const res = await fetch("/api/ha/broadcast_update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      if (typeof showToast === "function") {
+        showToast(`Standby [${nodeId}] に更新シグナルを送信しました`, "success");
+      } else {
+        alert(`Standby [${nodeId}] に更新シグナルを送信しました`);
+      }
+    } else {
+      alert(`更新指示エラー: ${data.error || res.statusText}`);
+    }
+  } catch (err) {
+    alert(`通信エラー: ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = originalText; }
+    loadManagerNodes();
+  }
+}
+window.triggerStandbyUpdate = triggerStandbyUpdate;
+
+async function triggerAllStandbysUpdate(btn) {
+  if (!confirm("すべてのStandby Slaveノードに最新コードの同期と自律アップデートを一括指示しますか？")) return;
+  const originalText = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ 一括送信中..."; }
+  try {
+    const res = await fetch("/api/ha/broadcast_update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      if (typeof showToast === "function") {
+        showToast("全Standbyノードに更新シグナルを一括送信しました", "success");
+      } else {
+        alert("全Standbyノードに更新シグナルを一括送信しました");
+      }
+    } else {
+      alert(`一括更新エラー: ${data.error || res.statusText}`);
+    }
+  } catch (err) {
+    alert(`通信エラー: ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = originalText; }
+    loadManagerNodes();
+  }
+}
+window.triggerAllStandbysUpdate = triggerAllStandbysUpdate;
 
 async function loadWorkerNodes() {
   try {

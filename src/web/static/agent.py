@@ -729,6 +729,44 @@ def get_effective_hostname() -> str:
         nid_sub = node_id[7:].strip()
         if nid_sub and not re.match(r"^[0-9a-fA-F]{12}$", nid_sub):
             return nid_sub
+
+    # Docker Socket API (/info) からホストマシンの真のホスト名を取得
+    docker_sock = "/var/run/docker.sock"
+    if os.path.exists(docker_sock):
+        try:
+            import http.client
+            class _UnixConn(http.client.HTTPConnection):
+                def __init__(conn_self, sp):
+                    super().__init__("localhost", timeout=2.0)
+                    conn_self.sp = sp
+                def connect(conn_self):
+                    conn_self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    conn_self.sock.settimeout(2.0)
+                    conn_self.sock.connect(conn_self.sp)
+            c = _UnixConn(docker_sock)
+            c.request("GET", "/info")
+            r = c.getresponse()
+            if r.status == 200:
+                info_j = json.loads(r.read())
+                host_n = info_j.get("Name", "")
+                if host_n and not re.match(r"^[0-9a-fA-F]{12}$", host_n.strip()):
+                    c.close()
+                    return host_n.strip()
+            c.close()
+        except Exception:
+            pass
+
+    # Windows wmic によるホスト名取得
+    if platform.system() == "Windows":
+        try:
+            w_res = subprocess.run(["wmic", "computersystem", "get", "name"], capture_output=True, text=True, timeout=3)
+            for line in w_res.stdout.splitlines():
+                line = line.strip()
+                if line and line.lower() != "name":
+                    return line
+        except Exception:
+            pass
+
     return socket.gethostname()
 
 
@@ -738,9 +776,68 @@ def detect_hardware_specs() -> Dict[str, Any]:
     Windows: nvidia-smi / wmic を利用
     Linux:   nvidia-smi / /proc/meminfo / nproc を利用
     """
+    host_h = get_effective_hostname()
+    
+    # OS詳細名の検出 (Ubuntu 24.04, Windows 11 等)
+    os_detail = platform.platform()
+    if platform.system() == "Linux":
+        try:
+            os_rel = Path("/etc/os-release")
+            if os_rel.exists():
+                for line in os_rel.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("PRETTY_NAME="):
+                        os_detail = line.split("=", 1)[1].strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+    elif platform.system() == "Windows":
+        try:
+            w_res = subprocess.run(["wmic", "os", "get", "Caption", "/value"], capture_output=True, text=True, timeout=4)
+            for line in w_res.stdout.splitlines():
+                if "Caption=" in line:
+                    os_detail = line.split("=", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
+    # Docker Engine バージョンの検出
+    docker_ver = "N/A"
+    docker_sock = "/var/run/docker.sock"
+    if os.path.exists(docker_sock):
+        try:
+            import http.client
+            class _UnixConn(http.client.HTTPConnection):
+                def __init__(conn_self, sp):
+                    super().__init__("localhost", timeout=2.0)
+                    conn_self.sp = sp
+                def connect(conn_self):
+                    conn_self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    conn_self.sock.settimeout(2.0)
+                    conn_self.sock.connect(conn_self.sp)
+            c = _UnixConn(docker_sock)
+            c.request("GET", "/version")
+            r = c.getresponse()
+            if r.status == 200:
+                v_json = json.loads(r.read())
+                docker_ver = v_json.get("Version", "N/A")
+            c.close()
+        except Exception:
+            pass
+    if docker_ver == "N/A":
+        try:
+            d_res = subprocess.run(["docker", "--version"], capture_output=True, text=True, timeout=3)
+            if d_res.returncode == 0 and d_res.stdout:
+                docker_ver = d_res.stdout.strip().replace("Docker version ", "").split(",")[0].strip()
+        except Exception:
+            pass
+
     specs: Dict[str, Any] = {
-        "hostname": get_effective_hostname(),
+        "hostname": host_h,
+        "host_hostname": host_h,
         "platform": platform.system(),
+        "os": os_detail,
+        "os_name": os_detail,
+        "docker_version": docker_ver,
         "cpu_count": os.cpu_count() or 1,
         "total_ram_gb": 0.0,
         "gpu": False,

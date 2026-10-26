@@ -123,6 +123,7 @@ class WebServer:
         self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
         self._load_ha_nodes()
         self.ha_force_update_time: float = 0.0
+        self.ha_slave_force_update_nodes: Dict[str, float] = {}
         self._code_hash_cache = None
         self._code_hash_cache_time = 0.0
         self.runner: Optional[web.AppRunner] = None
@@ -1148,6 +1149,11 @@ class WebServer:
         host_info = get_host_system_info()
         master_port = int(os.getenv("HOST_WEB_PORT", getattr(self.config, "web_port", 8088)) or 8088)
 
+        force_target = False
+        if node_id and hasattr(self, "ha_slave_force_update_nodes"):
+            if (now_ts - self.ha_slave_force_update_nodes.get(node_id, 0.0)) < 120.0:
+                force_target = True
+
         return web.json_response({
             "status": "ok",
             "role": "master",
@@ -1172,7 +1178,7 @@ class WebServer:
             "timestamp": time.time(),
             "version": AGENT_VERSION,
             "code_hash": code_hash,
-            "force_update": (now_ts - self.ha_force_update_time) < 120.0
+            "force_update": ((now_ts - self.ha_force_update_time) < 120.0) or force_target
         })
 
     def _get_code_hash(self) -> str:
@@ -1345,9 +1351,25 @@ class WebServer:
         if not authorized:
             await self._require_admin(request)
 
-        self.ha_force_update_time = time.time()
-        logger.info("📢 [HA Update] Broadcasted auto-update signal to all HA Standby Slave nodes.")
-        return web.json_response({"status": "ok", "message": "HA Standby update broadcasted."})
+        target_node_id = None
+        if request.can_read_body:
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    target_node_id = body.get("node_id")
+            except Exception:
+                pass
+
+        if target_node_id:
+            if not hasattr(self, "ha_slave_force_update_nodes"):
+                self.ha_slave_force_update_nodes = {}
+            self.ha_slave_force_update_nodes[target_node_id] = time.time()
+            logger.info(f"📢 [HA Update] Targeted auto-update signal to HA Standby node '{target_node_id}'.")
+            return web.json_response({"status": "ok", "message": f"HA Standby update targeted to {target_node_id}."})
+        else:
+            self.ha_force_update_time = time.time()
+            logger.info("📢 [HA Update] Broadcasted auto-update signal to all HA Standby Slave nodes.")
+            return web.json_response({"status": "ok", "message": "HA Standby update broadcasted."})
 
     async def api_system_get_manager_nodes(self, request: web.Request) -> web.Response:
         """Master-Slave HA 構成のノード一覧と死活状況を取得 (管理者のみ)"""
@@ -3942,6 +3964,12 @@ class WebServer:
                         # RAMDisk 常駐モデル一覧
                         if "ram_models" in data:
                             node.specs["ram_models"] = data["ram_models"]
+                        # Agent からの最新スペック (OS詳細名, Dockerバージョン, ホスト名等) をマージ
+                        hb_specs = data.get("specs")
+                        if isinstance(hb_specs, dict) and hb_specs:
+                            for sk, sv in hb_specs.items():
+                                if sv not in (None, "", "N/A") or sk not in node.specs:
+                                    node.specs[sk] = sv
                         clean_h = node.hostname or ""
                         for prefix in ("worker_", "worker-"):
                             if clean_h.lower().startswith(prefix):
