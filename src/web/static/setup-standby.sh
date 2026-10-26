@@ -167,11 +167,19 @@ echo "  .env 設定ファイルを生成中..."
 # 既存の設定値をバックアップ
 touch "$ENV_FILE"
 
+# ホストマシンの真のホスト名およびローカルIPを自動検出
+DETECTED_HOSTNAME=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo "SlaveHost")
+DETECTED_LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7}' || echo "")
+
 cat <<EOF > "$ENV_FILE"
 # ==============================================================================
 # TTSBot Slave (Standby) 環境設定
 # 生成日時: $(date '+%Y-%m-%d %H:%M:%S')
 # ==============================================================================
+
+# ホスト実体情報
+HOST_HOSTNAME=${DETECTED_HOSTNAME}
+HOST_LOCAL_IP=${DETECTED_LOCAL_IP}
 
 # HA ロール設定
 TTSBOT_HA_ROLE=slave

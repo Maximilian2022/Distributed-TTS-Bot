@@ -6851,23 +6851,29 @@ async function loadManagerNodes() {
 
     // 1. Master カード
     const masterUptime = master.uptime_seconds != null ? formatUptime(master.uptime_seconds) : "-";
+    const masterContainerId = (master.container_hostname && master.container_hostname !== master.hostname) ? `<span style="font-size:11px;color:var(--text-dim);font-family:monospace;font-weight:normal;" title="Container ID">(${escapeHtml(master.container_hostname)})</span>` : "";
+    const masterLocalIpDisplay = master.local_ip ? `${escapeHtml(master.local_ip)} <span style="font-size:10px;color:var(--text-dim);">(Host: ${escapeHtml(master.ip || '-')})</span>` : escapeHtml(master.ip || "-");
+
     cardsHtml += `
       <div class="card" style="background:rgba(88,101,242,0.08);border:1px solid rgba(88,101,242,0.35);padding:16px;border-radius:10px;position:relative;">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
           <div>
-            <div style="font-size:12px;color:#7289da;font-weight:700;display:flex;align-items:center;gap:6px;">
+            <div style="font-size:12px;color:#7289da;font-weight:700;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
               <span>👑 主系ノード (Primary Master)</span>
               <span class="badge" style="background:rgba(88,101,242,0.25);color:#7289da;border:1px solid rgba(88,101,242,0.5);font-weight:700;">★ Priority 0 (最優先本尊)</span>
             </div>
-            <h4 style="margin:4px 0 0;font-size:16px;color:var(--text-normal);display:flex;align-items:center;gap:8px;">
+            <h4 style="margin:4px 0 0;font-size:16px;color:var(--text-normal);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
               <span>${escapeHtml(master.hostname || "Master Node")}</span>
+              ${masterContainerId}
             </h4>
           </div>
           <span class="badge" style="background:rgba(46,204,113,0.2);color:#2ecc71;border:1px solid rgba(46,204,113,0.4);font-weight:700;">🟢 Active (稼働中)</span>
         </div>
 
         <div style="font-size:12px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,0.2);padding:10px;border-radius:6px;margin-bottom:12px;">
-          <div>IP: <strong style="color:var(--text-normal);">${escapeHtml(master.ip || "-")}</strong></div>
+          <div>IP: <strong style="color:var(--text-normal);">${masterLocalIpDisplay}</strong></div>
+          <div>OS: <strong style="color:var(--text-normal);">${escapeHtml(master.os_name || "Linux")}</strong></div>
+          <div>Docker: <strong style="color:var(--text-normal);">${master.docker_version && master.docker_version !== 'N/A' ? 'v' + escapeHtml(master.docker_version) : 'N/A'}</strong></div>
           <div>Version: <strong style="color:var(--text-normal);">v${escapeHtml(master.version || "-")}</strong></div>
           <div>稼働Bot数: <strong style="color:#50e6ff;">${master.active_bots || 1}台</strong></div>
           <div>稼働時間: <strong style="color:var(--text-normal);">${masterUptime}</strong></div>
@@ -6914,6 +6920,19 @@ async function loadManagerNodes() {
           </span>
         `;
 
+        // ローカル直通検証状態バッジ
+        let directBadge = "";
+        let slaveIpDisplay = "";
+        if (slave.is_direct_verified && slave.local_ip) {
+          directBadge = `<span class="badge" style="background:rgba(46,204,113,0.15);color:#2ecc71;border:1px solid rgba(46,204,113,0.35);font-size:10px;" title="MasterのローカルIPに対するHandshake照合に成功し、LAN直接接続されています">🟢 LAN直通検証済</span>`;
+          slaveIpDisplay = `<strong style="color:#2ecc71;">${escapeHtml(slave.local_ip)}</strong> <span style="font-size:10px;color:var(--text-dim);">(WAN: ${escapeHtml(slave.ip || '-')})</span>`;
+        } else {
+          directBadge = `<span class="badge" style="background:rgba(88,101,242,0.15);color:#7289da;border:1px solid rgba(88,101,242,0.35);font-size:10px;" title="外部WAN/Cloudflare経由で安全に通信しています">🌐 WAN経由通信</span>`;
+          slaveIpDisplay = `<strong style="color:var(--text-normal);">${escapeHtml(slave.ip || "-")}</strong>` + (slave.local_ip ? ` <span style="font-size:10px;color:var(--text-dim);">(LAN: ${escapeHtml(slave.local_ip)})</span>` : '');
+        }
+
+        const slaveContainerId = (slave.container_hostname && slave.container_hostname !== slave.hostname) ? `<span style="font-size:11px;color:var(--text-dim);font-family:monospace;font-weight:normal;" title="Container ID">(${escapeHtml(slave.container_hostname)})</span>` : "";
+
         const lastSyncText = slave.last_sync_ago >= 0 ? `${slave.last_sync_ago}秒前` : (slave.last_sync > 0 ? new Date(slave.last_sync * 1000).toLocaleTimeString() : "未同期");
         const lastSeenText = slave.last_seen_ago >= 0 ? `${slave.last_seen_ago}秒前` : (slave.last_seen > 0 ? new Date(slave.last_seen * 1000).toLocaleTimeString() : "未交信");
 
@@ -6932,6 +6951,9 @@ async function loadManagerNodes() {
           `;
         }
 
+        const dockerText = slave.docker_version && slave.docker_version !== 'N/A' ? ` (v${escapeHtml(slave.docker_version)})` : '';
+        const osText = escapeHtml(slave.os_name || "Linux") + dockerText;
+
         cardsHtml += `
           <div class="card" style="background:rgba(0,0,0,0.2);border:1px solid ${borderCol};padding:16px;border-radius:10px;">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
@@ -6939,9 +6961,11 @@ async function loadManagerNodes() {
                 <div style="font-size:12px;color:var(--text-muted);font-weight:700;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
                   <span>🛡️ 待機ノード (Standby Slave)</span>
                   ${priorityBadge}
+                  ${directBadge}
                 </div>
-                <h4 style="margin:4px 0 0;font-size:15px;color:var(--text-normal);">
-                  ${escapeHtml(slave.hostname || "Slave Node")}
+                <h4 style="margin:4px 0 0;font-size:15px;color:var(--text-normal);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span>${escapeHtml(slave.hostname || "Slave Node")}</span>
+                  ${slaveContainerId}
                 </h4>
                 <div style="font-size:11px;color:var(--text-dim);font-family:monospace;margin-top:2px;">
                   ID: ${escapeHtml(slave.node_id)}
@@ -6951,7 +6975,8 @@ async function loadManagerNodes() {
             </div>
 
             <div style="font-size:12px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,0.25);padding:10px;border-radius:6px;margin-bottom:12px;">
-              <div>IP: <strong style="color:var(--text-normal);">${escapeHtml(slave.ip || "-")}</strong></div>
+              <div>IP: ${slaveIpDisplay}</div>
+              <div>OS / Docker: <strong style="color:var(--text-normal);">${osText}</strong></div>
               <div>スペック: <strong style="color:var(--text-normal);">${escapeHtml(slave.spec_display || "-")}</strong></div>
               <div>最終ハートビート: <strong style="color:var(--text-normal);">${lastSeenText}</strong></div>
               <div>最終DB同期: <strong style="color:#50e6ff;">${lastSyncText}</strong></div>

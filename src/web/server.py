@@ -18,6 +18,7 @@ import io
 import tarfile
 import hashlib
 import ipaddress
+import uuid
 import aiohttp
 from aiohttp import web
 import discord
@@ -33,6 +34,7 @@ from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
 from src.utils.avatar_manager import get_avatar_path, has_avatar
 from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script, sanitize_filename
+from src.utils.system_info import get_host_system_info
 from .auth import DiscordAuth
 
 logger = logging.getLogger(__name__)
@@ -115,6 +117,7 @@ class WebServer:
             middlewares=[self._security_and_rate_limit_middleware]
         )
         self._start_time = time.time()
+        self.master_instance_id = f"master_{uuid.uuid4().hex[:12]}"
         self.ha_slaves: Dict[str, Dict[str, Any]] = {}
         self.ha_revoked_nodes: set = set()
         self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
@@ -167,7 +170,12 @@ class WebServer:
         cpu_cores: int = 1,
         memory_gb: float = 0.0,
         os_name: str = "",
-        requested_priority: Optional[int] = None
+        requested_priority: Optional[int] = None,
+        local_ip: str = "",
+        docker_version: str = "",
+        is_direct_verified: bool = False,
+        direct_url: str = "",
+        container_hostname: str = ""
     ):
         if not node_id:
             return
@@ -178,7 +186,11 @@ class WebServer:
             self.ha_slaves[node_id] = {
                 "node_id": node_id,
                 "hostname": hostname,
+                "container_hostname": container_hostname,
                 "ip": ip,
+                "local_ip": local_ip,
+                "is_direct_verified": is_direct_verified,
+                "direct_url": direct_url,
                 "first_seen": now,
                 "last_seen": now,
                 "last_sync": now if is_sync else 0.0,
@@ -187,12 +199,20 @@ class WebServer:
                 "priority": priority,
                 "cpu_cores": cpu_cores,
                 "memory_gb": memory_gb,
-                "os_name": os_name
+                "os_name": os_name,
+                "docker_version": docker_version
             }
         else:
             entry = self.ha_slaves[node_id]
             entry["hostname"] = hostname or entry.get("hostname", "unknown")
+            if container_hostname:
+                entry["container_hostname"] = container_hostname
             entry["ip"] = ip or entry.get("ip", "unknown")
+            if local_ip:
+                entry["local_ip"] = local_ip
+            entry["is_direct_verified"] = is_direct_verified
+            if direct_url:
+                entry["direct_url"] = direct_url
             entry["last_seen"] = now
             if is_sync:
                 entry["last_sync"] = now
@@ -211,6 +231,8 @@ class WebServer:
                 entry["memory_gb"] = memory_gb
             if os_name:
                 entry["os_name"] = os_name
+            if docker_version:
+                entry["docker_version"] = docker_version
         self._save_ha_nodes()
 
     async def _get_or_fetch_member(self, guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
@@ -1052,6 +1074,13 @@ class WebServer:
         client_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or "unknown"
         user_agent = request.headers.get("User-Agent", "")
 
+        local_ip = request.headers.get("X-HA-Local-IP", "").strip()
+        docker_version = request.headers.get("X-HA-Docker-Version", "").strip()
+        container_hostname = request.headers.get("X-HA-Container-Hostname", "").strip()
+        is_direct_str = request.headers.get("X-HA-Direct-Verified", "").strip().lower()
+        is_direct_verified = is_direct_str in ("true", "1", "yes")
+        direct_url = request.headers.get("X-HA-Direct-Url", "").strip()
+
         p_raw = request.headers.get("X-HA-Priority", "").strip()
         req_p = int(p_raw) if (p_raw and p_raw.isdigit()) else None
         cores_raw = request.headers.get("X-HA-Cpu-Cores", "1").strip()
@@ -1067,7 +1096,9 @@ class WebServer:
             logger.warning(f"🛑 [HA] Status check from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
             self._record_ha_slave_heartbeat(
                 node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
-                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p,
+                local_ip=local_ip, docker_version=docker_version, is_direct_verified=is_direct_verified,
+                direct_url=direct_url, container_hostname=container_hostname
             )
             return web.json_response({
                 "action": "terminate",
@@ -1079,7 +1110,9 @@ class WebServer:
         if node_id:
             self._record_ha_slave_heartbeat(
                 node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
-                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p,
+                local_ip=local_ip, docker_version=docker_version, is_direct_verified=is_direct_verified,
+                direct_url=direct_url, container_hostname=container_hostname
             )
 
         db_path = self.config.db_path
@@ -1112,11 +1145,20 @@ class WebServer:
         is_updating = updating_flag.exists()
 
         code_hash = self._get_code_hash()
+        host_info = get_host_system_info()
+        master_port = int(os.getenv("HOST_WEB_PORT", getattr(self.config, "web_port", 8088)) or 8088)
 
         return web.json_response({
             "status": "ok",
             "role": "master",
             "is_active": True,
+            "master_instance_id": getattr(self, "master_instance_id", "master_primary"),
+            "master_hostname": host_info.get("hostname") or socket.gethostname(),
+            "master_container_hostname": host_info.get("container_hostname") or socket.gethostname(),
+            "master_os": host_info.get("os_name", "Linux"),
+            "master_docker_version": host_info.get("docker_version", "N/A"),
+            "master_local_ips": host_info.get("local_ips", []),
+            "master_port": master_port,
             "is_updating": is_updating,
             "updating": is_updating,
             "active_bots": active_bots,
@@ -1313,11 +1355,24 @@ class WebServer:
         now = time.time()
         active_bots = self.bot_pool.get_active_bot_count() if (self.bot_pool and hasattr(self.bot_pool, "get_active_bot_count")) else 1
 
+        host_info = get_host_system_info()
+        local_ips = host_info.get("local_ips", [])
+        primary_local_ip = next((ip for ip in local_ips if not ip.startswith("172.")), local_ips[0] if local_ips else "")
+        master_port = int(os.getenv("HOST_WEB_PORT", getattr(self.config, "web_port", 8088)) or 8088)
+
         master_info = {
             "node_id": "master_primary",
+            "instance_id": getattr(self, "master_instance_id", "master_primary"),
             "role": "master",
-            "hostname": socket.gethostname(),
+            "hostname": host_info.get("hostname") or socket.gethostname(),
+            "container_hostname": host_info.get("container_hostname") or socket.gethostname(),
+            "os_name": host_info.get("os_name", "Linux"),
+            "kernel": host_info.get("kernel", ""),
+            "docker_version": host_info.get("docker_version", "N/A"),
             "ip": request.host.split(":")[0] if request.host else "127.0.0.1",
+            "local_ip": primary_local_ip,
+            "local_ips": local_ips,
+            "port": master_port,
             "status": "active",
             "status_display": "稼働中 (Active Master)",
             "active_bots": active_bots,
@@ -1339,16 +1394,25 @@ class WebServer:
             cpu_cores = slave.get("cpu_cores", 1)
             memory_gb = slave.get("memory_gb", 0.0)
             os_name = slave.get("os_name", "")
+            docker_ver = slave.get("docker_version", "")
+            local_ip = slave.get("local_ip", "")
+            is_direct = bool(slave.get("is_direct_verified", False))
+            direct_url = slave.get("direct_url", "")
 
             slaves_list.append({
                 "node_id": node_id,
                 "hostname": slave.get("hostname", "unknown"),
+                "container_hostname": slave.get("container_hostname", ""),
                 "ip": slave.get("ip", "unknown"),
+                "local_ip": local_ip,
+                "is_direct_verified": is_direct,
+                "direct_url": direct_url,
                 "priority": priority,
                 "priority_display": f"Priority {priority}" + (" (第1待機系・最速昇格)" if priority == 1 else f" (第{priority}待機系)"),
                 "cpu_cores": cpu_cores,
                 "memory_gb": memory_gb,
                 "os_name": os_name,
+                "docker_version": docker_ver,
                 "spec_display": f"{cpu_cores} Cores / {memory_gb:.1f} GB RAM" if memory_gb > 0 else f"{cpu_cores} Cores",
                 "last_seen": last_seen,
                 "last_seen_ago": int(now - last_seen) if last_seen > 0 else -1,

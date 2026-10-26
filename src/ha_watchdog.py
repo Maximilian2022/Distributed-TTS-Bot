@@ -162,7 +162,15 @@ class HAWatchdog:
         self.db_path = Path(os.getenv("TTSBOT_LOCAL_DB_PATH", "/app/data/bot.db"))
         self.docker = DockerSocketClient(os.getenv("TTSBOT_DOCKER_SOCKET", "/var/run/docker.sock"))
 
-        self.hostname = socket.gethostname()
+        # システム情報・ホスト実体検出
+        try:
+            from src.utils.system_info import get_host_system_info
+            self.host_info = get_host_system_info()
+        except Exception:
+            self.host_info = {}
+
+        self.hostname = self.host_info.get("hostname") or socket.gethostname()
+        self.container_hostname = self.host_info.get("container_hostname") or socket.gethostname()
         self.node_id = self._init_node_id()
 
         # クラスタトポロジー (他ノード情報) の保持
@@ -172,7 +180,17 @@ class HAWatchdog:
         # システムスペックの自動検出 (Master での Priority 自動提案・表示用)
         self.cpu_cores = os.cpu_count() or 1
         self.memory_gb = self._detect_memory_gb()
-        self.os_name = platform.system()
+        self.os_name = self.host_info.get("os_name", platform.system())
+        self.docker_version = self.host_info.get("docker_version", "N/A")
+
+        self.local_ips = self.host_info.get("local_ips", [])
+        self.local_ip = next((ip for ip in self.local_ips if not ip.startswith("172.")), self.local_ips[0] if self.local_ips else "")
+
+        # ローカル直接接続 (Active Handshake) 検証状態
+        self.is_direct_verified = False
+        self.direct_master_url = ""
+        self.last_direct_check_time = 0.0
+        self.master_instance_id: Optional[str] = None
 
         self.tunnel_token = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", os.getenv("TUNNEL_TOKEN", "")).strip()
         self.has_tunnel = bool(self.tunnel_token)
@@ -186,8 +204,9 @@ class HAWatchdog:
         self.running = True
 
         logger.info(
-            f"🆔 HA Watchdog initialized. Node ID: {self.node_id} (Host: {self.hostname}, "
-            f"Spec: {self.cpu_cores} cores / {self.memory_gb} GB RAM / {self.os_name}, "
+            f"🆔 HA Watchdog initialized. Node ID: {self.node_id} (Host: {self.hostname} [{self.container_hostname}], "
+            f"Spec: {self.cpu_cores} cores / {self.memory_gb} GB RAM / {self.os_name} (Docker: {self.docker_version}), "
+            f"Local IP: {self.local_ip or 'None'}, "
             f"Priority: {self.priority}, Failover threshold: {self.fail_threshold} checks = {self.fail_threshold * self.check_interval:.0f}s, "
             f"Tunnel Failover: {'ENABLED' if self.has_tunnel else 'DISABLED'})"
         )
@@ -302,15 +321,82 @@ class HAWatchdog:
             "User-Agent": f"TTSBot-HA-Watchdog/{self.node_id}",
             "X-HA-Node-ID": self.node_id,
             "X-HA-Hostname": self.hostname,
+            "X-HA-Container-Hostname": self.container_hostname,
             "X-HA-Priority": str(self.priority),
             "X-HA-Cpu-Cores": str(self.cpu_cores),
             "X-HA-Memory-Gb": str(self.memory_gb),
             "X-HA-Os": self.os_name,
+            "X-HA-Docker-Version": self.docker_version,
+            "X-HA-Local-IP": self.local_ip,
+            "X-HA-Direct-Verified": "true" if self.is_direct_verified else "false",
+            "X-HA-Direct-Url": self.direct_master_url if self.is_direct_verified else "",
         }
         if self.ha_secret:
             headers["Authorization"] = f"Bearer {self.ha_secret}"
             headers["X-HA-Secret"] = self.ha_secret
         return headers
+
+    def verify_master_local_direct(self, master_local_ips: List[str], master_port: int, expected_instance_id: str) -> bool:
+        """
+        ローカルIPを妄信せず、実際に Master のローカルIPに対して HA 認証付きで接続し、
+        master_instance_id の暗号的完全一致を検証する（物理的別サブネット/別拠点の誤認を完全防止）。
+        """
+        if not master_local_ips or not expected_instance_id:
+            self.is_direct_verified = False
+            self.direct_master_url = ""
+            return False
+
+        now = time.time()
+        # 成功時は5分(300秒)毎、未確認時は60秒毎に再検証
+        cooldown = 300.0 if self.is_direct_verified else 60.0
+        if (now - self.last_direct_check_time) < cooldown:
+            return self.is_direct_verified
+
+        self.last_direct_check_time = now
+
+        for ip in master_local_ips:
+            if not ip or ip.startswith("127."):
+                continue
+            candidate_url = f"http://{ip}:{master_port}"
+            check_url = f"{candidate_url}/api/ha/status"
+            headers = {
+                "User-Agent": f"TTSBot-HA-Handshake/{self.node_id}",
+                "X-HA-Node-ID": self.node_id,
+                "X-HA-Handshake": "direct_verify",
+            }
+            if self.ha_secret:
+                headers["Authorization"] = f"Bearer {self.ha_secret}"
+                headers["X-HA-Secret"] = self.ha_secret
+
+            try:
+                req = urllib.request.Request(check_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        # 厳格な実体照合: role が master かつ instance_id が完全一致するか確認
+                        if data.get("role") == "master" and data.get("master_instance_id") == expected_instance_id:
+                            if not self.is_direct_verified or self.direct_master_url != candidate_url:
+                                logger.info(
+                                    f"🟢 [HA Direct Handshake] Verified LAN Direct connection to Master at {candidate_url} "
+                                    f"(Instance ID matched: {expected_instance_id})! Direct sync enabled."
+                                )
+                            self.is_direct_verified = True
+                            self.direct_master_url = candidate_url
+                            return True
+                        else:
+                            logger.warning(
+                                f"⚠️ [HA Direct Handshake] IP {ip}:{master_port} responded, but instance ID mismatch! "
+                                f"(Expected {expected_instance_id}, got {data.get('master_instance_id')}). "
+                                f"Subnet collision or different cluster detected. Ignoring candidate."
+                            )
+            except Exception as e:
+                logger.debug(f"[HA Direct Handshake] Candidate {candidate_url} unreachable: {e}")
+
+        if self.is_direct_verified:
+            logger.warning("🟡 [HA Direct Handshake] Direct LAN connection to Master lost. Falling back to WAN URL.")
+        self.is_direct_verified = False
+        self.direct_master_url = ""
+        return False
 
     def check_internet_connectivity(self) -> bool:
         """外向きインターネット接続 (Cloudflare/Discord) 疎通検証"""
@@ -341,6 +427,14 @@ class HAWatchdog:
                         self.priority = assigned_p
                         self.fail_threshold = self._calc_fail_threshold(self.priority)
                         logger.info(f"⏱️ [Failover] New failover threshold: {self.fail_threshold} checks ({self.fail_threshold * self.check_interval:.0f}s)")
+
+                    # Active Handshake: Master のローカルIPに対する暗号的・実体照合直接検証
+                    target_instance_id = data.get("master_instance_id")
+                    master_local_ips = data.get("master_local_ips", [])
+                    master_port = data.get("master_port", 8088)
+                    if target_instance_id and master_local_ips:
+                        self.master_instance_id = target_instance_id
+                        self.verify_master_local_direct(master_local_ips, master_port, target_instance_id)
 
                     # 他ノード (Peer Standbys) の最新情報をキャッシュ更新
                     peers = data.get("cluster_nodes", [])
@@ -406,68 +500,79 @@ class HAWatchdog:
         sys.exit(0)
 
     def sync_db_snapshot(self) -> bool:
-        """Master の /api/ha/db_snapshot から SQLite バックアップをプル同期"""
+        """Master の /api/ha/db_snapshot から SQLite バックアップをプル同期 (LAN直通優先 & WAN自動フォールバック)"""
         if not self.master_url or not self.ha_secret:
             return False
 
-        sync_url = f"{self.master_url}/api/ha/db_snapshot"
+        # LAN直通接続が検証済みならローカルURLを優先、未検証またはエラー時は外部マスターURLを使用
+        primary_url = self.direct_master_url if (self.is_direct_verified and self.direct_master_url) else self.master_url
+        candidate_urls = [primary_url]
+        if primary_url != self.master_url:
+            candidate_urls.append(self.master_url)
+
         headers = self._get_common_headers()
         if self.last_db_hash:
             headers["If-None-Match"] = f'"{self.last_db_hash}"'
 
-        req = urllib.request.Request(sync_url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=15.0) as resp:
-                if resp.status == 304:
-                    logger.debug("DB snapshot unchanged (304 Not Modified).")
+        for base_url in candidate_urls:
+            sync_url = f"{base_url}/api/ha/db_snapshot"
+            req = urllib.request.Request(sync_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                    if resp.status == 304:
+                        logger.debug(f"DB snapshot unchanged (304 Not Modified) via {base_url}.")
+                        self.last_sync_time = time.time()
+                        return True
+
+                    if resp.status == 410:
+                        self._handle_revocation()
+                        return False
+
+                    if resp.status != 200:
+                        logger.warning(f"DB snapshot sync failed with HTTP {resp.status} via {base_url}")
+                        continue
+
+                    compressed = resp.read()
+                    raw_bytes = gzip.decompress(compressed)
+                    sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+                    # ハッシュが同じなら書き込みスキップ
+                    if sha256 == self.last_db_hash and self.db_path.exists():
+                        self.last_sync_time = time.time()
+                        return True
+
+                    # 一時ファイルへ保存しアトミック配置
+                    self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_target = self.db_path.with_suffix(".db.sync_tmp")
+                    tmp_target.write_bytes(raw_bytes)
+                    tmp_target.replace(self.db_path)
+
+                    # 単一整合性DBとして読み込ませるため古い WAL/SHM を掃除
+                    wal_file = self.db_path.with_name(f"{self.db_path.name}-wal")
+                    shm_file = self.db_path.with_name(f"{self.db_path.name}-shm")
+                    if wal_file.exists():
+                        wal_file.unlink(missing_ok=True)
+                    if shm_file.exists():
+                        shm_file.unlink(missing_ok=True)
+
+                    self.last_db_hash = sha256
+                    self.last_sync_time = time.time()
+                    logger.info(f"✨ DB snapshot synchronized successfully via {base_url}! (Size: {len(raw_bytes)} bytes, Hash: {sha256[:10]}...)")
+                    return True
+            except urllib.error.HTTPError as e:
+                if e.code == 304:
                     self.last_sync_time = time.time()
                     return True
-
-                if resp.status == 410:
+                if e.code == 410:
                     self._handle_revocation()
                     return False
+                logger.warning(f"DB sync HTTP error via {base_url}: {e.code} {e.reason}")
+            except Exception as e:
+                logger.warning(f"DB sync error via {base_url}: {e}")
+                if base_url == self.direct_master_url and self.is_direct_verified:
+                    logger.info("Direct LAN sync failed, will attempt WAN fallback.")
+                    self.is_direct_verified = False
 
-                if resp.status != 200:
-                    logger.warning(f"DB snapshot sync failed with HTTP {resp.status}")
-                    return False
-
-                compressed = resp.read()
-                raw_bytes = gzip.decompress(compressed)
-                sha256 = hashlib.sha256(raw_bytes).hexdigest()
-
-                # ハッシュが同じなら書き込みスキップ
-                if sha256 == self.last_db_hash and self.db_path.exists():
-                    self.last_sync_time = time.time()
-                    return True
-
-                # 一時ファイルへ保存しアトミック配置
-                self.db_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_target = self.db_path.with_suffix(".db.sync_tmp")
-                tmp_target.write_bytes(raw_bytes)
-                tmp_target.replace(self.db_path)
-
-                # 単一整合性DBとして読み込ませるため古い WAL/SHM を掃除
-                wal_file = self.db_path.with_name(f"{self.db_path.name}-wal")
-                shm_file = self.db_path.with_name(f"{self.db_path.name}-shm")
-                if wal_file.exists():
-                    wal_file.unlink(missing_ok=True)
-                if shm_file.exists():
-                    shm_file.unlink(missing_ok=True)
-
-                self.last_db_hash = sha256
-                self.last_sync_time = time.time()
-                logger.info(f"✨ DB snapshot synchronized successfully! (Size: {len(raw_bytes)} bytes, Hash: {sha256[:10]}...)")
-                return True
-        except urllib.error.HTTPError as e:
-            if e.code == 304:
-                self.last_sync_time = time.time()
-                return True
-            if e.code == 410:
-                self._handle_revocation()
-                return False
-            logger.warning(f"DB sync HTTP error: {e.code} {e.reason}")
-        except Exception as e:
-            logger.error(f"DB sync error: {e}")
         return False
 
     def sync_code_snapshot(self, master_hash: str) -> bool:
