@@ -948,6 +948,9 @@
                   </div>
                 </div>
                 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="triggerStandbyCacheSync(null, this)" style="background:rgba(46,204,113,0.18);border:1px solid rgba(46,204,113,0.4);color:#2ecc71;" title="再利用実績のある頻出音声キャッシュ (hit>=2) を全Standby Slaveノードへ即時同期します">
+                    📦 Standbyへキャッシュ同期
+                  </button>
                   <button type="button" class="btn btn-secondary btn-sm" onclick="triggerAllStandbysUpdate(this)" style="background:rgba(88,101,242,0.18);border:1px solid rgba(88,101,242,0.4);color:#50e6ff;" title="全Standby SlaveノードへMaster最新コードへの同期更新・再起動を指示します">
                     📢 全Standby一括更新
                   </button>
@@ -1825,6 +1828,51 @@
                     <span>使用量: <strong id="vv-cache-used-text" style="color:var(--text-main);">0 MB</strong></span>
                     <span>ファイル数: <strong id="vv-cache-files-text" style="color:var(--text-main);">0 個</strong></span>
                     <span>上限: <strong id="vv-cache-max-text" style="color:var(--text-main);">20.0 GB</strong> (目標: 17.0 GB)</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 🎯 投機的キャッシュ事前生成 (ホットワードプレウォーム) -->
+              <div class="card" id="speculative-cache-card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:10px;">
+                  <div>
+                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                      🎯 投機的キャッシュ事前生成 (ホットワードプレウォーム)
+                      <span class="badge" style="background:rgba(88,101,242,0.2);color:#5865f2;font-size:11px;border:1px solid rgba(88,101,242,0.4);">JST 04:30 自動生成 ➔ 05:00 HA同期</span>
+                    </h3>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">
+                      直近3日間で3回以上使われた相槌・短文・名前プレフィックス（15文字以下）を最閑散時間帯に先行生成し、初動再生遅延0msを維持します。
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center;">
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="loadSpeculativeCacheStatus()" id="spec-refresh-btn" style="font-size:12px;padding:5px 10px;">状態更新 🔄</button>
+                    <button type="button" class="btn btn-primary btn-sm" onclick="triggerSpeculativePrewarm(this)" id="spec-trigger-btn" style="font-size:12px;padding:5px 12px;background:linear-gradient(135deg, #5865f2, #eb459e);border:none;">⚡ 今すぐ事前生成を実行</button>
+                  </div>
+                </div>
+
+                <!-- 稼働状態インジケータ -->
+                <div style="background:rgba(0,0,0,0.2);padding:12px;border-radius:8px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+                  <div style="font-size:12px;line-height:1.6;">
+                    <div>ステータス: <span id="spec-status-badge" class="badge" style="background:#23a55a;color:white;font-size:11px;">待機中 (アイドル)</span></div>
+                    <div style="color:var(--text-muted);margin-top:2px;">
+                      前回実行: <strong id="spec-last-run-text" style="color:var(--text-main);">未実行</strong>
+                      <span id="spec-last-stats-text" style="margin-left:8px;color:#a0a0a0;"></span>
+                    </div>
+                  </div>
+                  <div style="font-size:12px;color:var(--text-muted);text-align:right;">
+                    <div>次回自動実行: <strong style="color:var(--text-main);">毎日 04:30 JST</strong></div>
+                    <div style="margin-top:2px;">Standby同期: <span style="color:#57f287;">生成直後 05:00 に自動引継</span></div>
+                  </div>
+                </div>
+
+                <!-- 頻出ホットワード候補プレビュー -->
+                <div>
+                  <div style="font-size:12px;font-weight:600;margin-bottom:8px;color:var(--text-muted);display:flex;justify-content:space-between;">
+                    <span>🔥 直近3日間の頻出ホットワード候補 (生成対象 TOP 20)</span>
+                    <span id="spec-candidate-count" style="font-weight:normal;">0 件検出</span>
+                  </div>
+                  <div id="spec-candidates-list" style="display:flex;flex-wrap:wrap;gap:6px;max-height:120px;overflow-y:auto;padding:4px 0;">
+                    <span style="font-size:12px;color:var(--text-muted);">読み込み中...</span>
                   </div>
                 </div>
               </div>

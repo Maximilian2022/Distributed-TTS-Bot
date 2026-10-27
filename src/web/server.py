@@ -125,6 +125,9 @@ class WebServer:
         self._load_ha_nodes()
         self.ha_force_update_time: float = 0.0
         self.ha_slave_force_update_nodes: Dict[str, float] = {}
+        self.ha_force_cache_sync_time: float = 0.0
+        self.ha_slave_force_cache_sync_nodes: Dict[str, float] = {}
+        self.ha_slave_delivered_cache_sync_nodes: Dict[str, float] = {}
         self._code_hash_cache = None
         self._code_hash_cache_time = 0.0
         self.runner: Optional[web.AppRunner] = None
@@ -401,14 +404,20 @@ class WebServer:
         # HA (High Availability) & Standby 同期 API
         self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
         self.app.router.add_get("/api/ha/code_snapshot", self.api_ha_code_snapshot)
+        self.app.router.add_get("/api/ha/frequent_cache_snapshot", self.api_ha_frequent_cache_snapshot)
         self.app.router.add_get("/api/ha/status", self.api_ha_status)
         self.app.router.add_post("/api/ha/broadcast_update", self.api_ha_broadcast_update)
         self.app.router.add_get("/api/system/manager_nodes", self.api_system_get_manager_nodes)
         self.app.router.add_post("/api/system/manager_nodes/priority", self.api_system_set_manager_nodes_priority)
+        self.app.router.add_post("/api/system/manager_nodes/cache_sync", self.api_system_trigger_cache_sync)
         self.app.router.add_post("/api/system/manager_nodes/revoke", self.api_system_revoke_manager_node)
         self.app.router.add_delete("/api/system/manager_nodes/{node_id}", self.api_system_delete_manager_node)
         self.app.router.add_post("/api/worker/kick", self.api_worker_kick_node)
         self.app.router.add_post("/api/worker/broadcast_update", self.api_worker_broadcast_update)
+
+        # 投機的キャッシュ事前生成 (ホットワードプレウォーム) API
+        self.app.router.add_get("/api/system/cache/speculative_status", self.api_system_speculative_cache_status)
+        self.app.router.add_post("/api/system/cache/speculative_trigger", self.api_system_speculative_cache_trigger)
 
         # テスト・シミュレーション API (ローカルまたは管理者用)
         self.app.router.add_post("/api/test/simulate", self.api_test_simulate)
@@ -1167,6 +1176,24 @@ class WebServer:
             if delivered_time < broadcast_time:
                 broadcast_force = True
 
+        # キャッシュ同期強制シグナル判定
+        if not hasattr(self, "ha_slave_delivered_cache_sync_nodes"):
+            self.ha_slave_delivered_cache_sync_nodes = {}
+
+        force_cache_target = False
+        if node_id and hasattr(self, "ha_slave_force_cache_sync_nodes"):
+            c_req_time = self.ha_slave_force_cache_sync_nodes.get(node_id, 0.0)
+            c_del_time = self.ha_slave_delivered_cache_sync_nodes.get(node_id, 0.0)
+            if (now_ts - c_req_time) < 120.0 and c_del_time < c_req_time:
+                force_cache_target = True
+
+        broadcast_cache_force = False
+        b_cache_time = getattr(self, "ha_force_cache_sync_time", 0.0)
+        if (now_ts - b_cache_time) < 120.0:
+            c_del_time = self.ha_slave_delivered_cache_sync_nodes.get(node_id, 0.0)
+            if c_del_time < b_cache_time:
+                broadcast_cache_force = True
+
         return web.json_response({
             "status": "ok",
             "role": "master",
@@ -1191,7 +1218,8 @@ class WebServer:
             "timestamp": time.time(),
             "version": AGENT_VERSION,
             "code_hash": code_hash,
-            "force_update": force_target or broadcast_force
+            "force_update": force_target or broadcast_force,
+            "force_cache_sync": force_cache_target or broadcast_cache_force
         })
 
     def _get_code_hash(self) -> str:
@@ -1407,6 +1435,162 @@ class WebServer:
             self.ha_force_update_time = time.time()
             logger.info("📢 [HA Update] Broadcasted auto-update signal to all HA Standby Slave nodes.")
             return web.json_response({"status": "ok", "message": "HA Standby update broadcasted."})
+
+    async def api_ha_frequent_cache_snapshot(self, request: web.Request) -> web.Response:
+        """
+        Masterノードから再利用実績のある音声キャッシュ (hit_count >= 2) を tar.gz 形式で配信。
+        Slaveノードの早朝自動同期および手動即時同期用。
+        """
+        if not self._verify_ha_auth(request):
+            return web.json_response({"error": "Unauthorized: Invalid or missing HA shared secret"}, status=403)
+
+        node_id = request.headers.get("X-HA-Node-ID")
+        # 配信完了時間を記録（手動強制シグナルのワンショット消費）
+        if node_id and hasattr(self, "ha_slave_delivered_cache_sync_nodes"):
+            self.ha_slave_delivered_cache_sync_nodes[node_id] = time.time()
+
+        loop = asyncio.get_running_loop()
+
+        def _generate_cache_archive():
+            import sqlite3, io, tarfile
+            db_path = getattr(self.config, "db_path", "/app/data/bot.db")
+            if not os.path.exists(db_path):
+                return None, 0, 0
+
+            # 1. hit_count >= 2 のキャッシュレコードを取得
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            cur = con.cursor()
+            cur.execute("SELECT cache_key, provider FROM cache_metadata WHERE hit_count >= 2;")
+            rows = cur.fetchall()
+            con.close()
+
+            if not rows:
+                return None, 0, 0
+
+            buf = io.BytesIO()
+            file_count = 0
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for cache_key, provider in rows:
+                    file_path = self.cache_manager.get_file_path(cache_key, provider)
+                    if not file_path.exists():
+                        alt_dir = self.cache_manager.cache_dir if self.cache_manager.get_cache_dir(provider) == self.cache_manager.voicevox_cache_dir else self.cache_manager.voicevox_cache_dir
+                        alt_path = alt_dir / cache_key
+                        if alt_path.exists():
+                            file_path = alt_path
+                        else:
+                            continue
+
+                    try:
+                        stat = file_path.stat()
+                        if stat.st_size <= 44:
+                            continue
+                        cat = "local" if (str(provider).lower() in self.cache_manager.LOCAL_PROVIDERS or str(provider).lower().startswith("vv_")) else "cloud"
+                        tar.add(str(file_path), arcname=f"{cat}/{cache_key}")
+                        file_count += 1
+                    except OSError:
+                        pass
+
+            buf.seek(0)
+            data = buf.getvalue()
+            return data, file_count, len(data)
+
+        archive_data, file_count, archive_size = await loop.run_in_executor(None, _generate_cache_archive)
+        if not archive_data or file_count == 0:
+            return web.json_response({"message": "No frequent cache files found to sync", "file_count": 0}, status=200)
+
+        headers = {
+            "Content-Type": "application/gzip",
+            "Content-Disposition": 'attachment; filename="frequent_cache.tar.gz"',
+            "X-Cache-Count": str(file_count),
+            "X-Archive-Size": str(archive_size)
+        }
+        logger.info(f"✨ [HA] Generated frequent cache archive: {file_count} files ({archive_size} bytes) for Slave '{node_id or 'unknown'}'")
+        return web.Response(body=archive_data, headers=headers)
+
+    async def api_system_trigger_cache_sync(self, request: web.Request) -> web.Response:
+        """WebUIからStandbyノードへのキャッシュ同期シグナルを発行"""
+        await self._require_admin(request)
+
+        target_node_id = None
+        if request.can_read_body:
+            try:
+                body = await request.json()
+                if isinstance(body, dict):
+                    target_node_id = body.get("node_id")
+            except Exception:
+                pass
+
+        now = time.time()
+        if not hasattr(self, "ha_slave_force_cache_sync_nodes"):
+            self.ha_slave_force_cache_sync_nodes = {}
+
+        if target_node_id:
+            self.ha_slave_force_cache_sync_nodes[target_node_id] = now
+            msg = f"Standbyノード '{target_node_id}' へのキャッシュ同期シグナルを送信しました。"
+            logger.info(f"📢 [HA Cache Sync] Targeted cache sync signal to HA Standby node '{target_node_id}'.")
+            return web.json_response({"status": "ok", "message": msg, "target": target_node_id})
+        else:
+            self.ha_force_cache_sync_time = now
+            msg = "全Standbyノードへの一括キャッシュ同期シグナルを送信しました。"
+            logger.info("📢 [HA Cache Sync] Broadcasted cache sync signal to all HA Standby Slave nodes.")
+            return web.json_response({"status": "ok", "message": msg, "target": "all"})
+
+    async def api_system_speculative_cache_status(self, request: web.Request) -> web.Response:
+        """投機的キャッシュ事前生成（ホットワードプレウォーム）の稼働状況と候補フレーズを取得"""
+        await self._require_admin(request)
+        prewarm = getattr(self.bot, "prewarm_service", None) if self.bot else None
+
+        candidates = []
+        if hasattr(self.database, "get_frequent_phrases_for_prewarm"):
+            try:
+                candidates = await self.database.get_frequent_phrases_for_prewarm(days=3, min_hits=3, max_length=15, limit=20)
+            except Exception as e:
+                logger.warning(f"Error fetching speculative candidates: {e}")
+
+        status = {
+            "is_running": getattr(prewarm, "_speculative_running", False) if prewarm else False,
+            "last_run_time": getattr(prewarm, "last_speculative_run_time", None) if prewarm else None,
+            "last_stats": getattr(prewarm, "last_speculative_stats", {}) if prewarm else {},
+            "candidates_top20": candidates,
+            "daily_schedule": "04:30 JST (Early morning idle batch -> 05:00 Standby HA sync)"
+        }
+        return web.json_response(status)
+
+    async def api_system_speculative_cache_trigger(self, request: web.Request) -> web.Response:
+        """手動で投機的キャッシュ事前生成を即時実行（オプションで完了後Standby同期シグナルも連動）"""
+        await self._require_admin(request)
+        prewarm = getattr(self.bot, "prewarm_service", None) if self.bot else None
+        if not prewarm:
+            return web.json_response({"error": "IntelligentPrewarmService is not running on this node"}, status=400)
+
+        data = {}
+        try:
+            if request.can_read_body:
+                data = await request.json()
+        except Exception:
+            pass
+
+        days = int(data.get("days", 3))
+        min_hits = int(data.get("min_hits", 3))
+        sync_standby = bool(data.get("sync_standby", True))
+
+        if getattr(prewarm, "_speculative_running", False):
+            return web.json_response({"status": "already_running", "message": "投機的キャッシュ生成は既に実行中です。"}, status=409)
+
+        async def _run_and_sync():
+            try:
+                await prewarm.run_speculative_prewarm(days=days, min_hits=min_hits, max_candidates=30)
+                if sync_standby:
+                    logger.info("📢 [Speculative Prewarm] Triggering follow-up HA cache sync to Standby nodes...")
+                    self.ha_force_cache_sync_time = time.time()
+            except Exception as e:
+                logger.error(f"Error in manual speculative prewarm: {e}", exc_info=True)
+
+        asyncio.create_task(_run_and_sync(), name="manual_speculative_prewarm_task")
+        return web.json_response({
+            "status": "started",
+            "message": f"投機的キャッシュ事前生成を開始しました (条件: 直近{days}日間で{min_hits}回以上使用)。完了後にStandbyへの同期シグナルを{'送信します' if sync_standby else 'スキップします'}。"
+        })
 
     async def api_system_get_manager_nodes(self, request: web.Request) -> web.Response:
         """Master-Slave HA 構成のノード一覧と死活状況を取得 (管理者のみ)"""

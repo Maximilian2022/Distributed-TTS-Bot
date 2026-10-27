@@ -47,6 +47,25 @@ _MIN_PART_CHARS = 5
 _RE_SPLIT_SLANG_DELIM = re.compile(r'((?:(?<![a-zA-Z0-9])[wｗW]+(?![a-zA-Z0-9])|草+|パチパチ))[\s\u3000]*')
 _RE_SPLIT_ENDING = re.compile(r'((?:です|ます|でした|ました|ですね|ですよ|ですよね|だよね|じゃん|だし)(?:よ|ね|な)?)(?=[^\s、。！？\d])')
 
+# 定型挨拶・相槌の文頭/文末スライス用正規表現 (キャッシュ再利用率・ヒット率最大化)
+_RE_SPLIT_GREETING_HEAD = re.compile(
+    r'^(おはようございます|おはよう|こんにちは|こんばんわ|こんばんは|おつかれさまです|おつかれさま|おつかれ|おつ|ありがとうございます|ありがとう|よろしくお願いします|よろしく|了解です|了解|なるほど|草|まじかよ|まじか|助かる|はい|いいえ)'
+    r'([！!？?wｗ\s、。]+|$)',
+    re.IGNORECASE
+)
+_RE_SPLIT_GREETING_TAIL = re.compile(
+    r'([、\s]*)'
+    r'(おはようございます|おはよう|こんにちは|こんばんわ|こんばんは|おつかれさまです|おつかれさま|おつかれ|おつ|ありがとうございます|ありがとう|よろしくお願いします|よろしく|了解です|了解|なるほど|草|まじかよ|まじか|助かる)'
+    r'([！!？?wｗ\s、。]*)$',
+    re.IGNORECASE
+)
+
+# 文頭接続詞・相槌の先頭スライス用正規表現 (先頭即時ヒット・TTFA短縮)
+_RE_SPLIT_HEAD_CONJ = re.compile(
+    r'^(でも、|でも|だから、|だから|確かに、|確かに|あと、|あと|そういえば、|そういえば|いや、|いや|あ、|え、|えーと、|うーん、|うーん)'
+    r'(?=[^\s、。！？\d])'
+)
+
 _janome_tokenizer = None
 _janome_failed = False
 _janome_lock = threading.Lock()
@@ -711,6 +730,57 @@ class TextCleaner:
         return parts
 
     @staticmethod
+    def _split_by_greetings_boundary(sentence: str, delim: str) -> List[Tuple[str, str]]:
+        """
+        文頭または文末に独立した定型挨拶・相槌・了解等のフレーズが存在する場合、
+        前後の文脈から独立したチャンクとして切り離し、キャッシュヒット率を最大化する。
+        """
+        s = sentence.strip()
+        if not s:
+            return []
+
+        # 1. 文頭チェック
+        m_head = _RE_SPLIT_GREETING_HEAD.match(s)
+        if m_head:
+            matched_greeting = m_head.group(1)
+            punct = m_head.group(2) or ""
+            remainder = s[m_head.end():].strip()
+            # 残りの文が実質2文字以上あればスライス採用
+            if len(_RE_STRIP_PUNCT_SPACES.sub('', remainder)) >= 2:
+                greeting_part = (matched_greeting + punct).strip()
+                return [(greeting_part, "greeting"), (remainder, delim)]
+
+        # 2. 文末チェック
+        m_tail = _RE_SPLIT_GREETING_TAIL.search(s)
+        if m_tail and m_tail.start() > 0:
+            matched_greeting = m_tail.group(2)
+            punct = m_tail.group(3) or ""
+            prefix = s[:m_tail.start()].strip()
+            # 前半の文が実質2文字以上あればスライス採用
+            if len(_RE_STRIP_PUNCT_SPACES.sub('', prefix)) >= 2:
+                greeting_part = (matched_greeting + punct).strip()
+                return [(prefix, "greeting_before"), (greeting_part, delim or "greeting")]
+
+        return [(sentence, delim)]
+
+    @staticmethod
+    def _split_by_head_conjunction(sentence: str, delim: str) -> List[Tuple[str, str]]:
+        """
+        先頭チャンクの文頭に「でも、」「だから」「確かに」等の接続詞・相槌がある場合、
+        先頭独立チャンクとして切り出し、Time to First Audio (TTFA) のゼロ遅延化を図る。
+        """
+        s = sentence.strip()
+        if not s:
+            return []
+        m = _RE_SPLIT_HEAD_CONJ.match(s)
+        if m:
+            conj = m.group(1)
+            remainder = s[m.end():].lstrip(" 、,\t\u3000")
+            if len(_RE_STRIP_PUNCT_SPACES.sub('', remainder)) >= 3:
+                return [(conj, "head_conj"), (remainder, delim)]
+        return [(sentence, delim)]
+
+    @staticmethod
     def split_into_chunks(text: str, author_prefix: Optional[str] = None) -> List['TextChunk']:
         """
         テキストを発言者名プレフィックスおよび多段文境界（句点・読点・スペース・スラング・終助詞・形態素・30文字ハードキャップ）で超低遅延パーツ分割する。
@@ -815,9 +885,22 @@ class TextCleaner:
             if full:
                 current_sentences.append((full, delim))
 
-        # 2. 読点境界（「、」）での分割 (15文字超)
-        comma_refined: List[Tuple[str, str]] = []
+        # 2. 定型挨拶・相槌の文頭/文末スライス (キャッシュ再利用性最大化)
+        greeting_refined: List[Tuple[str, str]] = []
         for sentence, delim in current_sentences:
+            greeting_refined.extend(TextCleaner._split_by_greetings_boundary(sentence, delim))
+
+        # 3. 文頭の接続詞・相槌スライス (先頭チャンクのTTFAゼロ遅延化)
+        head_conj_refined: List[Tuple[str, str]] = []
+        for idx, (sentence, delim) in enumerate(greeting_refined):
+            if idx == 0:
+                head_conj_refined.extend(TextCleaner._split_by_head_conjunction(sentence, delim))
+            else:
+                head_conj_refined.append((sentence, delim))
+
+        # 4. 読点境界（「、」）での分割 (15文字超)
+        comma_refined: List[Tuple[str, str]] = []
+        for sentence, delim in head_conj_refined:
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
             if '、' in sentence and raw_len > 15:
                 sub_parts = _RE_SPLIT_COMMA.split(sentence)
@@ -916,6 +999,10 @@ class TextCleaner:
                 pause_ms = 120
             elif '、' in delim:
                 pause_ms = 90
+            elif delim == 'greeting' or delim == 'greeting_before':
+                pause_ms = 90
+            elif delim == 'head_conj':
+                pause_ms = 85
             elif delim == 'space':
                 pause_ms = 75
             elif delim == 'slang':

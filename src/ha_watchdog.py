@@ -209,6 +209,8 @@ class HAWatchdog:
         self.code_update_time_file = self.db_path.parent / "ha_code_update_time.txt"
         self.current_code_hash: Optional[str] = self._load_code_hash()
         self.last_code_update_time = self._load_last_code_update_time()
+        self.last_cache_sync_time = 0.0
+        self.last_cache_sync_date = ""
         self.running = True
 
         logger.info(
@@ -544,6 +546,12 @@ class HAWatchdog:
                                 self.current_code_hash = master_code_hash
                                 self._save_code_hash(master_code_hash)
 
+                        # Master からの強制キャッシュ同期シグナル検知 (WebUI手動トリガー)
+                        force_cache_sync = data.get("force_cache_sync", False)
+                        if force_cache_sync:
+                            logger.info("📦 [HA Watchdog] Force cache sync signal received from Master! Triggering instant cache sync...")
+                            self.sync_frequent_cache_snapshot()
+
                         return data.get("is_active", True)
                     elif resp.status == 410:
                         self._handle_revocation()
@@ -665,6 +673,75 @@ class HAWatchdog:
                 if base_url == self.direct_master_url and self.is_direct_verified:
                     logger.info("Direct LAN sync failed, will attempt WAN fallback.")
                     self.is_direct_verified = False
+
+        return False
+
+    def sync_frequent_cache_snapshot(self) -> bool:
+        """
+        Master の /api/ha/frequent_cache_snapshot から再利用実績のある音声キャッシュ (hit_count >= 2) をプル同期。
+        早朝自動同期および手動シグナル実行用。
+        """
+        if not self.master_url or not self.ha_secret:
+            return False
+
+        primary_url = self.direct_master_url if (self.is_direct_verified and self.direct_master_url) else self.master_url
+        candidate_urls = [primary_url]
+        if primary_url != self.master_url:
+            candidate_urls.append(self.master_url)
+
+        headers = self._get_common_headers()
+
+        # キャッシュディレクトリの特定 (/app/cache, /app/cache_voicevox または 相対パス)
+        base_dir = self.db_path.parent.parent  # /app
+        cloud_cache_dir = base_dir / "cache"
+        local_cache_dir = base_dir / "cache_voicevox"
+        cloud_cache_dir.mkdir(parents=True, exist_ok=True)
+        local_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        for base_url in candidate_urls:
+            sync_url = f"{base_url}/api/ha/frequent_cache_snapshot"
+            req = urllib.request.Request(sync_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30.0) as resp:
+                    if resp.status == 410:
+                        self._handle_revocation()
+                        return False
+                    if resp.status != 200:
+                        continue
+
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "gzip" not in content_type:
+                        logger.debug("No frequent cache archive returned from Master.")
+                        self.last_cache_sync_time = time.time()
+                        return True
+
+                    raw_archive = resp.read()
+                    import tarfile, io
+                    extracted_count = 0
+                    with tarfile.open(fileobj=io.BytesIO(raw_archive), mode="r:gz") as tar:
+                        for member in tar.getmembers():
+                            # セキュリティ: ディレクトリトラバーサル防止 (CWE-22)
+                            safe_name = Path(member.name).name
+                            if not safe_name or ".." in safe_name:
+                                continue
+
+                            if member.name.startswith("cloud/"):
+                                target_file = cloud_cache_dir / safe_name
+                            elif member.name.startswith("local/"):
+                                target_file = local_cache_dir / safe_name
+                            else:
+                                continue
+
+                            f = tar.extractfile(member)
+                            if f is not None:
+                                target_file.write_bytes(f.read())
+                                extracted_count += 1
+
+                    self.last_cache_sync_time = time.time()
+                    logger.info(f"✨ [HA Watchdog] Synced {extracted_count} frequent cache files ({len(raw_archive)} bytes) successfully via {base_url}!")
+                    return True
+            except Exception as e:
+                logger.warning(f"Frequent cache sync error via {base_url}: {e}")
 
         return False
 
@@ -901,6 +978,17 @@ class HAWatchdog:
                     now = time.time()
                     if now - self.last_sync_time >= self.sync_interval:
                         await loop.run_in_executor(None, self.sync_db_snapshot)
+
+                    # 早朝 (JST 05:00 〜 05:30) の日次キャッシュ自動同期 (1日1回)
+                    from datetime import datetime, timezone, timedelta
+                    jst_now = datetime.now(timezone(timedelta(hours=9)))
+                    today_str = jst_now.strftime("%Y-%m-%d")
+                    if jst_now.hour == 5 and jst_now.minute <= 30:
+                        if getattr(self, "last_cache_sync_date", "") != today_str:
+                            logger.info(f"🌅 [HA Watchdog] Early morning daily cache sync triggered (JST {jst_now.strftime('%H:%M:%S')})...")
+                            cache_ok = await loop.run_in_executor(None, self.sync_frequent_cache_snapshot)
+                            if cache_ok:
+                                self.last_cache_sync_date = today_str
 
                 else:
                     self.fail_count += 1

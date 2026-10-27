@@ -2617,6 +2617,55 @@ class Database:
                 "monthly_tts_usage": monthly_usage
             }
 
+    async def get_frequent_phrases_for_prewarm(
+        self,
+        days: int = 3,
+        min_hits: int = 3,
+        max_length: int = 15,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        投機的キャッシュ事前生成（プレウォーム）向けの頻出フレーズ候補を抽出
+        - 直近 `days` 日以内に参照または生成されたもの
+        - 再利用（ヒット数）が `min_hits` 以上のもの
+        - `max_length` 文字以下の短文・単語
+        - 記号のみやテスト試聴音声、伏字を除外
+        """
+        import re
+        async with self.get_connection() as db:
+            query = """
+                SELECT text, SUM(hit_count) as total_hits, MAX(last_hit_at) as latest_hit
+                FROM cache_metadata
+                WHERE (last_hit_at >= datetime('now', '-' || ? || ' days') OR created_at >= datetime('now', '-' || ? || ' days'))
+                  AND hit_count >= ?
+                  AND length(text) <= ?
+                  AND length(text) >= 1
+                  AND text NOT LIKE 'sample_%'
+                  AND text NOT LIKE '%[ピー]%'
+                  AND trim(text) != ''
+                GROUP BY text
+                ORDER BY total_hits DESC
+                LIMIT ?
+            """
+            cur = await db.execute(query, (days, days, min_hits, max_length, limit * 2))
+            rows = await cur.fetchall()
+
+            # 記号のみ（感嘆符や句読点だけ）を除外し、日本語や英数字を含む有意義なフレーズのみ抽出
+            re_has_content = re.compile(r'[\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
+            results: List[Dict[str, Any]] = []
+            for r in rows:
+                text = r[0]
+                if text and re_has_content.search(text):
+                    results.append({
+                        "text": text,
+                        "total_hits": r[1] or 0,
+                        "latest_hit": r[2] or ""
+                    })
+                    if len(results) >= limit:
+                        break
+
+            return results
+
     async def maintenance(self) -> Dict[str, Any]:
         """
         SQLite WAL ファイルの完全チェックポイント & クエリオプティマイザの統計更新

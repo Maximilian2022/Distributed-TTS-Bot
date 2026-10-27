@@ -5781,6 +5781,9 @@ async function loadCacheStatsSummary() {
         topWordsListEl.innerHTML = html;
       }
     }
+
+    // 投機的事前生成のステータスも連動更新
+    loadSpeculativeCacheStatus();
   } catch (err) {
     console.warn("Failed to load cache stats summary:", err);
   }
@@ -6970,9 +6973,15 @@ async function loadManagerNodes() {
             🔄 Standbyを更新
           </button>
         `;
+        const cacheSyncBtn = `
+          <button class="btn btn-sm" onclick="triggerStandbyCacheSync('${escapeHtml(slave.node_id)}', this)" style="background:rgba(46,204,113,0.15);border:1px solid rgba(46,204,113,0.4);color:#2ecc71;cursor:pointer;font-weight:600;padding:4px 10px;border-radius:6px;transition:all 0.2s;margin-right:6px;" title="このStandbyノードに頻出音声キャッシュ (hit>=2) を即時同期させます">
+            📦 キャッシュ同期
+          </button>
+        `;
         if (slave.status !== "revoked") {
           actionBtnHtml = `
             ${updateBtn}
+            ${cacheSyncBtn}
             <button class="btn btn-sm" onclick="revokeManagerSlave('${escapeHtml(slave.node_id)}')" style="background:rgba(231,76,60,0.15);border:1px solid rgba(231,76,60,0.4);color:#ff6b6b;cursor:pointer;font-weight:600;padding:4px 10px;border-radius:6px;transition:all 0.2s;" title="このSlaveノードを除外・停止します。次回アクセス時に410 Goneが送られ安全停止します。">
               🛑 登録解除 & 停止 (Revoke)
             </button>
@@ -7184,6 +7193,126 @@ async function triggerAllStandbysUpdate(btn) {
   }
 }
 window.triggerAllStandbysUpdate = triggerAllStandbysUpdate;
+
+async function triggerStandbyCacheSync(nodeId, btn) {
+  const targetLabel = nodeId ? `Standbyノード [${nodeId}]` : "すべてのStandbyノード";
+  if (!confirm(`${targetLabel} に再利用実績のある音声キャッシュ (hit>=2) を即時同期させますか？`)) return;
+  const originalText = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ 同期指示中..."; }
+  try {
+    const res = await fetch("/api/system/manager_nodes/cache_sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(nodeId ? { node_id: nodeId } : {})
+    });
+    const data = await res.json();
+    if (res.ok) {
+      if (typeof showToast === "function") {
+        showToast(data.message || `${targetLabel} にキャッシュ同期シグナルを送信しました`, "success");
+      } else {
+        alert(data.message || `${targetLabel} にキャッシュ同期シグナルを送信しました`);
+      }
+    } else {
+      alert(`キャッシュ同期指示エラー: ${data.error || res.statusText}`);
+    }
+  } catch (err) {
+    alert(`通信エラー: ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = originalText; }
+    loadManagerNodes();
+  }
+}
+window.triggerStandbyCacheSync = triggerStandbyCacheSync;
+
+// --- 🎯 投機的キャッシュ事前生成 (ホットワードプレウォーム) ---
+async function loadSpeculativeCacheStatus() {
+  try {
+    const res = await fetch("/api/system/cache/speculative_status");
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const statusBadge = document.getElementById("spec-status-badge");
+    if (statusBadge) {
+      if (data.is_running) {
+        statusBadge.textContent = "⚡ 事前生成実行中...";
+        statusBadge.style.background = "#eb459e";
+      } else {
+        statusBadge.textContent = "待機中 (アイドル)";
+        statusBadge.style.background = "#23a55a";
+      }
+    }
+
+    const lastRunText = document.getElementById("spec-last-run-text");
+    if (lastRunText) {
+      if (data.last_run_time) {
+        const d = new Date(data.last_run_time * 1000);
+        lastRunText.textContent = `${d.getFullYear()}/${(d.getMonth()+1).toString().padStart(2, '0')}/${d.getDate().toString().padStart(2, '0')} ${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}`;
+      } else {
+        lastRunText.textContent = "未実行";
+      }
+    }
+
+    const statsText = document.getElementById("spec-last-stats-text");
+    if (statsText && data.last_stats) {
+      const s = data.last_stats;
+      if (s.status === "completed") {
+        statsText.textContent = `(生成: ${s.generated}件, 既存スキップ: ${s.skipped}件, 所要時間: ${s.duration_seconds}s)`;
+      } else if (s.status === "no_candidates") {
+        statsText.textContent = "(対象候補なし)";
+      }
+    }
+
+    const countElem = document.getElementById("spec-candidate-count");
+    const listElem = document.getElementById("spec-candidates-list");
+    if (countElem && listElem) {
+      const cands = data.candidates_top20 || [];
+      countElem.textContent = `${cands.length} 件検出`;
+      if (cands.length === 0) {
+        listElem.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">直近3日間で3回以上再利用された候補フレーズは現在ありません。</span>';
+      } else {
+        listElem.innerHTML = cands.map(c => `
+          <div style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);padding:4px 10px;border-radius:6px;font-size:12px;display:flex;align-items:center;gap:6px;">
+            <span style="font-weight:600;color:var(--text-main);">${escapeHtml(c.text)}</span>
+            <span style="background:rgba(88,101,242,0.25);color:#5865f2;font-size:10px;padding:1px 5px;border-radius:4px;font-weight:bold;">${c.total_hits} hits</span>
+          </div>
+        `).join("");
+      }
+    }
+  } catch (err) {
+    console.debug("Error loading speculative cache status:", err);
+  }
+}
+window.loadSpeculativeCacheStatus = loadSpeculativeCacheStatus;
+
+async function triggerSpeculativePrewarm(btn) {
+  if (!confirm("直近3日間の頻出単語（3回以上再利用）をバックグラウンドで先行生成しますか？\\n※生成完了後、Standbyノードへのキャッシュ同期も自動連動します。")) return;
+  const originalText = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ 開始中..."; }
+
+  try {
+    const res = await fetch("/api/system/cache/speculative_trigger", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ days: 3, min_hits: 3, sync_standby: true })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      if (typeof showToast === "function") {
+        showToast(data.message, "success");
+      } else {
+        alert(data.message);
+      }
+    } else {
+      alert(`事前生成開始エラー: ${data.error || data.message || res.statusText}`);
+    }
+  } catch (err) {
+    alert(`通信エラー: ${err.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = originalText; }
+    loadSpeculativeCacheStatus();
+  }
+}
+window.triggerSpeculativePrewarm = triggerSpeculativePrewarm;
 
 async function loadWorkerNodes() {
   try {
