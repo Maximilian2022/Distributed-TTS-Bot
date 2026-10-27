@@ -617,9 +617,9 @@ class TTSManager:
             except Exception as e:
                 logger.warning(f"{engine_name.upper()} external GPU chunk synthesis failed: {e}")
 
-        # 外部GPUノードがおらず、外部CPUノードのみまたはMaster自機が必要な場合:
-        if self.resource_manager:
-            ready = await self.resource_manager.start_engine(engine_name, wait_healthy=True, timeout=8.0)
+        # 外部ノードプールに利用可能なノードが1台もいない場合、Master自機コンテナの起動を試行
+        if self.resource_manager and not any(n.is_available for n in pool.nodes):
+            ready = await self.resource_manager.start_engine(engine_name, wait_healthy=True, timeout=25.0)
             if not ready:
                 return None
         slot_ctx = self.resource_manager.acquire_synthesis_slot(engine_name) if self.resource_manager else self._local_synthesis_lock
@@ -1386,7 +1386,7 @@ class TTSManager:
                 if self.resource_manager and prov in self.resource_manager.LOCAL_ENGINES:
                     is_running = await self.resource_manager.is_engine_running(prov)
                     if not is_running:
-                        started = await self.resource_manager.start_engine(prov, wait_healthy=True, timeout=8.0)
+                        started = await self.resource_manager.start_engine(prov, wait_healthy=True, timeout=25.0)
                         if not started:
                             unhealthy_providers.add(prov)
                             logger.warning(f"Engine '{prov}' failed to start. Skipping remaining models for this provider.")

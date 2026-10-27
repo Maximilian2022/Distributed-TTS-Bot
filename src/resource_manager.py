@@ -292,7 +292,7 @@ class LocalEngineResourceManager:
         except Exception:
             return False
 
-    async def start_engine(self, provider: str, wait_healthy: bool = False, timeout: float = 6.0) -> bool:
+    async def start_engine(self, provider: str, wait_healthy: bool = False, timeout: float = 25.0) -> bool:
         """
         指定エンジンのコンテナを起動する。
         - Workerノードプールに利用可能ノードがあれば即座にTrue
@@ -345,9 +345,9 @@ class LocalEngineResourceManager:
                     self._starting_engines.discard(provider)
                     return False
 
-                # 起動リクエスト成功時、バックグラウンド監視タスクをスケジュール
+                # 起動リクエスト成功時、バックグラウンド監視タスクをスケジュール (最大35秒)
                 safe_create_task(
-                    self._poll_until_ready(provider, timeout=20.0),
+                    self._poll_until_ready(provider, timeout=35.0),
                     name=f"poll_ready_{provider}"
                 )
 
@@ -357,7 +357,7 @@ class LocalEngineResourceManager:
         # 同期的にヘルスチェックを待機
         return await self.wait_until_ready(provider, timeout=timeout)
 
-    async def _poll_until_ready(self, provider: str, timeout: float = 15.0) -> bool:
+    async def _poll_until_ready(self, provider: str, timeout: float = 35.0) -> bool:
         """バックグラウンドでヘルスチェックを行い、成功したら starting セットから除外"""
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -371,7 +371,7 @@ class LocalEngineResourceManager:
         self._starting_engines.discard(provider)
         return False
 
-    async def wait_until_ready(self, provider: str, timeout: float = 5.0) -> bool:
+    async def wait_until_ready(self, provider: str, timeout: float = 25.0) -> bool:
         """
         早撃ち対策: 音声合成直前に、対象エンジンが利用可能になるまで最大 timeout 秒待機。
         """

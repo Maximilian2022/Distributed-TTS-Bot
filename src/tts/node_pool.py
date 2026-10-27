@@ -229,7 +229,7 @@ class TTSNode:
         """このノードのホストが更新/再起動のため割り当て停止(ドレイン)中か"""
         return bool(self._host) and self._host in DRAINING_HOSTS
 
-    async def try_remote_start(self) -> bool:
+    async def try_remote_start(self, timeout: float = 35.0) -> bool:
         """ワーカーのAgentに対してエンジンのオンデマンド遠隔起動を試みる (GPU・CPU・自ホスト問わず自律復帰)"""
         if not self.url:
             return False
@@ -244,18 +244,25 @@ class TTSNode:
             target_ip = "127.0.0.1" if ip in ("localhost", "127.0.0.1") else ip
             engine = self.engine_name.lower()
             agent_url = f"http://{target_ip}:50030/engine/start"
-            logger.info(f"⚡ [On-Demand Start] Sending remote start for '{engine}' to worker ({target_ip}:50030)...")
-            session = await self._get_agent_session()
-            async with session.post(agent_url, json={"engine": engine}) as resp:
-                if resp.status == 200:
-                    logger.info(f"✨ [On-Demand Start] Successfully woke engine '{engine}' on worker ({target_ip})")
-                    self.is_healthy = True
-                    self.engine_running = True
-                    self.specs["engine_running"] = True
-                    self.unhealthy_until = 0.0
-                    return True
+            logger.info(f"⚡ [On-Demand Start] Sending remote start for '{engine}' to worker ({target_ip}:50030) (waiting up to {timeout:.0f}s)...")
+            
+            # コンテナ起動＋ヘルスチェック完了（最大60秒、実測10〜15秒）を待機できる専用タイムアウトで送出
+            client_to = aiohttp.ClientTimeout(total=timeout, connect=5.0)
+            async with aiohttp.ClientSession(timeout=client_to) as temp_session:
+                async with temp_session.post(agent_url, json={"engine": engine}) as resp:
+                    if resp.status == 200:
+                        logger.info(f"✨ [On-Demand Start] Successfully woke engine '{engine}' on worker ({target_ip})")
+                        self.is_healthy = True
+                        self.engine_running = True
+                        self.specs["engine_running"] = True
+                        self.specs["engine_healthy"] = True
+                        self.unhealthy_until = 0.0
+                        return True
+                    else:
+                        err_text = await resp.text()
+                        logger.warning(f"⚠️ [On-Demand Start] Worker ({target_ip}) returned HTTP {resp.status} for '{engine}': {err_text}")
         except Exception as e:
-            logger.debug(f"Could not remote-start engine on worker {self.id}: {e}")
+            logger.warning(f"Could not remote-start engine on worker {self.id} ({self.url}): {e}")
         return False
 
     @property
@@ -674,6 +681,46 @@ class TTSNodePool:
             if node.is_available:
                 return node.url
         return self.nodes[0].url if self.nodes else ""
+
+    async def wake_up_nodes(self, wait_healthy: bool = True, timeout: float = 35.0) -> bool:
+        """
+        スリープ中の外部Workerノード（GPU最優先）に対してオンデマンド遠隔起動を一括送出し、
+        いずれかのノードがヘルスチェックOK（is_available）になるまで待機する (バッチ事前生成・コールドスタート用)。
+        """
+        if any(n.is_available for n in self.nodes):
+            return True
+
+        candidates = [n for n in self.nodes if n.enabled and not n.draining]
+        if not candidates:
+            return False
+
+        # GPUノードを最優先、次にCPUノード
+        candidates.sort(key=lambda n: (0 if n.has_gpu else 1, n.priority))
+
+        # 上位候補（GPUノードおよびCPUノード）にリモート起動を並行送信
+        tasks = []
+        for n in candidates[:3]:
+            tasks.append(n.try_remote_start(timeout=timeout))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"⚡ [NodePool] Wake-up broadcast for '{self.engine_name}' returned: {results}")
+
+        if not wait_healthy:
+            return any(n.is_available for n in self.nodes)
+
+        # いずれかのノードが利用可能になるまでポーリング待機 (最大 timeout 秒)
+        start_t = time.time()
+        while time.time() - start_t < timeout:
+            if any(n.is_available for n in self.nodes):
+                logger.info(f"✨ [NodePool] At least one node for '{self.engine_name}' is fully ready (took {time.time() - start_t:.2f}s)")
+                return True
+            await asyncio.sleep(0.5)
+
+        ready = any(n.is_available for n in self.nodes)
+        if not ready:
+            logger.warning(f"⚠️ [NodePool] Wake-up for '{self.engine_name}' timed out after {timeout:.1f}s.")
+        return ready
 
     async def acquire_node(
         self,

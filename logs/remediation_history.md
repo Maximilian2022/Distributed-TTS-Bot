@@ -1,5 +1,40 @@
 
 # 修正・作業履歴 (Remediation History)
+## [2026-10-27] 投機的キャッシュ事前生成におけるコールドスタート待機タイムアウト不整合の解消 ＆ 外部Worker一括先行起動
+
+- **ユーザーフィードバック & 課題**:
+  - 「ログを確認してほしい。手動で投機的キャッシュ事前生成を実施してみた、エンジンが起動してないか、ロード待ちが短すぎてタイムアウトでコレ結局何も生成できてなくない？」
+- **ログ調査結果（真因分析）**:
+  1. **ユーザーの指摘が完全に的中**:
+     - 実行ログ（19:21:42〜19:22:05）において、`Wait for engine 'voicevox' exceeded 15.0s limit` / `Wait for engine 'coeiroink' exceeded 8.0s limit` が多発し、全リクエストが Edge-TTS へフォールバックしていた。
+     - 事前生成側のフォールバックガード（`actual_prov != target_prov`）により「偽キャッシュとして保存されないようスキップ」されたため、結果として **0 generated, 650 skipped** となり、本来の音声モデルのキャッシュが1件も生成されていなかった。
+  2. **起動・待機タイムアウトの短小ハードコード**:
+     - `src/tts/node_pool.py`: `_get_agent_session` の HTTP セッションタイムアウトが `total=8.0`（8秒）に設定されており、Worker Agent側がコンテナ起動・ヘルスチェック待機（実測10〜15秒）完了を待つ間にMaster側がタイムアウトを起こしていた。
+     - `src/resource_manager.py`: `start_engine` のデフォルト待機時間が `6.0秒`、`wait_until_ready` が `5.0秒`。
+     - `src/tts/manager.py`: 音声合成前の `start_engine` 待機が `8.0秒` ハードコード。
+  3. **事前生成における外部Worker先行起動ロジックの欠如**:
+     - `src/cache_prewarm.py` 冒頭で `rm.start_engine`（自機コンテナのみ）しか呼んでおらず、GPUを持つ外部ノードプールへの一括先行起動・待機が行われていなかった。
+
+- **対応内容**:
+  1. **外部Workerノード一括先行起動 & 待機メソッド新設 (`src/tts/node_pool.py`)**:
+     - `TTSNode.try_remote_start(timeout=35.0)`: タイムアウトを35秒に拡張し、コンテナ起動＋ヘルスチェック完了まで途中で切断されず待機可能に改修。成功時に `specs["engine_healthy"]` 等を確実にセット。
+     - `TTSNodePool.wake_up_nodes(wait_healthy=True, timeout=35.0)` を新設: スリープ中の外部Workerノード（GPU最優先、外部優先）に対してオンデマンド遠隔起動を一括並行送出し、いずれかのノードがヘルスチェックOK（`is_available`）になるまで待機。
+  2. **自機エンジン待機タイムアウト拡張 (`src/resource_manager.py`)**:
+     - `start_engine`: `timeout=25.0`
+     - `_poll_until_ready`: `timeout=35.0`
+     - `wait_until_ready`: `timeout=25.0`
+  3. **TTSManagerの起動条件最適化 & タイムアウト拡張 (`src/tts/manager.py`)**:
+     - `pool.nodes` に既に利用可能な外部ノード（`is_available`）が存在する場合は無駄な自機コンテナ起動をスキップ。自機起動時は `timeout=25.0`。
+  4. **事前生成バッチへの外部ノード一括先行起動の統合 (`src/cache_prewarm.py`)**:
+     - バッチ開始冒頭で、対象プロバイダー（`voicevox`, `coeiroink`, `sharevox`）のノードプールに対して `pool.wake_up_nodes(wait_healthy=True, timeout=35.0)` を並行送出。外部ノードがいない場合のみ自機コンテナを起動。
+
+- **本番検証結果**:
+  - `touch data/.ha_updating` 誤昇格抑止のもと `docker compose restart app` で安全反映。
+  - `POST /api/system/cache/speculative_trigger` 実行検証:
+    - VOICEVOX外部ノードへのウェイクアップ送出（`Wake-up broadcast for 'voicevox' returned: [True, True, True]`）。
+    - COEIROINKにて `MasterUbuntu`（CPU）がフォールバックなしで本来の `coeiroink` 音声として正常に合成完了（`Saved new cache (coeiroink): ...wav (39180 bytes)`）。
+    - 完了後に自動スリープ停止され、メモリ返却も正常動作を確認。
+
 ## [2026-10-27] WebUI分散コンピュートワーカーカード描画時の ReferenceError (resolvedHostname 未定義) の即時解消
 
 - **ユーザーフィードバック & 現象**:

@@ -217,19 +217,28 @@ class IntelligentPrewarmService:
 
             # 1. ローカルプロバイダー（voicevox, coeiroink, sharevox）の事前一括起動
             # 投機実行は最閑散時間帯（VC無人時）に実行されるため、ローカルエンジンがスリープ停止している。
-            # 合成前にあらかじめ確実に起動させ、Edge-TTSへの意図しないフォールバックを防止する。
+            # 合成前に外部GPU/CPUワーカーノードおよび自機コンテナを確実に起動・待機させ、Edge-TTSへの意図しないフォールバックを防止する。
             rm = getattr(self.tts, "resource_manager", None)
             local_providers_needed = {
                 self._resolve_speaker_provider(s) for s in target_speakers 
                 if self._resolve_speaker_provider(s) in ("voicevox", "coeiroink", "sharevox")
             }
-            if rm and local_providers_needed:
+            if local_providers_needed:
                 for prov in local_providers_needed:
-                    logger.info(f"⚡ [Speculative Prewarm] Ensuring local engine '{prov}' is running before batch...")
-                    try:
-                        await rm.start_engine(prov, wait_healthy=True, timeout=15.0)
-                    except Exception as e:
-                        logger.warning(f"⚠️ [Speculative Prewarm] Failed to pre-start local engine '{prov}': {e}")
+                    logger.info(f"⚡ [Speculative Prewarm] Ensuring engine '{prov}' nodes are awake before batch...")
+                    pool = getattr(self.tts, f"{prov}_pool", None)
+                    ready = False
+                    if pool and hasattr(pool, "wake_up_nodes"):
+                        try:
+                            ready = await pool.wake_up_nodes(wait_healthy=True, timeout=35.0)
+                        except Exception as e:
+                            logger.warning(f"⚠️ [Speculative Prewarm] NodePool wake-up error for '{prov}': {e}")
+                    # 外部ノードが利用不可の場合のみ自機コンテナを起動
+                    if not ready and rm:
+                        try:
+                            await rm.start_engine(prov, wait_healthy=True, timeout=30.0)
+                        except Exception as e:
+                            logger.warning(f"⚠️ [Speculative Prewarm] Failed to pre-start local container '{prov}': {e}")
 
             from src.cache_manager import CacheManager
 
@@ -251,12 +260,16 @@ class IntelligentPrewarmService:
                     break
                 prov_speakers = speakers_by_provider[prov]
 
-                # ローカルプロバイダー処理直前の再確認（万が一停止していた場合の起動）
-                if rm and prov in ("voicevox", "coeiroink", "sharevox"):
-                    try:
-                        await rm.start_engine(prov, wait_healthy=True, timeout=10.0)
-                    except Exception:
-                        pass
+                # ローカルプロバイダー処理直前の再確認（外部ノード・自機コンテナの健全化待機）
+                if prov in ("voicevox", "coeiroink", "sharevox"):
+                    pool = getattr(self.tts, f"{prov}_pool", None)
+                    is_ready = bool(pool and any(n.is_available for n in pool.nodes))
+                    if not is_ready:
+                        logger.info(f"⚡ [Speculative Prewarm] Waiting for '{prov}' nodes to become healthy before synthesis...")
+                        if pool and hasattr(pool, "wake_up_nodes"):
+                            is_ready = await pool.wake_up_nodes(wait_healthy=True, timeout=35.0)
+                        if not is_ready and rm:
+                            await rm.start_engine(prov, wait_healthy=True, timeout=30.0)
 
                 for phrase in target_phrases:
                     if not self._running:
