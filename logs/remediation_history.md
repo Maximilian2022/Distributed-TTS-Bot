@@ -1,6 +1,36 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-27] WebUI「Standbyへキャッシュ同期」エラー（JSONパース失敗）の原因調査・Standby更新確認・Master最小瞬断ロールオーバー
+- **ユーザーフィードバック & 課題**:
+  - 「Standbyへキャッシュ同期ボタンを押すと以下エラー
+    通信エラー: Unexpected non-whitespace character after JSON at position 3 (line 1 column 4)
+    一応このボタン押す前に全Standby一括更新したんだけどな・・・？
+    まずは、StandbySlaveがキャッシュ同期対応したバージョンになってるか確認してほしい
+    次に、Standby一括更新で更新できなかった理由を調査してほしい。」
+- **原因調査 & 事実確認結果**:
+  1. **Standby Slave の更新状態の確認**:
+     - **【結論: 2台とも正常に更新済みであった】**
+     - ログ検証（16:38:58 〜 16:39:03）:
+       - 16:38:58 に「全Standby一括更新」シグナルを受信した直後、
+       - 16:39:01 に `slave_f960592ba045_00af7ef3` (192.168.11.248) が `GET /api/ha/code_snapshot HTTP/1.1 200 1264061` を実行。
+       - 16:39:03 に `slave_92db75a83282_e7fcf41e` (192.168.11.244) が `GET /api/ha/code_snapshot HTTP/1.1 200 1264061` を実行。
+       - 両ノードとも Master から最新のソースコード（キャッシュ同期対応コード）をダウンロードし、構文検証を経て自律リロード（`os.execv`）を完了していた。
+  2. **エラー `Unexpected non-whitespace character after JSON at position 3 (line 1 column 4)` の真因**:
+     - Standby Slave ではなく、**Master 側（本機 `ttsbot-app-1`）のプロセスが旧コードのまま稼働していた** ことが原因。
+     - 「本番運用中につき頻繁な再起動を避ける」原則により Master コンテナの再起動を控えていたため、新設したエンドポイント（`POST /api/system/manager_nodes/cache_sync` 等）が Master の Web サーバーにロードされていなかった。
+     - その結果、Master が `404 Not Found`（プレーンテキスト）を返却し、ブラウザ側 JS の `res.json()` が `404` の直後のスペース（position 3）で構文エラーを発生させていた。
+- **対応内容**:
+  1. **Primary Master 安全最小瞬断ロールオーバーの実施**:
+     - Slave 側の誤昇格（フェイルオーバー）を防止するため、HA 調停ロック `data/.ha_updating` を作成。
+     - `docker compose restart app` により Master コンテナを再起動（瞬断約5秒、Bot 全機即時復帰）。
+     - 起動完了後に `data/.ha_updating` を削除。
+     - `curl` による疎通検証にて、`/api/system/manager_nodes/cache_sync` および `/api/system/cache/speculative_status` が正常にロードされ、`401 Unauthorized (JSON)` を返すことを確認（404 解消）。
+  2. **フロントエンド（`app.js`）の防御的レスポンスパース改善 (`src/web/static/app.js`)**:
+     - `triggerStandbyCacheSync` および `triggerSpeculativePrewarm` において、万が一 404/500 等の非 JSON レスポンスが返った場合でも構文エラーでクラッシュせず、`HTTP 404: Not Found` 等の明瞭なエラーメッセージを表示するようガードを強化。
+  3. **Standby Slave 稼働健全性の確認**:
+     - 2台の Slave から Master への定常ハートビートが `200 OK` で正常に届いていることを確認。
+
 ## [2026-10-27] 投機的キャッシュ事前生成（ホットワードプレウォーム）＆ 早朝04:30生成 ➔ 05:00 HA同期 直列連携パイプラインの実装
 - **ユーザーフィードバック & 課題**:
   - 「よく使われる単語を先にローカルエンジンで自動生成しておく事前キャッシュの仕組みってなかったっけ。キャッシュのところで、再利用回数が短期間で一定数を超えたものを先行して作る仕組みはどうかな。検討してみて」

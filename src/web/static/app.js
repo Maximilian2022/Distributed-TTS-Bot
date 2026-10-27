@@ -7205,7 +7205,13 @@ async function triggerStandbyCacheSync(nodeId, btn) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(nodeId ? { node_id: nodeId } : {})
     });
-    const data = await res.json();
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      const text = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}: ${text.slice(0, 80) || res.statusText}`);
+    }
     if (res.ok) {
       if (typeof showToast === "function") {
         showToast(data.message || `${targetLabel} にキャッシュ同期シグナルを送信しました`, "success");
@@ -7295,7 +7301,13 @@ async function triggerSpeculativePrewarm(btn) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ days: 3, min_hits: 3, sync_standby: true })
     });
-    const data = await res.json();
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      const text = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}: ${text.slice(0, 80) || res.statusText}`);
+    }
     if (res.ok) {
       if (typeof showToast === "function") {
         showToast(data.message, "success");
