@@ -1,6 +1,35 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-27] 投機的キャッシュ事前生成の話者ユーザー名除外 ＆ WebServer AttributeError (読み込み中停止) 修正
+- **ユーザーフィードバック & 課題**:
+  - 「事前生成を手動実行してみたけど、、読み込み中のままかわらず。投機実行にめっちゃ話者読み上げのユーザー名含まれちゃってるので、それは除外してほしいかな。その人でのリユースがメインになるだろうから。」
+  - 「あ、あとログみて。エラーがいくつか記録されてた」
+- **ログ調査 & 原因分析**:
+  1. **WebUIが「読み込み中...」のまま変わらなかった原因**:
+     - `logs/bot.log` を確認したところ、以下エラーが発生していた：
+       `AttributeError: 'WebServer' object has no attribute 'database'`
+       `api_system_speculative_cache_status` 内で `self.db` ではなく `self.database` を参照していたため HTTP 500 を返却。
+     - フロントエンドの `loadSpeculativeCacheStatus()` が `!res.ok` で早期リターンし、HTMLの初期プレースホルダー（「読み込み中...」）が更新されない状態になっていた。
+  2. **手動実行自体の動作状況**:
+     - ログ上、事前生成自体は正常に実行され `Finished in 28.96s: 13 generated, 17 skipped` で完了し、Standbyノードへのキャッシュアーカイブ同期（281ファイル、31.7MB）まで連動して完了していた。
+  3. **ユーザー名プレフィックスが混入していた原因**:
+     - Discordの「話者ユーザー名読み上げ」によって生成された名前キャッシュ（`サバス、` `やどん、` `チェインドベル、` 等）が、末尾読点「、」付きで `cache_metadata` に保存されていた。
+     - ユーザーの指摘通り、話者読み上げはその人自身の声で発言時にキャッシュされ、他話者での一括先行生成はリソースの無駄になるため、明示的に除外する必要があった。
+- **対応内容**:
+  1. **名前プレフィックスおよび記号単体の完全除外 (`src/database.py`)**:
+     - `get_frequent_phrases_for_prewarm()` のクエリに `AND text NOT LIKE '%、' AND text NOT LIKE '%,%'` を追加。
+     - Python側で英数字・日本語の実体文字が存在しない記号単体（`！` や `？`）を除外する正規表現ガードを追加。
+     - 実機DBで検証した結果、名前プレフィックスが100%除外され、純粋な会話短文・相槌・日常単語（`おつかれ`, `こんにちは！`, `了解です`, `草`, `助かる`, `わら`, `ユーアールエル`, `え` 等）のみ 20件が正確に抽出されることを確認。
+  2. **WebServer AttributeError の解消 (`src/web/server.py`)**:
+     - `self.database` を `self.db or getattr(self.bot, "db", None)` に修正。
+     - 単体テストにて `api_system_speculative_cache_status` が HTTP 200 OK で正常なJSONデータを返却することを確認。
+  3. **WebUIフロントエンドの初期化・表示強化 (`src/web/static/app.js`)**:
+     - システムタブ切り替えイベント（`triggerTabDataLoad`）で無条件に `loadSpeculativeCacheStatus()` を呼び出し、確実に最新状態を表示するようフックを追加。
+  4. **Masterノード安全ロールオーバー**:
+     - `data/.ha_updating` によるHA誤昇格抑止を行った上で Master コンテナを再起動（瞬断約3秒）。
+     - Bot全機およびWorkerノードが正常再接続し稼働中であることを確認。
+
 ## [2026-10-27] WebUI「Standbyへキャッシュ同期」エラー（JSONパース失敗）の原因調査・Standby更新確認・Master最小瞬断ロールオーバー
 - **ユーザーフィードバック & 課題**:
   - 「Standbyへキャッシュ同期ボタンを押すと以下エラー

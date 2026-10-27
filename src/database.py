@@ -2629,6 +2629,7 @@ class Database:
         - 直近 `days` 日以内に参照または生成されたもの
         - 再利用（ヒット数）が `min_hits` 以上のもの
         - `max_length` 文字以下の短文・単語
+        - 話者読み上げ用ユーザー名プレフィックス（末尾が読点「、」や「,」で終わるもの）を除外
         - 記号のみやテスト試聴音声、伏字を除外
         """
         import re
@@ -2642,6 +2643,8 @@ class Database:
                   AND length(text) >= 1
                   AND text NOT LIKE 'sample_%'
                   AND text NOT LIKE '%[ピー]%'
+                  AND text NOT LIKE '%、'
+                  AND text NOT LIKE '%,%'
                   AND trim(text) != ''
                 GROUP BY text
                 ORDER BY total_hits DESC
@@ -2650,12 +2653,19 @@ class Database:
             cur = await db.execute(query, (days, days, min_hits, max_length, limit * 2))
             rows = await cur.fetchall()
 
-            # 記号のみ（感嘆符や句読点だけ）を除外し、日本語や英数字を含む有意義なフレーズのみ抽出
+            # 記号のみ（感嘆符や句読点だけ）を除外し、日本語や英数字の実体テキストを含む有意義なフレーズのみ抽出
             re_has_content = re.compile(r'[\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
             results: List[Dict[str, Any]] = []
             for r in rows:
                 text = r[0]
-                if text and re_has_content.search(text):
+                if not text:
+                    continue
+                # 文字列から記号・空白を除去して実体文字が残るか確認
+                sub_chars = re.sub(r'[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', text)
+                if not sub_chars:
+                    continue  # 「！」や「？」など記号単体を除外
+
+                if re_has_content.search(text):
                     results.append({
                         "text": text,
                         "total_hits": r[1] or 0,
@@ -2665,6 +2675,27 @@ class Database:
                         break
 
             return results
+
+    async def get_configured_speakers(self) -> List[str]:
+        """
+        現在ユーザー（グローバル設定）またはサーバー別設定（guild_user_settings）で
+        実際に利用設定されている音声モデル（speaker_id）の一覧を取得。
+        クラウド（Azure, Google）・ローカル（VOICEVOX, COEIROINK, SHAREVOX）を問わず集約。
+        """
+        async with self.get_connection() as db:
+            query = """
+                SELECT speaker_id, COUNT(*) as user_count
+                FROM (
+                    SELECT speaker_id FROM user_settings WHERE speaker_id IS NOT NULL AND trim(speaker_id) != ''
+                    UNION ALL
+                    SELECT speaker_id FROM guild_user_settings WHERE speaker_id IS NOT NULL AND trim(speaker_id) != ''
+                )
+                GROUP BY speaker_id
+                ORDER BY user_count DESC, speaker_id ASC
+            """
+            cur = await db.execute(query)
+            rows = await cur.fetchall()
+            return [str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip()]
 
     async def maintenance(self) -> Dict[str, Any]:
         """

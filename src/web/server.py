@@ -1541,17 +1541,31 @@ class WebServer:
         prewarm = getattr(self.bot, "prewarm_service", None) if self.bot else None
 
         candidates = []
-        if hasattr(self.database, "get_frequent_phrases_for_prewarm"):
+        db_obj = self.db or getattr(self.bot, "db", None)
+        if db_obj and hasattr(db_obj, "get_frequent_phrases_for_prewarm"):
             try:
-                candidates = await self.database.get_frequent_phrases_for_prewarm(days=3, min_hits=3, max_length=15, limit=20)
+                candidates = await db_obj.get_frequent_phrases_for_prewarm(days=3, min_hits=3, max_length=15, limit=20)
             except Exception as e:
                 logger.warning(f"Error fetching speculative candidates: {e}")
+
+        target_speakers = []
+        if prewarm and hasattr(prewarm, "_get_speculative_target_speakers"):
+            try:
+                target_speakers = await prewarm._get_speculative_target_speakers()
+            except Exception as e:
+                logger.warning(f"Error fetching speculative target speakers: {e}")
+        elif db_obj and hasattr(db_obj, "get_configured_speakers"):
+            try:
+                target_speakers = await db_obj.get_configured_speakers()
+            except Exception:
+                pass
 
         status = {
             "is_running": getattr(prewarm, "_speculative_running", False) if prewarm else False,
             "last_run_time": getattr(prewarm, "last_speculative_run_time", None) if prewarm else None,
             "last_stats": getattr(prewarm, "last_speculative_stats", {}) if prewarm else {},
             "candidates_top20": candidates,
+            "target_speakers": target_speakers,
             "daily_schedule": "04:30 JST (Early morning idle batch -> 05:00 Standby HA sync)"
         }
         return web.json_response(status)

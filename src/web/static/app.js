@@ -91,6 +91,9 @@ function triggerTabDataLoad(activeSubOrTab) {
       checkModelsStatus();
       loadMyCoeiroinkList(1);
     }
+    if (typeof loadSpeculativeCacheStatus === "function") {
+      loadSpeculativeCacheStatus();
+    }
     startSystemMetricsPolling();
     loadLogs();
     loadWorkerLogs(false);
@@ -7274,7 +7277,7 @@ async function loadSpeculativeCacheStatus() {
       const cands = data.candidates_top20 || [];
       countElem.textContent = `${cands.length} 件検出`;
       if (cands.length === 0) {
-        listElem.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">直近3日間で3回以上再利用された候補フレーズは現在ありません。</span>';
+        listElem.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">直近3日間で3回以上再利用された候補フレーズは現在ありません（※話者名プレフィックスは自動除外）。</span>';
       } else {
         listElem.innerHTML = cands.map(c => `
           <div style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);padding:4px 10px;border-radius:6px;font-size:12px;display:flex;align-items:center;gap:6px;">
@@ -7282,6 +7285,48 @@ async function loadSpeculativeCacheStatus() {
             <span style="background:rgba(88,101,242,0.25);color:#5865f2;font-size:10px;padding:1px 5px;border-radius:4px;font-weight:bold;">${c.total_hits} hits</span>
           </div>
         `).join("");
+      }
+    }
+
+    // 🎙️ 対象音声モデル一覧（クラウド・ローカル動的集約）の描画
+    const speakersCountElem = document.getElementById("spec-speakers-count-text");
+    const speakersSummaryElem = document.getElementById("spec-speakers-summary-text");
+    const speakersListElem = document.getElementById("spec-speakers-list");
+    if (speakersListElem) {
+      const speakers = data.target_speakers || [];
+      if (speakersCountElem) speakersCountElem.textContent = `${speakers.length} 種`;
+      if (speakersSummaryElem) speakersSummaryElem.textContent = `全${speakers.length}種 自動追従中`;
+
+      if (speakers.length === 0) {
+        speakersListElem.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">設定中モデルなし</span>';
+      } else {
+        speakersListElem.innerHTML = speakers.map(spk => {
+          let badgeStyle = "background:rgba(255,255,255,0.08);color:var(--text-muted);border:1px solid rgba(255,255,255,0.15);";
+          let provLabel = "Azure";
+          if (spk.startsWith("vv_")) {
+            badgeStyle = "background:rgba(35, 165, 90, 0.2);color:#57f287;border:1px solid rgba(35, 165, 90, 0.4);";
+            provLabel = "VOICEVOX";
+          } else if (spk.startsWith("ci_")) {
+            badgeStyle = "background:rgba(235, 69, 158, 0.2);color:#f47fff;border:1px solid rgba(235, 69, 158, 0.4);";
+            provLabel = "COEIROINK";
+          } else if (spk.startsWith("sv_")) {
+            badgeStyle = "background:rgba(245, 158, 11, 0.2);color:#fbbf24;border:1px solid rgba(245, 158, 11, 0.4);";
+            provLabel = "SHAREVOX";
+          } else if (spk.startsWith("g_")) {
+            badgeStyle = "background:rgba(66, 133, 244, 0.2);color:#8ab4f8;border:1px solid rgba(66, 133, 244, 0.4);";
+            provLabel = "Google";
+          } else {
+            badgeStyle = "background:rgba(168, 85, 247, 0.2);color:#c084fc;border:1px solid rgba(168, 85, 247, 0.4);";
+            provLabel = "Azure/Edge";
+          }
+
+          return `
+            <span style="${badgeStyle}padding:2px 8px;border-radius:4px;font-size:11px;font-family:monospace;display:inline-flex;align-items:center;gap:4px;" title="${provLabel}: ${escapeHtml(spk)}">
+              <span style="font-size:9px;opacity:0.75;text-transform:uppercase;">${provLabel}</span>
+              <strong>${escapeHtml(spk)}</strong>
+            </span>
+          `;
+        }).join("");
       }
     }
   } catch (err) {

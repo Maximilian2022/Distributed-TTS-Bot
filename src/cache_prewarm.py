@@ -223,8 +223,7 @@ class IntelligentPrewarmService:
                     while self._busy:
                         await asyncio.sleep(2.0)
 
-                    voice_cfg = getattr(self.tts, "_get_voice_config", lambda s: None)(spk)
-                    provider = voice_cfg.provider if voice_cfg else "edge"
+                    provider = self._resolve_speaker_provider(spk)
                     cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
 
                     cached = await self.cache.get(cache_key, provider=provider)
@@ -260,7 +259,7 @@ class IntelligentPrewarmService:
             }
             self.last_speculative_stats = stats
             self.last_speculative_run_time = time.time()
-            logger.info(f"✅ [Speculative Prewarm] Finished in {duration}s: {generated_count} generated, {skipped_count} skipped.")
+            logger.info(f"✅ [Speculative Prewarm] Finished in {duration}s: {generated_count} generated, {skipped_count} skipped across {len(target_speakers)} speakers.")
             return stats
 
         except Exception as e:
@@ -271,37 +270,53 @@ class IntelligentPrewarmService:
         finally:
             self._speculative_running = False
 
-    async def _get_speculative_target_speakers(self) -> List[str]:
-        """投機的キャッシュ生成用の対象話者（アクティブユーザーの話者優先）を取得"""
-        speakers: List[str] = []
-        voices = getattr(self.config, "voices", {})
+    def _resolve_speaker_provider(self, speaker_id: str) -> str:
+        """話者IDから対応プロバイダーを正確に特定（ローカル/クラウドのキャッシュディレクトリ振り分け用）"""
+        spk = str(speaker_id).strip()
+        voice_cfg = getattr(self.tts, "_get_voice_config", lambda s: None)(spk)
+        if voice_cfg and getattr(voice_cfg, "id", "") == spk:
+            return getattr(voice_cfg, "provider", "edge")
+        if spk.startswith("vv_"):
+            return "voicevox"
+        if spk.startswith("ci_"):
+            return "coeiroink"
+        if spk.startswith("sv_"):
+            return "sharevox"
+        if spk.startswith("g_"):
+            return "google"
+        return "azure"
 
+    async def _get_speculative_target_speakers(self) -> List[str]:
+        """
+        投機的キャッシュ生成用の対象話者を取得。
+        クラウド・ローカル問わず、現在ユーザー（user_settings）またはサーバー別（guild_user_settings）で
+        実際に利用設定されている全モデルを抽出する。
+        今後新しい音声モデルが設定された場合も、翌朝の投機キャッシュ生成に自動連動する。
+        """
+        speakers: List[str] = []
+
+        # 1. デフォルト話者
         def_spk = getattr(self.config, "default_speaker", "nanami")
-        if def_spk and def_spk in voices:
+        if def_spk:
             speakers.append(def_spk)
 
-        # 実際のユーザーが設定している話者をDBから抽出
-        try:
-            if hasattr(self.db, "get_connection"):
-                async with self.db.get_connection() as db:
-                    cur = await db.execute("SELECT DISTINCT speaker FROM user_settings WHERE speaker IS NOT NULL LIMIT 8")
-                    rows = await cur.fetchall()
-                    for r in rows:
-                        spk = str(r[0])
-                        if spk in voices and spk not in speakers:
-                            speakers.append(spk)
-        except Exception as e:
-            logger.debug(f"Failed to query active speakers from user_settings: {e}")
+        # 2. 実際にユーザーやギルドで設定されている全音声モデルをDBから動的取得
+        if hasattr(self.db, "get_configured_speakers"):
+            try:
+                db_speakers = await self.db.get_configured_speakers()
+                for spk in db_speakers:
+                    if spk not in speakers:
+                        speakers.append(spk)
+            except Exception as e:
+                logger.warning(f"Error fetching configured speakers from DB: {e}")
 
-        # 代表的な人気話者を追加
-        popular = ["nanami", "keiko", "1", "2", "3"]
-        for p in popular:
-            if p in voices and p not in speakers:
+        # 3. 代表フォールバック話者（未登録時のセーフティネット）
+        for p in ["nanami", "keita", "g_wavenet_c", "vv_10", "ci_90"]:
+            if p not in speakers:
                 speakers.append(p)
-            if len(speakers) >= 5:
-                break
 
-        return speakers[:5]
+        logger.info(f"🎙️ [Speculative Prewarm] Target configured speakers ({len(speakers)} models): {speakers}")
+        return speakers
 
     def _get_target_speakers(self) -> List[str]:
         """事前キャッシュの対象とする代表的な話者IDリストを返却"""
