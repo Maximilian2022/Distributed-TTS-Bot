@@ -7301,18 +7301,23 @@ async function loadSpeculativeCacheStatus() {
         speakersListElem.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">設定中モデルなし</span>';
       } else {
         speakersListElem.innerHTML = speakers.map(spk => {
+          const spkId = typeof spk === "object" ? (spk.id || "") : String(spk);
+          const spkName = typeof spk === "object" ? (spk.name || spkId) : spkId;
+          const spkProv = typeof spk === "object" ? (spk.provider || "") : "";
+
           let badgeStyle = "background:rgba(255,255,255,0.08);color:var(--text-muted);border:1px solid rgba(255,255,255,0.15);";
           let provLabel = "Azure";
-          if (spk.startsWith("vv_")) {
+
+          if (spkProv === "voicevox" || spkId.startsWith("vv_")) {
             badgeStyle = "background:rgba(35, 165, 90, 0.2);color:#57f287;border:1px solid rgba(35, 165, 90, 0.4);";
             provLabel = "VOICEVOX";
-          } else if (spk.startsWith("ci_")) {
+          } else if (spkProv === "coeiroink" || spkId.startsWith("ci_")) {
             badgeStyle = "background:rgba(235, 69, 158, 0.2);color:#f47fff;border:1px solid rgba(235, 69, 158, 0.4);";
             provLabel = "COEIROINK";
-          } else if (spk.startsWith("sv_")) {
+          } else if (spkProv === "sharevox" || spkId.startsWith("sv_")) {
             badgeStyle = "background:rgba(245, 158, 11, 0.2);color:#fbbf24;border:1px solid rgba(245, 158, 11, 0.4);";
             provLabel = "SHAREVOX";
-          } else if (spk.startsWith("g_")) {
+          } else if (spkProv === "google" || spkId.startsWith("g_")) {
             badgeStyle = "background:rgba(66, 133, 244, 0.2);color:#8ab4f8;border:1px solid rgba(66, 133, 244, 0.4);";
             provLabel = "Google";
           } else {
@@ -7321,9 +7326,9 @@ async function loadSpeculativeCacheStatus() {
           }
 
           return `
-            <span style="${badgeStyle}padding:2px 8px;border-radius:4px;font-size:11px;font-family:monospace;display:inline-flex;align-items:center;gap:4px;" title="${provLabel}: ${escapeHtml(spk)}">
-              <span style="font-size:9px;opacity:0.75;text-transform:uppercase;">${provLabel}</span>
-              <strong>${escapeHtml(spk)}</strong>
+            <span style="${badgeStyle}padding:2px 8px;border-radius:4px;font-size:11px;display:inline-flex;align-items:center;gap:4px;" title="${provLabel}: ${escapeHtml(spkName)} (${escapeHtml(spkId)})">
+              <span style="font-size:9px;opacity:0.8;text-transform:uppercase;font-weight:600;">${provLabel}</span>
+              <strong style="color:var(--text-main);">${escapeHtml(spkName)}</strong>
             </span>
           `;
         }).join("");

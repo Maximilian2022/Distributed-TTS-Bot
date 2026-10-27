@@ -1,6 +1,37 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-27] 投機的キャッシュ事前生成のクラウド・ローカル全設定音声モデル動的自動連動
+- **ユーザーフィードバック & 課題**:
+  - 「今事前生成されるキャッシュの音声モデルなんだけど、クラウド・ローカルともに設定されているモデルで実施するように変更できるかな？そうすれば今後新規音声モデルが選択されたら、後日そのモデルでの投機キャッシュが生成されると思ってる。」
+- **設計方針**:
+  - ハードコードによる固定モデル選定を完全廃止。
+  - `user_settings`（ユーザー個人設定）および `guild_user_settings`（サーバー別個人設定）の双方から `DISTINCT speaker_id` をDBから動的集約。
+  - 実機DBで現在設定されている全26音声モデル（Azure 7種, Google 12種, VOICEVOX 5種, COEIROINK 2種）を漏れなく自動検出。
+  - 各話者ID（`vv_*`, `ci_*`, `sv_*`, `g_*`, `nanami` 等）のプレフィックスからエンジン種別（クラウド / ローカル）を判定し、適切なキャッシュディレクトリへ振り分け生成。
+  - ユーザーが今後新しい音声モデル（例: VOICEVOX新スタイル、COEIROINK、Google WaveNet等）を選択した場合、翌朝 04:30 の自動バッチ生成に対象として完全自動追従。
+  - WebUI の「投機的キャッシュ事前生成」カードに設定中モデル一覧（プロバイダー別カラーバッジ）と連動件数を動的表示。
+- **実装内容**:
+  1. **設定中全話者の動的取得クエリ新設 (`src/database.py`)**:
+     - `get_configured_speakers()` メソッドを追加。`user_settings` と `guild_user_settings` から有効な `speaker_id` を `UNION` 取得。
+  2. **プロバイダー自動判別 ＆ 動的モデル集約 (`src/cache_prewarm.py`)**:
+     - `_resolve_speaker_provider(speaker_id)` を実装し、`vv_` は `voicevox`、`ci_` は `coeiroink`、`sv_` は `sharevox`、`g_` は `google`、その他は `azure` と判別。
+     - `_get_speculative_target_speakers()` を実装し、デフォルト話者 + DB設定中話者 + 代表フォールバック話者を重複なく動的集約。
+     - `run_speculative_prewarm()` 内でローカル／クラウドそれぞれのキャッシュマネージャー・ディレクトリへ適切に振り分けて事前生成。
+  3. **WebUI API の対象モデル返却 (`src/web/server.py`)**:
+     - `api_system_speculative_cache_status` のレスポンスに `target_speakers` リスト（全26種）を追加。
+  4. **WebUI テンプレート拡張 (`src/web/templates/index.html`)**:
+     - 投機的キャッシュ事前生成カード内に「🎙️ 事前生成の対象音声モデル (設定中の全モデル)」表示枠および動的連動インジケータを追加。
+  5. **WebUI フロントエンドのバッジレンダリング (`src/web/static/app.js`)**:
+     - `loadSpeculativeCacheStatus()` 内で各モデルを Azure(紫), Google(青), VOICEVOX(緑), COEIROINK(ピンク) に色分けバッジ描画。
+  6. **安全再起動 & 実機検証**:
+     - `data/.ha_updating` 作成のもと `docker compose restart app` を安全実行（瞬断約3秒、HA誤昇格抑止）。
+     - ブラウザ（`http://127.0.0.1:8088/`）にて目視確認完了。
+       - 「対象モデル: 26 種 (クラウド・ローカル動的連動)」
+       - 全26モデルのカラーバッジ正常描画
+       - 話者名プレフィックスが100%除外された純粋な会話短文20件の正常表示
+       - 待機中（アイドル）ステータスの正常表示
+
 ## [2026-10-27] 投機的キャッシュ事前生成の話者ユーザー名除外 ＆ WebServer AttributeError (読み込み中停止) 修正
 - **ユーザーフィードバック & 課題**:
   - 「事前生成を手動実行してみたけど、、読み込み中のままかわらず。投機実行にめっちゃ話者読み上げのユーザー名含まれちゃってるので、それは除外してほしいかな。その人でのリユースがメインになるだろうから。」

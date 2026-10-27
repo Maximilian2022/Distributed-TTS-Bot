@@ -1560,12 +1560,42 @@ class WebServer:
             except Exception:
                 pass
 
+        detailed_target_speakers = []
+        for spk in target_speakers:
+            prov = "azure"
+            name = spk
+            if prewarm and hasattr(prewarm, "_resolve_speaker_provider"):
+                prov = prewarm._resolve_speaker_provider(spk)
+            elif spk.startswith("vv_"):
+                prov = "voicevox"
+            elif spk.startswith("ci_"):
+                prov = "coeiroink"
+            elif spk.startswith("sv_"):
+                prov = "sharevox"
+            elif spk.startswith("g_"):
+                prov = "google"
+
+            if prewarm and hasattr(prewarm, "get_speaker_display_name"):
+                name = prewarm.get_speaker_display_name(spk)
+            elif self.config and hasattr(self.config, "voices") and spk in self.config.voices:
+                name = self.config.voices[spk].name
+            elif spk.startswith("g_"):
+                parts = spk.split("_")
+                if len(parts) >= 3:
+                    name = f"Google {parts[1].capitalize()} {parts[2].upper()}"
+
+            detailed_target_speakers.append({
+                "id": spk,
+                "name": name,
+                "provider": prov
+            })
+
         status = {
             "is_running": getattr(prewarm, "_speculative_running", False) if prewarm else False,
             "last_run_time": getattr(prewarm, "last_speculative_run_time", None) if prewarm else None,
             "last_stats": getattr(prewarm, "last_speculative_stats", {}) if prewarm else {},
             "candidates_top20": candidates,
-            "target_speakers": target_speakers,
+            "target_speakers": detailed_target_speakers,
             "daily_schedule": "04:30 JST (Early morning idle batch -> 05:00 Standby HA sync)"
         }
         return web.json_response(status)

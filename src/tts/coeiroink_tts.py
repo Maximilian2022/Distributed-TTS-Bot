@@ -62,7 +62,7 @@ class CoeiroinkTTSClient(BaseTTSClient):
 
     def is_available(self) -> bool:
         if self.node_pool:
-            return any(n.is_available for n in self.node_pool.get_nodes())
+            return len(self.node_pool.get_nodes()) > 0
         return bool(self.base_url)
 
     async def _get_session(self) -> aiohttp.ClientSession:
