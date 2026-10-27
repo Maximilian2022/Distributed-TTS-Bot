@@ -84,12 +84,41 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Prepare Japanese Release Notes
+        id: release_notes
+        run: |
+          if [ -s RELEASE_NOTES.md ]; then
+            echo "✓ Using RELEASE_NOTES.md"
+            cp RELEASE_NOTES.md release_body.md
+          else
+            echo "ℹ️ RELEASE_NOTES.md not found or empty. Extracting latest entry from logs/remediation_history.md"
+            python3 -c "
+            import re
+            body = ''
+            try:
+                with open('logs/remediation_history.md', 'r', encoding='utf-8') as f:
+                    content = f.read()
+                entries = re.split(r'\n(?=## \[)', content)
+                if len(entries) > 1:
+                    body = entries[1].strip()
+            except Exception as e:
+                print(f'Error reading remediation history: {e}')
+
+            if not body:
+                body = '## 🚀 アップデート\n詳細な変更内容はコミット履歴をご確認ください。'
+
+            with open('release_body.md', 'w', encoding='utf-8') as out:
+                out.write(body + '\n')
+            "
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: "Distributed-TTS-Bot ${{ steps.version.outputs.tag }}"
-          generate_release_notes: true
+          body_path: release_body.md
+          generate_release_notes: false
           draft: false
           prerelease: false
           files: |
