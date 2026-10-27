@@ -985,6 +985,78 @@
               </details>
             </div>
 
+            <!-- 1.5 📈 ホスト & Bot本体 リソース推移 (CPU / メモリ) -->
+            <div class="card" id="host-bot-metrics-card" style="margin-bottom:20px;padding:20px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:12px;">
+                <div>
+                  <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
+                    <span>📈 ホスト全体 &amp; Bot本体 リソース推移 (CPU / メモリ)</span>
+                    <span id="host-metrics-status-badge" class="badge" style="background:rgba(35,165,90,0.18);color:#23a55a;border:1px solid rgba(35,165,90,0.4);font-weight:600;">正常稼働</span>
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    物理ホスト全体とDiscord Bot本体（コンテナ/プロセス）のCPU使用率・メモリ実消費量をリアルタイム計測・可視化します（過去30分 / 30秒間隔更新）。
+                  </div>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+                  <span id="metrics-concurrency-badge" class="badge" style="background:#3ba55c;color:white;font-weight:600;padding:5px 10px;border-radius:12px;">
+                    ⚡ 並列合成モード (最大2並列)
+                  </span>
+                  <span id="metrics-active-slots-badge" class="badge" style="background:var(--bg-tertiary, #2f3136);color:var(--text-normal, #dcddde);border:1px solid var(--border-color, rgba(255,255,255,0.1));padding:5px 10px;border-radius:12px;">
+                    合成中: 0 / 2
+                  </span>
+                  <span id="host-metrics-last-updated" style="font-size:11px;color:var(--text-dim, #72767d);">
+                    更新: --:--:--
+                  </span>
+                </div>
+              </div>
+
+              <!-- 凡例 -->
+              <div style="display:flex;flex-wrap:wrap;gap:16px;font-size:12px;margin-bottom:14px;padding:8px 14px;background:rgba(0,0,0,0.2);border-radius:8px;border:1px solid rgba(255,255,255,0.05);align-items:center;">
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <span style="display:inline-block;width:14px;height:3px;background:#95a5a6;border-radius:1px;border-top:1px dashed #95a5a6;"></span>
+                  <span style="color:var(--text-normal);font-weight:600;">ホスト全体</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <span style="display:inline-block;width:14px;height:3px;background:#5865f2;border-radius:1px;"></span>
+                  <span style="color:var(--text-normal);font-weight:600;">Bot本体 (コンテナ/プロセス)</span>
+                </div>
+                <div style="margin-left:auto;font-size:11px;color:var(--text-dim);">
+                  ※ 30秒間隔サンプリング・直近60件
+                </div>
+              </div>
+
+              <!-- グラフ表示グリッド (CPU & メモリ) -->
+              <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:16px;">
+                <!-- CPU推移グラフ -->
+                <div style="background:rgba(0,0,0,0.15);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <span style="font-size:13px;font-weight:600;color:var(--text-normal);">🔥 CPU使用率推移 (%)</span>
+                    <div style="font-size:12px;display:flex;gap:10px;">
+                      <span id="host-cpu-cur" style="color:#95a5a6;font-weight:600;">ホスト: --%</span>
+                      <span id="bot-cpu-cur" style="color:#5865f2;font-weight:600;">Bot: --%</span>
+                    </div>
+                  </div>
+                  <div style="position:relative;width:100%;height:180px;">
+                    <canvas id="host-bot-cpu-chart" style="width:100%;height:100%;display:block;"></canvas>
+                  </div>
+                </div>
+
+                <!-- メモリ推移グラフ -->
+                <div style="background:rgba(0,0,0,0.15);padding:14px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
+                  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <span style="font-size:13px;font-weight:600;color:var(--text-normal);">💾 メモリ使用量推移 (RAM)</span>
+                    <div style="font-size:12px;display:flex;gap:10px;">
+                      <span id="host-mem-cur" style="color:#95a5a6;font-weight:600;">ホスト: -- GB</span>
+                      <span id="bot-mem-cur" style="color:#5865f2;font-weight:600;">Bot: -- MB</span>
+                    </div>
+                  </div>
+                  <div style="position:relative;width:100%;height:180px;">
+                    <canvas id="host-bot-mem-chart" style="width:100%;height:100%;display:block;"></canvas>
+                  </div>
+                </div>
+              </div>
+            </div>
+
             <!-- 2. 🤖 Discord Bot プール管理 (動的スケール) -->
             <div class="card" style="margin-bottom:20px;padding:20px;">
               <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
@@ -1505,93 +1577,6 @@
                     </table>
                   </div>
                 </details>
-              </div>
-
-              <!-- 0. 📈 システムリソース & 各エンジン負荷推移 (30秒間隔・適応型並列制御) -->
-              <div class="card" id="system-metrics-card" style="margin-bottom:20px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
-                  <div>
-                    <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
-                      <span>📈</span> システムリソース & 各エンジン負荷推移
-                    </h3>
-                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
-                      ホストおよび各コンテナのCPU・メモリ使用量を30秒間隔で可視化（過去30分/最大60点）
-                    </div>
-                  </div>
-                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                    <span id="metrics-concurrency-badge" class="badge" style="background:#3ba55c;color:white;font-weight:600;padding:5px 10px;border-radius:12px;">
-                      ⚡ 並列合成モード (最大2並列)
-                    </span>
-                    <span id="metrics-active-slots-badge" class="badge" style="background:var(--bg-tertiary, #2f3136);color:var(--text-normal, #dcddde);border:1px solid var(--border-color, rgba(255,255,255,0.1));padding:5px 10px;border-radius:12px;">
-                      合成中: 0 / 2
-                    </span>
-                    <span id="metrics-last-updated" style="font-size:11px;color:var(--text-dim, #72767d);">
-                      更新: --:--:--
-                    </span>
-                  </div>
-                </div>
-
-                <!-- ノード選択タブ -->
-                <div id="metrics-nodes-tabs" style="display:flex;gap:8px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:8px;flex-wrap:wrap;">
-                  <button id="metrics-tab-master" class="btn btn-sm metrics-node-tab active" onclick="switchMetricsNode('master')" style="background:#5865f2;color:white;font-weight:600;padding:4px 12px;border-radius:6px;font-size:11px;border:none;cursor:pointer;">
-                    🏢 Primary Node (Master)
-                  </button>
-                </div>
-
-                <!-- グラフ凡例 -->
-                <div id="metrics-legend" style="display:flex;flex-wrap:wrap;gap:12px;font-size:12px;margin-bottom:14px;padding:8px 12px;background:rgba(0,0,0,0.2);border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
-                  <div style="display:flex;align-items:center;gap:5px;">
-                    <span style="display:inline-block;width:12px;height:12px;background:#95a5a6;border-radius:2px;"></span>
-                    <span style="color:var(--text-normal);">ホスト全体</span>
-                  </div>
-                  <div style="display:flex;align-items:center;gap:5px;">
-                    <span style="display:inline-block;width:12px;height:12px;background:#5865f2;border-radius:2px;"></span>
-                    <span style="color:var(--text-normal);">Bot本体</span>
-                  </div>
-                  <div style="display:flex;align-items:center;gap:5px;">
-                    <span style="display:inline-block;width:12px;height:12px;background:#2ecc71;border-radius:2px;"></span>
-                    <span style="color:var(--text-normal);">VOICEVOX</span>
-                  </div>
-                  <div style="display:flex;align-items:center;gap:5px;">
-                    <span style="display:inline-block;width:12px;height:12px;background:#3498db;border-radius:2px;"></span>
-                    <span style="color:var(--text-normal);">SHAREVOX</span>
-                  </div>
-                  <div style="display:flex;align-items:center;gap:5px;">
-                    <span style="display:inline-block;width:12px;height:12px;background:#9b59b6;border-radius:2px;"></span>
-                    <span style="color:var(--text-normal);">COEIROINK</span>
-                  </div>
-                </div>
-
-                <!-- グラフ表示グリッド (CPU & メモリ) -->
-                <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(320px, 1fr));gap:16px;">
-                  <!-- CPU推移グラフ -->
-                  <div style="background:rgba(0,0,0,0.15);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                      <span id="metrics-cpu-title" style="font-size:13px;font-weight:600;color:var(--text-normal);">🔥 CPU使用率推移 (%)</span>
-                      <span id="metrics-current-cpu" style="font-size:12px;color:#3ba55c;font-weight:600;">ホスト: --%</span>
-                    </div>
-                    <div style="position:relative;width:100%;height:180px;">
-                      <canvas id="metrics-cpu-chart" style="width:100%;height:100%;display:block;"></canvas>
-                    </div>
-                  </div>
-
-                  <!-- メモリ推移グラフ -->
-                  <div style="background:rgba(0,0,0,0.15);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                      <span id="metrics-mem-title" style="font-size:13px;font-weight:600;color:var(--text-normal);">💾 実質メモリ / VRAM使用量</span>
-                      <span id="metrics-current-mem" style="font-size:12px;color:var(--text-muted);font-weight:600;">ホスト: -- GB</span>
-                    </div>
-                    <div style="position:relative;width:100%;height:180px;">
-                      <canvas id="metrics-mem-chart" style="width:100%;height:100%;display:block;"></canvas>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- フッター説明 -->
-                <div style="margin-top:12px;font-size:11px;color:var(--text-dim);display:flex;align-items:center;gap:6px;">
-                  <span>💡</span>
-                  <span>CPU負荷適応型制御: 通常時は2並列処理、CPU 70%超過で直列化（1並列）、85%超過時はホスト保護のため即座にEdge-TTSへ退避します。</span>
-                </div>
               </div>
 
               <!-- 1. ☁️ クラウドTTS 利用状況 & キャッシュ節約 (Azure / Google / Edge) -->

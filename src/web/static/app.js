@@ -79,6 +79,10 @@ function triggerTabDataLoad(activeSubOrTab) {
     loadBotSlots();
     if (typeof loadWorkerNodes === "function") loadWorkerNodes();
     if (typeof loadTierRouting === "function") loadTierRouting();
+    startSystemMetricsPolling();
+    if (latestMetricsData) {
+      setTimeout(() => renderSystemMetricsUI(latestMetricsData), 50);
+    }
   }
   if (activeSubOrTab === "credentials") {
     loadCredentials();
@@ -97,7 +101,8 @@ function triggerTabDataLoad(activeSubOrTab) {
     startSystemMetricsPolling();
     loadLogs();
     loadWorkerLogs(false);
-  } else {
+  }
+  if (activeSubOrTab !== "bots" && activeSubOrTab !== "system") {
     stopSystemMetricsPolling();
     if (typeof workerLogInterval !== "undefined" && workerLogInterval) {
       clearInterval(workerLogInterval);
@@ -314,7 +319,7 @@ async function switchGuild(guildId) {
     checkModelsStatus();
     loadMemberVoices(currentGuildId);
     const activeTab = document.querySelector(".tab-btn.active");
-    if (activeTab && activeTab.dataset.tab === "system") {
+    if (activeTab && (activeTab.dataset.tab === "system" || activeTab.dataset.tab === "infrastructure")) {
       startSystemMetricsPolling();
     }
   }
@@ -2731,6 +2736,19 @@ function renderWorkerNodes(nodesData) {
       workerHostDisplay = isMaster ? "MasterUbuntu" : (nodeIp ? `Worker (${nodeIp})` : "Worker Node");
     }
 
+    // クラスタWorker (HTTP直接ポートを持つノード) が存在する場合、ボランティア判定に優先
+    const hasClusterEngine = (node.engines || []).some(e => e.url && !e.url.startsWith('ws://') && !e.is_volunteer);
+    const isVolunteer = !hasClusterEngine && Boolean(
+      node.is_volunteer || 
+      (node.engines || []).every(e => e.is_volunteer) || 
+      cleanCandidate.startsWith('volunteer_') || 
+      (node.url && node.url.startsWith('ws://'))
+    );
+
+    // 1. Agent のオンライン/オフライン判定 (ハートビート疎通)
+    const hbAgo = node.last_heartbeat_ago;
+    const isAgentOnline = isMaster || (node.agent_online !== undefined ? Boolean(node.agent_online) : (hbAgo != null && hbAgo < 60));
+
     // OS種類の解決
     let workerOsDisplay = specs.os_name || specs.os || specs.platform || "";
     if (!workerOsDisplay) {
@@ -2749,15 +2767,6 @@ function renderWorkerNodes(nodesData) {
       workerDockerDisplay = "v29.4.2";
     }
 
-    // クラスタWorker (HTTP直接ポートを持つノード) が存在する場合、ボランティア判定に優先
-    const hasClusterEngine = (node.engines || []).some(e => e.url && !e.url.startsWith('ws://') && !e.is_volunteer);
-    const isVolunteer = !hasClusterEngine && Boolean(
-      node.is_volunteer || 
-      (node.engines || []).every(e => e.is_volunteer) || 
-      cleanCandidate.startsWith('volunteer_') || 
-      (node.url && node.url.startsWith('ws://'))
-    );
-
     // アイコン & ボランティアバッジ (エスケープ分離)
     const icon = isMaster ? "🏢" : (isVolunteer ? "🤝" : (hasGpu ? "🎮" : "🖥️"));
     const nodeName = isMaster ? (workerHostDisplay.includes("Master") ? workerHostDisplay : `${workerHostDisplay} (Master)`) : workerHostDisplay;
@@ -2765,9 +2774,6 @@ function renderWorkerNodes(nodesData) {
       ? '<span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;margin-left:4px;">🤝 ボランティア</span>'
       : '';
 
-    // 1. Agent のオンライン/オフライン判定 (ハートビート疎通)
-    const hbAgo = node.last_heartbeat_ago;
-    const isAgentOnline = isMaster || (node.agent_online !== undefined ? Boolean(node.agent_online) : (hbAgo != null && hbAgo < 60));
     const agentBadge = isVolunteer
       ? '<span class="badge" style="background:rgba(88,101,242,0.2);color:#50e6ff;border:1px solid rgba(88,101,242,0.4);font-size:10px;font-weight:700;">⚡ WSS 常時接続</span>'
       : (isAgentOnline
@@ -2838,13 +2844,36 @@ function renderWorkerNodes(nodesData) {
       ? `<span style="font-size:10px;color:${resources.gpu_temp_celsius > 80 ? '#f04747' : 'var(--text-dim)'};">🌡️ ${resources.gpu_temp_celsius}°C</span>`
       : '';
     const hasResourceData = resources.cpu_percent != null || resources.mem_percent != null;
+    const cleanId = String(cleanCandidate || node.id || "worker").toLowerCase().replace(/[^a-zA-Z0-9_-]/g, "_");
+    const sparklineSection = `
+      <div style="margin-top:8px;background:rgba(0,0,0,0.24);border-radius:6px;padding:8px 10px;border:1px solid rgba(255,255,255,0.05);">
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;margin-bottom:4px;color:var(--text-dim);">
+          <span style="display:flex;align-items:center;gap:4px;font-weight:600;color:var(--text-muted);">
+            <span>📈</span> 直近負荷推移
+          </span>
+          <div style="display:flex;gap:8px;font-size:9px;">
+            <span style="color:#5865f2;font-weight:600;">● CPU</span>
+            <span style="color:#00b0f4;font-weight:600;">● RAM</span>
+            ${hasGpu ? '<span style="color:#a8ff78;font-weight:600;">● GPU</span>' : ''}
+          </div>
+        </div>
+        <div style="position:relative;width:100%;height:52px;">
+          <canvas id="worker-sparkline-${cleanId}" data-node-key="${cleanId}" data-has-gpu="${hasGpu ? 'true' : 'false'}" style="width:100%;height:100%;display:block;"></canvas>
+        </div>
+      </div>
+    `;
+
     const resourceSection = hasResourceData
       ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);">
            ${cpuBar}${memBar}${gpuBar}
            ${gpuTemp}
+           ${sparklineSection}
          </div>`
       : (node.is_healthy && !isMaster
-          ? `<div style="font-size:10px;color:var(--text-dim);margin-top:6px;">リソース情報待機中... (次のハートビートで更新)</div>`
+          ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);">
+               <div style="font-size:10px;color:var(--text-dim);margin-bottom:6px;">リソース情報待機中... (次のハートビートで更新)</div>
+               ${sparklineSection}
+             </div>`
           : '');
 
     // エンジン別稼働状況 & セマフォスロット (視覚的ステータスを大幅強化)
@@ -3095,6 +3124,7 @@ function renderWorkerNodes(nodesData) {
       console.error("Worker node render error:", err);
     }
   });
+  setTimeout(renderAllWorkerSparklines, 50);
 }
 
 // システムリソース ノード切り替え
@@ -3511,95 +3541,24 @@ function renderTtsUsage(usage) {
   if (localSavedEl) localSavedEl.textContent = `当月節約: ${localSaved.toLocaleString()}文字`;
 }
 
-// --- 📈 システムリソース & 各エンジン負荷推移 (30秒間隔・適応型並列制御) ---
+// --- 📈 ホスト & Bot本体 リソース推移 (30秒間隔) & ワーカー推移スパークライン ---
 
 let systemMetricsTimer = null;
 let latestMetricsData = null;
 
-const METRICS_SERIES = [
-  { key: "host", label: "ホスト全体", color: "#95a5a6", dashed: true, width: 1.5 },
-  { key: "bot", label: "Bot本体", color: "#5865f2", dashed: false, width: 2 },
-  { key: "voicevox", label: "VOICEVOX", color: "#2ecc71", dashed: false, width: 2 },
-  { key: "sharevox", label: "SHAREVOX", color: "#3498db", dashed: false, width: 2 },
-  { key: "coeiroink", label: "COEIROINK", color: "#9b59b6", dashed: false, width: 2 },
+const HOST_BOT_CPU_SERIES = [
+  { key: "host", label: "ホスト全体", color: "#95a5a6", dashed: true, width: 2 },
+  { key: "bot", label: "Bot本体", color: "#5865f2", dashed: false, width: 2.5 }
 ];
 
-const WORKER_CPU_SERIES = [
-  { key: "cpu_percent", label: "CPU使用率", color: "#5865f2", dashed: false, width: 2 },
-  { key: "gpu_util_percent", label: "GPU使用率", color: "#2ecc71", dashed: false, width: 2 },
+const HOST_BOT_MEM_SERIES = [
+  { key: "host", label: "ホスト全体", color: "#95a5a6", dashed: true, width: 2 },
+  { key: "bot", label: "Bot本体", color: "#5865f2", dashed: false, width: 2.5 }
 ];
-
-const WORKER_MEM_SERIES = [
-  { key: "mem_used_gb", label: "RAM使用量", color: "#3498db", dashed: false, width: 2 },
-  { key: "gpu_mem_used_gb", label: "VRAM使用量", color: "#9b59b6", dashed: false, width: 2 },
-];
-
-function updateMetricsLegend(nodeKey) {
-  const legendEl = document.getElementById("metrics-legend");
-  if (!legendEl) return;
-  if (!nodeKey || nodeKey === 'master' || nodeKey === 'masterdebian') {
-    legendEl.innerHTML = `
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#95a5a6;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">ホスト全体</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#5865f2;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">Bot本体</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#2ecc71;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">VOICEVOX</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#3498db;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">SHAREVOX</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#9b59b6;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">COEIROINK</span>
-      </div>
-    `;
-  } else if (nodeKey === 'masterubuntu') {
-    legendEl.innerHTML = `
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#5865f2;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">CPU使用率 (%)</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#3498db;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">RAM使用量 (GB)</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#747f8d;border-radius:2px;"></span>
-        <span style="color:var(--text-muted);">GPU非搭載 (CPU専用)</span>
-      </div>
-    `;
-  } else {
-    legendEl.innerHTML = `
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#5865f2;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">CPU使用率 (%)</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#2ecc71;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">GPU使用率 (%)</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#3498db;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">RAM使用量 (GB)</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:5px;">
-        <span style="display:inline-block;width:12px;height:12px;background:#9b59b6;border-radius:2px;"></span>
-        <span style="color:var(--text-normal);">VRAM使用量 (GB)</span>
-      </div>
-    `;
-  }
-}
 
 function startSystemMetricsPolling() {
-  if (systemMetricsTimer) return;
   fetchSystemMetrics();
+  if (systemMetricsTimer) return;
   systemMetricsTimer = setInterval(fetchSystemMetrics, 30000);
 }
 
@@ -3612,9 +3571,9 @@ function stopSystemMetricsPolling() {
 
 async function fetchSystemMetrics() {
   if (document.hidden) return;
-  if (!currentGuildId) return;
   try {
-    const res = await fetch(`/api/system/metrics?guild_id=${encodeURIComponent(currentGuildId)}`, { cache: "no-store" });
+    const url = currentGuildId ? `/api/system/metrics?guild_id=${encodeURIComponent(currentGuildId)}` : "/api/system/metrics";
+    const res = await fetch(url, { cache: "no-store" });
     if (res.status === 403) {
       stopSystemMetricsPolling();
       return;
@@ -3624,7 +3583,7 @@ async function fetchSystemMetrics() {
     latestMetricsData = data;
     renderSystemMetricsUI(data);
     // メトリクス更新周期 (30秒) に合わせてワーカーノード一覧およびシステム統計も最新に維持
-    loadStats(currentGuildId);
+    if (currentGuildId) loadStats(currentGuildId);
   } catch (e) {
     console.error("Failed to fetch system metrics:", e);
   }
@@ -3632,13 +3591,11 @@ async function fetchSystemMetrics() {
 
 function renderSystemMetricsUI(data) {
   if (!data) return;
-  const nodeKey = window.currentMetricsNode || 'master';
-  updateMetricsLegend(nodeKey);
 
   const status = data.status || {};
   const history = data.history || [];
 
-  // 1. 稼働モードバッジ
+  // 1. 稼働モードバッジ (適応型並列制御)
   const badgeMode = document.getElementById("metrics-concurrency-badge");
   if (badgeMode) {
     if (status.mode === "parallel") {
@@ -3663,68 +3620,195 @@ function renderSystemMetricsUI(data) {
     badgeSlots.textContent = `合成中: ${status.active_synthesis || 0} / ${maxSlots}`;
   }
 
-  // 3. 最終更新時刻
-  const lastUpdatedEl = document.getElementById("metrics-last-updated");
+  // 3. 最終更新時刻 & 稼働ステータスバッジ
+  const lastUpdatedEl = document.getElementById("host-metrics-last-updated");
   if (lastUpdatedEl) {
     const now = new Date();
     lastUpdatedEl.textContent = `更新: ${now.toLocaleTimeString()}`;
   }
-
-  // 4. ノード別現在値および折れ線グラフ描画
-  const hostCpuEl = document.getElementById("metrics-current-cpu");
-  const hostMemEl = document.getElementById("metrics-current-mem");
-
-  if (nodeKey === 'master') {
-    // --- Master (自機) 表示 ---
-    if (hostCpuEl) {
-      const cpuVal = typeof status.host_cpu === "number" ? status.host_cpu.toFixed(1) : "--";
-      hostCpuEl.textContent = `ホスト: ${cpuVal}%`;
-      if (status.host_cpu >= 85) hostCpuEl.style.color = "#ed4245";
-      else if (status.host_cpu >= 70) hostCpuEl.style.color = "#faa61a";
-      else hostCpuEl.style.color = "#3ba55c";
+  const statusBadge = document.getElementById("host-metrics-status-badge");
+  if (statusBadge) {
+    const hostCpu = status.host_cpu || 0;
+    if (hostCpu >= 85) {
+      statusBadge.textContent = "⚠️ 高負荷 (85%超過)";
+      statusBadge.style.background = "rgba(237,66,69,0.2)";
+      statusBadge.style.color = "#ed4245";
+      statusBadge.style.borderColor = "rgba(237,66,69,0.5)";
+    } else if (hostCpu >= 70) {
+      statusBadge.textContent = "⚠️ 注意 (70%超過)";
+      statusBadge.style.background = "rgba(250,166,26,0.2)";
+      statusBadge.style.color = "#faa61a";
+      statusBadge.style.borderColor = "rgba(250,166,26,0.5)";
+    } else {
+      statusBadge.textContent = "🟢 正常稼働";
+      statusBadge.style.background = "rgba(35,165,90,0.18)";
+      statusBadge.style.color = "#23a55a";
+      statusBadge.style.borderColor = "rgba(35,165,90,0.4)";
     }
-
-    if (hostMemEl && history.length > 0) {
-      const lastPoint = history[history.length - 1];
-      if (lastPoint && lastPoint.host) {
-        hostMemEl.textContent = `ホスト: ${lastPoint.host.memory_used_gb || "--"} GB (${lastPoint.host.memory_percent || "--"}%)`;
-      }
-    }
-
-    renderCpuChart(history);
-    renderMemoryChart(history);
-  } else {
-    // --- Worker ノード表示 ---
-    const wHistory = (data.workers_history && data.workers_history[nodeKey]) || [];
-    const latestPt = wHistory.length > 0 ? wHistory[wHistory.length - 1] : (data.workers_current && data.workers_current[nodeKey]);
-
-    if (hostCpuEl) {
-      const cpuVal = (latestPt && typeof latestPt.cpu_percent === 'number') ? latestPt.cpu_percent.toFixed(1) : '--';
-      const gpuVal = (latestPt && typeof latestPt.gpu_util_percent === 'number') ? `${latestPt.gpu_util_percent.toFixed(1)}%` : (nodeKey === 'masterubuntu' ? 'なし (CPU専用)' : 'N/A');
-      hostCpuEl.textContent = `CPU: ${cpuVal}% | GPU: ${gpuVal}`;
-      if (latestPt && typeof latestPt.cpu_percent === 'number') {
-        if (latestPt.cpu_percent >= 85) hostCpuEl.style.color = "#ed4245";
-        else if (latestPt.cpu_percent >= 70) hostCpuEl.style.color = "#faa61a";
-        else hostCpuEl.style.color = "#3ba55c";
-      } else {
-        hostCpuEl.style.color = "var(--text-muted)";
-      }
-    }
-
-    if (hostMemEl) {
-      const ramVal = (latestPt && typeof latestPt.mem_used_gb === 'number') ? `${latestPt.mem_used_gb} GB` : '-- GB';
-      const vramVal = (latestPt && typeof latestPt.gpu_mem_used_gb === 'number' && latestPt.gpu_mem_used_gb > 0) ? `${latestPt.gpu_mem_used_gb} GB` : (nodeKey === 'masterubuntu' ? 'なし' : 'N/A');
-      hostMemEl.textContent = `RAM: ${ramVal} | VRAM: ${vramVal}`;
-    }
-
-    renderWorkerCpuChart(wHistory);
-    renderWorkerMemoryChart(wHistory);
   }
 
-  // 6. 発話〜再生レイテンシ モニター描画
+  // 4. ホスト全体 & Bot本体の現在値テキスト
+  const hostCpuEl = document.getElementById("host-cpu-cur");
+  const botCpuEl = document.getElementById("bot-cpu-cur");
+  const hostMemEl = document.getElementById("host-mem-cur");
+  const botMemEl = document.getElementById("bot-mem-cur");
+
+  const lastPt = history.length > 0 ? history[history.length - 1] : null;
+  const hostCpuVal = (lastPt && lastPt.host && typeof lastPt.host.cpu_percent === "number")
+    ? lastPt.host.cpu_percent.toFixed(1)
+    : (typeof status.host_cpu === "number" ? status.host_cpu.toFixed(1) : "--");
+  const botCpuVal = (lastPt && lastPt.bot && typeof lastPt.bot.cpu_percent === "number")
+    ? lastPt.bot.cpu_percent.toFixed(1)
+    : "--";
+
+  if (hostCpuEl) hostCpuEl.textContent = `ホスト: ${hostCpuVal}%`;
+  if (botCpuEl) botCpuEl.textContent = `Bot: ${botCpuVal}%`;
+
+  if (hostMemEl && lastPt && lastPt.host) {
+    const usedGb = lastPt.host.mem_used_gb != null ? `${lastPt.host.mem_used_gb} GB` : (lastPt.host.memory_used_mb ? `${(lastPt.host.memory_used_mb/1024).toFixed(1)} GB` : "-- GB");
+    const totalGb = lastPt.host.mem_total_gb ? ` / ${lastPt.host.mem_total_gb} GB` : "";
+    hostMemEl.textContent = `ホスト: ${usedGb}${totalGb}`;
+  }
+  if (botMemEl && lastPt && lastPt.bot) {
+    const botMb = lastPt.bot.mem_mb ?? lastPt.bot.memory_mb;
+    botMemEl.textContent = `Bot: ${botMb != null ? Math.round(botMb) + " MB" : "-- MB"}`;
+  }
+
+  // 5. グラフ描画 (ホスト全体 & Bot本体)
+  renderHostBotCpuChart(history);
+  renderHostBotMemoryChart(history);
+
+  // 6. 分散コンピュートワーカーカード内の直近推移スパークライン描画
+  renderAllWorkerSparklines();
+
+  // 7. 発話〜再生レイテンシ モニター描画
   if (data.latency) {
     renderLatencyMonitorUI(data.latency, data.profiler);
   }
+}
+
+// 分散コンピュートワーカー向け直近負荷推移スパークライン描画
+function renderWorkerSparkline(canvasId, history, hasGpu) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = rect.width || canvas.parentElement.clientWidth || 240;
+  const height = rect.height || 52;
+
+  canvas.width = width * dpr;
+  canvas.height = height * dpr;
+
+  const ctx = canvas.getContext("2d");
+  ctx.save();
+  ctx.scale(dpr, dpr);
+
+  ctx.clearRect(0, 0, width, height);
+
+  if (!history || history.length === 0) {
+    ctx.fillStyle = "rgba(255, 255, 255, 0.25)";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("推移データ蓄積中...", width / 2, height / 2);
+    ctx.restore();
+    return;
+  }
+
+  const padLeft = 4;
+  const padRight = 4;
+  const padTop = 4;
+  const padBottom = 4;
+  const plotW = width - padLeft - padRight;
+  const plotH = height - padTop - padBottom;
+
+  // ガイドライン (50%, 100%)
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.06)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([2, 2]);
+  const y50 = padTop + plotH * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(padLeft, y50);
+  ctx.lineTo(padLeft + plotW, y50);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 系列描画ヘルパー
+  function drawSparkSeries(key, color, widthLine) {
+    const pts = [];
+    const len = history.length;
+    for (let i = 0; i < len; i++) {
+      const val = history[i] ? history[i][key] : null;
+      if (typeof val === "number") {
+        const x = padLeft + (len === 1 ? plotW / 2 : (i / (len - 1)) * plotW);
+        const clampedVal = Math.min(100, Math.max(0, val));
+        const y = padTop + plotH - (clampedVal / 100) * plotH;
+        pts.push({ x, y, val });
+      }
+    }
+    if (pts.length < 2) {
+      if (pts.length === 1) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(pts[0].x, pts[0].y, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      return;
+    }
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = widthLine;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+
+    // 最新点に発光ドット
+    const lastP = pts[pts.length - 1];
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(lastP.x, lastP.y, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // 1. RAM使用率 (水色)
+  drawSparkSeries("mem_percent", "#00b0f4", 1.5);
+  // 2. CPU使用率 (紫青)
+  drawSparkSeries("cpu_percent", "#5865f2", 1.8);
+  // 3. GPU使用率 (緑、GPU搭載時のみ)
+  if (hasGpu) {
+    drawSparkSeries("gpu_util_percent", "#a8ff78", 1.5);
+  }
+
+  ctx.restore();
+}
+
+function renderAllWorkerSparklines() {
+  if (!latestMetricsData || !latestMetricsData.workers_history) return;
+  const wHist = latestMetricsData.workers_history;
+
+  // 全ワーカーのカードキャンバスを探索
+  const canvases = document.querySelectorAll("canvas[id^='worker-sparkline-']");
+  canvases.forEach(cv => {
+    const nodeKey = cv.dataset.nodeKey;
+    const hasGpu = cv.dataset.hasGpu === "true";
+    let history = [];
+    if (nodeKey && wHist[nodeKey]) {
+      history = wHist[nodeKey];
+    } else {
+      // マッチング試行
+      for (const k of Object.keys(wHist)) {
+        if (nodeKey && (k.includes(nodeKey) || nodeKey.includes(k))) {
+          history = wHist[k];
+          break;
+        }
+      }
+    }
+    renderWorkerSparkline(cv.id, history, hasGpu);
+  });
 }
 
 function formatSmartWorker(rawLabel, provider) {
@@ -4414,8 +4498,8 @@ window.toggleLatencyDetail = function(idx) {
   }
 };
 
-function renderCpuChart(history) {
-  renderLineChart("metrics-cpu-chart", history, {
+function renderHostBotCpuChart(history) {
+  renderLineChart("host-bot-cpu-chart", history, {
     yMin: 0,
     yMax: 100,
     yFormat: (val) => `${Math.round(val)}%`,
@@ -4423,43 +4507,53 @@ function renderCpuChart(history) {
       { value: 70, color: "rgba(250, 166, 26, 0.7)", label: "70% 並列上限" },
       { value: 85, color: "rgba(237, 66, 69, 0.7)", label: "85% 退避" }
     ],
-    series: METRICS_SERIES,
-    getValue: (pt, key) => (pt[key] && typeof pt[key].cpu_percent === "number") ? pt[key].cpu_percent : null
-  });
-}
-
-function renderMemoryChart(history) {
-  // 履歴全体の最大メモリ(MB)を算出
-  let maxMb = 500;
-  if (history && history.length > 0) {
-    history.forEach(pt => {
-      METRICS_SERIES.forEach(s => {
-        let mb = null;
-        if (s.key === "host" && pt.host) mb = pt.host.memory_used_mb;
-        else if (pt[s.key]) mb = pt[s.key].memory_mb;
-        if (typeof mb === "number" && mb > maxMb) maxMb = mb;
-      });
-    });
-  }
-  // 15%マージン
-  maxMb = Math.ceil(maxMb * 1.15);
-
-  renderLineChart("metrics-mem-chart", history, {
-    yMin: 0,
-    yMax: maxMb,
-    yFormat: (mb) => {
-      if (mb >= 1024) return `${(mb / 1024).toFixed(1)}GB`;
-      return `${Math.round(mb)}MB`;
-    },
-    thresholds: [],
-    series: METRICS_SERIES,
+    series: HOST_BOT_CPU_SERIES,
     getValue: (pt, key) => {
-      if (key === "host" && pt.host) return pt.host.memory_used_mb;
-      if (pt[key] && typeof pt[key].memory_mb === "number") return pt[key].memory_mb;
+      if (key === "host" && pt.host) return (typeof pt.host.cpu_percent === "number") ? pt.host.cpu_percent : pt.host.cpu;
+      if (key === "bot" && pt.bot) return (typeof pt.bot.cpu_percent === "number") ? pt.bot.cpu_percent : pt.bot.cpu;
       return null;
     }
   });
 }
+
+function renderHostBotMemoryChart(history) {
+  // 履歴全体の最大ホストメモリ(GB)を算出
+  let maxGb = 16;
+  if (history && history.length > 0) {
+    history.forEach(pt => {
+      if (pt.host && typeof pt.host.mem_total_gb === "number" && pt.host.mem_total_gb > maxGb) {
+        maxGb = pt.host.mem_total_gb;
+      }
+      if (pt.host && typeof pt.host.mem_used_gb === "number" && pt.host.mem_used_gb * 1.2 > maxGb) {
+        maxGb = pt.host.mem_used_gb * 1.2;
+      }
+    });
+  }
+  maxGb = Math.ceil(maxGb);
+
+  renderLineChart("host-bot-mem-chart", history, {
+    yMin: 0,
+    yMax: maxGb,
+    yFormat: (gb) => `${gb.toFixed(1)}GB`,
+    thresholds: [],
+    series: HOST_BOT_MEM_SERIES,
+    getValue: (pt, key) => {
+      if (key === "host" && pt.host) {
+        if (typeof pt.host.mem_used_gb === "number") return pt.host.mem_used_gb;
+        if (typeof pt.host.mem_used_mb === "number") return pt.host.mem_used_mb / 1024;
+      }
+      if (key === "bot" && pt.bot) {
+        if (typeof pt.bot.mem_mb === "number") return pt.bot.mem_mb / 1024;
+        if (typeof pt.bot.memory_mb === "number") return pt.bot.memory_mb / 1024;
+      }
+      return null;
+    }
+  });
+}
+
+// 互換性維持ラッパー
+function renderCpuChart(history) { renderHostBotCpuChart(history); }
+function renderMemoryChart(history) { renderHostBotMemoryChart(history); }
 
 function renderWorkerCpuChart(history) {
   renderLineChart("metrics-cpu-chart", history, {
@@ -4502,8 +4596,10 @@ function renderLineChart(canvasId, history, options) {
 
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  const width = rect.width || canvas.parentElement.clientWidth || 360;
-  const height = rect.height || 180;
+  const parentW = canvas.parentElement ? canvas.parentElement.clientWidth : 0;
+  const width = (rect.width > 30) ? rect.width : (parentW > 30 ? parentW : 360);
+  const parentH = canvas.parentElement ? canvas.parentElement.clientHeight : 0;
+  const height = (rect.height > 30) ? rect.height : (parentH > 30 ? parentH : 180);
 
   canvas.width = width * dpr;
   canvas.height = height * dpr;

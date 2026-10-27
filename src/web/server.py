@@ -2752,12 +2752,19 @@ class WebServer:
 
     async def api_get_system_metrics(self, request: web.Request) -> web.Response:
         """ホストおよび各コンテナのCPU/メモリメトリクス推移（30秒間隔）と並列制御ステータスを取得"""
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response(
-                {"error": "Access denied. Only administrators and assigned roles can view system metrics."},
-                status=403
-            )
+        guild_id_param = request.query.get("guild_id")
+        if guild_id_param:
+            try:
+                guild, perms = await self._get_guild_and_perms(request, guild_id_param)
+                if not (perms["is_admin"] or perms["has_role"]):
+                    return web.json_response(
+                        {"error": "Access denied. Only administrators and assigned roles can view system metrics."},
+                        status=403
+                    )
+            except Exception:
+                await self._require_admin(request)
+        else:
+            await self._require_admin(request)
 
         rm = getattr(self.tts_manager, "resource_manager", None)
         if rm:

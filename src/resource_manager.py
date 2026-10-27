@@ -1305,7 +1305,7 @@ class LocalEngineResourceManager:
         # 2. 各コンテナ統計
         containers_stats: Dict[str, Any] = {}
         targets = [
-            ("bot", ["discord-tts-bot"], "Bot本体"),
+            ("bot", ["ttsbot-app-1", "ttsbot_app_1", "ttsbot-app", "discord-tts-bot"], "Bot本体"),
             ("voicevox", ["ttsworker-voicevox", "ttsbot-voicevox"], "VOICEVOX"),
             ("sharevox", ["ttsworker-sharevox", "ttsbot-sharevox"], "SHAREVOX"),
             ("coeiroink", ["ttsworker-coeiroink", "ttsbot-coeiroink"], "COEIROINK"),
@@ -1360,6 +1360,32 @@ class LocalEngineResourceManager:
                             }
             except Exception as e:
                 logger.debug(f"Docker stats collection error: {e}")
+
+        # Bot本体のフォールバック (Docker APIで取れなかった場合は自プロセスおよび子プロセスから実測)
+        bot_stat = containers_stats.get("bot")
+        if not bot_stat or bot_stat.get("status") != "running" or (bot_stat.get("mem_mb", 0) == 0 and bot_stat.get("cpu_percent", 0) == 0):
+            try:
+                import psutil, os
+                cur_proc = psutil.Process(os.getpid())
+                proc_mem_bytes = cur_proc.memory_info().rss
+                for child in cur_proc.children(recursive=True):
+                    try:
+                        proc_mem_bytes += child.memory_info().rss
+                    except Exception:
+                        pass
+                bot_mem_mb = round(proc_mem_bytes / (1024 * 1024), 1)
+                bot_cpu = round(cur_proc.cpu_percent(interval=None), 1)
+                containers_stats["bot"] = {
+                    "name": "Bot本体",
+                    "container": "ttsbot-app-1",
+                    "status": "running",
+                    "cpu": bot_cpu,
+                    "cpu_percent": bot_cpu,
+                    "mem_mb": bot_mem_mb,
+                    "memory_mb": bot_mem_mb
+                }
+            except Exception as e:
+                logger.debug(f"psutil fallback failed: {e}")
 
         # 3. スナップショット組み立て
         entry = {
