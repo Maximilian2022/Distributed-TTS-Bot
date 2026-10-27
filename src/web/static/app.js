@@ -77,7 +77,11 @@ function triggerTabDataLoad(activeSubOrTab) {
   if (activeSubOrTab === "bots") {
     if (typeof loadManagerNodes === "function") loadManagerNodes();
     loadBotSlots();
-    if (typeof loadWorkerNodes === "function") loadWorkerNodes();
+    if (typeof startWorkerNodesPolling === "function") {
+      startWorkerNodesPolling();
+    } else if (typeof loadWorkerNodes === "function") {
+      loadWorkerNodes();
+    }
     if (typeof loadTierRouting === "function") loadTierRouting();
     startSystemMetricsPolling();
     if (latestMetricsData) {
@@ -101,6 +105,11 @@ function triggerTabDataLoad(activeSubOrTab) {
     startSystemMetricsPolling();
     loadLogs();
     loadWorkerLogs(false);
+  }
+  if (activeSubOrTab !== "bots") {
+    if (typeof stopWorkerNodesPolling === "function") {
+      stopWorkerNodesPolling();
+    }
   }
   if (activeSubOrTab !== "bots" && activeSubOrTab !== "system") {
     stopSystemMetricsPolling();
@@ -2778,7 +2787,9 @@ function renderWorkerNodes(nodesData) {
       ? '<span class="badge" style="background:rgba(88,101,242,0.2);color:#50e6ff;border:1px solid rgba(88,101,242,0.4);font-size:10px;font-weight:700;">⚡ WSS 常時接続</span>'
       : (isAgentOnline
         ? '<span class="badge" style="background:rgba(35,165,90,0.18);color:#23a55a;border:1px solid rgba(35,165,90,0.35);font-size:10px;font-weight:700;">🟢 Agent 稼働</span>'
-        : `<span class="badge" style="background:rgba(240,71,71,0.18);color:#f04747;border:1px solid rgba(240,71,71,0.35);font-size:10px;font-weight:700;">🔴 Agent 不通 (${hbAgo != null ? Math.round(hbAgo)+'s前' : '不明'})</span>`);
+        : (hbAgo != null && hbAgo <= 150
+          ? `<span class="badge" style="background:rgba(250,166,26,0.18);color:#ffcc66;border:1px solid rgba(250,166,26,0.45);font-size:10px;font-weight:700;">🟡 接続待機中 (ハートビート待機)</span>`
+          : `<span class="badge" style="background:rgba(240,71,71,0.18);color:#f04747;border:1px solid rgba(240,71,71,0.35);font-size:10px;font-weight:700;">🔴 Agent 不通 (${hbAgo != null ? Math.round(hbAgo)+'s前' : '待機中'})</span>`));
 
     // 2. エンジン全体の稼働状況判定
     const engines = node.engines || [];
@@ -2804,7 +2815,11 @@ function renderWorkerNodes(nodesData) {
     } else if (!node.enabled) {
       engineSummaryBadge = '<span class="badge" style="background:#747f8d;color:white;font-size:10px;">無効</span>';
     } else if (!isAgentOnline) {
-      engineSummaryBadge = '<span class="badge" style="background:#f04747;color:white;font-size:10px;font-weight:700;">⚠️ ホスト不通</span>';
+      if (hbAgo != null && hbAgo <= 150) {
+        engineSummaryBadge = '<span class="badge" style="background:rgba(250,166,26,0.2);color:#faa61a;border:1px solid rgba(250,166,26,0.5);font-size:10px;font-weight:700;">🟡 再接続待機中</span>';
+      } else {
+        engineSummaryBadge = '<span class="badge" style="background:#f04747;color:white;font-size:10px;font-weight:700;">⚠️ ホスト不通</span>';
+      }
     } else if (runningEnginesCount === engines.length && engines.length > 0) {
       engineSummaryBadge = '<span class="badge" style="background:#23a55a;color:white;font-size:10px;font-weight:700;">● 全エンジン稼働</span>';
     } else if (runningEnginesCount > 0) {
@@ -7367,18 +7382,63 @@ async function loadSpeculativeCacheStatus() {
       }
     }
 
+    // 🎯 頻出ホットワード候補（歴代定番 TOP 30 vs 直近急上昇 TOP 30 ハイブリッド）の描画
+    const hybrid = data.candidates_hybrid || {};
+    const alltimeList = Array.isArray(hybrid.alltime) ? hybrid.alltime : [];
+    const recentList = Array.isArray(hybrid.recent) ? hybrid.recent : [];
+    const combinedList = Array.isArray(hybrid.combined) ? hybrid.combined : (Array.isArray(data.candidates_top20) ? data.candidates_top20 : []);
+
+    const totalBadge = document.getElementById("spec-total-badge");
+    if (totalBadge) {
+      totalBadge.textContent = `合計 ${combinedList.length} 件 (生成対象)`;
+    }
+
+    // 1. 🏆 歴代定番枠 (TOP 30)
+    const alltimeCountElem = document.getElementById("spec-alltime-count");
+    const alltimeListElem = document.getElementById("spec-alltime-candidates-list");
+    if (alltimeCountElem) alltimeCountElem.textContent = `${alltimeList.length} 件`;
+    if (alltimeListElem) {
+      if (alltimeList.length === 0) {
+        alltimeListElem.innerHTML = '<span style="font-size:11px;color:var(--text-muted);padding:4px;">直近3日間に利用実績がある定番フレーズはありません。</span>';
+      } else {
+        alltimeListElem.innerHTML = alltimeList.map(c => `
+          <div style="background:rgba(192,132,252,0.08);border:1px solid rgba(192,132,252,0.25);padding:3px 8px;border-radius:5px;font-size:11px;display:flex;align-items:center;gap:5px;">
+            <span style="font-weight:600;color:var(--text-main);">${escapeHtml(c.text)}</span>
+            <span style="background:rgba(192,132,252,0.3);color:#e9d5ff;font-size:9px;padding:1px 4px;border-radius:3px;font-weight:bold;">${Number(c.total_hits || 0).toLocaleString()} hits</span>
+          </div>
+        `).join("");
+      }
+    }
+
+    // 2. 🔥 直近急上昇枠 (TOP 30)
+    const recentCountElem = document.getElementById("spec-recent-count");
+    const recentListElem = document.getElementById("spec-recent-candidates-list");
+    if (recentCountElem) recentCountElem.textContent = `${recentList.length} 件`;
+    if (recentListElem) {
+      if (recentList.length === 0) {
+        recentListElem.innerHTML = '<span style="font-size:11px;color:var(--text-muted);padding:4px;">直近3日間に新規作成・3回以上利用された急上昇フレーズはありません。</span>';
+      } else {
+        recentListElem.innerHTML = recentList.map(c => `
+          <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.25);padding:3px 8px;border-radius:5px;font-size:11px;display:flex;align-items:center;gap:5px;">
+            <span style="font-weight:600;color:var(--text-main);">${escapeHtml(c.text)}</span>
+            <span style="background:rgba(245,158,11,0.3);color:#fde68a;font-size:9px;padding:1px 4px;border-radius:3px;font-weight:bold;">${Number(c.total_hits || 0).toLocaleString()} hits</span>
+          </div>
+        `).join("");
+      }
+    }
+
+    // レガシー互換要素へのフォールバック
     const countElem = document.getElementById("spec-candidate-count");
     const listElem = document.getElementById("spec-candidates-list");
-    if (countElem && listElem) {
-      const cands = data.candidates_top20 || [];
-      countElem.textContent = `${cands.length} 件検出`;
-      if (cands.length === 0) {
-        listElem.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">直近3日間で3回以上再利用された候補フレーズは現在ありません（※話者名プレフィックスは自動除外）。</span>';
+    if (countElem) countElem.textContent = `${combinedList.length} 件検出`;
+    if (listElem && !alltimeListElem) {
+      if (combinedList.length === 0) {
+        listElem.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">直近3日間で3回以上再利用された候補フレーズは現在ありません。</span>';
       } else {
-        listElem.innerHTML = cands.map(c => `
+        listElem.innerHTML = combinedList.map(c => `
           <div style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);padding:4px 10px;border-radius:6px;font-size:12px;display:flex;align-items:center;gap:6px;">
             <span style="font-weight:600;color:var(--text-main);">${escapeHtml(c.text)}</span>
-            <span style="background:rgba(88,101,242,0.25);color:#5865f2;font-size:10px;padding:1px 5px;border-radius:4px;font-weight:bold;">${c.total_hits} hits</span>
+            <span style="background:rgba(88,101,242,0.25);color:#5865f2;font-size:10px;padding:1px 5px;border-radius:4px;font-weight:bold;">${Number(c.total_hits || 0).toLocaleString()} hits</span>
           </div>
         `).join("");
       }
@@ -7485,6 +7545,54 @@ async function loadWorkerNodes() {
   }
 }
 window.loadWorkerNodes = loadWorkerNodes;
+
+let workerNodesPollTimer = null;
+
+function startWorkerNodesPolling() {
+  if (workerNodesPollTimer) clearInterval(workerNodesPollTimer);
+  loadWorkerNodes();
+  // 5秒間隔でリアルタイムポーリング (#bots タブ表示中のみ)
+  workerNodesPollTimer = setInterval(() => {
+    const botsTab = document.getElementById("subtab-bots");
+    if (botsTab && botsTab.style.display !== "none") {
+      loadWorkerNodes();
+      if (typeof loadManagerNodes === "function") {
+        loadManagerNodes();
+      }
+    }
+  }, 5000);
+}
+
+function stopWorkerNodesPolling() {
+  if (workerNodesPollTimer) {
+    clearInterval(workerNodesPollTimer);
+    workerNodesPollTimer = null;
+  }
+}
+
+async function refreshWorkerNodes(btn) {
+  const icon = document.getElementById("btn-refresh-workers-icon") || (btn ? btn.querySelector("span") : null);
+  if (icon) {
+    icon.style.display = "inline-block";
+    icon.style.transition = "transform 0.6s ease";
+    icon.style.transform = "rotate(360deg)";
+  }
+  if (btn) btn.disabled = true;
+  try {
+    await Promise.all([
+      loadWorkerNodes(),
+      typeof loadManagerNodes === "function" ? loadManagerNodes() : Promise.resolve()
+    ]);
+  } finally {
+    setTimeout(() => {
+      if (icon) icon.style.transform = "rotate(0deg)";
+      if (btn) btn.disabled = false;
+    }, 400);
+  }
+}
+window.startWorkerNodesPolling = startWorkerNodesPolling;
+window.stopWorkerNodesPolling = stopWorkerNodesPolling;
+window.refreshWorkerNodes = refreshWorkerNodes;
 
 async function kickWorkerNode(nodeId, ip, btn) {
   if (!confirm(`Workerノード [${nodeId || ip}] を切断・キックしますか？\nボランティア接続の場合はWebSocketが即座にクローズされます。`)) {

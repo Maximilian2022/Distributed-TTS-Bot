@@ -2622,19 +2622,20 @@ class Database:
         days: int = 3,
         min_hits: int = 3,
         max_length: int = 15,
-        limit: int = 50
-    ) -> List[Dict[str, Any]]:
+        limit: int = 30
+    ) -> Dict[str, Any]:
         """
-        投機的キャッシュ事前生成（プレウォーム）向けの頻出フレーズ候補を抽出
-        - 直近 `days` 日以内に参照または生成されたもの
-        - 再利用（ヒット数）が `min_hits` 以上のもの
-        - `max_length` 文字以下の短文・単語
-        - 話者読み上げ用ユーザー名プレフィックス（末尾が読点「、」や「,」で終わるもの）を除外
-        - 記号のみやテスト試聴音声、伏字を除外
+        投機的キャッシュ事前生成（プレウォーム）向けの頻出フレーズ候補をハイブリッド抽出
+        - alltime: 歴代定番TOP (直近 days 日以内に利用実績があり、全期間累計ヒット数TOP limit件)
+        - recent: 直近トレンドTOP (直近 days 日間に作成・利用され、hit_count >= min_hits のホットワード TOP limit件)
+        - combined: 上記2枠を重複なくマージした事前生成対象リスト (最大 limit*2 件)
         """
         import re
+        re_has_content = re.compile(r'[\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
+
         async with self.get_connection() as db:
-            query = """
+            # 1. 🏆 歴代定番枠: 直近 days 日以内に参照または作成され、全期間ヒット数が多い上位 limit 件
+            query_alltime = """
                 SELECT text, SUM(hit_count) as total_hits, MAX(last_hit_at) as latest_hit
                 FROM cache_metadata
                 WHERE (last_hit_at >= datetime('now', '-' || ? || ' days') OR created_at >= datetime('now', '-' || ? || ' days'))
@@ -2650,31 +2651,82 @@ class Database:
                 ORDER BY total_hits DESC
                 LIMIT ?
             """
-            cur = await db.execute(query, (days, days, min_hits, max_length, limit * 2))
-            rows = await cur.fetchall()
+            cur_all = await db.execute(query_alltime, (days, days, min_hits, max_length, limit * 2))
+            rows_all = await cur_all.fetchall()
 
-            # 記号のみ（感嘆符や句読点だけ）を除外し、日本語や英数字の実体テキストを含む有意義なフレーズのみ抽出
-            re_has_content = re.compile(r'[\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
-            results: List[Dict[str, Any]] = []
-            for r in rows:
+            alltime_list: List[Dict[str, Any]] = []
+            seen_texts = set()
+
+            for r in rows_all:
+                text = r[0]
+                if not text or text in seen_texts:
+                    continue
+                sub_chars = re.sub(r'[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', text)
+                if not sub_chars:
+                    continue
+                if re_has_content.search(text):
+                    seen_texts.add(text)
+                    alltime_list.append({
+                        "text": text,
+                        "total_hits": r[1] or 0,
+                        "latest_hit": r[2] or "",
+                        "category": "alltime"
+                    })
+                    if len(alltime_list) >= limit:
+                        break
+
+            # 2. 🔥 直近トレンド枠: 直近 days 日間に新規作成され、hit_count >= min_hits のホットワード上位 limit 件
+            query_recent = """
+                SELECT text, SUM(hit_count) as recent_hits, MAX(last_hit_at) as latest_hit, MAX(created_at) as recent_created
+                FROM cache_metadata
+                WHERE created_at >= datetime('now', '-' || ? || ' days')
+                  AND hit_count >= ?
+                  AND length(text) <= ?
+                  AND length(text) >= 1
+                  AND text NOT LIKE 'sample_%'
+                  AND text NOT LIKE '%[ピー]%'
+                  AND text NOT LIKE '%、'
+                  AND text NOT LIKE '%,%'
+                  AND trim(text) != ''
+                GROUP BY text
+                ORDER BY recent_hits DESC, recent_created DESC
+                LIMIT ?
+            """
+            cur_rec = await db.execute(query_recent, (days, min_hits, max_length, limit * 2))
+            rows_rec = await cur_rec.fetchall()
+
+            recent_list: List[Dict[str, Any]] = []
+            for r in rows_rec:
                 text = r[0]
                 if not text:
                     continue
-                # 文字列から記号・空白を除去して実体文字が残るか確認
                 sub_chars = re.sub(r'[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', text)
                 if not sub_chars:
-                    continue  # 「！」や「？」など記号単体を除外
-
+                    continue
                 if re_has_content.search(text):
-                    results.append({
+                    recent_list.append({
                         "text": text,
                         "total_hits": r[1] or 0,
-                        "latest_hit": r[2] or ""
+                        "latest_hit": r[2] or "",
+                        "category": "recent"
                     })
-                    if len(results) >= limit:
+                    if len(recent_list) >= limit:
                         break
 
-            return results
+            # 3. 🎯 結合リスト (combined): 歴代定番枠 + 直近トレンド枠 (重複排除、最大 limit*2 件)
+            combined_list: List[Dict[str, Any]] = list(alltime_list)
+            combined_texts = {item["text"] for item in alltime_list}
+
+            for item in recent_list:
+                if item["text"] not in combined_texts:
+                    combined_texts.add(item["text"])
+                    combined_list.append(item)
+
+            return {
+                "alltime": alltime_list,
+                "recent": recent_list,
+                "combined": combined_list
+            }
 
     async def get_configured_speakers(self) -> List[str]:
         """

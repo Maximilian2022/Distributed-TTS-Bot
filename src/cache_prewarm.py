@@ -188,15 +188,19 @@ class IntelligentPrewarmService:
         try:
             logger.info(f"🔥 [Speculative Prewarm] Starting speculative hotword warm-up (days={days}, min_hits={min_hits}, max_candidates={max_candidates})...")
 
-            # DBから頻出フレーズ候補を抽出
+            # DBから頻出フレーズ候補を抽出 (歴代定番TOP30 + 直近トレンドTOP30 のハイブリッド)
             if hasattr(self.db, "get_frequent_phrases_for_prewarm"):
-                candidates = await self.db.get_frequent_phrases_for_prewarm(
+                candidates_res = await self.db.get_frequent_phrases_for_prewarm(
                     days=days,
                     min_hits=min_hits,
                     max_length=15,
                     limit=max_candidates
                 )
-                target_phrases = [c["text"] for c in candidates if c.get("text")]
+                if isinstance(candidates_res, dict):
+                    target_phrases = [c["text"] for c in candidates_res.get("combined", []) if c.get("text")]
+                    self.last_speculative_candidates = candidates_res
+                else:
+                    target_phrases = [c["text"] for c in candidates_res if c.get("text")]
 
             if not target_phrases:
                 logger.info("ℹ️ [Speculative Prewarm] No candidate phrases found matching criteria.")

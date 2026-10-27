@@ -123,6 +123,10 @@ class WebServer:
         self.ha_revoked_nodes: set = set()
         self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
         self._load_ha_nodes()
+        self.cluster_workers_file = Path(self.config.db_path).parent / "cluster_workers.json"
+        self.cluster_workers: Dict[str, Dict[str, Any]] = {}
+        self._load_cluster_workers()
+        self._restore_cluster_workers_to_pool()
         self.ha_force_update_time: float = 0.0
         self.ha_slave_force_update_nodes: Dict[str, float] = {}
         self.ha_force_cache_sync_time: float = 0.0
@@ -153,6 +157,53 @@ class WebServer:
             self.ha_nodes_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             logger.error(f"[HA] Failed to save ha_manager_nodes.json: {e}")
+
+    def _load_cluster_workers(self):
+        """ディスクから登録済みクラスタWorker情報を復元"""
+        try:
+            if self.cluster_workers_file.exists():
+                data = json.loads(self.cluster_workers_file.read_text(encoding="utf-8"))
+                self.cluster_workers = data.get("workers", {})
+                logger.info(f"📂 [WorkerPersistence] Loaded {len(self.cluster_workers)} cluster worker(s) from disk.")
+        except Exception as e:
+            logger.error(f"[WorkerPersistence] Failed to load cluster_workers.json: {e}")
+
+    def _save_cluster_workers(self):
+        """登録済みクラスタWorker情報をディスクへアトミック保存"""
+        try:
+            data = {"workers": self.cluster_workers}
+            self.cluster_workers_file.parent.mkdir(parents=True, exist_ok=True)
+            self.cluster_workers_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.error(f"[WorkerPersistence] Failed to save cluster_workers.json: {e}")
+
+    def _restore_cluster_workers_to_pool(self):
+        """Master起動時に永続化されたクラスタWorkerをTTSNodePoolへ先行投入 (再起動直後の消失・空表示を防止)"""
+        if not self.cluster_workers or not self.tts_manager:
+            return
+        restored = 0
+        for node_id, wdata in self.cluster_workers.items():
+            try:
+                ip = wdata.get("ip")
+                engines = wdata.get("engines", {})
+                specs = wdata.get("specs", {})
+                if not ip or not engines:
+                    continue
+                self._register_worker_internal(
+                    node_id=node_id,
+                    ip=ip,
+                    specs=specs,
+                    engines_data=engines,
+                    node_name=wdata.get("node_name"),
+                    agent_port=wdata.get("agent_port", 50030),
+                    rsync_port=wdata.get("rsync_port", 8730),
+                    initial_standby=True
+                )
+                restored += 1
+            except Exception as e:
+                logger.warning(f"[WorkerPersistence] Failed to restore worker '{node_id}': {e}")
+        if restored > 0:
+            logger.info(f"✨ [WorkerPersistence] Pre-restored {restored} cluster worker(s) into TTS node pools.")
 
     def _get_next_available_priority(self, exclude_node_id: str = "") -> int:
         """未割り当ての最小 Priority (1, 2, 3...) を計算"""
@@ -1540,11 +1591,15 @@ class WebServer:
         await self._require_admin(request)
         prewarm = getattr(self.bot, "prewarm_service", None) if self.bot else None
 
-        candidates = []
+        candidates_data = {"alltime": [], "recent": [], "combined": []}
         db_obj = self.db or getattr(self.bot, "db", None)
         if db_obj and hasattr(db_obj, "get_frequent_phrases_for_prewarm"):
             try:
-                candidates = await db_obj.get_frequent_phrases_for_prewarm(days=3, min_hits=3, max_length=15, limit=20)
+                res = await db_obj.get_frequent_phrases_for_prewarm(days=3, min_hits=3, max_length=15, limit=30)
+                if isinstance(res, dict):
+                    candidates_data = res
+                else:
+                    candidates_data = {"alltime": res, "recent": [], "combined": res}
             except Exception as e:
                 logger.warning(f"Error fetching speculative candidates: {e}")
 
@@ -1594,7 +1649,8 @@ class WebServer:
             "is_running": getattr(prewarm, "_speculative_running", False) if prewarm else False,
             "last_run_time": getattr(prewarm, "last_speculative_run_time", None) if prewarm else None,
             "last_stats": getattr(prewarm, "last_speculative_stats", {}) if prewarm else {},
-            "candidates_top20": candidates,
+            "candidates_hybrid": candidates_data,
+            "candidates_top20": candidates_data.get("combined", []),
             "target_speakers": detailed_target_speakers,
             "daily_schedule": "04:30 JST (Early morning idle batch -> 05:00 Standby HA sync)"
         }
@@ -4069,30 +4125,22 @@ class WebServer:
 
         return False
 
-    async def api_worker_register(self, request: web.Request) -> web.Response:
-        """
-        Worker からの自動登録リクエストを受け付け、TTSNodePool に動的追加する。
-        スペック（GPU/CPU/RAM）に基づいて max_concurrent / priority を自動設定。
-        """
-        if not self._verify_worker_auth(request):
-            return web.json_response({"error": "Unauthorized worker request"}, status=401)
+    def _register_worker_internal(
+        self,
+        node_id: str,
+        ip: str,
+        specs: Dict[str, Any],
+        engines_data: Dict[str, Any],
+        node_name: Optional[str] = None,
+        agent_port: int = 50030,
+        rsync_port: int = 8730,
+        initial_standby: bool = False
+    ) -> List[str]:
+        """Worker登録の共通処理（TTSNodePool登録 ＆ cluster_workers.json 永続化）"""
+        if not node_id or not ip or not self.tts_manager:
+            return []
 
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
-
-        node_id = data.get("node_id")
-        node_name = data.get("node_name", node_id)
-        ip = data.get("ip")
-        agent_port = data.get("agent_port", 50030)
-        rsync_port = data.get("rsync_port", 8730)
-        specs = data.get("specs", {})
-        engines_data = data.get("engines", {})
-
-        if not node_id or not ip:
-            return web.json_response({"error": "node_id and ip are required"}, status=400)
-
+        node_name = node_name or node_id
         hostname = specs.get("host_hostname") or specs.get("hostname", node_id)
         # コンテナID (12文字Hex) の露出を防止し、物理ホスト名またはスペックベースへ解決
         clean_host = hostname
@@ -4137,13 +4185,18 @@ class WebServer:
                 max_concurrent=engine_info.get("max_concurrent", mac),
                 enabled=True,
             )
-            eng_running = engine_info.get("running", True)
+            eng_running = False if initial_standby else engine_info.get("running", True)
             node_specs = dict(specs)
             node_specs["engine_running"] = eng_running
             target_node = pool.register_or_update(node_config, specs=node_specs, hostname=hostname)
             target_node.engine_running = eng_running
-            if not eng_running:
+            if initial_standby:
                 target_node.is_healthy = False
+                target_node.last_heartbeat = time.time() - 100.0  # 待機中状態 (ハートビート受信で即座にオンライン化)
+            elif not eng_running:
+                target_node.is_healthy = False
+            else:
+                target_node.is_healthy = True
             registered_engines.append(engine_name)
 
         try:
@@ -4151,6 +4204,59 @@ class WebServer:
             worker_log_collector.register_worker(node_id, ip)
         except Exception:
             pass
+
+        # 永続化情報に保存
+        self.cluster_workers[node_id] = {
+            "node_id": node_id,
+            "node_name": node_name,
+            "ip": ip,
+            "agent_port": agent_port,
+            "rsync_port": rsync_port,
+            "specs": specs,
+            "engines": engines_data,
+            "last_seen": time.time(),
+            "updated_at": time.time()
+        }
+        self._save_cluster_workers()
+        return registered_engines
+
+    async def api_worker_register(self, request: web.Request) -> web.Response:
+        """
+        Worker からの自動登録リクエストを受け付け、TTSNodePool に動的追加する。
+        スペック（GPU/CPU/RAM）に基づいて max_concurrent / priority を自動設定。
+        """
+        if not self._verify_worker_auth(request):
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        node_id = data.get("node_id")
+        node_name = data.get("node_name", node_id)
+        ip = data.get("ip")
+        agent_port = data.get("agent_port", 50030)
+        rsync_port = data.get("rsync_port", 8730)
+        specs = data.get("specs", {})
+        engines_data = data.get("engines", {})
+
+        if not node_id or not ip:
+            return web.json_response({"error": "node_id and ip are required"}, status=400)
+
+        registered_engines = self._register_worker_internal(
+            node_id=node_id,
+            ip=ip,
+            specs=specs,
+            engines_data=engines_data,
+            node_name=node_name,
+            agent_port=agent_port,
+            rsync_port=rsync_port,
+            initial_standby=False
+        )
+
+        mac = specs.get("recommended_max_concurrent", 1)
+        pri = specs.get("recommended_priority", 2)
 
         logger.info(
             f"✨ [WorkerAPI] Worker '{node_id}' ({ip}) 登録完了: engines={registered_engines}, "
@@ -4182,7 +4288,7 @@ class WebServer:
         })
 
     async def api_worker_heartbeat(self, request: web.Request) -> web.Response:
-        """Worker からのハートビートを受け付け、ノード生存状態を更新する"""
+        """Worker からのハートビートを受け付け、ノード生存状態を更新する (未登録時は即座に自動復元)"""
         if not self._verify_worker_auth(request):
             return web.json_response({"error": "Unauthorized worker request"}, status=401)
 
@@ -4226,6 +4332,8 @@ class WebServer:
                         elif not is_eng_healthy:
                             node.is_healthy = False
                             node.unhealthy_until = time.time() + 20.0
+                        else:
+                            node.is_healthy = True
                         # リソース情報 (CPU/メモリ/GPU) を更新
                         if resources:
                             node.specs["resources"] = resources
@@ -4257,6 +4365,32 @@ class WebServer:
                             else:
                                 node.hostname = f"Worker ({clean_h[:6]})"
                             node.specs["hostname"] = node.hostname
+
+        # 💡 ハートビート相乗りオートレジスター (Master再起動直後の404往復遅延を解消)
+        if not found_any and data.get("ip") and engines_status:
+            logger.info(f"⚡ [WorkerAPI] Auto-recovering unregistered worker '{node_id}' ({data.get('ip')}) directly from heartbeat...")
+            auto_engines = self._register_worker_internal(
+                node_id=node_id,
+                ip=data.get("ip"),
+                specs=data.get("specs", {}) or {},
+                engines_data=engines_status,
+                agent_port=data.get("agent_port", 50030),
+                initial_standby=False
+            )
+            if auto_engines:
+                found_any = True
+                for engine_name in auto_engines:
+                    full_node_id = f"{node_id}_{engine_name}"
+                    p = pool_map.get(engine_name)
+                    if p:
+                        p.update_heartbeat(full_node_id)
+                        for n in p.nodes:
+                            if n.id == full_node_id:
+                                n.is_healthy = True
+                                n.engine_running = engines_status.get(engine_name, {}).get("running", True)
+                                if resources:
+                                    n.specs["resources"] = resources
+                                    n.specs["resources_updated_at"] = time.time()
 
         if not found_any:
             return web.json_response({"registered": False, "message": "Node not found. Please re-register."}, status=404)
@@ -4460,9 +4594,20 @@ class WebServer:
                         kicked = True
                         logger.info(f"🚫 [Worker Kick] 常設 Worker {nid} ({nurl}) in {engine_name} was removed/deactivated.")
 
+        # 3. 永続化データ cluster_workers.json からも削除
+        removed_persisted = False
+        for k in list(self.cluster_workers.keys()):
+            wdata = self.cluster_workers[k]
+            if (node_id and k == node_id) or (ip and wdata.get("ip") == ip):
+                del self.cluster_workers[k]
+                removed_persisted = True
+                logger.info(f"🗑️ [WorkerPersistence] Removed kicked worker '{k}' from cluster_workers.json")
+        if removed_persisted:
+            self._save_cluster_workers()
+
         return web.json_response({
             "status": "ok",
-            "kicked": kicked,
+            "kicked": kicked or removed_persisted,
             "target": target_name,
             "message": f"Worker ノード '{target_name}' を切断・除外しました。"
         })
