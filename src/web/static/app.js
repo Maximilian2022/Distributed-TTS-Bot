@@ -2992,6 +2992,7 @@ function renderWorkerNodes(nodesData) {
     // レイテンシトラッカーからの実測平均推論ms
     const workerLatencyStats = (typeof latestMetricsData !== 'undefined' && latestMetricsData?.latency?.workers) ? latestMetricsData.latency.workers : {};
     let realSynthLabel = lastLatency;
+    const resolvedHostname = workerHostDisplay || cleanCandidate || "";
     for (const [wLbl, wStat] of Object.entries(workerLatencyStats)) {
       if ((resolvedHostname && wLbl.includes(resolvedHostname)) || (rawHostname && wLbl.includes(rawHostname)) || (node.id && wLbl.includes(node.id)) || (isMaster && (wLbl.includes("Master") || wLbl.includes("local")))) {
         realSynthLabel = `<span style="color:#50e6ff;font-weight:700;" title="直近実測TTS合成速度">${wStat.avg_synthesis_ms}ms</span>`;

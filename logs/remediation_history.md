@@ -1,5 +1,18 @@
 
 # 修正・作業履歴 (Remediation History)
+## [2026-10-27] WebUI分散コンピュートワーカーカード描画時の ReferenceError (resolvedHostname 未定義) の即時解消
+
+- **ユーザーフィードバック & 現象**:
+  - 「スーパーリロードしても表示されないけど？」
+  - 添付画像にて「分散コンピュートワーカー (マルチノード推論)」ヘッダーのみ表示され、Workerカード一覧が表示されない状態。
+- **真因分析**:
+  - [src/web/static/app.js](file:///root/ttsbot/src/web/static/app.js) の `renderWorkerNodes` 内（Line 2996）にて、実測レイテンシ集計ループ内で `resolvedHostname` を参照していたが、直前のリファクタリングで変数名が `workerHostDisplay` / `cleanCandidate` に改名された際に宣言が抜けていた。
+  - このため `ReferenceError: resolvedHostname is not defined` が発生し、カード生成途中の `try { ... } catch (err) { ... }` で処理がスキップされ、全ノードのカードがDOM（`container`）に追加されず空欄になっていた。
+- **対応内容**:
+  - `src/web/static/app.js` の Line 2995 に `const resolvedHostname = workerHostDisplay || cleanCandidate || "";` を追加。
+  - ホスト名・クリーン名が安全に解決され、例外なく確実に全Workerカードがレンダリングされるよう修復。
+  - 実機ブラウザ検証（`browser_subagent`）により、`http://127.0.0.1:8088/#bots` にて全4台のWorkerカード（MASTEROMEN2017, MASTERSOMEN2022, MasterDebian, MasterUbuntu）が正常かつ美しく表示されることを確認完了（画面撮影: `bots_management_page_1793096449865.png`）。
+
 ## [2026-10-27] 分散コンピュートワーカーの登録永続化（Master再起動保護）＆ ハートビート時オートレジスター ＆ WebUI 5秒リアルタイム自動ポーリング新設
 
 - **ユーザーフィードバック & 課題**:
