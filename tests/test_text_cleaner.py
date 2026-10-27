@@ -96,6 +96,25 @@ class TestTextCleaner(unittest.TestCase):
         self.assertGreater(split_ms, 0.0)
         self.assertLess(split_ms, 500.0, f"split_ms was too slow after hot warmup: {split_ms}ms")
 
+    def test_split_greeting_tail(self):
+        # 文末の挨拶が独立チャンクとして切り出されること
+        text = "今日も一日 おつかれさまでした！"
+        chunks = TextCleaner.split_into_chunks("今日も一日、おつかれさま！")
+        self.assertGreaterEqual(len(chunks), 2)
+        chunk_texts = [c.text.strip() for c in chunks]
+        self.assertIn("今日も一日", chunk_texts)
+        self.assertIn("おつかれさま！", chunk_texts)
+
+    def test_split_greeting_tail_redos_safety(self):
+        # タブや空白が大量に連続した場合でもReDoSを起こさず瞬時に処理されること
+        nasty_text = "\t" * 500 + "おつかれ！"
+        import time
+        t0 = time.perf_counter()
+        chunks = TextCleaner.split_into_chunks(nasty_text)
+        duration = time.perf_counter() - t0
+        self.assertLess(duration, 0.05, f"ReDoS suspected! Took {duration}s")
+
 if __name__ == "__main__":
     unittest.main()
+
 

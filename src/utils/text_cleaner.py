@@ -54,11 +54,11 @@ _RE_SPLIT_GREETING_HEAD = re.compile(
     re.IGNORECASE
 )
 _RE_SPLIT_GREETING_TAIL = re.compile(
-    r'([、\s]*)'
     r'(おはようございます|おはよう|こんにちは|こんばんわ|こんばんは|おつかれさまです|おつかれさま|おつかれ|おつ|ありがとうございます|ありがとう|よろしくお願いします|よろしく|了解です|了解|なるほど|草|まじかよ|まじか|助かる)'
     r'([！!？?wｗ\s、。]*)$',
     re.IGNORECASE
 )
+
 
 # 文頭接続詞・相槌の先頭スライス用正規表現 (先頭即時ヒット・TTFA短縮)
 _RE_SPLIT_HEAD_CONJ = re.compile(
@@ -753,9 +753,9 @@ class TextCleaner:
         # 2. 文末チェック
         m_tail = _RE_SPLIT_GREETING_TAIL.search(s)
         if m_tail and m_tail.start() > 0:
-            matched_greeting = m_tail.group(2)
-            punct = m_tail.group(3) or ""
-            prefix = s[:m_tail.start()].strip()
+            matched_greeting = m_tail.group(1)
+            punct = m_tail.group(2) or ""
+            prefix = s[:m_tail.start()].rstrip("、 \t\u3000").strip()
             # 前半の文が実質2文字以上あればスライス採用
             if len(_RE_STRIP_PUNCT_SPACES.sub('', prefix)) >= 2:
                 greeting_part = (matched_greeting + punct).strip()

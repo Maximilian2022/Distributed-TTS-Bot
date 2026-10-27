@@ -7762,3 +7762,21 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 5. **テスト・検証**:
    - 新規単体テスト `tests/test_setup_worker_delivery.py`（全5ケース）を作成し、WAN/LAN双方でのURL注入・agent.py配信を実機検証。全33テスト100%合格。
    - 本番環境にて無停止で即時配信反映を確認。
+
+
+## [2026-10-27] GitHub PR / Code Scanning 点検 & CodeQL Alert #82 (ReDoS) 解消
+- **点検結果**:
+  - Pull Request: オープン中のPRは 0 件（全19件マージ・クローズ済み）。
+  - Dependabot / Secret Scanning: オープン中のアラートは 0 件。
+  - Code Scanning: Alert #82 (`py/polynomial-redos`, CWE-1333, High) がオープン状態であることを確認。
+- **原因分析**:
+  - `src/utils/text_cleaner.py` 内の `_RE_SPLIT_GREETING_TAIL` にて、先頭に曖昧な量指定子 `([、\s]*)` が存在し、末尾アンカー `$` との組み合わせにより、タブや空白が連続する文字列に対して多項式バックトラック（Polynomial ReDoS）が発生する脆弱性。
+- **対処内容**:
+  1. `src/utils/text_cleaner.py`:
+     - `_RE_SPLIT_GREETING_TAIL` から先頭の曖昧な `([、\s]*)` を完全除去。末尾アンカー `$` による確定的な後方探索構造へ是正。
+     - キャプチャグループの参照番号を `group(1)` / `group(2)` に安全追従。
+     - 文末挨拶切り出し時の直前文字列トリミングに `s[:m_tail.start()].rstrip("、 \t\u3000").strip()` を適用し、余分な読点や空白を安全に除去。
+  2. `tests/test_text_cleaner.py`:
+     - `test_split_greeting_tail`（文末挨拶の独立チャンク切り出し）および `test_split_greeting_tail_redos_safety`（大量タブ連続時のReDoS非発生検証）を追加。
+  3. **サンドボックス検証**:
+     - `./scripts/run_sandbox_test.sh` を用いて隔離コンテナ内で全テストを実行し、100%合格を確認（テストコンテナは自動破棄）。
