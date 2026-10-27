@@ -144,7 +144,7 @@ AGENT_SCRIPT_PATH = os.getenv("AGENT_SCRIPT_PATH", os.path.abspath(__file__))
 # 自動バージョンチェック間隔 (分)
 AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 # エージェントバージョン (定数 - 定義変更で自動アップデート判定に使用)
-AGENT_VERSION = "3.13.2"
+AGENT_VERSION = "3.13.3"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -172,18 +172,30 @@ def read_local_manifest_version() -> str:
 def normalize_coeiroink_compose_volumes(compose_text: str, hybrid_src: str, ssd_src: str, ram_src: str) -> str:
     r"""
     docker-compose.worker.yml 内の COEIROINK ボリュームマウント行を安全に正規化。
-    行頭 (^\s*-\s*) を厳格に判定し、既存のクォートやWindowsパス(C:/)の有無に関わらず安全に置換。
-    パス名に含まれるハイフン等による誤マッチや多重挿入を完全防止する。
+    speaker_info に加え、シンボリックリンクの解決に必要な storage/ssd:ro および storage/ram の
+    マウント行が存在しない場合は自動的に挿入・補完する。
     """
+    has_ssd_mount = bool(re.search(r':/opt/coeiroink/[^/\s]+/storage/ssd', compose_text))
+    has_ram_mount = bool(re.search(r':/opt/coeiroink/[^/\s]+/storage/ram', compose_text))
+
     lines = []
     for line in compose_text.splitlines():
         if re.search(r':/opt/coeiroink/[^/\s]+/speaker_info["\']?', line):
             m = re.match(r'^(\s*-\s*)', line)
             if m:
                 indent = m.group(1)
-                dest_m = re.search(r'(:/opt/coeiroink/[^/\s]+/speaker_info)', line)
+                dest_m = re.search(r':(/opt/coeiroink/[^/\s]+)/speaker_info', line)
                 if dest_m:
-                    line = f'{indent}"{hybrid_src}{dest_m.group(1)}"'
+                    base_dest = dest_m.group(1)
+                    line = f'{indent}"{hybrid_src}:{base_dest}/speaker_info"'
+                    lines.append(line)
+                    if not has_ssd_mount:
+                        lines.append(f'{indent}"{ssd_src}:{base_dest}/storage/ssd:ro"')
+                        has_ssd_mount = True
+                    if not has_ram_mount:
+                        lines.append(f'{indent}"{ram_src}:{base_dest}/storage/ram"')
+                        has_ram_mount = True
+                    continue
         elif re.search(r':/opt/coeiroink/[^/\s]+/storage/ssd:ro["\']?', line):
             m = re.match(r'^(\s*-\s*)', line)
             if m:

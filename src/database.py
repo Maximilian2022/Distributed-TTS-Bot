@@ -2833,6 +2833,39 @@ class Database:
             await db.commit()
             return cur.rowcount > 0
 
+    async def get_pinned_coeiroink_speaker_ids(self, limit: int = 4, active_days: int = 30) -> List[str]:
+        """
+        常駐・ピン留め対象とするCOEIROINK話者IDリストをアクティブユーザー順に取得 (案B: 最大4モデル)
+        
+        直近 active_days 日間にアクティブ（発言/キャッシュ更新/設定更新）なユーザー数を最優先し、
+        設定者数、最終アクティブ日時の降順でソートして上位 limit 件を返す。
+        """
+        query = """
+            WITH user_ci_speakers AS (
+                SELECT u.user_id, u.speaker_id, COALESCE(gmc.updated_at, u.updated_at) AS last_active
+                FROM (
+                    SELECT user_id, speaker_id, updated_at FROM guild_user_settings WHERE speaker_id LIKE 'ci_%'
+                    UNION
+                    SELECT user_id, speaker_id, updated_at FROM user_settings WHERE speaker_id LIKE 'ci_%'
+                ) u
+                LEFT JOIN (
+                    SELECT user_id, MAX(updated_at) AS updated_at FROM guild_member_cache GROUP BY user_id
+                ) gmc ON u.user_id = gmc.user_id
+            )
+            SELECT speaker_id
+            FROM user_ci_speakers
+            GROUP BY speaker_id
+            ORDER BY 
+                COUNT(DISTINCT CASE WHEN last_active >= datetime('now', '-' || ? || ' days') THEN user_id END) DESC,
+                COUNT(DISTINCT user_id) DESC,
+                MAX(last_active) DESC
+            LIMIT ?;
+        """
+        async with self.get_connection() as db:
+            async with db.execute(query, (int(active_days), int(limit))) as cur:
+                rows = await cur.fetchall()
+                return [r[0] for r in rows if r[0]]
+
 
 
 

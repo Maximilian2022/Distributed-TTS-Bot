@@ -418,22 +418,16 @@ async def main():
     async def broadcast_pinned_models_to_workers():
         try:
             await asyncio.sleep(8.0)  # Worker自動登録の完了を待機
-            async with db.get_connection() as conn:
-                async with conn.execute(
-                    "SELECT DISTINCT speaker_id FROM ("
-                    "  SELECT speaker_id FROM user_settings WHERE speaker_id LIKE 'ci_%'"
-                    "  UNION"
-                    "  SELECT speaker_id FROM guild_user_settings WHERE speaker_id LIKE 'ci_%'"
-                    ")"
-                ) as cursor:
-                    rows = await cursor.fetchall()
+            speaker_ids = await db.get_pinned_coeiroink_speaker_ids(limit=4, active_days=30)
             pinned_models = set()
-            for (spk_id,) in rows:
+            for spk_id in speaker_ids:
                 v_info = config.voices.get(spk_id)
+                if not v_info and tts_manager:
+                    v_info = getattr(tts_manager, "_get_voice_config", lambda _: None)(spk_id)
                 if v_info and getattr(v_info, "voice_name", None):
                     spk_uuid = v_info.voice_name.split("_")[0]
                     pinned_models.add(spk_uuid)
-                else:
+                elif spk_id:
                     pinned_models.add(spk_id)
             if pinned_models:
                 logging.info(f"📌 [WorkerRAM] 個人設定ピン留めモデルを全Workerへブロードキャスト: {list(pinned_models)}")

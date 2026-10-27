@@ -611,10 +611,18 @@ class LocalEngineResourceManager:
                 if not spk_id:
                     continue
 
-                voice_cfg = self.config.voices.get(spk_id)
-                if voice_cfg and voice_cfg.provider in LOCAL_ENGINES:
-                    needed_providers.add(voice_cfg.provider)
-                    needed_voice_configs_map[voice_cfg.id] = voice_cfg
+                # 静的config.voicesだけでなく、動的話者 (ci_*, vv_* 等) も解決できる tts_manager._get_voice_config を優先
+                voice_cfg = None
+                if self.tts_manager and hasattr(self.tts_manager, "_get_voice_config"):
+                    voice_cfg = self.tts_manager._get_voice_config(spk_id)
+                elif self.config and self.config.voices:
+                    voice_cfg = self.config.voices.get(spk_id)
+
+                if voice_cfg and getattr(voice_cfg, "provider", None) in LOCAL_ENGINES:
+                    prov = voice_cfg.provider
+                    needed_providers.add(prov)
+                    vid = getattr(voice_cfg, "id", spk_id)
+                    needed_voice_configs_map[vid] = voice_cfg
             except Exception as e:
                 logger.debug(f"Failed to resolve settings for prewarm (uid={uid}): {e}")
 
@@ -790,19 +798,26 @@ class LocalEngineResourceManager:
         if not self.db or not self.config:
             return desired
 
-        # 1. DB ピン留めモデル
+        # 1. DB ピン留めモデル (直近30日アクティブ優先・上限4モデル)
         try:
-            async with self.db.get_connection() as conn:
-                async with conn.execute(
-                    "SELECT DISTINCT speaker_id FROM ("
-                    "  SELECT speaker_id FROM user_settings WHERE speaker_id LIKE 'ci_%'"
-                    "  UNION"
-                    "  SELECT speaker_id FROM guild_user_settings WHERE speaker_id LIKE 'ci_%'"
-                    ")"
-                ) as cursor:
-                    rows = await cursor.fetchall()
-            for (spk_id,) in rows:
+            if hasattr(self.db, "get_pinned_coeiroink_speaker_ids"):
+                speaker_ids = await self.db.get_pinned_coeiroink_speaker_ids(limit=4, active_days=30)
+            else:
+                async with self.db.get_connection() as conn:
+                    async with conn.execute(
+                        "SELECT DISTINCT speaker_id FROM ("
+                        "  SELECT speaker_id FROM user_settings WHERE speaker_id LIKE 'ci_%'"
+                        "  UNION"
+                        "  SELECT speaker_id FROM guild_user_settings WHERE speaker_id LIKE 'ci_%'"
+                        ")"
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+                speaker_ids = [r[0] for r in rows if r[0]]
+
+            for spk_id in speaker_ids:
                 v_info = self.config.voices.get(spk_id)
+                if not v_info and self.tts_manager:
+                    v_info = getattr(self.tts_manager, "_get_voice_config", lambda _: None)(spk_id)
                 if v_info and getattr(v_info, "voice_name", None):
                     spk_uuid = v_info.voice_name.split("_")[0]
                     desired.add(spk_uuid)

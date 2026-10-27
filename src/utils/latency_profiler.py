@@ -5,8 +5,31 @@ from typing import Dict, Any, Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
 
+# 各エンジン別・ハードウェア別の初期推論特性基準値 (事前分布 / コールドスタート用)
+# 実績ログ蓄積後は EWMA (指数移動平均) により各実機・各エンジンの真値に自動収束
+ENGINE_INITIAL_PRIORS = {
+    "COEIROINK": {
+        "gpu_top": {"base_ms": 100.0, "ms_per_char": 20.0},
+        "gpu_mid": {"base_ms": 150.0, "ms_per_char": 45.0},
+        "gpu_gen": {"base_ms": 120.0, "ms_per_char": 30.0},
+        "cpu":     {"base_ms": 320.0, "ms_per_char": 130.0},  # COEIROINK CPU推論は重い
+    },
+    "VOICEVOX": {
+        "gpu_top": {"base_ms": 80.0,  "ms_per_char": 12.0},
+        "gpu_mid": {"base_ms": 120.0, "ms_per_char": 30.0},
+        "gpu_gen": {"base_ms": 100.0, "ms_per_char": 20.0},
+        "cpu":     {"base_ms": 220.0, "ms_per_char": 65.0},   # VOICEVOX CPU推論は中速
+    },
+    "SHAREVOX": {
+        "gpu_top": {"base_ms": 90.0,  "ms_per_char": 15.0},
+        "gpu_mid": {"base_ms": 130.0, "ms_per_char": 35.0},
+        "gpu_gen": {"base_ms": 110.0, "ms_per_char": 25.0},
+        "cpu":     {"base_ms": 250.0, "ms_per_char": 75.0},
+    },
+}
+
 class NodeLatencyProfile:
-    """単一ノード×エンジンの動的レイテンシプロファイル"""
+    """単一ノード×各エンジンの動的レイテンシプロファイル (同一ノードでもエンジン別に独立管理)"""
 
     def __init__(
         self,
@@ -26,20 +49,21 @@ class NodeLatencyProfile:
         self.machine_name = machine_name
         self.ip = ip
 
-        # コールドスタート用の初期値
+        # エンジン別・ハードウェア別のコールドスタート初期値
+        eng_priors = ENGINE_INITIAL_PRIORS.get(self.engine_name, ENGINE_INITIAL_PRIORS["VOICEVOX"])
         if has_gpu:
             if "3090" in gpu_name or "4090" in gpu_name or vram_mb >= 20000:
-                self.base_latency_ms = 80.0
-                self.ms_per_char = 14.0
+                p = eng_priors["gpu_top"]
             elif "1080" in gpu_name or "1060" in gpu_name or vram_mb >= 10000:
-                self.base_latency_ms = 120.0
-                self.ms_per_char = 32.0
+                p = eng_priors["gpu_mid"]
             else:
-                self.base_latency_ms = 100.0
-                self.ms_per_char = 24.0
+                p = eng_priors["gpu_gen"]
+            self.base_latency_ms = p["base_ms"]
+            self.ms_per_char = p["ms_per_char"]
         else:
-            self.base_latency_ms = 250.0
-            self.ms_per_char = 65.0
+            p = eng_priors["cpu"]
+            self.base_latency_ms = p["base_ms"]
+            self.ms_per_char = p["ms_per_char"]
 
         self.sample_count = 0
         self.last_updated = time.time()
@@ -68,6 +92,22 @@ class NodeLatencyProfile:
     def estimate(self, text_len: int) -> float:
         """指定文字数の予測合成時間をミリ秒で算出"""
         return max(30.0, self.base_latency_ms + (text_len * self.ms_per_char))
+
+    def calc_max_chars(
+        self,
+        target_budget_ms: float = 1750.0,
+        min_chars: int = 8,
+        max_chars: int = 30
+    ) -> int:
+        """
+        目標許容時間 (target_budget_ms) 以内に推論完了する最大文字数を逆算。
+        - 実測値 (base_latency_ms, ms_per_char) に基づき自律適応。
+        - min_chars 〜 max_chars の範囲に安全クランプ。
+        """
+        safe_rate = max(1.0, self.ms_per_char)
+        available_time = max(0.0, target_budget_ms - self.base_latency_ms)
+        chars = int(available_time / safe_rate)
+        return max(min_chars, min(chars, max_chars))
 
     @property
     def gpu_power_score(self) -> float:
@@ -204,6 +244,71 @@ class EngineLatencyProfiler:
             return None
         ranked = self.rank_nodes_by_power(available_gpus)
         return ranked[0] if ranked else None
+
+    def get_dynamic_max_chars(
+        self,
+        engine: Optional[str] = None,
+        target_budget_ms: float = 1750.0,
+        min_chars: int = 8,
+        max_chars: int = 30,
+        candidate_nodes: Optional[List[Any]] = None
+    ) -> int:
+        """
+        指定エンジンの現在の実測推論性能に基づき、目標許容時間 (target_budget_ms) 以内に
+        安全に合成完了できる動的な最大文字数を算出する。
+        - クラウドTTS (azure, google, edge 等) や軽量ルール (openjtalk): 固定の max_chars (30) を返却。
+        - ローカルTTS (coeiroink, voicevox, sharevox 等):
+          1. candidate_nodes (候補ノード) が指定されている場合: 最有力ノードのプロファイルを採用。
+          2. 指定がない場合: self._profiles から該当エンジンの有効プロファイルを検索。
+             - GPUノードが存在する場合は最強GPUノードのプロファイルを採用。
+             - CPUノードのみの場合は、最も代表的なCPUノードのプロファイルを採用。
+          3. プロファイルが未登録の場合:
+             - クラスタ全体のGPU有無に応じた安全な初期値（GPU: max_chars, CPU: 13文字）を返却。
+        """
+        if not engine:
+            return max_chars
+
+        eng_lower = engine.strip().lower()
+        LOCAL_ENGINES = {"coeiroink", "voicevox", "sharevox"}
+        if eng_lower not in LOCAL_ENGINES:
+            return max_chars
+
+        eng_upper = eng_lower.upper()
+
+        # 該当エンジンのプロファイルを収集
+        matched_profiles: List[NodeLatencyProfile] = []
+        if candidate_nodes:
+            for n in candidate_nodes:
+                p = self.get_or_create(n)
+                if p.engine_name == eng_upper:
+                    matched_profiles.append(p)
+        else:
+            for (nid, e_name), p in self._profiles.items():
+                if e_name == eng_upper:
+                    matched_profiles.append(p)
+
+        if not matched_profiles:
+            # 該当エンジンの登録がまだない場合の初期推論基準値からエンジン別に逆算
+            eng_prior = ENGINE_INITIAL_PRIORS.get(eng_upper, ENGINE_INITIAL_PRIORS["VOICEVOX"])
+            has_any_gpu = any(p.has_gpu for p in self._profiles.values())
+            prior = eng_prior["gpu_gen"] if has_any_gpu else eng_prior["cpu"]
+            avail_ms = max(0.0, target_budget_ms - prior["base_ms"])
+            chars = int(avail_ms / max(1.0, prior["ms_per_char"]))
+            return max(min_chars, min(chars, max_chars))
+
+        # GPUノードがあれば最強GPUノードのプロファイルを採用
+        gpu_profiles = [p for p in matched_profiles if p.has_gpu]
+        if gpu_profiles:
+            best_gpu = max(gpu_profiles, key=lambda p: p.gpu_power_score)
+            return best_gpu.calc_max_chars(target_budget_ms, min_chars, max_chars)
+
+        # CPUノードのみの場合: サンプル数が多く安定したプロファイルを採用
+        cpu_profiles = matched_profiles
+        if cpu_profiles:
+            best_cpu = max(cpu_profiles, key=lambda p: (p.sample_count, -p.ms_per_char))
+            return best_cpu.calc_max_chars(target_budget_ms, min_chars, max_chars)
+
+        return max_chars
 
     def get_all_stats(self) -> Dict[str, Any]:
         """全プロファイルの統計データを取得 (WebUI API用)"""

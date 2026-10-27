@@ -756,8 +756,8 @@ class TTSNodePool:
                     return 99
 
             candidates_to_start.sort(key=lambda n: (get_node_tier_rank(n), n.priority))
-            # 最上位の候補からオンデマンド遠隔起動
-            for n in candidates_to_start[:2]:
+            # スリープ中のノードがあれば、Tier順位で足切りせず全ノードに対して並行して起動を試行
+            for n in candidates_to_start:
                 if now_ts - getattr(n, "last_start_attempt", 0.0) > 10.0:
                     n.last_start_attempt = now_ts
                     asyncio.create_task(n.try_remote_start())

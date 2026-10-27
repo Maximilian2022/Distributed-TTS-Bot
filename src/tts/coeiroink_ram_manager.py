@@ -367,23 +367,26 @@ class CoeiroinkRamManager:
                 logger.warning(f"[CoeiroinkRamManager] アラート送信失敗: {e}")
 
     async def sync_pinned_models(self) -> None:
-        """DBから個人設定された COEIROINK モデルを取得しピン留め・昇格"""
+        """DBから個人設定された COEIROINK モデルを取得しピン留め・昇格 (直近30日アクティブ優先・上限4モデル)"""
         if not self.db:
             return
         try:
-            # user_settings および guild_user_settings を走査
-            async with self.db.get_connection() as conn:
-                async with conn.execute(
-                    "SELECT DISTINCT speaker_id FROM ("
-                    "  SELECT speaker_id FROM user_settings WHERE speaker_id LIKE 'ci_%'"
-                    "  UNION"
-                    "  SELECT speaker_id FROM guild_user_settings WHERE speaker_id LIKE 'ci_%'"
-                    ")"
-                ) as cursor:
-                    rows = await cursor.fetchall()
+            if hasattr(self.db, "get_pinned_coeiroink_speaker_ids"):
+                speaker_ids = await self.db.get_pinned_coeiroink_speaker_ids(limit=4, active_days=30)
+            else:
+                async with self.db.get_connection() as conn:
+                    async with conn.execute(
+                        "SELECT DISTINCT speaker_id FROM ("
+                        "  SELECT speaker_id FROM user_settings WHERE speaker_id LIKE 'ci_%'"
+                        "  UNION"
+                        "  SELECT speaker_id FROM guild_user_settings WHERE speaker_id LIKE 'ci_%'"
+                        ")"
+                    ) as cursor:
+                        rows = await cursor.fetchall()
+                speaker_ids = [r[0] for r in rows if r[0]]
 
             new_pinned: Set[str] = set()
-            for (spk_id,) in rows:
+            for spk_id in speaker_ids:
                 model_dir = None
                 # config または voices から speakerUuid を特定
                 cfg = self.config if self.config else getattr(self.db, "config", None)

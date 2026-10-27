@@ -1068,9 +1068,14 @@ class TTSManager:
                 safe_create_task(self.db.record_cache_hit(len(full_text), is_local=self._is_local_provider(provider)), name="record_cache_hit_full")
             return cached_file
 
-        # 2. チャンクの取得 (未指定なら split_into_chunks で自動分割)
+        # 2. チャンクの取得 (未指定なら split_into_chunks で自動分割: 各マシン×各エンジン推論性能に適応)
         if chunks is None:
-            chunks = TextCleaner.split_into_chunks(text, author_prefix=author_prefix)
+            chunks = TextCleaner.split_into_chunks(
+                text,
+                author_prefix=author_prefix,
+                engine=provider,
+                speaker_id=speaker_id
+            )
 
         voice_cfg = self.config.voices.get(speaker_id)
         speaker_name = voice_cfg.name if voice_cfg else speaker_id

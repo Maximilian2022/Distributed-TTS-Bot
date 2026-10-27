@@ -488,14 +488,20 @@ class TextCleaner:
         return text
 
     @staticmethod
-    def _split_long_sentence_morphological(sentence: str, delim: str) -> List[Tuple[str, str]]:
+    def _split_long_sentence_morphological(
+        sentence: str,
+        delim: str,
+        min_chars_threshold: int = 18,
+        min_head_chars: int = 7,
+        min_tail_chars: int = 5
+    ) -> List[Tuple[str, str]]:
         """
-        読点のない長い文（18文字以上）を、超高速・高精度な形態素解析（SudachiPy）を用いて
-        接続詞・接続助詞の自然な境界で分割する。
+        読点のない長い文（閾値以上、通常18文字以上、動的短文時は10〜14文字）を、
+        超高速・高精度な形態素解析（SudachiPy）を用いて接続詞・接続助詞の自然な境界で分割する。
         SudachiPy が未導入または失敗した場合は Janome / 正規表現ルールに安全フォールバック。
         """
         raw_text = sentence.strip()
-        if len(raw_text) < 18:
+        if len(raw_text) < min_chars_threshold:
             return [(sentence, delim)]
 
         # 1. SudachiPy 形態素解析器の取得を試みる (最優先: Rust製超高速・最新辞書)
@@ -511,7 +517,7 @@ class TextCleaner:
                     surface = tok.surface()
                     cur_len += len(surface)
                     pos = tok.part_of_speech()
-                    # 接続助詞の直後で分割 (前が7文字以上、後が6文字以上残っていること)
+                    # 接続助詞の直後で分割 (前がmin_head_chars以上、後がmin_tail_chars以上残っていること)
                     if pos[0] == '助詞' and pos[1] == '接続助詞':
                         is_split_target = False
                         if surface in {'ので', 'から', 'けど', 'けれど', 'たら', 'なら', 'が'}:
@@ -527,20 +533,20 @@ class TextCleaner:
                                     is_split_target = True
                         if is_split_target:
                             remaining_chars = len(raw_text) - cur_len
-                            if cur_len >= 7 and remaining_chars >= 6:
+                            if cur_len >= min_head_chars and remaining_chars >= min_tail_chars:
                                 split_indices.append((cur_len, 'conj_particle'))
                     # 接続詞の直前で分割
                     elif pos[0] == '接続詞' and surface in {'しかし', 'そして', 'また', 'だから', 'なお', 'ただ', 'あるいは', 'それに'}:
                         split_pos = cur_len - len(surface)
                         remaining_chars = len(raw_text) - split_pos
-                        if split_pos >= 7 and remaining_chars >= 6:
+                        if split_pos >= min_head_chars and remaining_chars >= min_tail_chars:
                             split_indices.append((split_pos, 'conjunction'))
 
                 if split_indices:
                     pieces: List[Tuple[str, str]] = []
                     last_pos = 0
                     for s_pos, _ in split_indices:
-                        if s_pos - last_pos >= 7 and (len(raw_text) - s_pos) >= 5:
+                        if (s_pos - last_pos) >= min_head_chars and (len(raw_text) - s_pos) >= min_tail_chars:
                             sub_str = raw_text[last_pos:s_pos].strip()
                             if sub_str:
                                 pieces.append((sub_str, 'conj'))
@@ -567,7 +573,7 @@ class TextCleaner:
                 for i, tok in enumerate(tokens):
                     cur_len += len(tok.surface)
                     pos = tok.part_of_speech.split(',')
-                    # 接続助詞の直後で分割 (前が7文字以上、後が6文字以上残っていること)
+                    # 接続助詞の直後で分割
                     if pos[0] == '助詞' and pos[1] == '接続助詞':
                         is_split_target = False
                         if tok.surface in {'ので', 'から', 'けど', 'けれど', 'たら', 'なら', 'が'}:
@@ -581,20 +587,19 @@ class TextCleaner:
                                     is_split_target = True
                         if is_split_target:
                             remaining_chars = len(raw_text) - cur_len
-                            if cur_len >= 7 and remaining_chars >= 6:
+                            if cur_len >= min_head_chars and remaining_chars >= min_tail_chars:
                                 split_indices.append((cur_len, 'conj_particle'))
                     # 接続詞の直前で分割
                     elif pos[0] == '接続詞' and tok.surface in {'しかし', 'そして', 'また', 'だから', 'なお', 'ただ', 'あるいは'}:
                         split_pos = cur_len - len(tok.surface)
                         remaining_chars = len(raw_text) - split_pos
-                        if split_pos >= 7 and remaining_chars >= 6:
+                        if split_pos >= min_head_chars and remaining_chars >= min_tail_chars:
                             split_indices.append((split_pos, 'conjunction'))
 
                 if split_indices:
-                    # 分割ポイントが近すぎないように調整
                     last_pos = 0
                     for s_pos, s_type in split_indices:
-                        if s_pos - last_pos >= 7 and (len(raw_text) - s_pos) >= 5:
+                        if (s_pos - last_pos) >= min_head_chars and (len(raw_text) - s_pos) >= min_tail_chars:
                             sub_str = raw_text[last_pos:s_pos].strip()
                             if sub_str:
                                 pieces.append((sub_str, 'conj'))
@@ -608,8 +613,9 @@ class TextCleaner:
             except Exception as e:
                 logger.debug(f"Morphological tokenization error: {e}")
 
-        # 2. フォールバック: 接続助詞・接続詞の正規表現ルール分割
-        pattern = r'(ので|から|けど|けれど|たら|なら)(?=[^、。！？\s]{5,})'
+        # 3. フォールバック: 接続助詞・接続詞の正規表現ルール分割
+        min_p_match = max(3, min_tail_chars)
+        pattern = rf'(ので|から|けど|けれど|たら|なら)(?=[^、。！？\s]{{{min_p_match},}})'
         parts = re.split(pattern, raw_text)
         if len(parts) > 1:
             temp = []
@@ -617,7 +623,7 @@ class TextCleaner:
             for idx, p in enumerate(parts):
                 buf += p
                 if idx % 2 == 1: # マッチした助詞
-                    if len(buf) >= 7 and len(raw_text) - len("".join(parts[:idx+1])) >= 5:
+                    if len(buf) >= min_head_chars and len(raw_text) - len("".join(parts[:idx+1])) >= min_tail_chars:
                         temp.append((buf.strip(), 'conj'))
                         buf = ""
             if buf:
@@ -657,10 +663,11 @@ class TextCleaner:
         return merged if len(merged) > 1 else [(text, delim)]
 
     @staticmethod
-    def _hardcap_slice_30(text: str, delim: str = "") -> List[Tuple[str, str]]:
-        """30文字を超える塊を、形態素自立語境界または強制スライスで30文字以内に安全分割"""
+    def _hardcap_slice(text: str, delim: str = "", max_chars: int = _MAX_CHUNK_CHARS) -> List[Tuple[str, str]]:
+        """指定文字数（通常30文字、動的設定時は10〜14文字）を超える塊を、形態素自立語境界または強制スライスで安全分割"""
+        effective_max = max(_MIN_PART_CHARS * 2, max_chars)
         raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', text))
-        if raw_len <= _MAX_CHUNK_CHARS:
+        if raw_len <= effective_max:
             return [(text, delim)]
 
         tokenizer, split_mode = get_sudachi_tokenizer()
@@ -672,7 +679,7 @@ class TextCleaner:
                 cur_slice = ""
                 for tok in tokens:
                     s = tok.surface()
-                    if len(cur_slice) + len(s) > _MAX_CHUNK_CHARS and len(cur_slice) >= _MIN_PART_CHARS:
+                    if len(cur_slice) + len(s) > effective_max and len(cur_slice) >= _MIN_PART_CHARS:
                         slices.append((cur_slice.strip(), "hardcap"))
                         cur_slice = s
                     else:
@@ -684,15 +691,20 @@ class TextCleaner:
             except Exception as e:
                 logger.debug(f"Sudachi hardcap tokenization error: {e}")
 
-        # フォールバック: 強制30文字ハードスライス
+        # フォールバック: 強制ハードスライス
         cur = 0
         while cur < len(text):
-            end = min(cur + _MAX_CHUNK_CHARS, len(text))
+            end = min(cur + effective_max, len(text))
             part = text[cur:end].strip()
             if part:
                 slices.append((part, "hardcap" if end < len(text) else delim))
             cur = end
         return slices if slices else [(text, delim)]
+
+    @staticmethod
+    def _hardcap_slice_30(text: str, delim: str = "") -> List[Tuple[str, str]]:
+        """30文字ハードキャップ (後方互換ラッパー)"""
+        return TextCleaner._hardcap_slice(text, delim, max_chars=_MAX_CHUNK_CHARS)
 
     @staticmethod
     def _split_by_space_boundary(sentence: str) -> List[str]:
@@ -781,13 +793,54 @@ class TextCleaner:
         return [(sentence, delim)]
 
     @staticmethod
-    def split_into_chunks(text: str, author_prefix: Optional[str] = None) -> List['TextChunk']:
+    def split_into_chunks(
+        text: str,
+        author_prefix: Optional[str] = None,
+        engine: Optional[str] = None,
+        speaker_id: Optional[str] = None,
+        max_first_chunk_chars: Optional[int] = None,
+        max_chunk_chars: Optional[int] = None,
+    ) -> List['TextChunk']:
         """
-        テキストを発言者名プレフィックスおよび多段文境界（句点・読点・スペース・スラング・終助詞・形態素・30文字ハードキャップ）で超低遅延パーツ分割する。
+        テキストを発言者名プレフィックスおよび多段文境界（句点・読点・スペース・スラング・終助詞・形態素・動的ハードキャップ）で超低遅延パーツ分割する。
         各パーツには音響ストリーミングに最適な間（pause_after_ms）を付与。
+        各マシン・各エンジンの実測推論性能統計 (latency_profiler) に基づき、第1チャンク上限 (max_first_chunk_chars) を自律動的決定。
         """
         t_start = time.time()
         chunks: List[TextChunk] = []
+
+        # 0. 動的第1チャンク文字数上限 (max_first_chunk_chars) の自律解決 (各マシン×各エンジン特性を反映)
+        effective_first_chars = max_first_chunk_chars
+        effective_max_chars = max_chunk_chars or _MAX_CHUNK_CHARS
+
+        if effective_first_chars is None:
+            resolved_engine = engine
+            if not resolved_engine and speaker_id:
+                spk = str(speaker_id).strip().lower()
+                if "ci_" in spk or "coeiroink" in spk:
+                    resolved_engine = "coeiroink"
+                elif "vv_" in spk or "voicevox" in spk:
+                    resolved_engine = "voicevox"
+                elif "sv_" in spk or "sharevox" in spk:
+                    resolved_engine = "sharevox"
+                elif "ojt_" in spk or "openjtalk" in spk:
+                    resolved_engine = "openjtalk"
+                elif "az_" in spk or "azure" in spk:
+                    resolved_engine = "azure"
+                elif "g_" in spk or "google" in spk:
+                    resolved_engine = "google"
+
+            if resolved_engine:
+                try:
+                    from src.utils.latency_profiler import latency_profiler
+                    effective_first_chars = latency_profiler.get_dynamic_max_chars(
+                        engine=resolved_engine,
+                        target_budget_ms=1750.0,
+                        min_chars=8,
+                        max_chars=effective_max_chars
+                    )
+                except Exception as e:
+                    logger.debug(f"Dynamic max chars resolution error: {e}")
 
         # 1. 発言者名プレフィックスがあれば先頭パーツとして追加 (間: 80ms)
         # NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) を含む場合は前後でチャンク分割
@@ -821,8 +874,7 @@ class TextCleaner:
             return chunks
 
         # 2. 本文の処理: NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) の先行抽出
-        # BEEPタグは自然言語ではなく制御メタトークンであるため、自然言語処理（スペース・スラング・形態素・30文字ハードキャップ）
-        # に巻き込まれるとタグが途中で切断・破壊されてしまう。そのため最初に分離して保護する。
+        is_first_plain_seg = True
         if '<<__BEEP' in text or '<<ピー音' in text:
             raw_segments = _RE_BEEP_SPLIT.split(text)
             for s_idx, seg in enumerate(raw_segments):
@@ -848,10 +900,24 @@ class TextCleaner:
                         if peek_s:
                             next_is_beep = bool(_RE_BEEP_TAG.match(peek_s))
                             break
-                    plain_chunks = TextCleaner._split_plain_text(clean_s, next_is_beep=next_is_beep)
+                    plain_chunks = TextCleaner._split_plain_text(
+                        clean_s,
+                        next_is_beep=next_is_beep,
+                        max_first_chunk_chars=effective_first_chars if is_first_plain_seg else None,
+                        max_chunk_chars=effective_max_chars,
+                        is_first_plain_segment=is_first_plain_seg
+                    )
                     chunks.extend(plain_chunks)
+                    if plain_chunks:
+                        is_first_plain_seg = False
         else:
-            chunks.extend(TextCleaner._split_plain_text(text, next_is_beep=False))
+            chunks.extend(TextCleaner._split_plain_text(
+                text,
+                next_is_beep=False,
+                max_first_chunk_chars=effective_first_chars,
+                max_chunk_chars=effective_max_chars,
+                is_first_plain_segment=True
+            ))
 
         # 分割結果が空なら全文を1パーツとして扱う
         if not chunks and text.strip():
@@ -867,10 +933,16 @@ class TextCleaner:
         return chunks
 
     @staticmethod
-    def _split_plain_text(text: str, next_is_beep: bool = False) -> List['TextChunk']:
+    def _split_plain_text(
+        text: str,
+        next_is_beep: bool = False,
+        max_first_chunk_chars: Optional[int] = None,
+        max_chunk_chars: int = _MAX_CHUNK_CHARS,
+        is_first_plain_segment: bool = True
+    ) -> List['TextChunk']:
         """
         純粋な自然言語テキスト（メタタグを含まないプレーンテキスト）を、
-        句読点・読点・スペース・スラング・語尾・形態素・30文字ハードキャップで文分割する。
+        句読点・読点・スペース・スラング・語尾・形態素・動的ハードキャップで文分割する。
         """
         if not text or not text.strip():
             return []
@@ -898,11 +970,12 @@ class TextCleaner:
             else:
                 head_conj_refined.append((sentence, delim))
 
-        # 4. 読点境界（「、」）での分割 (15文字超)
+        # 4. 読点境界（「、」）での分割 (動的短文時は低閾値連動)
         comma_refined: List[Tuple[str, str]] = []
-        for sentence, delim in head_conj_refined:
+        for idx, (sentence, delim) in enumerate(head_conj_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
-            if '、' in sentence and raw_len > 15:
+            comma_thresh = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars and max_first_chunk_chars < 15) else 15)
+            if '、' in sentence and raw_len > comma_thresh:
                 sub_parts = _RE_SPLIT_COMMA.split(sentence)
                 temp_pieces: List[Tuple[str, str]] = []
                 for j in range(0, len(sub_parts), 2):
@@ -971,20 +1044,36 @@ class TextCleaner:
             else:
                 ending_refined.append((sentence, delim))
 
-        # 6. 長文に対する形態素（SudachiPy / Janome / 接続助詞・接続詞）での分割 (18文字超)
+        # 6. 長文に対する形態素（SudachiPy / Janome / 接続助詞・接続詞）での分割 (動的閾値連動)
         morph_refined: List[Tuple[str, str]] = []
-        for sentence, delim in ending_refined:
+        for idx, (sentence, delim) in enumerate(ending_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
-            if raw_len >= 18:
-                m_pieces = TextCleaner._split_long_sentence_morphological(sentence, delim)
+            # 第1文かつ動的第1文上限が指定されている場合
+            if idx == 0 and is_first_plain_segment and max_first_chunk_chars and max_first_chunk_chars < 18:
+                m_thresh = max(8, max_first_chunk_chars)
+                m_head = min(5, max(3, max_first_chunk_chars // 2))
+                m_tail = min(4, max(3, max_first_chunk_chars // 3))
+            else:
+                m_thresh = 18
+                m_head = 7
+                m_tail = 5
+
+            if raw_len >= m_thresh:
+                m_pieces = TextCleaner._split_long_sentence_morphological(
+                    sentence, delim,
+                    min_chars_threshold=m_thresh,
+                    min_head_chars=m_head,
+                    min_tail_chars=m_tail
+                )
                 morph_refined.extend(m_pieces)
             else:
                 morph_refined.append((sentence, delim))
 
-        # 7. 30文字ハードキャップ安全スライス (新設: 最終防衛線)
+        # 7. 動的ハードキャップ安全スライス (最終防衛線: 第1文は動的上限、以降は通常上限)
         final_sentences: List[Tuple[str, str]] = []
-        for sentence, delim in morph_refined:
-            hardcap_pieces = TextCleaner._hardcap_slice_30(sentence, delim)
+        for idx, (sentence, delim) in enumerate(morph_refined):
+            cur_max = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars) else max_chunk_chars)
+            hardcap_pieces = TextCleaner._hardcap_slice(sentence, delim, max_chars=cur_max)
             final_sentences.extend(hardcap_pieces)
 
         # 8. TextChunk の構築

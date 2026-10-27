@@ -1,5 +1,107 @@
 
 # 修正・作業履歴 (Remediation History)
+
+## [2026-10-28] 各マシン×各エンジンの推論統計に基づく動的チャンク上限（Dynamic Chunk Sizing）の実装
+
+- **ユーザーフィードバック & 課題**:
+  1. 「各マシンの各エンジンの処理時間と文字数って統計にとってなかったっけ。文字数とフォールバックへの影響はマシン性能によって変わるじゃん、公開している以上決め打ちだとかえってダメパターンとか、もっと切り詰めないとダメパターンも生まれそうダなと思って、統計に基づいた各マシン・各エンジンの動的な上限って感じにできないかな」
+  2. 「Githubで公開されてるOSSだから、いろんなユーザーがいる前提で、この動的な仕組みを完成させてほしい」
+  3. 「念のため。ノード単位だけでなく、各エンジン単位で考えてほしいんよ。エンジンによって同じノードでも時間差変わると思うので」
+
+- **原因分析 & 定量調査結果**:
+  1. **マシンスペック・エンジン種別による文字数推論速度の極端な格差**:
+     - 直近ログ（`bot.db`）および実測プロファイルの解析により、以下の事実を確認：
+       - **RTX 3090 (OMEN2022)**: 約 29ms/字 ➔ 30文字でも 600〜700ms（上限30文字で超余裕）。
+       - **GTX 1080 Ti (OMEN2017)**: 約 60ms/字 ➔ 30文字でも 約1.4秒（余裕）。
+       - **Core i7 CPU (MasterUbuntu)**: COEIROINKで 約 120〜150ms/字 ➔ 15文字超で 4.5秒を超え、投機フォールバック（4秒）が直撃。
+       - **VOICEVOX (CPU)**: 約 65ms/字 ➔ 20文字でも 約1.5秒で完了。
+     - 一律固定値（例: 14文字）で決め打ちすると、GPU機でイントネーション分断・往復オーバーヘッドが増大し、逆に非力CPUや重いエンジンでフォールバックを防ぎきれない問題が生じる。
+  2. **既存統計基盤の発見**:
+     - `src/utils/latency_profiler.py`（`latency_profiler`）が毎リクエスト EWMA（指数移動平均）で `(node_id, engine_name)` 単位の `base_latency_ms` と `ms_per_char` を追跡していた。
+
+- **対応内容**:
+  1. **エンジン別事前分布テーブルの導入 (`src/utils/latency_profiler.py`)**:
+     - `ENGINE_INITIAL_PRIORS` を新設し、コールドスタート時・実績ゼロ時でも `COEIROINK`, `VOICEVOX`, `SHAREVOX` のエンジン特性および GPU/CPU スペックを差別化した初期値を適用。
+  2. **動的文字数逆算ロジックの実装 (`src/utils/latency_profiler.py`)**:
+     - `NodeLatencyProfile.calc_max_chars(target_budget_ms=1750.0)`: 実測値から目標許容時間（名前バッファ約1.75秒）内に収まる最大文字数を自律逆算（8〜30文字安全クランプ）。
+     - `EngineLatencyProfiler.get_dynamic_max_chars(engine, target_budget_ms=1750.0)`: 対象エンジンに特化してノードプロファイルを取得し、GPU優先・CPU適応・クラウド固定（30文字）を判定。
+  3. **動的文節スライス・形態素解析連動 (`src/utils/text_cleaner.py`)**:
+     - `split_into_chunks`: `engine` および `speaker_id` から動的上限を自律解決。
+     - `_split_long_sentence_morphological`: 動的上限文字数（11〜13文字等）に合わせて形態素解析の分割閾値と最小文節長を自動連動。
+     - `_hardcap_slice`: 30文字固定だったハードキャップを任意文字数（動的上限）対応に汎用化。
+  4. **呼び出し元の統合 (`src/cogs/vc_handler.py`, `src/tts/manager.py`, `src/web/server.py`)**:
+     - 音声合成キュー取り出し時および先行プリフェッチ時に、話者IDからエンジン種別を解決して `split_into_chunks` へ伝播。
+
+- **検証結果**:
+  - 一時検証コンテナによるテストで、初期状態で COEIROINK (CPU) が 11文字、VOICEVOX (CPU) が 23文字、GPU機が 30文字、クラウドが 30文字、低速学習時が 8文字に自律適応することを確認。
+  - 原文「もともとのオリジナルのNGワードはTVの放送用語禁止リスト、...」が COEIROINK (CPU) 時に 11文字・11文字・8文字・22文字 の自然な文節チャンクへ美しくスライスされることを実証。
+  - 既存テストスイート全49件（HA、Worker、API、TextCleaner等）が 100% PASS を確認。
+
+## [2026-10-28] MasterDebian COEIROINK HTTP 500（シンボリックリンク切れ）の究明・修復 ＆ agent.py 自動マウント補完
+
+- **ユーザーフィードバック & 課題**:
+  1. 「こーれいい題材かも。フォールバックした理由とか、もともとのCoeiroinkで生成に何秒かかったかとか、諸々調査してほしい（画像添付: 00:24:07 チェインドベル様発話、Edge-TTS 4830ms/4721ms）」
+  2. 「必要ならMasterdebianにつないでもいい、MasterdebianのCoeiroinkがわりとよく500エラーになってるっぽい」
+
+- **原因分析 & 調査結果**:
+  1. **フォールバック理由と表示時間の内訳**:
+     - 発話（`ci_72` 銀芽 呆れ）時、MasterDebian が HTTP 500 で即死し一時隔離（25秒）された。
+     - 別ノードへの再試行を含め合成処理が 4.0 秒（`speculative_timeout`）を超過したため、Speculative TTS（投機的TTS）が発動し並行して Edge-TTS を呼び出し。
+     - クラウド側が約 1.1 秒で先着したため、未完了の COEIROINK を自動キャンセル（`prim_task.cancel()`）して Edge-TTS 音声を本番再生に採用。
+     - 4830ms / 4721ms の表示は「COEIROINKを待った4000ms ＋ 投機クラウド生成約1100ms」の合計時間。
+  2. **MasterDebian で HTTP 500 が多発していた真因**:
+     - エラーログ: `NameError: name 'meta_manager' is not defined`
+     - `agent.py` が RAMDisk/SSD ハイブリッド管理のため `coeiroink_hybrid` 内に `../storage/ssd/...` および `../storage/ram/...` への相対シンボリックリンクを作成していた。
+     - しかし、MasterDebian の Compose ファイルには `speaker_info`（`coeiroink_hybrid`）しかマウントされておらず、`storage/ssd`（ホストの `coeiroink_models`）と `storage/ram`（ホストの `coeiroink_ram`）がコンテナ内に存在しなかった。
+     - このためコンテナ内部から見ると全モデルのシンボリックリンクがリンク切れ（Broken Symlink）になり、公式エンジンがモデルを1つも読み込めず `meta_manager` 初期化失敗で全リクエストが即死していた。
+
+- **対応内容**:
+  1. **MasterDebian 実機 Compose ボリューム修復**:
+     - `docker-compose.worker.yml` に `storage/ssd:ro` と `storage/ram` のマウント行を追記し、コンテナを再ビルド・再起動。
+     - 実機検証にて `curl /v1/speakers` および `curl /v1/synthesis`（44KB/122KB WAV生成）が 100% 成功することを確認。
+  2. **`agent.py` の自動正規化ロジック強化 (`src/web/static/agent.py`)**:
+     - `normalize_coeiroink_compose_volumes` を改修し、`speaker_info` を検出した際に `storage/ssd:ro` と `storage/ram` が Compose 内になければ自動挿入・補完する安全機構を追加。
+     - `AGENT_VERSION` を `3.13.3` に更新。
+  3. **初期展開テンプレート強化 (`src/web/static/setup-worker.sh`)**:
+     - Compose 展開テンプレートに最初から `storage/ssd:ro` と `storage/ram` を記述。
+  4. **MasterDebian 上のエージェント更新**:
+     - `ttsworker-agent` を v3.13.3 に更新して再起動。ヘルスチェック（`is_healthy: true, is_available: true`）の完全復帰を確認。
+
+## [2026-10-28] 音飛び防止（名前直後Adaptive Preroll）、スリープノード起動足切り撤廃、VC入室時動的話者Prewarm、COEIROINK常駐モデル動的選定（案B）
+
+- **ユーザーフィードバック & 課題**:
+  1. 「レイテンシ履歴って、Webだと15件だけしか掲載されてないけど、どっかにそれ以前のものこってるっけ？音飛びが発生したものを抽出して分析したい」
+  2. 「名前直後の音飛びのところの対策をもうちょっとちゃんとしようか。Coeiroinkは遅い前提だし、細かいのは一旦今はコスパ悪いから後に回そう」
+  3. 「添付のケース（Incident #700）ってなんでUbuntuだけで処理させてるんだっけ。優先順位はあれど、別マシンで並行稼働させればよかったケースじゃない？今って優先度低かったらスリープから起動してこないの？即時撤廃でお願い。寝ているノードが起きてこないといけないのは、ローカルエンジンを使う人がVCにはいってきたとき、だよね」
+  4. 「Coeiroinkの初動常駐ってリリンとカナエなのはなんでだっけ・・・この常駐、動的にユーザー設定でCoeiroinkのモデル使ってる人の上位って感じにするとどうなるかな？案B（直近30日アクティブ優先＋上限4モデル）でいこう。とりあえず4でいいんじゃないかな」
+
+- **原因分析 & 調査結果**:
+  1. **音飛びの真因（名前プレフィックス直後への集中）**:
+     - 全260件の音飛び（`A_UNDERRUN`）中、**98.1% (255件)** が「発言者名プレフィックス（Chunk #0）と本文（Chunk #1）の間」で発生。
+     - 名前音声はキャッシュ即時取得（0ms）だが尺が短く（350〜800ms）、本文推論（VOICEVOX/Cloud 500〜800ms）の完了を待たずに再生開始され、無音ギャップが発生していた。
+  2. **スリープノードが起動してこなかった原因**:
+     - `src/tts/node_pool.py` のオンデマンド遠隔起動ループに `for n in candidates_to_start[:2]:` のハードリミットが存在し、Tier順位で3番目以降（GPUマシン等）だった場合に起動シグナルすら送られていなかった。
+  3. **VC入室時の先行ウェイクアップが空振りしていた原因**:
+     - `src/resource_manager.py` の `prewarm_for_users` が `self.config.voices.get()` という静的設定辞書のみを参照していたため、動的話者（`ci_90` 等）を利用するユーザーが入室しても `None` になり、外部ワーカー（GPU）への先行ウェイクアップが送出されていなかった。
+  4. **COEIROINK初動常駐モデルの仕様とリスク**:
+     - DB内の全COEIROINK設定者を `DISTINCT` で無制限にピン留めする実装になっており、サーバー内で現在COEIROINKを設定しているユーザーがたまたま嶽ちゃん（ci_90）ともう1名（ci_100）の2名のみだったため「リリンとカナエ」になっていた。利用者が増えると全モデル（数十GB）をRAMDiskに展開しようとしてOOMクラッシュする危険があった。
+
+- **対応内容**:
+  1. **名前直後特化の動的待機戦略の実装 (`src/cogs/vc_handler.py`)**:
+     - `first_chunk.is_name_prefix` を判定し、名前直後の場合は安全マージン 250ms、上限 750ms、未完了時最低待機枠 150ms を適用。本文プロバイダ（`target_prov`）と優先ワーカーラベルに基づき正確な推論時間を算出。
+  2. **スリープノード起動足切りの即時撤廃 (`src/tts/node_pool.py`)**:
+     - `candidates_to_start[:2]` のスライスを撤廃し、スリープ中の全ノードに対して並行起動（`try_remote_start`）を送出。
+  3. **VC入室時先行プリウォームの動的話者対応 (`src/resource_manager.py`)**:
+     - `prewarm_for_users` にて `tts_manager._get_voice_config` を優先参照し、動的話者（`ci_*`, `vv_*` 等）でも確実に外部ワーカーへ事前起動が飛ぶよう修正。
+  4. **COEIROINK常駐モデルの動的選定（案B: 上限4モデル）の実装**:
+     - `src/database.py`: `get_pinned_coeiroink_speaker_ids(limit=4, active_days=30)` を新設。直近30日以内にアクティブ（発言/キャッシュ更新/設定更新）なユーザー数を最優先し、総設定者数、最終アクティブ日時の降順でソートして上位4モデルのみを抽出。
+     - `src/main.py`: `broadcast_pinned_models_to_workers` 内の直書きSQLを `get_pinned_coeiroink_speaker_ids` 呼び出しに置き換え。動的話者フォールバックを追加。
+     - `src/tts/coeiroink_ram_manager.py`: `sync_pinned_models` 内の直書きSQLを `get_pinned_coeiroink_speaker_ids` 呼び出しに置き換え。
+     - `src/resource_manager.py`: `get_desired_coeiroink_models` 内の直書きSQLを `get_pinned_coeiroink_speaker_ids` 呼び出しに置き換え。
+  5. **テスト・外部記憶同期**:
+     - 実機DB（`bot.db`）にて `['ci_90', 'ci_72', 'ci_100']`（上位4件以内）が抽出されることを確認。
+     - 一時検証コンテナによる全49単体テストを実行し、100% 合格（OK）を確認。一時ファイルおよびコンテナを完全消去。
+
 ## [2026-10-27] 投機的キャッシュ事前生成におけるコールドスタート待機タイムアウト不整合の解消 ＆ 外部Worker一括先行起動
 
 - **ユーザーフィードバック & 課題**:
@@ -7839,3 +7941,40 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - ワーキングツリーの変更を `git checkout` で破棄し、本来の改修目的であった **CodeQL Alert #82（ReDoS脆弱性）修正完了コミット（`c62abcb`）** のクリーンな状態へと完全ロールバック。
 - **検証**:
   - サンドボックス隔離テスト（全49テスト）を実行し、100%合格を確認。
+
+## [2026-10-27] 名前直後の音飛び対策 (Adaptive Preroll 最適化)
+- **背景**:
+  - WebUIのレイテンシ履歴および過去のインシデントデータ（計260件）を分析した結果、音飛び（`A_UNDERRUN`）の **98.1% (255件)** が「発言者名プレフィックス（Chunk #0）と本文（Chunk #1）の間」で発生していることが判明。
+  - 名前（例:「たけちゃん、」）はキャッシュされているため 0ms で即座に再生が始まるが、名前再生尺（約800ms）に対して現行の動的Preroll計算では推論推定値より名前尺が大きいと `w_1 <= 0` と誤判定され、全体の **68.5% (178件) で待機ゼロ（Preroll=0ms）** で再生が始まってしまっていた。
+  - さらにハードキャップが 400ms（0.40秒）と厳しく、VOICEVOXやCloudの推論（500〜800ms）を待てずに名前再生が先に終了して無音ギャップ（音飛び）が発生していた。
+- **改修内容 (`src/cogs/vc_handler.py`)**:
+  1. **名前プレフィックス（`is_name_prefix`）特化の動的待機戦略**:
+     - `safety_margin_s = 0.25`（250ms）に拡大（ネットワーク・デコードの揺らぎを確実に吸収）。
+     - `max_cap_s = 0.75`（750ms）に緩和（VOICEVOXやGoogle Cloudの推論完了をしっかり待つ）。
+     - `min_wait_s = 0.15`（第1文が未完了の場合は最低150msの安全待機枠を確保し、待機ゼロ即落ちを根絶）。
+     - 推論完了時は待機が即座に打ち切られて再生開始されるため、無駄な遅延は発生しない（スマート待機）。
+  2. **対象プロバイダー・優先ワーカーの参照最適化**:
+     - キャッシュラベルではなく本文本来の `target_prov` および優先ワーカーラベルから推論時間を正確に推定。
+  3. **Coeiroink等の超長推論への配慮**:
+     - Coeiroink（CPU）などの数秒かかる推論は、最大750msで安全にタイムアウトして名前を先行送出し、会話テンポを維持。
+  4. **通常文パーツ（`is_name=False`）の動作維持**:
+     - 即応性最優先（キャップ400ms、安全マージン150ms）を完全保持。
+- **検証結果**:
+  - 過去の音飛びインシデントシミュレーション: VOICEVOX の 71.4%（40/56）、Google Cloud の 69.2%（18/26）の音飛びを救済可能であることを確認。
+  - サンドボックス一時コンテナによる全49単体テスト: 100% 合格（`Ran 49 tests in 7.750s, OK`）。
+
+## [2026-10-27] スリープ起動リミット撤廃 & VC入室時先行ウェイクアップ修正
+- **背景**:
+  - 複数チャンクの並行発話時、スリープ中のノード（OMEN2022 RTX 3090等）が起動してこず、特定ノード（Ubuntu 1台）に処理が集中して音飛び・フォールバックが発生した問題を調査。
+  - `src/tts/node_pool.py` のオンデマンド遠隔起動に `for n in candidates_to_start[:2]:` というハードリミットがあり、Tier順位で3番目以降のノードが起動シグナルすら受け取れず放置されていたことが判明。
+  - さらに `src/resource_manager.py` の `prewarm_for_users`（VC入室時事前起動）で、`self.config.voices.get(spk_id)` という静的config辞書のみを引いていたため、`ci_90` 等の動的話者（COEIROINK/VOICEVOX）のユーザーが入室しても `None` になり、外部ワーカー（OMEN2022等）への先行ウェイクアップが一切送出されていなかった設計漏れを特定。
+- **改修内容**:
+  1. **オンデマンド起動の `[:2]` 足切り撤廃 (`src/tts/node_pool.py`)**:
+     - スリープ中のノードがあれば、Tier順位で足切りせず全ノードに対して並行して起動を試行。
+  2. **動的話者（`ci_*`, `vv_*` 等）の先行プリウォーム対応 (`src/resource_manager.py`)**:
+     - `tts_manager._get_voice_config` を優先的に使用して動的話者も正しくプロバイダ解決（`provider="coeiroink"` 等）。
+     - ローカルエンジンを使用するユーザーがVCに入室した際、外部ワーカー（OMEN2022等）を含めて確実に先行ウェイクアップを実行。
+- **検証結果**:
+  - サンドボックス隔離テスト（全49テスト）を実行し、100%合格を確認（`Ran 49 tests in 6.531s, OK`）。
+
+

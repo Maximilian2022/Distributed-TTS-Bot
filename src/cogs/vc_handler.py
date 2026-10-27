@@ -868,7 +868,21 @@ class VCHandlerCog(commands.Cog):
         これにより、自分の再生順が回ってきた瞬間に 0ms キャッシュヒットで即座に音が鳴る。
         """
         try:
-            chunks = TextCleaner.split_into_chunks(item.text, author_prefix=item.author_prefix)
+            engine_name = None
+            try:
+                if hasattr(self, "tts_manager") and self.tts_manager:
+                    voice_cfg = self.tts_manager._get_voice_config(item.speaker_id)
+                    if voice_cfg:
+                        engine_name = voice_cfg.provider
+            except Exception:
+                pass
+
+            chunks = TextCleaner.split_into_chunks(
+                item.text,
+                author_prefix=item.author_prefix,
+                engine=engine_name,
+                speaker_id=item.speaker_id
+            )
             if not chunks:
                 return
 
@@ -1115,8 +1129,23 @@ class VCHandlerCog(commands.Cog):
                 logger.error(f"Streaming playback error in guild {guild.id}: {error}")
             self.bot.loop.call_soon_threadsafe(state.play_finished_event.set)
 
-        # チャンク分割の作成 (発言者名プレフィックス + 本文チャンク)
-        all_chunks = TextCleaner.split_into_chunks(item.text, author_prefix=item.author_prefix)
+        # 話者定義からエンジン（プロバイダー）を特定
+        engine_name = None
+        try:
+            if hasattr(self, "tts_manager") and self.tts_manager:
+                voice_cfg = self.tts_manager._get_voice_config(item.speaker_id)
+                if voice_cfg:
+                    engine_name = voice_cfg.provider
+        except Exception:
+            pass
+
+        # チャンク分割の作成 (発言者名プレフィックス + 本文チャンク: 各マシン×各エンジン推論性能に応じた動的文字数適応)
+        all_chunks = TextCleaner.split_into_chunks(
+            item.text,
+            author_prefix=item.author_prefix,
+            engine=engine_name,
+            speaker_id=item.speaker_id
+        )
         if not all_chunks:
             return False
 
@@ -1200,15 +1229,16 @@ class VCHandlerCog(commands.Cog):
 
             # 統計ベース動的 Adaptive Preroll 制御 (音飛び/アンダーランの根絶 & 初動ラグ極小化):
             # 第0パーツ実測再生長(dur0)および先行並行進捗(l0_elapsed)、後続パーツの推定推論時間・推定音声長から、
-            # 最適な「いい塩梅」の Preroll 待機時間 (最大400msキャップ ＆ 許容息継ぎ300ms考慮) を動的に算出する。
+            # 最適な「いい塩梅」の Preroll 待機時間 を動的に算出する。
             if remaining_tasks:
-                target_prov = c0_prov or getattr(self.tts_manager._get_voice_config(item.speaker_id), "provider", "voicevox")
+                voice_cfg = self.tts_manager._get_voice_config(item.speaker_id)
+                target_prov = getattr(voice_cfg, "provider", "voicevox")
+                est_worker_label = self.tts_manager._get_worker_label_for_provider(target_prov) if hasattr(self.tts_manager, "_get_worker_label_for_provider") else ""
 
                 # 物理状態フラグ (COEIROINK RAM常駐など) の事前判定
                 is_loaded = None
                 if target_prov.lower() == "coeiroink":
                     try:
-                        voice_cfg = self.tts_manager._get_voice_config(item.speaker_id)
                         model_id = getattr(voice_cfg, "speaker_uuid", "") or getattr(voice_cfg, "voice_name", "") or str(item.speaker_id)
                         c_pool = getattr(self.tts_manager, "coeiroink_pool", None)
                         if c_pool and hasattr(c_pool, "nodes"):
@@ -1218,19 +1248,30 @@ class VCHandlerCog(commands.Cog):
 
                 # 第0パーツの生成所要時間 (並行タスクがすでに消化したリードタイム)
                 l0_elapsed = max(0.0, c0_synth_end - c0_synth_start)
-                safety_margin_s = 0.15  # 150ms 安全マージン
                 item_speed = max(0.5, min(float(item.speed or 1.0), 2.0))
+
+                # 発言者名プレフィックスかどうかの判定:
+                # 名前直後の音飛び(全体の98%を占める)を根絶するため、名前時は第1文(Chunk #1)を待機する安全マージン・上限を最適化
+                is_name = getattr(first_chunk, "is_name_prefix", False)
+                if is_name:
+                    safety_margin_s = 0.25  # 250ms 安全マージン (ネットワーク・デコードの揺らぎを確実に吸収)
+                    max_cap_s = 0.75       # 最大0.75秒キャップ (Coeiroink等の超長推論は0.75秒で打ち切って名前先行送出)
+                    min_wait_s = 0.15      # 第1文がまだ完了していない場合の最低待機枠 (150ms)
+                else:
+                    safety_margin_s = 0.15  # 150ms 安全マージン
+                    max_cap_s = 0.40       # 通常文パーツは即応性最優先 (400msキャップ)
+                    min_wait_s = 0.0
 
                 # 各チャンクの必要待機時間 W_k を計算
                 w_candidates = [0.0]
                 cum_est_audio_dur = dur0  # 第0パーツの実測再生時間からスタート
 
                 for idx, ch in enumerate(all_chunks[1:], start=1):
-                    # 推定推論時間
+                    # 推定推論時間 (本文プロバイダと優先ワーカーに基づいて正確に算出)
                     est_synth = latency_tracker.get_estimated_synthesis_time(
                         provider=target_prov,
                         char_count=len(ch.text),
-                        worker_label=c0_worker,
+                        worker_label=est_worker_label,
                         is_model_loaded=is_loaded,
                     )
                     # 第0パーツ取得中にすでに並行して進んだ時間を控除
@@ -1239,6 +1280,9 @@ class VCHandlerCog(commands.Cog):
                     if idx == 1:
                         # 第1パーツ: 名前または短文直後の不自然な沈黙を完全根絶するため最優先
                         w_1 = rem_synth + safety_margin_s - dur0
+                        # 名前プレフィックスで第1文がまだ未完了なら最低待機枠を確保
+                        if is_name and not remaining_tasks[0].done():
+                            w_1 = max(w_1, min_wait_s)
                         w_candidates.append(w_1)
                     else:
                         # 第2パーツ以降: 文間の息継ぎ・句点ポーズ許容枠 (300ms) を差し引いた減衰モデル
@@ -1250,10 +1294,9 @@ class VCHandlerCog(commands.Cog):
                     cum_est_audio_dur += est_chunk_audio
 
                 needed_wait_s = max(w_candidates)
-                # 最大0.40秒 (400ms) でハードキャップ (会話テンポ・TTFS即応性を最優先)
-                dynamic_wait_timeout = max(0.0, min(needed_wait_s, 0.40))
+                dynamic_wait_timeout = max(0.0, min(needed_wait_s, max_cap_s))
                 logger.debug(
-                    f"Adaptive Preroll calc: l0={l0_elapsed*1000:.0f}ms, dur0={dur0*1000:.0f}ms, "
+                    f"Adaptive Preroll calc (is_name={is_name}): l0={l0_elapsed*1000:.0f}ms, dur0={dur0*1000:.0f}ms, "
                     f"needed_wait={needed_wait_s*1000:.0f}ms, dynamic_wait_timeout={dynamic_wait_timeout*1000:.0f}ms"
                 )
 

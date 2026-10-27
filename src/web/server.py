@@ -2917,8 +2917,13 @@ class WebServer:
                     spk_name = voice_cfg.name if voice_cfg else item.speaker_id
 
                     if mode == "streaming":
-                        # 超低遅延ストリーミング・パイプライン方式
-                        all_chunks = TextCleaner.split_into_chunks(item.text, author_prefix=item.author_prefix)
+                        # 超低遅延ストリーミング・パイプライン方式 (各マシン×各エンジン推論性能に適応)
+                        all_chunks = TextCleaner.split_into_chunks(
+                            item.text,
+                            author_prefix=item.author_prefix,
+                            engine=voice_cfg.provider if voice_cfg else None,
+                            speaker_id=item.speaker_id
+                        )
                         if not all_chunks:
                             test_queue.task_done()
                             continue

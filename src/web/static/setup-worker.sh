@@ -318,6 +318,8 @@ ${SV_DEPLOY}
       - OPENBLAS_NUM_THREADS=${THREAD_NUM}
     volumes:
       - ./coeiroink_models:/opt/coeiroink/${COEIROINK_DIR}/speaker_info
+      - ./coeiroink_models:/opt/coeiroink/${COEIROINK_DIR}/storage/ssd:ro
+      - ./coeiroink_ram:/opt/coeiroink/${COEIROINK_DIR}/storage/ram
 ${CI_DEPLOY}
     logging:
       driver: "json-file"
