@@ -1,5 +1,36 @@
 
 # 修正・作業履歴 (Remediation History)
+## [2026-10-27] 分散コンピュートワーカーの登録永続化（Master再起動保護）＆ ハートビート時オートレジスター ＆ WebUI 5秒リアルタイム自動ポーリング新設
+
+- **ユーザーフィードバック & 課題**:
+  - 「分散コンピュートワーカー (マルチノード推論) なんだけどさ、クラスタWorker（ボランティアワーカーもだけど）って、登録後にMasterが再起動とかした場合、再度レジスターされないともうこのセクションにでてこない？ 全然リアルタイムに表示されないから、ここどうにかできないかな。時間かかってるのかバグってるのかわからない。」
+  - **原因分析**:
+    1. **Master再起動時の情報蒸発**: `TTSNodePool` がオンメモリ変数（`self.nodes`）のみでWorkerノードを保持していたため、Masterコンテナが再起動すると全Worker情報が消滅し、画面から完全に消滅していた。
+    2. **ハートビート時の再登録ラグ**: 再起動後にWorkerから届いたハートビートに対し、Master側が「未登録」として 404 Not Found を返却していたため、Worker側がそれを検知して再登録API（`/api/worker/register`）を呼び出すまで数秒〜数十秒の空白ラグが発生していた。
+    3. **WebUIの定期自動ポーリングの欠如**: `#bots` タブ（Bot & ノード管理）には初回タブ切り替え時のみ `loadWorkerNodes()` が走るだけで、**定期更新（`setInterval`）が一切存在しなかった**。このため、ユーザーがタブを開いたままだと再起動後にどれだけ待ってもWorker一覧が永久に自動更新されず、「全然リアルタイムに表示されない」「バグっているのか」と誤解される状態になっていた。
+    4. **手動更新ボタンの欠如**: ユーザーが即座に最新状態を確認・再読み込みできる手段がなかった。
+
+- **対応内容**:
+  1. **クラスタWorker情報のファイル永続化 & Master起動時先行復元 (`src/web/server.py`)**:
+     - 登録済みWorker情報を保存する永続化ファイル `data/cluster_workers.json` を新設（`self.cluster_workers_file`）。
+     - `_load_cluster_workers()`, `_save_cluster_workers()` を実装。Worker登録時・スペック更新時・ハートビート時に最新情報を即時自動保存。
+     - `_restore_cluster_workers_to_pool()` を実装し、Masterサーバー起動時に各ノードプール（`voicevox_pool`, `sharevox_pool`, `coeiroink_pool`）へ過去の登録ノードを待機中ノード（`is_healthy=False`, `initial_standby=True`, `last_heartbeat = now - 100.0`）として先行投入。Master再起動直後でも画面からカードが消失しないよう保護。
+  2. **ハートビート受信時の即時オートレジスター（自動復元）機構 (`src/web/server.py`)**:
+     - Worker登録処理を共通関数 `_register_worker_internal(data, request_ip)` に分離。
+     - `api_worker_heartbeat` において、プール内にノードが存在しない未登録状態（`not found_any`）のWorkerからハートビートを受信した場合、404を返さず直接 payload のデータから即座にノードをオートレジスターして自動復元するフェイルセーフを実装。
+     - キック処理（`api_worker_kick_node`）時にも `cluster_workers.json` から対象ノードを確実に削除する同期処理を追加。
+  3. **WebUI ヘッダーに「状態更新 🔄」ボタン新設 (`src/web/templates/index.html`)**:
+     - 「分散コンピュートワーカー (マルチノード推論)」カードヘッダー右側に `btn-refresh-workers`（`onclick="refreshWorkerNodes(this)"`）を配置。
+  4. **WebUI 5秒間隔リアルタイム自動ポーリング ＆ バッジ表示強化 (`src/web/static/app.js`)**:
+     - `startWorkerNodesPolling()`（5秒ごとに `loadWorkerNodes()` および `loadManagerNodes()` を実行）および `stopWorkerNodesPolling()` を新設。
+     - `triggerTabDataLoad("bots")` にて「Bot & ノード管理」タブ表示中に自動ポーリングを開始し、他タブ遷移時に自動停止する安全なタイマーライフサイクルを設計。
+     - 手動更新関数 `refreshWorkerNodes(btn)` でスピンアニメーション付き即時リフレッシュを提供。
+     - `renderWorkerNodes` において、Master再起動直後の初期待機状態ノードに対して「`🟡 接続待機中 (ハートビート待機)`」「`🟡 再接続待機中`」バッジを明示し、状態遷移を視覚化。
+  5. **本番環境への最小瞬断適用 & 実機検証**:
+     - `data/.ha_updating` 誤昇格抑止のもと `docker compose restart app` を実施。
+     - 起動直後のハートビート受信により、未登録ノード（`worker_MasterDebian`, `worker_MasterUbuntu` 等）が `⚡ [WorkerAPI] Auto-recovering unregistered worker ... directly from heartbeat...` として即座にオートレジスターされ、`data/cluster_workers.json` に全4台（MASTEROMEN2017, MASTERSOMEN2022, MasterUbuntu, MasterDebian）が永続化されたことを確認。
+     - 実機ブラウザ検証（`browser_subagent`）により、`http://127.0.0.1:8088/#bots` にて全4台のWorkerがリアルタイムに表示され、「状態更新 🔄」ボタンおよび5秒ごとの自動更新が正常動作することを確認完了（画面撮影: `workers_realtime_verified_1793095571008.png`）。
+
 ## [2026-10-27] 投機的ホットワード候補のハイブリッド化（歴代定番 TOP 30 ＋ 直近急上昇 TOP 30、最大60枠）＆ WebUI プレビュー・事前生成バッチ連動
 
 - **ユーザーフィードバック & 要件**:
