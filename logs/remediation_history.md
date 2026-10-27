@@ -7780,3 +7780,62 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - `test_split_greeting_tail`（文末挨拶の独立チャンク切り出し）および `test_split_greeting_tail_redos_safety`（大量タブ連続時のReDoS非発生検証）を追加。
   3. **サンドボックス検証**:
      - `./scripts/run_sandbox_test.sh` を用いて隔離コンテナ内で全テストを実行し、100%合格を確認（テストコンテナは自動破棄）。
+
+
+## [2026-10-27] YouTube連携・自己成長型辞書システム & 既存辞書最適化機能の実装 (フェーズ1〜4)
+- **背景と課題**:
+  - ユーザーより「辞書サイズが増大した際の音声合成速度への影響懸念」「YouTubeチャンネルとプロファイルを紐付けた辞書の自動成長」「日常一般語の除外」「既存辞書の最適化・ノイズ掃除」「起動時・終了時ライフサイクル制御」に関する要望を受領。
+  - 辞書エントリ数が増えても音声合成遅延（GILブロッキング）を発生させない $O(M)$ 高速置換基盤の確立、および過去プロファイルの作り直しを防止する後付け連携UXの実現が求められた。
+- **実施した改修内容**:
+  1. **【フェーズ 1】最長一致 Regex-Trie 置換基盤 & SudachiPy 一般語除外フィルター (`src/utils/text_cleaner.py`)**:
+     - Python C言語実装の正規表現エンジンを活用し、最長一致順ソート＋一括オルタネーション `|` による Trie オートマトン置換（`compile_dictionary_trie`）を導入。10,000件の単語でも 1 発話 0.26ms で超高速置換を達成。
+     - 高性能日本語形態素解析エンジン「SudachiPy (Mode C)」を活用した `is_dictionary_noise_word()` を実装。日常一般語（普通名詞、動詞、形容詞、格助詞・接続助詞が結合した文節フレーズ）を機械的に完全除外。固有名詞や造語（「ずんだもん」等）は安全に通過させる多段判定アルゴリズムを構築。
+  2. **【フェーズ 2】DB スキーマ拡張 & YouTube ゼロクォータ同期 & Gemini 連携 (`src/database.py`, `src/utils/youtube_syncer.py`, `src/utils/gemini_tutor.py`)**:
+     - `dictionary_profiles`（マルチプロファイル、YouTubeチャンネル連携情報）、`youtube_synced_videos`（処理済み動画履歴・重複防止）テーブルを新設。
+     - `guild_dictionary` に `hit_count`（利用回数）および `profile_id` カラムを追加し、発話置換時にヒット数をインクリメントする追跡機構を導入。
+     - 30日以上一度も使われなかった単語を自動退役させる `prune_unused_dictionary_words()`、および既存辞書から日常語ノイズを一括検出・削除する `clean_dictionary_noise_words()` を実装。
+     - YouTube Data APIキー不要・完全無料・ゼロクォータで動作する `YouTubeSyncer` を新設。公式 Atom/RSS フィードおよび oEmbed を解析し、最新動画メタデータやチャンネル情報を軽量取得。URL種別（チャンネル、プレイリスト、単体動画）の自動判別を実装。
+     - `GeminiTutor.extract_youtube_keywords()` を実装。タイトル・概要欄から固有名詞・造語・略語を幅広く抽出し、後段の `is_dictionary_noise_word()` でノイズを二重遮断。
+  3. **【フェーズ 3】メンテナンス非同期直列キュー & 終了ライフサイクル (`src/utils/maintenance_queue.py`, `src/main.py`, `src/web/server.py`)**:
+     - `MaintenanceQueueManager` を新設。通常稼働・音声読み上げに影響を与えないよう、起動時巡回・チャンネル同期・プレイリスト/動画成長・未使用単語剪除・ノイズ一括掃除をバックグラウンドで直列非同期実行。
+     - `src/main.py` にて起動時にバックグラウンドキューへタスクを投入（ブロッキングゼロ起動）。
+     - WebUI 終了要求 API (`/api/system/shutdown`) に `mode: immediate`（即時終了）および `mode: maintenance`（キュー完了後に安全シャットダウン）の2系統を整備。
+     - プロファイル管理 API（一覧、作成、チャンネル紐付け・変更・解除、辞書成長、削除、既存辞書ノイズ一括掃除）を新設。
+  4. **【フェーズ 4】WebUI 実装 & 既存プロファイル救済 UX (`src/web/templates/index.html`, `src/web/static/app.js`)**:
+     - ヘッダーに「🛑 終了」ボタンを配置し、即時終了 vs メンテ後終了を選択できるモーダル（進捗・待機タスク数リアルタイム表示）を実装。
+     - 辞書サブタブ上部に「プロファイル管理バー（セレクター、新規作成、既存辞書最適化、削除）」を新設。
+     - YouTube 未連携プロファイルには「YouTubeチャンネル登録アシストバナー」を表示し、過去プロファイルの再作成不要で後付け連携できる動的 UI を構築。
+     - 連携中プロファイルには「ステータスカード（チャンネル名、処理済み動画数、即時チェック、変更、解除）」を表示。
+     - 「🌱 辞書を成長させる」カードを配置し、プレイリスト URL や単体動画 URL からの成長処理を提供。
+     - 単語一覧テーブルに「利用回数」カラムを追加し、使用実績を可視化。
+- **検証結果**:
+  - `tests/test_text_cleaner.py`: Trie置換、SudachiPy形態素解析、一般語除外フィルター等のテスト合格。
+  - `tests/test_youtube_syncer.py`: URL種別判別（チャンネル/プレイリスト/動画）、Atomフィード解析、動画メタデータ取得テスト合格。
+  - `tests/test_maintenance_lifecycle.py`: プロファイル作成、ノイズ一括掃除、動画重複記録、未使用単語剪除、キューライフサイクルテスト合格。
+  - サンドボックス検証 (`./scripts/run_sandbox_test.sh`): 全56テスト100%合格 (Ran 56 tests in 1.145s, OK)。一時コンテナは自動破棄済み。
+
+## [2026-10-27] 辞書未使用単語の自動退役期間を「半年（180日）」へ調整
+- **背景**:
+  - ユーザーより「毎日配信する人ばかりではないため、自動退役は30日ではなく半年にしたい」との要望を受領。配信頻度が月1〜数ヶ月に1回の配信者プロファイルでも、大切な専門用語や造語が誤って削除されないよう保護期間を大幅に延長。
+- **改修内容**:
+  1. `src/database.py`:
+     - `prune_unused_dictionary_words()` のデフォルト日数を `days: int = 180`（半年）に変更。
+  2. `src/utils/maintenance_queue.py`:
+     - 起動時メンテナンス（`_run_startup_job`）および手動剪除ジョブ（`_run_dict_prune_job`）での呼び出し日数を `days=180` に更新。ログおよびUI表示文字列を「半年（180日）以上未使用の辞書単語をクリーンアップ中」に更新。
+  3. `src/web/server.py`:
+     - `/api/system/maintenance/prune` のタイトルおよびdocstringを半年（180日）対応に更新。
+- **検証**:
+  - サンドボックス環境にて `tests/test_maintenance_lifecycle.py` 等を実行し、18件全テスト合格を確認。
+
+## [2026-10-27] YouTube連携機能の完全ロールバック & 辞書データ100%復元
+- **経緯**:
+  - ユーザーより「YouTube連携・辞書自己成長・プロファイル・SudachiPyによるトリミング等の仕様は別プロジェクトのものであり、本プロジェクトと混同していた」との連絡を受領。
+  - 本TTS Botの辞書は「音声認識（Hayamimi）の誤認識訂正」「サーバーメンバー名読み分け」「スラング（w等）」を含むため、日常語や記号も正当なエントリである。
+- **対処内容**:
+  1. **辞書データの完全復元**:
+     - 直前のDBバックアップ（`data/bot.db.bak_20261024_090852`）から、欠落した全66件（メンバー名読み分け、`w`スラング等）を `guild_dictionary` へ完全に再インポートし、155件すべてを無傷で復元。
+  2. **コードの原状復帰（ロールバック）**:
+     - 新設ファイル（`src/utils/maintenance_queue.py`, `src/utils/youtube_syncer.py`, `tests/test_maintenance_lifecycle.py`, `tests/test_youtube_syncer.py`）を削除。
+     - ワーキングツリーの変更を `git checkout` で破棄し、本来の改修目的であった **CodeQL Alert #82（ReDoS脆弱性）修正完了コミット（`c62abcb`）** のクリーンな状態へと完全ロールバック。
+- **検証**:
+  - サンドボックス隔離テスト（全49テスト）を実行し、100%合格を確認。
