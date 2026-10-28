@@ -453,8 +453,9 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(agent_ver_match)
         agent_py_version = agent_ver_match.group(1)
 
-        self.assertEqual(SERVER_AGENT_VERSION, "3.13.4")
-        self.assertEqual(agent_py_version, "3.13.4")
+        from src.version import AGENT_VERSION as EXPECTED_AGENT_VERSION
+        self.assertEqual(SERVER_AGENT_VERSION, EXPECTED_AGENT_VERSION)
+        self.assertEqual(agent_py_version, EXPECTED_AGENT_VERSION)
         self.assertEqual(SERVER_AGENT_VERSION, agent_py_version)
 
         # 3. HTML テンプレートの単一管理元プレースホルダー検証 (ハードコード廃止)
