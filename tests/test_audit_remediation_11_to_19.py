@@ -722,6 +722,42 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res_valid.status, 200)
             self.assertEqual(res_valid.headers.get("Content-Type"), "application/x-tar")
 
+    # =========================================================================
+    # BotPoolManager: インフライト予約 TTL および自号機再接続救済テスト
+    # =========================================================================
+    async def test_bot_pool_reservation_ttl_and_self_retry(self):
+        """BotPoolManager の予約 TTL 期限切れおよび同一号機による再接続上書きを検証"""
+        import time
+        from src.bot_pool import BotPoolManager
+        mock_cfg = MagicMock()
+        mock_cfg.get_discord_tokens.return_value = [(1, "token1"), (2, "token2")]
+        pool = BotPoolManager(mock_cfg, None, None, None)
+
+        # 1. 正常な初回予約 (Bot #1)
+        ok1 = await pool.reserve_vc_connection(guild_id=100, voice_channel_id=200, bot_index=1)
+        self.assertTrue(ok1)
+        self.assertTrue(pool.is_vc_connecting(guild_id=100, voice_channel_id=200))
+
+        # 2. 別号機 (Bot #2) からの重複予約は拒否
+        ok2 = await pool.reserve_vc_connection(guild_id=100, voice_channel_id=200, bot_index=2)
+        self.assertFalse(ok2)
+
+        # 3. 同一号機 (Bot #1) による再試行・再接続は上書き許可
+        ok1_retry = await pool.reserve_vc_connection(guild_id=100, voice_channel_id=200, bot_index=1)
+        self.assertTrue(ok1_retry)
+
+        # 4. 解放の検証
+        pool.release_vc_reservation(guild_id=100, voice_channel_id=200, bot_index=1)
+        self.assertFalse(pool.is_vc_connecting(guild_id=100, voice_channel_id=200))
+
+        # 5. TTL 期限切れによる上書き許可 (Bot #1 が予約したまま31秒放置 -> Bot #2 が上書き可能)
+        ok1_stale = await pool.reserve_vc_connection(guild_id=100, voice_channel_id=200, bot_index=1)
+        self.assertTrue(ok1_stale)
+        pool._connecting_vcs[(100, 200)] = (1, time.time() - 35.0)
+        self.assertFalse(pool.is_vc_connecting(guild_id=100, voice_channel_id=200))
+        ok2_takeover = await pool.reserve_vc_connection(guild_id=100, voice_channel_id=200, bot_index=2)
+        self.assertTrue(ok2_takeover)
+
 
 if __name__ == "__main__":
     unittest.main()
