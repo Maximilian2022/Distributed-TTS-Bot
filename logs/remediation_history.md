@@ -139,7 +139,7 @@
      - `Prepare Japanese Release Notes` ステップを追加。
      - `RELEASE_NOTES.md` が存在すればそれを優先採用。未記載または空ファイルの場合は `logs/remediation_history.md` の直近最新履歴を安全に自動抽出し、英語の機械的コミット一覧ではなく、詳細な日本語リリースノートとして自動反映する多段フォールバックを実装。
   3. **最新リリースノートの即時更新**:
-     - 発行済みの `Distributed-TTS-Bot-v2026.10.27.68` のリリースノートを、動的チャンク上限・COEIROINK動的常駐・MasterDebian修復の詳細を記載した日本語版へ即時アップデート完了。
+     - 発行済みの `Distributed-TTS-Bot-v2026.10.27.68` のリリースノートを、動的チャンク上限・COEIROINK動的常駐・Debian環境Worker修復の詳細を記載した日本語版へ即時アップデート完了。
 
 ## [2026-10-28] 各マシン×各エンジンの推論統計に基づく動的チャンク上限（Dynamic Chunk Sizing）の実装
 
@@ -177,7 +177,7 @@
   - 原文「もともとのオリジナルのNGワードはTVの放送用語禁止リスト、...」が COEIROINK (CPU) 時に 11文字・11文字・8文字・22文字 の自然な文節チャンクへ美しくスライスされることを実証。
   - 既存テストスイート全49件（HA、Worker、API、TextCleaner等）が 100% PASS を確認。
 
-## [2026-10-28] MasterDebian COEIROINK HTTP 500（シンボリックリンク切れ）の究明・修復 ＆ agent.py 自動マウント補完
+## [2026-10-28] Debian環境Worker COEIROINK HTTP 500（シンボリックリンク切れ）の究明・修復 ＆ agent.py 自動マウント補完
 
 - **ユーザーフィードバック & 課題**:
   1. 「こーれいい題材かも。フォールバックした理由とか、もともとのCoeiroinkで生成に何秒かかったかとか、諸々調査してほしい（画像添付: 00:24:07 チェインドベル様発話、Edge-TTS 4830ms/4721ms）」
@@ -185,18 +185,18 @@
 
 - **原因分析 & 調査結果**:
   1. **フォールバック理由と表示時間の内訳**:
-     - 発話（`ci_72` 銀芽 呆れ）時、MasterDebian が HTTP 500 で即死し一時隔離（25秒）された。
+     - 発話（`ci_72` 銀芽 呆れ）時、Debian環境Worker が HTTP 500 で即死し一時隔離（25秒）された。
      - 別ノードへの再試行を含め合成処理が 4.0 秒（`speculative_timeout`）を超過したため、Speculative TTS（投機的TTS）が発動し並行して Edge-TTS を呼び出し。
      - クラウド側が約 1.1 秒で先着したため、未完了の COEIROINK を自動キャンセル（`prim_task.cancel()`）して Edge-TTS 音声を本番再生に採用。
      - 4830ms / 4721ms の表示は「COEIROINKを待った4000ms ＋ 投機クラウド生成約1100ms」の合計時間。
-  2. **MasterDebian で HTTP 500 が多発していた真因**:
+  2. **Debian環境Worker で HTTP 500 が多発していた真因**:
      - エラーログ: `NameError: name 'meta_manager' is not defined`
      - `agent.py` が RAMDisk/SSD ハイブリッド管理のため `coeiroink_hybrid` 内に `../storage/ssd/...` および `../storage/ram/...` への相対シンボリックリンクを作成していた。
-     - しかし、MasterDebian の Compose ファイルには `speaker_info`（`coeiroink_hybrid`）しかマウントされておらず、`storage/ssd`（ホストの `coeiroink_models`）と `storage/ram`（ホストの `coeiroink_ram`）がコンテナ内に存在しなかった。
+     - しかし、Debian環境Worker の Compose ファイルには `speaker_info`（`coeiroink_hybrid`）しかマウントされておらず、`storage/ssd`（ホストの `coeiroink_models`）と `storage/ram`（ホストの `coeiroink_ram`）がコンテナ内に存在しなかった。
      - このためコンテナ内部から見ると全モデルのシンボリックリンクがリンク切れ（Broken Symlink）になり、公式エンジンがモデルを1つも読み込めず `meta_manager` 初期化失敗で全リクエストが即死していた。
 
 - **対応内容**:
-  1. **MasterDebian 実機 Compose ボリューム修復**:
+  1. **Debian環境Worker 実機 Compose ボリューム修復**:
      - `docker-compose.worker.yml` に `storage/ssd:ro` と `storage/ram` のマウント行を追記し、コンテナを再ビルド・再起動。
      - 実機検証にて `curl /v1/speakers` および `curl /v1/synthesis`（44KB/122KB WAV生成）が 100% 成功することを確認。
   2. **`agent.py` の自動正規化ロジック強化 (`src/web/static/agent.py`)**:
@@ -204,7 +204,7 @@
      - `AGENT_VERSION` を `3.13.3` に更新。
   3. **初期展開テンプレート強化 (`src/web/static/setup-worker.sh`)**:
      - Compose 展開テンプレートに最初から `storage/ssd:ro` と `storage/ram` を記述。
-  4. **MasterDebian 上のエージェント更新**:
+  4. **Debian環境Worker 上のエージェント更新**:
      - `ttsworker-agent` を v3.13.3 に更新して再起動。ヘルスチェック（`is_healthy: true, is_available: true`）の完全復帰を確認。
 
 ## [2026-10-28] 音飛び防止（名前直後Adaptive Preroll）、スリープノード起動足切り撤廃、VC入室時動的話者Prewarm、COEIROINK常駐モデル動的選定（案B）
@@ -288,7 +288,7 @@
 - **対応内容**:
   - `src/web/static/app.js` の Line 2995 に `const resolvedHostname = workerHostDisplay || cleanCandidate || "";` を追加。
   - ホスト名・クリーン名が安全に解決され、例外なく確実に全Workerカードがレンダリングされるよう修復。
-  - 実機ブラウザ検証（`browser_subagent`）により、`http://127.0.0.1:8088/#bots` にて全4台のWorkerカード（MASTEROMEN2017, MASTERSOMEN2022, MasterDebian, MasterUbuntu）が正常かつ美しく表示されることを確認完了（画面撮影: `bots_management_page_1793096449865.png`）。
+  - 実機ブラウザ検証（`browser_subagent`）により、`http://127.0.0.1:8088/#bots` にて全4台のWorkerカード（MASTEROMEN2017, MASTERSOMEN2022, Debian環境Worker, MasterUbuntu）が正常かつ美しく表示されることを確認完了（画面撮影: `bots_management_page_1793096449865.png`）。
 
 ## [2026-10-27] 分散コンピュートワーカーの登録永続化（Master再起動保護）＆ ハートビート時オートレジスター ＆ WebUI 5秒リアルタイム自動ポーリング新設
 

@@ -87,30 +87,48 @@ jobs:
       - name: Prepare Japanese Release Notes
         id: release_notes
         run: |
-          if [ -s RELEASE_NOTES.md ]; then
-            echo "✓ Using RELEASE_NOTES.md"
-            cp RELEASE_NOTES.md release_body.md
-          else
-            echo "ℹ️ RELEASE_NOTES.md not found or empty. Extracting latest entry from logs/remediation_history.md"
-            python3 -c "
-            import re
-            body = ''
-            try:
-                with open('logs/remediation_history.md', 'r', encoding='utf-8') as f:
-                    content = f.read()
-                entries = re.split(r'\n(?=## \[)', content)
-                if len(entries) > 1:
-                    body = entries[1].strip()
-            except Exception as e:
-                print(f'Error reading remediation history: {e}')
+          python3 -c "
+          import re, os
 
-            if not body:
-                body = '## 🚀 アップデート\n詳細な変更内容はコミット履歴をご確認ください。'
+          def sanitize_text(text: str) -> str:
+              # 環境固有のホスト名・マシン名・IPアドレス等の自動サニタイズ（匿名化）
+              replacements = [
+                  (r'(?i)\bMasterDebian\b', 'Debian環境マスター'),
+                  (r'(?i)\bMasterUbuntu\b', 'Ubuntu環境マスター'),
+                  (r'worker_Master[A-Za-z0-9_]+', 'worker_cluster'),
+                  (r'slave_[0-9a-fA-F_]+', 'slave_standby'),
+                  (r'192\.168\.\d+\.\d+', '192.168.x.x'),
+                  (r'100\.64\.\d+\.\d+', '100.64.x.x'),
+                  (r'172\.(1[6-9]|2[0-9]|3[0-1])\.\d+\.\d+', '172.x.x.x'),
+                  (r'10\.\d+\.\d+\.\d+', '10.x.x.x'),
+              ]
+              for pat, repl in replacements:
+                  text = re.sub(pat, repl, text)
+              return text
 
-            with open('release_body.md', 'w', encoding='utf-8') as out:
-                out.write(body + '\n')
-            "
-          fi
+          body = ''
+          if os.path.isfile('RELEASE_NOTES.md') and os.path.getsize('RELEASE_NOTES.md') > 0:
+              print('✓ Using RELEASE_NOTES.md')
+              with open('RELEASE_NOTES.md', 'r', encoding='utf-8') as f:
+                  body = f.read().strip()
+          else:
+              print('ℹ️ Extracting latest entry from logs/remediation_history.md')
+              try:
+                  with open('logs/remediation_history.md', 'r', encoding='utf-8') as f:
+                      content = f.read()
+                  entries = re.split(r'\n(?=## \[)', content)
+                  if len(entries) > 1:
+                      body = entries[1].strip()
+              except Exception as e:
+                  print(f'Error reading remediation history: {e}')
+
+          if not body:
+              body = '## 🚀 アップデート\n詳細な変更内容はコミット履歴をご確認ください。'
+
+          clean_body = sanitize_text(body)
+          with open('release_body.md', 'w', encoding='utf-8') as out:
+              out.write(clean_body + '\n')
+          "
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
