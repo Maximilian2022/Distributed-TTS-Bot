@@ -158,12 +158,14 @@ class TTSBot(commands.Bot):
 
             # データベース初期化 (WALモード・マイグレーション)
             await self.db.init_db()
-            # レイテンシトラッカーへのDB連携 & 過去計測履歴の復元
+            # レイテンシトラッカーへのDB連携 & 過去計測履歴の復元 (Profilerのウォームスタート含む)
             from src.utils.latency_tracker import latency_tracker
+            from src.utils.latency_profiler import latency_profiler
             latency_tracker.set_db(self.db)
             saved_latencies = await self.db.get_recent_playback_latencies(limit=200)
             if saved_latencies:
                 latency_tracker.restore_from_history(saved_latencies)
+                latency_profiler.restore_from_history(saved_latencies)
             # 定期キャッシュクリーンアップタスク
             self.cleanup_task = safe_create_task(self._periodic_cache_cleanup(), name="periodic_cache_cleanup")
             # 起動時のキャッシュ整合性スキャン（破損・無音の自己修復）を非同期タスクで実行

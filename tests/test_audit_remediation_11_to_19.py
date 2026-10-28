@@ -519,6 +519,151 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(follow_timeout, 2.5)
         self.assertLessEqual(follow_timeout, 6.0)
 
+    def test_latency_tracker_and_profiler_remediation(self):
+        """レイテンシモニター統計機能＆プロファイラの是正検証 (独立サンプリング, 10文字正規化P90, 物理的整合, 体感評価, ウォームスタート)"""
+        from src.utils.latency_tracker import (
+            LatencyTracker, get_synthesis_category, get_provider_profile_key,
+            CAT_CLOUD, CAT_GPU_FAST, CAT_CPU,
+            CAT_COEIROINK_WARM, CAT_COEIROINK_COLD
+        )
+        from src.utils.latency_profiler import EngineLatencyProfiler, NodeLatencyProfile
+
+        # 1. プロバイダー別独立カテゴリ分類 & バッファキーの検証
+        self.assertEqual(get_synthesis_category("azure"), CAT_CLOUD)
+        self.assertEqual(get_synthesis_category("edge"), CAT_CLOUD)
+        self.assertEqual(get_synthesis_category("google"), CAT_CLOUD)
+        self.assertEqual(get_synthesis_category("openjtalk"), CAT_CPU)
+        self.assertEqual(get_synthesis_category("voicevox", has_gpu=True), CAT_GPU_FAST)
+        self.assertEqual(get_synthesis_category("voicevox", has_gpu=False), CAT_CPU)
+        self.assertEqual(get_synthesis_category("coeiroink", is_model_loaded=True), CAT_COEIROINK_WARM)
+        self.assertEqual(get_synthesis_category("coeiroink", is_model_loaded=False), CAT_COEIROINK_COLD)
+
+        self.assertEqual(get_provider_profile_key("azure", CAT_CLOUD), "azure")
+        self.assertEqual(get_provider_profile_key("edge", CAT_CLOUD), "edge")
+        self.assertEqual(get_provider_profile_key("google", CAT_CLOUD), "google")
+
+        # 2. 独立サンプリング & 10文字正規化 P90 の検証
+        tracker = LatencyTracker(max_history=50)
+
+        # Azure: 10文字 200ms を多数投入
+        for _ in range(10):
+            tracker._add_chunk_sample({"provider": "azure", "char_count": 10, "synth_ms": 200.0, "is_cached": False})
+
+        # Edge: 10文字 3500ms を多数投入
+        for _ in range(10):
+            tracker._add_chunk_sample({"provider": "edge", "char_count": 10, "synth_ms": 3500.0, "is_cached": False})
+
+        # Azure と Edge のバッファが分離され、Azure に Edge が潰されないこと
+        est_azure = tracker.get_estimated_synthesis_time("azure", char_count=10)
+        est_edge = tracker.get_estimated_synthesis_time("edge", char_count=10)
+
+        # Azure は高速 (0.15s〜0.35s)
+        self.assertLess(est_azure, 0.40)
+        # Edge は 1.5s キャップで切り捨てられず、3.0秒以上の実態を反映すること
+        self.assertGreater(est_edge, 2.5)
+        self.assertLessEqual(est_edge, 4.5)
+
+        # 3. 内訳バーの物理的整合性 & 非キャッシュ実測平均の分離検証
+        # 発話1: 名前キャッシュ(0.1ms) + 本文推論(1500ms)
+        chunks1 = [
+            {"chunk_index": 0, "role": "name", "synth_ms": 0.1, "is_cached": True, "duration_ms": 800.0},
+            {"chunk_index": 1, "role": "body", "synth_ms": 1500.0, "is_cached": False, "duration_ms": 2000.0}
+        ]
+        r1 = tracker.record(
+            user_name="User1",
+            text="テスト発話本文です",
+            speaker_name="Speaker1",
+            provider="edge",
+            worker_label="Edge / CLOUD",
+            t_discord_created=100.0,
+            t_received=100.1,
+            t_queued=100.1,
+            t_dequeued=100.1,
+            t_synth_start=100.1,
+            t_synth_end=100.15,
+            t_play_start=100.3,
+            is_cached=False,
+            chunks=chunks1,
+            underrun_ms=0.0,
+            turn_ttfs_ms=200.0,
+            core_ttfs_ms=50.0,
+            initial_synth_ms=0.1,
+        )
+        self.assertEqual(r1.initial_synth_ms, 0.1)
+
+        summary = tracker.get_summary()
+        # 内訳バー用の synth_ms は initial_synth_ms (0.1ms) を反映していること
+        self.assertEqual(summary["breakdown"]["synth_ms"], 0.1)
+        self.assertEqual(summary["breakdown"]["total_synth_ms"], 1500.1)
+
+        # 4. ステータス評価の体感整合性 (アンダーラン発生時の即座警告判定)
+        r_underrun = tracker.record(
+            user_name="User2",
+            text="音飛びテスト",
+            speaker_name="Speaker1",
+            provider="edge",
+            worker_label="Edge / CLOUD",
+            t_discord_created=100.0,
+            t_received=100.1,
+            t_queued=100.1,
+            t_dequeued=100.1,
+            t_synth_start=100.1,
+            t_synth_end=100.15,
+            t_play_start=100.3,
+            is_cached=False,
+            chunks=chunks1,
+            underrun_ms=500.0,  # 500msの音飛び
+            turn_ttfs_ms=200.0,
+            core_ttfs_ms=10.0,  # core_ttfs が小さくても
+        )
+        # 音飛びがある場合は "slow" (要警告) になること
+        self.assertEqual(r_underrun.status_level, "slow")
+
+        # 名前キャッシュで core_ttfs=0.2ms でも turn_ttfs=750ms なら "good"/"ultra" に偽装されないこと
+        r_slow_turn = tracker.record(
+            user_name="User3",
+            text="待機ラグテスト",
+            speaker_name="Speaker1",
+            provider="edge",
+            worker_label="Edge / CLOUD",
+            t_discord_created=100.0,
+            t_received=100.1,
+            t_queued=100.1,
+            t_dequeued=100.1,
+            t_synth_start=100.1,
+            t_synth_end=100.15,
+            t_play_start=100.85,
+            is_cached=False,
+            chunks=chunks1,
+            underrun_ms=0.0,
+            turn_ttfs_ms=750.0,  # 750ms待たされた
+            core_ttfs_ms=0.2,   # 名前キャッシュによりcore_ttfsは極小
+        )
+        self.assertIn(r_slow_turn.status_level, ("fair", "slow"))
+
+        # 5. 適応型 EWMA & ウォームスタートの検証
+        prof = NodeLatencyProfile("test_node", "VOICEVOX", has_gpu=True, gpu_name="RTX 4090")
+        # 1回目の実績 (10文字 100ms)
+        prof.record(10, 100.0)
+        # 初回は alpha=1.0 が適用され、即座に実測値に急収束すること
+        self.assertLessEqual(prof.ms_per_char, 15.0)
+
+        # restore_from_history の検証
+        eng_prof = EngineLatencyProfiler()
+        history_records = [
+            {
+                "chunks": [
+                    {"provider": "edge", "char_count": 10, "synth_ms": 1200.0, "is_cached": False},
+                    {"provider": "azure", "char_count": 10, "synth_ms": 210.0, "is_cached": False},
+                ]
+            }
+        ]
+        cnt = eng_prof.restore_from_history(history_records)
+        self.assertEqual(cnt, 2)
+        stats = eng_prof.get_all_stats()
+        self.assertIn("cloud_direct:EDGE", stats["nodes"])
+        self.assertIn("cloud_direct:AZURE", stats["nodes"])
+
 
 if __name__ == "__main__":
     unittest.main()

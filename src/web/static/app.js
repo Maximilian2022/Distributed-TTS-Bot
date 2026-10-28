@@ -4048,13 +4048,16 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
     }
   }
 
-  // 3. 遅延内訳 (プログレスバー) - Discord → Queue → Synth → Preroll → Prep
+  // 3. 遅延内訳 (プログレスバー) - Discord → Queue → InitialSynth → Preroll → Prep (物理的整合)
   const discordMs = summary.avg_discord_latency_ms || 0;
   const queueMs = summary.avg_queue_wait_ms || 0;
-  const synthMs = summary.avg_synthesis_ms || 0;
+  // 初動チャンクの推論時間（内訳バー物理整合用、なければ avg_synthesis_ms）
+  const initialSynthMs = (summary.avg_initial_synth_ms !== undefined) ? summary.avg_initial_synth_ms : (summary.avg_synthesis_ms || 0);
+  const totalSynthMs = summary.avg_total_synthesis_ms || summary.avg_synthesis_ms || 0;
+  const activeSynthMs = summary.avg_active_synth_ms || initialSynthMs;
   const prerollMs = summary.avg_preroll_wait_ms || 0;
   const prepMs = summary.avg_play_prep_ms || 0;
-  const sumMs = discordMs + queueMs + synthMs + prerollMs + prepMs;
+  const sumMs = discordMs + queueMs + initialSynthMs + prerollMs + prepMs;
 
   const totalLbl = document.getElementById("lat-breakdown-total");
   if (totalLbl) {
@@ -4070,7 +4073,7 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
   if (sumMs > 0) {
     const dPct = ((discordMs / sumMs) * 100).toFixed(1);
     const qPct = ((queueMs / sumMs) * 100).toFixed(1);
-    const sPct = ((synthMs / sumMs) * 100).toFixed(1);
+    const sPct = ((initialSynthMs / sumMs) * 100).toFixed(1);
     const prePct = ((prerollMs / sumMs) * 100).toFixed(1);
     const pPct = ((prepMs / sumMs) * 100).toFixed(1);
 
@@ -4083,8 +4086,8 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
       barQueue.title = `キュー待機: ${queueMs.toFixed(1)}ms (${qPct}%)`;
     }
     if (barSynth) {
-      barSynth.style.width = `${(synthMs / sumMs) * 100}%`;
-      barSynth.title = `TTS推論 (Core): ${synthMs.toFixed(1)}ms (${sPct}%)`;
+      barSynth.style.width = `${(initialSynthMs / sumMs) * 100}%`;
+      barSynth.title = `初動TTS推論: ${initialSynthMs.toFixed(1)}ms (${sPct}%) (全文総推論: ${totalSynthMs.toFixed(1)}ms, 非キャッシュ実測: ${activeSynthMs.toFixed(1)}ms)`;
     }
     if (barPreroll) {
       barPreroll.style.width = `${(prerollMs / sumMs) * 100}%`;
@@ -4107,7 +4110,14 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
   const valQueue = document.getElementById("lat-val-queue");
   if (valQueue) valQueue.textContent = (summary.total_count > 0) ? `${queueMs.toFixed(1)} ms` : "-- ms";
   const valSynth = document.getElementById("lat-val-synth");
-  if (valSynth) valSynth.textContent = (summary.total_count > 0) ? `${synthMs.toFixed(1)} ms` : "-- ms";
+  if (valSynth) {
+    if (summary.total_count > 0) {
+      valSynth.textContent = `${initialSynthMs.toFixed(1)} ms`;
+      valSynth.title = `初動推論: ${initialSynthMs.toFixed(1)}ms / 全文総推論: ${totalSynthMs.toFixed(1)}ms / 非キャッシュ実測: ${activeSynthMs.toFixed(1)}ms`;
+    } else {
+      valSynth.textContent = "-- ms";
+    }
+  }
   const valPreroll = document.getElementById("lat-val-preroll");
   if (valPreroll) {
     valPreroll.textContent = (summary.total_count > 0) ? `${prerollMs.toFixed(1)} ms` : "-- ms";

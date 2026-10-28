@@ -91,7 +91,7 @@ class NodeLatencyProfile:
         self.last_synth_ms = 0.0
 
     def record(self, text_len: int, synth_ms: float) -> None:
-        """推論実績を反映してプロファイルを更新 (EWMA: 指数移動平均)"""
+        """推論実績を反映してプロファイルを更新 (適応型EWMA: 指数移動平均)"""
         if text_len <= 0 or synth_ms <= 0:
             return
 
@@ -99,7 +99,8 @@ class NodeLatencyProfile:
         self.last_synth_ms = synth_ms
         self.last_updated = time.time()
 
-        alpha = 0.25  # 直近の実績を重視
+        # サンプル初期 (N < 4) は実測値への収束を早めるため alpha を動的適応 (1回目で100%、2回目で50%等)
+        alpha = max(0.25, 1.0 / float(self.sample_count))
 
         # 1文字あたりの時間 (最小でも 3ms/字)
         instant_rate = max(3.0, (synth_ms - max(20.0, self.base_latency_ms * 0.5)) / max(1, text_len))
@@ -110,8 +111,25 @@ class NodeLatencyProfile:
         if text_len <= 5:
             self.base_latency_ms = round(alpha * max(20.0, synth_ms - text_len * self.ms_per_char) + (1.0 - alpha) * self.base_latency_ms, 1)
 
+    def _maybe_apply_aging(self) -> None:
+        """数時間アクセスのないノードプロファイルを事前基準値(Prior)へ緩やかに回帰 (時間的エージング)"""
+        now = time.time()
+        elapsed = now - self.last_updated
+        if elapsed > 7200.0 and self.sample_count > 0:  # 2時間以上経過
+            decay_steps = min(5, int(elapsed / 7200.0))
+            eng_priors = ENGINE_INITIAL_PRIORS.get(self.engine_name, ENGINE_INITIAL_PRIORS.get("VOICEVOX", {}))
+            target_p = eng_priors.get("cloud" if "cloud" in eng_priors else ("gpu_top" if self.has_gpu else "cpu"), {})
+            if target_p:
+                prior_rate = float(target_p.get("ms_per_char", 25.0))
+                prior_base = float(target_p.get("base_ms", 120.0))
+                factor = 0.9 ** decay_steps
+                self.ms_per_char = round(self.ms_per_char * factor + prior_rate * (1.0 - factor), 1)
+                self.base_latency_ms = round(self.base_latency_ms * factor + prior_base * (1.0 - factor), 1)
+            self.last_updated = now
+
     def estimate(self, text_len: int) -> float:
-        """指定文字数の予測合成時間をミリ秒で算出"""
+        """指定文字数の予測合成時間をミリ秒で算出 (エージング反映)"""
+        self._maybe_apply_aging()
         return max(30.0, self.base_latency_ms + (text_len * self.ms_per_char))
 
     def calc_max_chars(
@@ -125,6 +143,7 @@ class NodeLatencyProfile:
         - 実測値 (base_latency_ms, ms_per_char) に基づき自律適応。
         - min_chars 〜 max_chars の範囲に安全クランプ。
         """
+        self._maybe_apply_aging()
         safe_rate = max(1.0, self.ms_per_char)
         available_time = max(0.0, target_budget_ms - self.base_latency_ms)
         chars = int(available_time / safe_rate)
@@ -480,6 +499,41 @@ class EngineLatencyProfiler:
             "strongest_machines": {eng.lower(): m for eng, m in strongest_machines.items() if m},
             "list": list(node_dicts.values())
         }
+
+    def restore_from_history(self, records: List[Dict[str, Any]]) -> int:
+        """再起動時に過去の再生履歴から各ノード・プロバイダーの推論プロファイルを自動ウォームスタート"""
+        restored = 0
+        for r in records:
+            chunks = r.get("chunks") or []
+            for c in chunks:
+                if c.get("is_cached"):
+                    continue
+                s_ms = float(c.get("synth_ms") or c.get("synthesis_ms") or 0.0)
+                if s_ms <= 0:
+                    continue
+                raw_len = int(c.get("char_count") or len(c.get("text", "") or "") or 0)
+                if raw_len <= 0:
+                    continue
+                prov = str(c.get("provider", "")).lower()
+                w = str(c.get("worker", "") or c.get("worker_label", ""))
+
+                if prov in ("edge", "azure", "google", "openjtalk"):
+                    self.record_synth_direct(prov, raw_len, s_ms)
+                    restored += 1
+                elif w:
+                    class _DummyNode:
+                        def __init__(self, wid: str, eng: str, wlbl: str):
+                            self.id = wid
+                            self.engine_name = eng.upper()
+                            self.machine_name = wlbl
+                            self.has_gpu = any(k in wlbl.lower() for k in ("gpu", "rtx", "gtx", "cuda", "radeon"))
+                            self.specs = {"gpu": self.has_gpu}
+                    dn = _DummyNode(w, prov, w)
+                    self.record_synth(dn, raw_len, s_ms)
+                    restored += 1
+        if restored > 0:
+            logger.info(f"✨ Restored {restored} chunk profiles into EngineLatencyProfiler from history.")
+        return restored
 
 # グローバルシングルトンインスタンス
 latency_profiler = EngineLatencyProfiler()

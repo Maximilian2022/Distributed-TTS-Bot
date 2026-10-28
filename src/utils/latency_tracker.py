@@ -39,19 +39,23 @@ INCIDENT_DISCORD_LAG_MS = 1000.0    # 参考タグ: Discord Gateway 配信遅延
 CLOUD_PROVIDERS = {"edge", "azure", "google", "openjtalk"}
 COLD_LOAD_SYNTH_MS = 3000.0         # COEIROINK でこれを超える単一チャンク推論はモデルロード待ちを疑う
 
-# --- 合成カテゴリ分類 (動的 Adaptive Preroll 用) ---
+# --- 合成カテゴリ分類 (動的 Adaptive Preroll 用: 完全後方互換) ---
 CAT_CLOUD = "CLOUD"                  # Google, Edge, Azure
 CAT_GPU_FAST = "LOCAL_GPU_FAST"      # VOICEVOX / SHAREVOX on RTX 3090 / GTX 1080 Ti
 CAT_CPU = "LOCAL_CPU"                # VOICEVOX / SHAREVOX / OpenJTalk on CPU
 CAT_COEIROINK_WARM = "COEIROINK_WARM" # RAMDisk/VRAM常駐・ロード済み
 CAT_COEIROINK_COLD = "COEIROINK_COLD" # 未ロード初回 (コールドロード)
 
-# カテゴリ別事前基準値 (Prior) (秒)
+# カテゴリ別・プロバイダー別事前基準値 (Prior) (10文字基準、秒)
 CATEGORY_PRIORS: Dict[str, float] = {
+    "azure": 0.22,
+    "google": 0.40,
+    "edge": 1.50,
+    "openjtalk": 0.08,
     CAT_CLOUD: 0.35,
     CAT_GPU_FAST: 0.15,
-    CAT_CPU: 0.50,
-    CAT_COEIROINK_WARM: 0.30,
+    CAT_CPU: 0.45,
+    CAT_COEIROINK_WARM: 0.35,
     CAT_COEIROINK_COLD: 2.50,
 }
 
@@ -62,8 +66,8 @@ def get_synthesis_category(
     is_model_loaded: Optional[bool] = None,
     has_gpu: Optional[bool] = None,
 ) -> str:
-    """プロバイダー、WorkerのGPU有無・ラベル、モデルロード状態から推論カテゴリを環境非依存に判定"""
-    prov = (provider or "").lower()
+    """プロバイダー、WorkerのGPU有無・ラベル、モデルロード状態から推論カテゴリを環境非依存に判定 (完全後方互換)"""
+    prov = (provider or "").lower().strip()
     if prov in ("edge", "google", "azure"):
         return CAT_CLOUD
     if prov == "openjtalk":
@@ -92,6 +96,14 @@ def get_synthesis_category(
         return CAT_CPU
 
     return CAT_CPU
+
+
+def get_provider_profile_key(provider: str, category: str) -> str:
+    """プロバイダーと推論カテゴリを組み合わせた一意のバッファキー (AzureとEdgeのサンプル完全分離)"""
+    prov = (provider or "").lower().strip()
+    if prov in ("azure", "google", "edge", "openjtalk"):
+        return prov
+    return f"{prov}_{category}"
 
 
 @dataclass
@@ -146,6 +158,7 @@ class PlaybackLatencyRecord:
     masking_ratio: float = 100.0 # 推論隠蔽率 (%)
     preroll_wait_ms: float = 0.0 # Adaptive Preroll待機時間 (ms)
     core_ttfs_ms: float = 0.0   # 推論起因ラグ (Preroll除外, dequeue→第1チャンク合成完了)
+    initial_synth_ms: float = 0.0 # 初動チャンク推論時間 (ms: 内訳バー整合用)
     chunks: List[Dict[str, Any]] = None  # パーツ別詳細リスト
 
     def __post_init__(self):
@@ -159,6 +172,12 @@ class PlaybackLatencyRecord:
             self.e2e_ttfs_ms = self.total_latency_ms
         if self.core_ttfs_ms == 0.0 and self.turn_ttfs_ms > 0.0:
             self.core_ttfs_ms = max(0.0, round(self.turn_ttfs_ms - self.preroll_wait_ms, 1))
+        if self.initial_synth_ms == 0.0:
+            if self.chunks:
+                c0 = self.chunks[0]
+                self.initial_synth_ms = float(c0.get("synth_ms", c0.get("synthesis_ms", 0.0)) or 0.0)
+            else:
+                self.initial_synth_ms = self.synthesis_ms
 
 
 from src.utils.async_task import safe_create_task
@@ -211,9 +230,13 @@ class LatencyTracker:
         self._incidents: deque[Dict[str, Any]] = deque(maxlen=50)
         self._node_snapshot_provider: Optional[Callable[[], List[Dict[str, Any]]]] = None
 
-        # 動的 Adaptive Preroll 用: カテゴリ別独立推論実績バッファ (各カテゴリ直近30件)
-        # 頻繁に使われるエンジン (Google等) による他エンジン (COEIROINK/GPU等) のサンプル押し出し・飢餓を完全防止
+        # 動的 Adaptive Preroll 用: プロバイダー/カテゴリ別独立推論実績バッファ (各直近30件)
+        # エンジン/プロバイダー別に完全独立化し、多頻度エンジン (Azure等) による Edge 等の飢餓を根絶
         self._category_samples: Dict[str, deque[float]] = {
+            "azure": deque(maxlen=30),
+            "google": deque(maxlen=30),
+            "edge": deque(maxlen=30),
+            "openjtalk": deque(maxlen=30),
             CAT_CLOUD: deque(maxlen=30),
             CAT_GPU_FAST: deque(maxlen=30),
             CAT_CPU: deque(maxlen=30),
@@ -222,12 +245,14 @@ class LatencyTracker:
         }
 
     def _add_chunk_sample(self, ch: Dict[str, Any]) -> None:
-        """非キャッシュチャンクの推論所要時間を該当カテゴリの独立バッファへ蓄積"""
+        """非キャッシュチャンクの推論所要時間を該当プロバイダ/カテゴリの独立バッファへ蓄積 (10文字基準に正規化)"""
         if ch.get("is_cached", False):
             return
         synth_ms = float(ch.get("synth_ms") or ch.get("synthesis_ms") or 0.0)
         if synth_ms <= 0:
             return
+        raw_chars = int(ch.get("char_count") or len(ch.get("text", "") or "") or 0)
+        chars = max(1, raw_chars)
         prov = str(ch.get("provider", "")).lower()
         w = str(ch.get("worker", "") or ch.get("worker_label", "")).lower()
 
@@ -235,8 +260,15 @@ class LatencyTracker:
         if prov == "coeiroink":
             is_loaded = (synth_ms < 1500.0)
         cat = get_synthesis_category(prov, w, is_model_loaded=is_loaded)
-        if cat in self._category_samples:
-            self._category_samples[cat].append(synth_ms / 1000.0)
+        prof_key = get_provider_profile_key(prov, cat)
+        if prof_key not in self._category_samples:
+            self._category_samples[prof_key] = deque(maxlen=30)
+
+        # 10文字正規化秒数 (短文・長文を10文字相当に揃えて蓄積することで公平かつロバストにP90算出)
+        norm_sec = (synth_ms / 1000.0) * (10.0 / float(chars))
+        self._category_samples[prof_key].append(norm_sec)
+        if cat in self._category_samples and cat != prof_key:
+            self._category_samples[cat].append(norm_sec)
 
     def set_node_snapshot_provider(self, fn: Callable[[], List[Dict[str, Any]]]) -> None:
         """インシデント発生時にワーカーノード状態を取得するコールバックを登録"""
@@ -461,6 +493,7 @@ class LatencyTracker:
         total_audio_duration_ms: Optional[float] = 0.0,
         preroll_wait_ms: Optional[float] = 0.0,
         core_ttfs_ms: Optional[float] = None,
+        initial_synth_ms: Optional[float] = None,
         incident_context: Optional[Dict[str, Any]] = None,
     ) -> PlaybackLatencyRecord:
         """1回の音声再生に関する各区間のレイテンシを記録"""
@@ -531,11 +564,27 @@ class LatencyTracker:
         elif tot_duration > 0:
             calc_rtf = round(synthesis / tot_duration, 2)
 
-        # 評価判定 (推論起因ラグおよび実質初動ラグを総合評価)
-        # ストリーミング再生における意図的なPrerollバッファ蓄積も考慮
-        if is_cached or (calc_core_ttfs < 250.0 and calc_turn_ttfs < 500.0):
+        # 初動チャンク推論時間の算出 (内訳バー整合用)
+        if initial_synth_ms is not None:
+            calc_initial_synth = round(initial_synth_ms, 1)
+        elif chunks:
+            c0 = chunks[0]
+            calc_initial_synth = round(float(c0.get("synth_ms", c0.get("synthesis_ms", 0.0)) or 0.0), 1)
+        else:
+            calc_initial_synth = round(synthesis, 1)
+
+        # 評価判定 (ユーザー体感QoE第一基準)
+        # 1. 音途切れ（アンダーラン/ギャップ遅延）が発生した場合は最優先で "slow" (要改善警告)
+        if (underrun_ms and underrun_ms > 0) or (gap_lag_ms and gap_lag_ms > 0):
+            level = "slow"
+        # 2. 全編キャッシュで音飛びなし
+        elif is_cached:
             level = "ultra"
-        elif calc_core_ttfs < 400.0 or calc_turn_ttfs < 600.0:
+        # 3. ユーザーが実際に待たされた時間 (turn_ttfs) と推論起因ラグ (core_ttfs) を総合判定
+        #    ※ 名前キャッシュにより core_ttfs が 0.2ms でも、turn_ttfs が長ければ相応の評価とする
+        elif calc_turn_ttfs < 350.0 and calc_core_ttfs < 300.0:
+            level = "ultra"
+        elif calc_turn_ttfs < 650.0 and calc_core_ttfs < 550.0:
             level = "good"
         elif calc_turn_ttfs < 1500.0:
             level = "fair"
@@ -589,6 +638,7 @@ class LatencyTracker:
             masking_ratio=round(calc_masking, 1),
             preroll_wait_ms=calc_preroll,
             core_ttfs_ms=calc_core_ttfs,
+            initial_synth_ms=calc_initial_synth,
             chunks=chunks or []
         )
 
@@ -709,6 +759,7 @@ class LatencyTracker:
         sample = list(self._history)[-20:]
         totals = [r.total_latency_ms for r in sample]
         synths = [r.synthesis_ms for r in sample]
+        initial_synths = [getattr(r, "initial_synth_ms", r.synthesis_ms) for r in sample]
         queues = [r.queue_wait_ms for r in sample]
         discords = [r.discord_latency_ms for r in sample]
         preps = [r.play_prep_ms for r in sample]
@@ -727,6 +778,11 @@ class LatencyTracker:
 
         avg_total = round(sum(totals) / len(totals), 1)
         avg_synth = round(sum(synths) / len(synths), 1)
+        avg_initial_synth = round(sum(initial_synths) / len(initial_synths), 1) if initial_synths else 0.0
+        # 非キャッシュの実推論のみの平均 (キャッシュ混入による過小偽装の防止)
+        active_synths = [getattr(r, "initial_synth_ms", r.synthesis_ms) for r in sample if not r.is_cached and r.synthesis_ms > 0]
+        avg_active_synth = round(sum(active_synths) / len(active_synths), 1) if active_synths else avg_initial_synth
+
         avg_queue = round(sum(queues) / len(queues), 1)
         avg_discord = round(sum(discords) / len(discords), 1)
         avg_prep = round(sum(preps) / len(preps), 1)
@@ -752,6 +808,9 @@ class LatencyTracker:
             "cache_hit_rate_percent": hit_rate,
             "avg_total_latency_ms": avg_total,
             "avg_synthesis_ms": avg_synth,
+            "avg_initial_synth_ms": avg_initial_synth,
+            "avg_active_synth_ms": avg_active_synth,
+            "avg_total_synthesis_ms": avg_synth,
             "avg_queue_wait_ms": avg_queue,
             "avg_discord_latency_ms": avg_discord,
             "avg_play_prep_ms": avg_prep,
@@ -781,7 +840,7 @@ class LatencyTracker:
             "history": recent_events,
             # 互換用フラットキー
             "recent_avg_total_ms": avg_total,
-            "recent_avg_synth_ms": avg_synth,
+            "recent_avg_synth_ms": avg_initial_synth,
             "recent_avg_queue_ms": avg_queue,
             "recent_min_total_ms": min(totals),
             "recent_max_total_ms": max(totals),
@@ -797,7 +856,8 @@ class LatencyTracker:
             "breakdown": {
                 "discord_ms": avg_discord,
                 "queue_ms": avg_queue,
-                "synth_ms": avg_synth,
+                "synth_ms": avg_initial_synth,  # 内訳バーには初動推論時間を採用して物理整合
+                "total_synth_ms": avg_synth,    # 全チャンク合算
                 "prep_ms": avg_prep,
                 "ttfs_ms": avg_turn_ttfs,
                 "turn_ttfs_ms": avg_turn_ttfs,
@@ -820,13 +880,14 @@ class LatencyTracker:
     ) -> float:
         """
         カテゴリ判定と直近推論履歴から、第1文の推定合成所要時間 (秒) を動的に算出する。
+        - 10文字基準に正規化されたサンプルバッファからロバストな P90 を算出。
         - 物理状態 (コールドロード) が確定している場合は統計を見ずに長めの枠を即座に確保
         - サンプル不足時 (N < 5) は事前基準値 (Prior) とベイズ平滑化ブレンド + 悲観的マージンで安全側に倒す
-        - 十分なサンプル (N >= 5) では実績 P90 を信頼採用
-        - 文字数に応じたスケール時間を加算
+        - 要求文字数に応じたスケーリングと、各エンジンの物理的特性に適合した安全クランプ
         """
         cat = get_synthesis_category(provider, worker_label, is_model_loaded, has_gpu=has_gpu)
-        prior_time = CATEGORY_PRIORS.get(cat, 0.40)
+        prof_key = get_provider_profile_key(provider, cat)
+        prior_time = CATEGORY_PRIORS.get(prof_key, CATEGORY_PRIORS.get(cat, 0.40))
         if estimated_node_ms is not None and estimated_node_ms > 0:
             prior_time = max(0.08, min(estimated_node_ms / 1000.0, 2.50))
 
@@ -837,35 +898,46 @@ class LatencyTracker:
                 est += (char_count - 15) * 0.020
             return max(2.0, min(est, 4.0))
 
-        # カテゴリ別独立サンプルバッファ (各30件) から非キャッシュ推論実績 (秒) を取得
-        samples: List[float] = list(self._category_samples.get(cat, []))
+        # プロバイダー別独立サンプルバッファ (優先) またはカテゴリバッファから 10文字正規化推論実績 (秒) を取得
+        samples: List[float] = list(self._category_samples.get(prof_key, self._category_samples.get(cat, [])))
 
         n = len(samples)
         if n >= 5:
-            # 十分な実績がある場合: P90 (遅いケースをカバーする90パーセンタイル)
+            # 十分な実績がある場合: 10文字正規化値の P90 (遅いケースをカバーする90パーセンタイル)
             sorted_samples = sorted(samples)
             p90_idx = min(len(sorted_samples) - 1, int(len(sorted_samples) * 0.90))
-            est = sorted_samples[p90_idx]
+            norm_est = sorted_samples[p90_idx]
         elif n > 0:
             # サンプル数が少ない場合 (1〜4件): ベイズ的平滑化ブレンド + 悲観的マージン
-            k = 4.0  # 事前分布の仮想サンプル重み
+            k = 3.0  # 事前分布の仮想サンプル重み
             sample_val = sorted(samples)[-1]  # サンプルの最大値 (悲観的)
-            est = (k / (n + k)) * prior_time + (n / (n + k)) * sample_val + 0.10  # 100ms 安全マージン
+            norm_est = (k / (n + k)) * prior_time + (n / (n + k)) * sample_val + 0.08
         else:
             # 実績ゼロ件: 事前基準値を100%採用
-            est = prior_time
+            norm_est = prior_time
 
-        # 文字数が15文字を超える場合は文字数スケールを加算
-        if char_count > 15:
-            est += (char_count - 15) * 0.012
+        # 要求文字数に応じた線形スケーリング (10文字基準: 固定オーバーヘッドと文字依存部分を分離)
+        safe_chars = max(1, char_count)
+        fixed_ratio = 0.40 if prof_key in ("edge", "google", "azure") or cat == CAT_CLOUD else 0.25
+        fixed_part = norm_est * fixed_ratio
+        char_part = norm_est * (1.0 - fixed_ratio) * (float(safe_chars) / 10.0)
+        est = fixed_part + char_part
 
-        # カテゴリに応じたクランプ
-        if cat == CAT_GPU_FAST:
+        # プロバイダー/カテゴリに応じた物理的クランプ (Edge-TTS は本番実測 P90 4.7s に適合させ最大4.5sまで許容)
+        if prof_key == "azure":
+            return max(0.12, min(est, 0.80))
+        elif prof_key == "google":
+            return max(0.20, min(est, 3.50))
+        elif prof_key == "edge":
+            return max(0.50, min(est, 4.50))
+        elif prof_key == "openjtalk":
+            return max(0.04, min(est, 0.35))
+        elif cat == CAT_GPU_FAST:
             return max(0.10, min(est, 1.20))
-        elif cat == CAT_CLOUD:
-            return max(0.20, min(est, 1.50))
+        elif cat == CAT_CPU:
+            return max(0.20, min(est, 2.50))
         else:
-            return max(0.20, min(est, 3.00))
+            return max(0.20, min(est, 4.00))
 
 
 

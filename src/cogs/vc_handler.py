@@ -1333,7 +1333,11 @@ class VCHandlerCog(commands.Cog):
                 is_name = getattr(first_chunk, "is_name_prefix", False)
                 if is_name:
                     safety_margin_s = 0.25  # 250ms 安全マージン (ネットワーク・デコードの揺らぎを確実に吸収)
-                    max_cap_s = 0.75       # 最大0.75秒キャップ (Coeiroink等の超長推論は0.75秒で打ち切って名前先行送出)
+                    # Edge-TTS や COEIROINK 等の重量プロバイダ時は待機上限を緩和してアンダーラン防止
+                    if target_prov in ("edge", "coeiroink") or not est_has_gpu:
+                        max_cap_s = 1.35   # 重量プロバイダ時は最大1.35秒まで待機してアンダーラン防止
+                    else:
+                        max_cap_s = 0.85   # 高速GPU/Azure等は0.85秒キャップ
                     min_wait_s = 0.15      # 第1文がまだ完了していない場合の最低待機枠 (150ms)
                 else:
                     safety_margin_s = 0.15  # 150ms 安全マージン
@@ -1590,6 +1594,7 @@ class VCHandlerCog(commands.Cog):
                     total_audio_duration_ms=round(total_audio_duration * 1000.0, 1),
                     preroll_wait_ms=round(preroll_wait_ms, 1),
                     core_ttfs_ms=round(core_ttfs, 1),
+                    initial_synth_ms=round(max(0.0, (c0_synth_end - c0_synth_start) * 1000.0), 1),
                     incident_context={
                         "guild_id": guild.id,
                         "guild_name": guild.name,
