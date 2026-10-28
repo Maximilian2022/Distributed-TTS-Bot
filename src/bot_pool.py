@@ -31,7 +31,8 @@ class BotPoolManager:
         self.tokens: List[Tuple[int, str]] = config.get_discord_tokens()
         self.bot_tasks: Dict[int, asyncio.Task] = {}
         self.bot_factory = None  # main.py から注入されるBotインスタンス生成ファクトリ
-        self._connecting_vcs: Dict[Tuple[int, int], int] = {}  # (guild_id, vc_id) -> bot_index
+        self._connecting_vcs: Dict[Tuple[int, int], Tuple[int, float]] = {}  # (guild_id, vc_id) -> (bot_index, timestamp)
+        self.RESERVATION_TTL_SECONDS: float = 30.0
         self._vc_locks: Dict[Tuple[int, int], asyncio.Lock] = {}
         self._pool_lock = asyncio.Lock()
         self._manually_disconnected_vcs: Set[Tuple[int, int]] = set()  # (guild_id, vc_id) 手動切断フラグ
@@ -61,57 +62,83 @@ class BotPoolManager:
         return self._vc_locks[key]
 
     def is_vc_connecting(self, guild_id: int, voice_channel_id: int) -> bool:
-        """指定ギルド・指定VCが現在いずれかのBotによって接続ハンドシェイク中かどうか"""
-        return (guild_id, voice_channel_id) in self._connecting_vcs
+        """指定ギルド・指定VCが現在いずれかのBotによって接続ハンドシェイク中かどうか (TTL考慮)"""
+        key = (guild_id, voice_channel_id)
+        if key in self._connecting_vcs:
+            _, ts = self._connecting_vcs[key]
+            if (time.time() - ts) < self.RESERVATION_TTL_SECONDS:
+                return True
+            else:
+                self._connecting_vcs.pop(key, None)
+        return False
 
     async def reserve_vc_connection(self, guild_id: int, voice_channel_id: int, bot_index: int) -> bool:
         """
         指定VCへの接続権を原子的に予約 (In-Flight Reservation)。
-        既にいずれかのBotが接続中、または予約中の場合は False を返す。
+        既に他Botが接続中、または他Botが予約中の場合は False を返す。
+        同一号機による再接続や、30秒超過のゾンビ予約は上書き許可する。
         """
+        now = time.time()
         async with self._pool_lock:
-            # 1. 既にいずれかの号機が接続済みかチェック
-            if self.find_connected_bot_in_vc(guild_id, voice_channel_id) is not None:
-                logger.warning(
-                    f"[BotPool] Reserve rejected: VC {voice_channel_id} in guild {guild_id} "
-                    f"already has an active bot connected."
-                )
-                return False
+            # 1. 既にいずれかの号機が接続済みかチェック (自号機以外の別号機が接続済みなら拒否)
+            connected = self.find_connected_bot_in_vc(guild_id, voice_channel_id)
+            if connected is not None:
+                connected_idx, _ = connected
+                if connected_idx != bot_index:
+                    logger.warning(
+                        f"[BotPool] Reserve rejected: VC {voice_channel_id} in guild {guild_id} "
+                        f"already has active Bot #{connected_idx} connected."
+                    )
+                    return False
 
             # 2. 既にいずれかの号機が接続処理中 (インフライト) かチェック
             key = (guild_id, voice_channel_id)
             if key in self._connecting_vcs:
-                existing_bot = self._connecting_vcs[key]
-                logger.warning(
-                    f"[BotPool] Reserve rejected: VC {voice_channel_id} in guild {guild_id} "
-                    f"is currently being connected by Bot #{existing_bot}."
-                )
-                return False
+                existing_bot, ts = self._connecting_vcs[key]
+                # TTL内かつ別号機による予約の場合のみ拒否 (同一号機による再試行や期限切れゾンビは許可)
+                if existing_bot != bot_index and (now - ts) < self.RESERVATION_TTL_SECONDS:
+                    logger.warning(
+                        f"[BotPool] Reserve rejected: VC {voice_channel_id} in guild {guild_id} "
+                        f"is currently being connected by Bot #{existing_bot} (age: {now - ts:.1f}s)."
+                    )
+                    return False
+                elif (now - ts) >= self.RESERVATION_TTL_SECONDS:
+                    logger.info(
+                        f"[BotPool] Overriding expired reservation for VC {voice_channel_id} in guild {guild_id} "
+                        f"(previous Bot #{existing_bot}, age: {now - ts:.1f}s)."
+                    )
 
-            # 3. 予約を確保
-            self._connecting_vcs[key] = bot_index
+            # 3. 予約を確保 (タイムスタンプ付き)
+            self._connecting_vcs[key] = (bot_index, now)
             logger.info(f"[BotPool] In-Flight Reservation ACQUIRED: VC {voice_channel_id} reserved for Bot #{bot_index}")
             return True
 
     def release_vc_reservation(self, guild_id: int, voice_channel_id: int, bot_index: int) -> None:
         """指定VCのインフライト接続予約を解除"""
         key = (guild_id, voice_channel_id)
-        if self._connecting_vcs.get(key) == bot_index:
-            self._connecting_vcs.pop(key, None)
-            logger.debug(f"[BotPool] In-Flight Reservation RELEASED: VC {voice_channel_id} by Bot #{bot_index}")
+        if key in self._connecting_vcs:
+            existing_bot, _ = self._connecting_vcs[key]
+            if existing_bot == bot_index:
+                self._connecting_vcs.pop(key, None)
+                logger.debug(f"[BotPool] In-Flight Reservation RELEASED: VC {voice_channel_id} by Bot #{bot_index}")
 
     def find_connected_or_connecting_bot_in_vc(
         self, guild_id: int, voice_channel_id: int
     ) -> Optional[Tuple[int, commands.Bot]]:
-        """指定ギルド・指定VCに接続完了済み、または現在ハンドシェイク処理中のBotを探索"""
+        """指定ギルド・指定VCに接続完了済み、または現在ハンドシェイク処理中のBotを探索 (TTL考慮)"""
         connected = self.find_connected_bot_in_vc(guild_id, voice_channel_id)
         if connected:
             return connected
 
         key = (guild_id, voice_channel_id)
-        connecting_idx = self._connecting_vcs.get(key)
-        if connecting_idx and connecting_idx in self.bots:
-            return connecting_idx, self.bots[connecting_idx]
+        if key in self._connecting_vcs:
+            connecting_idx, ts = self._connecting_vcs[key]
+            if (time.time() - ts) < self.RESERVATION_TTL_SECONDS:
+                if connecting_idx in self.bots:
+                    return connecting_idx, self.bots[connecting_idx]
+            else:
+                self._connecting_vcs.pop(key, None)
+        return None
 
         return None
 

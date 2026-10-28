@@ -1,6 +1,47 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] 孤児 tar プロセス暴走によるディスクI/O飽和・SQLite ロック・Discord 切断の連鎖障害の完全復旧と恒久対策
+
+- **ユーザーフィードバック & 課題**:
+  - 「botのログを見てほしい。エラーが大量にでてる」
+  - ログ調査時、`database is locked`、`TimeoutError: Database connection pool acquire timed out`、`voice heartbeat blocked for more than 10 seconds`、`Failed to auto-reconnect to VC 'わっしょい': is already reserved/connected by Bot #1` が大量発生。
+
+- **原因分析 & トリアージ調査結果**:
+  1. **発端 (孤児 tar プロセス 86 個の蓄積)**:
+     - Worker 保有の COEIROINK モデル高速ストリーミング配信処理（`handle_model_download`）において、クライアント切断や通信タイムアウト時に `proc.kill()` を呼ぶ `finally:` ブロックが欠落していた。
+     - このため、切断されるたびに `tar -cf - -C ...` がパイプ書き込み待ちのまま孤児（ゾンビ）プロセスとして生き残り、合計 **86 個** の `tar` プロセスがディスク（`/app/coeiroink_models`）を読み込もうとして滞留。
+  2. **物理的影響 (ディスクI/O飽和)**:
+     - システムの iowait が **73%**、I/Oブロックプロセス数が **8**（`b=8`）に張り付き、SATA ディスク帯域が完全に枯渇。
+  3. **二次災害① (SQLite 排他ロックの永続化)**:
+     - ディスクI/O遅延により SQLite の WAL 書込・fsync が 30秒以内に完了できず、`PRAGMA busy_timeout=30000;` を超過して `database is locked` が発生。
+     - さらに `SQLitePool.acquire()` において、クエリ実行中に例外やキャンセルが発生した際、`conn.in_transaction == True` の未完了トランザクションがロールバックされずにそのままプールに返却されていた。このため、プール内のコネクションが SQLite の書き込みロックを保持し続け、他の全クエリが 30秒直列ブロックされ、プール（5個）が使い尽くされて `Database connection pool acquire timed out` が多発した。
+  4. **二次災害② (イベントループ停止 & Discord Voice 強制切断)**:
+     - `src/web/server.py` の `_record_ha_slave_heartbeat` が、毎秒のハートビート受信のたびに同期ブロッキングI/O `self.ha_nodes_file.write_text(...)` を実行していた。ディスクI/O詰まりに伴いイベントループが 10秒以上完全停止し、Discord Gateway / Voice Gateway のハートビートが途絶えて全VCから切断された。
+  5. **二次災害③ (Bot #1 の再接続拒否ループ)**:
+     - `src/bot_pool.py` のインフライト予約（`_connecting_vcs`）に TTL（有効期限）がなく、かつ同一号機自身による再接続でも「接続中」として拒否していたため、Bot #1 が VC 'わっしょい' に永久に再接続できなくなっていた。
+
+- **対応内容**:
+  1. **即時復旧処置**:
+     - 滞留していた 86 個の孤児 `tar` プロセスを即時強制終了（`pkill -9 -f "tar -cf - -C"`）。
+     - これにより iowait が 73% ➔ **0〜7%**、ブロックプロセスが 8 ➔ **0** へ即座に正常化。
+     - ディスク解放に伴い `database is locked` が自然鎮火し、全Botが VC へ再接続完了。
+  2. **恒久対策①: 子プロセスリークの完全防止 & 同時実行数制限 (`src/web/static/agent.py` & `src/web/server.py`)**:
+     - `handle_model_download` および `api_worker_models_tar` に `try ... finally:` を配備し、切断・例外・キャンセル時を問わず `if proc.returncode is None: proc.kill(); await asyncio.shield(proc.wait())` を確実に実行。
+     - `asyncio.Semaphore(2)` を導入し、モデル配信プロセスの同時実行数を最大 2 並列に制限。
+  3. **恒久対策②: コネクションプール返却時の自動ロールバック保証 (`src/database.py`)**:
+     - `SQLitePool.acquire` の `finally` において、`if getattr(conn, "in_transaction", False): await conn.rollback()` を追加。未コミットトランザクションを持ったコネクションがプール滞留して他クエリを道連れロックするバグを 100% 根絶。
+  4. **恒久対策③: HA・Worker ハートビート同期ファイル書込のスロットリング (`src/web/server.py`)**:
+     - `_save_ha_nodes`（60秒間隔）および `_save_cluster_workers`（30秒間隔）にスロットリングを導入。毎秒の無駄な同期 `write_text` によるイベントループ停止を完全排除。
+  5. **恒久対策④: インフライト予約の TTL導入 & 自号機再接続救済 (`src/bot_pool.py`)**:
+     - `_connecting_vcs` にタイムスタンプを持たせ、`RESERVATION_TTL_SECONDS = 30.0` を導入。30秒超過のゾンビ予約を自動期限切れ化。
+     - 同一号機による再接続試行時は自号機の先行予約を自動上書き・更新して許可。
+  6. **バージョン更新 & テスト検証**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.10.28-2120"`, `AGENT_VERSION = "3.13.6"` に更新。
+     - サンドボックスコンテナにて全75件の単体テストを実行し、**100% PASS (OK)** を確認。テストコンテナは自動破棄済み。
+
+---
+
 ## [2026-10-28] GitHub Code Scanning (CodeQL CWE-022 パスインジェクション) アラート #91〜#94 の完全解消
 
 - **ユーザーフィードバック & 課題**:

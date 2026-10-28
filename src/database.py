@@ -104,6 +104,12 @@ class SQLitePool:
             yield conn
         finally:
             if conn is not None:
+                # 未コミットのトランザクションが残っている場合は必ずロールバック (排他ロック滞留による database is locked を完全防止)
+                if getattr(conn, "in_transaction", False):
+                    try:
+                        await conn.rollback()
+                    except Exception:
+                        pass
                 conn._last_used_at = time.monotonic()
 
             if not self._is_closed and conn is not None:

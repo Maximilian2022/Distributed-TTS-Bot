@@ -181,7 +181,10 @@ class WebServer:
         except Exception as e:
             logger.error(f"[HA] Failed to load ha_manager_nodes.json: {e}")
 
-    def _save_ha_nodes(self):
+    def _save_ha_nodes(self, force: bool = False):
+        now = time.time()
+        if not force and (now - getattr(self, "_last_ha_nodes_save_time", 0.0)) < 60.0:
+            return
         try:
             data = {
                 "slaves": self.ha_slaves,
@@ -189,6 +192,7 @@ class WebServer:
             }
             self.ha_nodes_file.parent.mkdir(parents=True, exist_ok=True)
             self.ha_nodes_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._last_ha_nodes_save_time = now
         except Exception as e:
             logger.error(f"[HA] Failed to save ha_manager_nodes.json: {e}")
 
@@ -202,12 +206,16 @@ class WebServer:
         except Exception as e:
             logger.error(f"[WorkerPersistence] Failed to load cluster_workers.json: {e}")
 
-    def _save_cluster_workers(self):
-        """登録済みクラスタWorker情報をディスクへアトミック保存"""
+    def _save_cluster_workers(self, force: bool = False):
+        """登録済みクラスタWorker情報をディスクへアトミック保存 (ハートビート時はスロットリング適用)"""
+        now = time.time()
+        if not force and (now - getattr(self, "_last_cluster_workers_save_time", 0.0)) < 30.0:
+            return
         try:
             data = {"workers": self.cluster_workers}
             self.cluster_workers_file.parent.mkdir(parents=True, exist_ok=True)
             self.cluster_workers_file.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._last_cluster_workers_save_time = now
         except Exception as e:
             logger.error(f"[WorkerPersistence] Failed to save cluster_workers.json: {e}")
 
@@ -292,6 +300,7 @@ class WebServer:
                 "os_name": os_name,
                 "docker_version": docker_version
             }
+            self._save_ha_nodes(force=True)
         else:
             entry = self.ha_slaves[node_id]
             entry["hostname"] = hostname or entry.get("hostname", "unknown")
@@ -323,7 +332,7 @@ class WebServer:
                 entry["os_name"] = os_name
             if docker_version:
                 entry["docker_version"] = docker_version
-        self._save_ha_nodes()
+            self._save_ha_nodes(force=False)
 
     async def _get_or_fetch_member(self, guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
         """
@@ -5610,8 +5619,6 @@ class WebServer:
             # ConnectionResetError / ClientConnectionResetError / ConnectionError (Connection lost) 等
             # Worker Agent がコンテナ再作成中に接続断が発生するのは正常動作
             # aiohttp の web_protocol.py に伝播させないよう raise せず return する
-            if proc.returncode is None:
-                proc.kill()
             err_name = type(e).__name__
             if any(k in err_name for k in ("Connection", "Reset", "Transport", "BrokenPipe")):
                 logger.warning(
@@ -5620,6 +5627,13 @@ class WebServer:
                 )
             else:
                 logger.error(f"❌ [ModelDownload] 予期しないエラー ({err_name}): {e}", exc_info=True)
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                    await asyncio.shield(proc.wait())
+                except Exception:
+                    pass
         return response
 
     async def _install_coeiroink_model_from_tar_file(self, clean_model_name: str, tar_path: Path) -> Tuple[bool, str]:

@@ -184,7 +184,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.13.5"
+    AGENT_VERSION = "3.13.6"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -3736,6 +3736,15 @@ async def handle_ram_flush(request: web.Request) -> web.Response:
     return web.json_response({"success": True, "message": "Emergency flush triggered"})
 
 
+_model_download_semaphore: Optional[asyncio.Semaphore] = None
+
+def _get_model_download_semaphore() -> asyncio.Semaphore:
+    global _model_download_semaphore
+    if _model_download_semaphore is None:
+        _model_download_semaphore = asyncio.Semaphore(2)
+    return _model_download_semaphore
+
+
 async def handle_model_download(request: web.Request) -> web.StreamResponse:
     """Master からの要請に応じて、Worker 保有の COEIROINK モデルを tar ストリームで高速配信 (項目⑲)"""
     model_name = request.match_info.get("model_name", "")
@@ -3780,44 +3789,49 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
 
-    if shutil.which("tar"):
-        proc = await asyncio.create_subprocess_exec(
-            "tar", "-cf", "-", "-C", str(model_dir), matched_dir_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        try:
-            while True:
-                chunk = await proc.stdout.read(64 * 1024)
-                if not chunk:
-                    break
-                await response.write(chunk)
-            await proc.wait()
-            await response.write_eof()
-        except asyncio.CancelledError:
-            if proc.returncode is None:
-                proc.kill()
-            raise
-    else:
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
-            tmp_tar = Path(tf.name)
-        try:
-            with tarfile.open(tmp_tar, "w") as tar:
-                tar.add(str(target_path), arcname=matched_dir_name)
-            with open(tmp_tar, "rb") as f:
+    sem = _get_model_download_semaphore()
+    async with sem:
+        if shutil.which("tar"):
+            proc = await asyncio.create_subprocess_exec(
+                "tar", "-cf", "-", "-C", str(model_dir), matched_dir_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            try:
                 while True:
-                    chunk = f.read(64 * 1024)
+                    chunk = await proc.stdout.read(64 * 1024)
                     if not chunk:
                         break
                     await response.write(chunk)
-            await response.write_eof()
-        finally:
-            if tmp_tar.exists():
-                try:
-                    tmp_tar.unlink()
-                except Exception:
-                    pass
+                await proc.wait()
+                await response.write_eof()
+            finally:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                        await asyncio.shield(proc.wait())
+                    except Exception:
+                        pass
+        else:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
+                tmp_tar = Path(tf.name)
+            try:
+                with tarfile.open(tmp_tar, "w") as tar:
+                    tar.add(str(target_path), arcname=matched_dir_name)
+                with open(tmp_tar, "rb") as f:
+                    while True:
+                        chunk = f.read(64 * 1024)
+                        if not chunk:
+                            break
+                        await response.write(chunk)
+                await response.write_eof()
+            finally:
+                if tmp_tar.exists():
+                    try:
+                        tmp_tar.unlink()
+                    except Exception:
+                        pass
 
     return response
 
