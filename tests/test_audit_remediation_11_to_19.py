@@ -849,6 +849,45 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fallback_url.startswith("http://"))
         self.assertTrue(":8088" in fallback_url)
 
+    def test_worker_agent_startup_sequence_order(self):
+        """Worker Agent 起動シーケンス (1.同一サブネットテスト ➔ 2.アップデート ➔ 3.モデル同期) の順序検証"""
+        from unittest.mock import AsyncMock, patch, MagicMock
+        from src.web.static.agent import WorkerAgent
+
+        agent = WorkerAgent.__new__(WorkerAgent)
+        agent.node_id = "test_node"
+        agent.local_ip = "192.168.11.200"
+        agent.specs = {"recommended_max_concurrent": 1, "recommended_priority": 1}
+        agent.ram_manager = None
+        agent._update_lock = MagicMock()
+        agent._update_lock.locked = MagicMock(return_value=False)
+
+        execution_order = []
+
+        async def mock_probe(candidates=None):
+            execution_order.append("1_subnet_probe")
+            return True
+
+        async def mock_register(deferred_model_sync=False):
+            execution_order.append("2_update_check")
+            return {
+                "update_available": False,
+                "models_to_upload": ["model_a"],
+                "models_to_pull": []
+            }
+
+        async def mock_upload(models):
+            execution_order.append("3_model_sync")
+
+        agent.register_to_master = mock_register
+        agent.upload_missing_models_to_master = mock_upload
+
+        with patch("src.web.static.agent.probe_and_promote_local_master", side_effect=mock_probe):
+            import asyncio
+            asyncio.run(agent.startup_sequence())
+
+        self.assertEqual(execution_order, ["1_subnet_probe", "2_update_check", "3_model_sync"])
+
 
 if __name__ == "__main__":
     unittest.main()

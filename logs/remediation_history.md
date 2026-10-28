@@ -8443,6 +8443,11 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   6. **ストリーミング配信切断 (ClientConnectionResetError) の安全捕捉 & Master Pull タイムアウト拡大**:
      - `src/web/static/agent.py`: `handle_model_download` でクライアント（Master）切断時に発生する `ClientConnectionResetError` / `ConnectionResetError` / `CancelledError` を `try...except` で適切に捕捉し、子プロセス（`tar`）を即座に `kill()` して未処理例外スタックトレースを抑止。
      - `src/web/server.py`: `_pull_missing_models_from_worker` のタイムアウトを大容量（2.2GB）対応として `sock_read=300.0`, `total=1800.0` に拡張。さらにハートビートごとの重複 Pull タスク生成を排他ガード。
+  7. **Agent 起動時シーケンスの厳格順序制御 (`startup_sequence` / Agent v3.13.8)**:
+     - ユーザー要望に基づき、Agent 起動時に「1. 同一サブネットテスト ➔ 2. アップデートチェック ➔ 3. ローカルモデル同期」の 3 段階を順番通りに確実に実行する `startup_sequence` を実装。
+     - 同一サブネットテスト: 自機 LAN IP から同一サブネットの Master 候補（`.245`, `.244`, `.1` 等）を自動探索・プローブし直接通信へ昇格。
+     - アップデートチェック: Master から新版（`update_available`）が指示された場合はモデル同期を保留して直ちに自己更新 & 再起動。
+     - ローカルモデル同期: バージョンが最新であることが保証された後、初めて COEIROINK モデル同期（Push/Pull）を安全に開始。
 - **検証結果**:
-  - サンドボックス隔離テスト（全79テスト）を実行し、**100% 合格（Ran 79 tests in 0.823s, OK）** を確認。一時コンテナは即座に完全破棄。
+  - サンドボックス隔離テスト（全80テスト）を実行し、**100% 合格（Ran 80 tests in 0.408s, OK）** を確認。一時コンテナは即座に完全破棄。
 

@@ -247,7 +247,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.13.7"
+    AGENT_VERSION = "3.13.8"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -2206,7 +2206,7 @@ hosts allow = *
                     except Exception as r_err:
                         logger.warning(f"⚠️ [ModelSync] COEIROINK 再起動エラー: {r_err}")
 
-    async def register_to_master(self) -> bool:
+    async def register_to_master(self, deferred_model_sync: bool = False) -> Union[bool, Dict[str, Any]]:
         """Master サーバーに自分自身を自動登録（ハードウェアスペック・保有モデルも送信）"""
         session = await self.get_session()
         master_url = get_master_url()
@@ -2248,6 +2248,10 @@ hosts allow = *
                     master_lan_url = data.get("master_lan_url")
                     if master_lan_url:
                         asyncio.create_task(probe_and_promote_local_master([master_lan_url]))
+
+                    if deferred_model_sync:
+                        return data
+
                     # Master から更新指示が出ている場合は、Model Sync を保留して最優先で自己アップデートを実行
                     if data.get("update_available"):
                         self._master_coordinates_updates = True
@@ -2269,10 +2273,65 @@ hosts allow = *
             logger.debug(f"Master ({master_url}) 未接続 (次回再試行): {e}")
         return False
 
+    async def startup_sequence(self) -> None:
+        """
+        Worker Agent 起動時シーケンス (厳密な順序制御):
+        ステップ 1: [同一サブネットテスト] ローカル / 同一LAN 内の Master への疎通プローブ & 昇格
+        ステップ 2: [アップデートチェック] Master とのバージョン照合 & 新版があれば最優先で自己更新・再起動
+        ステップ 3: [ローカルモデル同期] 最新版保証の元で COEIROINK モデルの同期 (Push/Pull) を開始
+        """
+        logger.info("🎬 [Startup] Worker Agent 起動時シーケンスを開始します...")
+
+        # --- ステップ 1: 同一サブネットテスト ---
+        logger.info("📡 [Startup 1/3] 同一サブネットテスト: ローカル/LAN Master への直接通信を検証中...")
+        candidates = ["http://127.0.0.1:8088", "http://localhost:8088"]
+        my_ip = get_local_ip()
+        if my_ip and "." in my_ip:
+            subnet_prefix = my_ip.rsplit(".", 1)[0]
+            for last_octet in ["245", "244", "1", "2"]:
+                cand = f"http://{subnet_prefix}.{last_octet}:8088"
+                if cand not in candidates:
+                    candidates.append(cand)
+        for u in MASTER_CANDIDATE_URLS:
+            if is_private_or_local_url(u) and u not in candidates:
+                candidates.append(u)
+
+        promoted = await probe_and_promote_local_master(candidates)
+        if promoted:
+            logger.info(f"✅ [Startup 1/3] 同一サブネット/ローカル Master ({get_master_url()}) を最優先に採用しました。")
+        else:
+            logger.info(f"ℹ️ [Startup 1/3] 同一サブネット/ローカル Master は未検出のため、指定 URL ({get_master_url()}) で接続します。")
+
+        # --- ステップ 2: Master 登録 & アップデートチェック ---
+        logger.info(f"🔍 [Startup 2/3] アップデートチェック: Master ({get_master_url()}) へ登録しバージョンを確認中...")
+        reg_result = await self.register_to_master(deferred_model_sync=True)
+        if isinstance(reg_result, dict):
+            if reg_result.get("update_available"):
+                logger.info("🚀 [Startup 2/3] Master から新バージョンの配信を検知しました。モデル同期を保留し、最優先で自己アップデートを実行します！")
+                self._master_coordinates_updates = True
+                await self.self_update(update_agent=True, update_engines=True, full=reg_result.get("require_full", False))
+                return
+            logger.info("✅ [Startup 2/3] バージョンは最新です (v%s)。", AGENT_VERSION)
+
+            # --- ステップ 3: ローカルモデル同期 ---
+            logger.info("📦 [Startup 3/3] ローカルモデル同期: COEIROINK モデル同期を開始します...")
+            models_to_upload = reg_result.get("models_to_upload")
+            if models_to_upload:
+                asyncio.create_task(self.upload_missing_models_to_master(models_to_upload))
+            models_to_pull = reg_result.get("models_to_pull")
+            if models_to_pull:
+                asyncio.create_task(self.pull_missing_models_from_master(models_to_pull))
+            logger.info("🎉 [Startup] 起動時シーケンスがすべて正常に完了しました！")
+        else:
+            logger.warning("⚠️ [Startup] Master への初期登録に失敗したため、後続の定期ハートビートで再試行します。")
+
     async def heartbeat_loop(self):
         """Master への定期ハートビート送信ループ (通常25秒間隔 / 切断時5秒高速リトライ ＆ Multi-Master自律切替)"""
-        # 初回登録を試みる
-        registered = await self.register_to_master()
+        # 初回登録を試みる (未登録の場合のみ)
+        if not self.registered_to_master:
+            registered = await self.register_to_master()
+        else:
+            registered = True
         retry_count = 0
         interval = 25 if registered else 5
         last_primary_check_time = time.time()
@@ -3959,12 +4018,6 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
 
 
 async def main():
-    # 起動直後にローカル/同一ホストの Master への直接疎通をプローブ
-    try:
-        await probe_and_promote_local_master()
-    except Exception as e:
-        logger.debug(f"Initial local Master probe: {e}")
-
     agent = WorkerAgent()
     agent.start_rsync_daemon()
 
@@ -4015,7 +4068,10 @@ async def main():
 
     logger.info(f"🚀 Worker Agent API サーバー起動: http://0.0.0.0:{AGENT_PORT}  node_id={NODE_ID}")
 
-    # バックグラウンドループ開始 (heartbeat_loop内で初回登録も行う)
+    # 起動時シーケンス (1. 同一サブネットテスト ➔ 2. アップデートチェック ➔ 3. ローカルモデル同期) を開始
+    asyncio.create_task(agent.startup_sequence())
+
+    # 定常バックグラウンドループ開始 (heartbeat_loop / watchdog / monitoring)
     asyncio.create_task(agent.auto_idle_monitor())
     asyncio.create_task(agent.heartbeat_loop())
     asyncio.create_task(agent.engine_watchdog_loop())
