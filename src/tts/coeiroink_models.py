@@ -1,4 +1,5 @@
 import os
+import re
 import io
 import time
 import json
@@ -76,7 +77,6 @@ class CoeiroinkModelManager:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 if resp.status == 200:
                     html = resp.read().decode("utf-8", errors="replace")
-                    import re
                     m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
                     if m:
                         data = json.loads(m.group(1))

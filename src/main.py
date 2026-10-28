@@ -11,6 +11,7 @@ import signal
 import asyncio
 import time
 import logging
+import traceback
 from logging.handlers import RotatingFileHandler
 import discord
 from discord.ext import commands
@@ -28,6 +29,13 @@ from src.disaster.service import DisasterAlertService
 from src.utils.log_handler import TwoStageZstdRotatingHandler
 from src.resource_manager import LocalEngineResourceManager
 from src.utils.async_task import safe_create_task
+from src.utils.alert_service import alert_service, CATEGORY_BOT, SEVERITY_ERROR
+from src.utils.latency_tracker import latency_tracker
+from src.utils.latency_profiler import latency_profiler
+from src.utils.worker_log_collector import worker_log_collector
+from src.cache_prewarm import IntelligentPrewarmService
+from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
+from src.utils.text_cleaner import warmup_morphological_tokenizers
 
 def setup_logger(bot_log_path: str, web_log_path: str) -> logging.Logger:
     """コンソールと logs/bot.log、さらに WebUI 用の logs/web.log を設定 (2段階ハイブリッドローテーション対応)"""
@@ -140,7 +148,6 @@ class TTSBot(commands.Bot):
 
         self.web_server = getattr(bot_pool, "web_server", None)
         if self.bot_index == 1:
-            from src.cache_prewarm import IntelligentPrewarmService
             self.prewarm_service = IntelligentPrewarmService(
                 tts_manager=self.tts_manager,
                 cache_manager=self.cache_manager,
@@ -153,14 +160,11 @@ class TTSBot(commands.Bot):
         # 1. メインBot (1号機) のみの初期化処理
         if self.bot_index == 1:
             # 障害検知・管理者DM通知サービスの初期化
-            from src.utils.alert_service import alert_service
             alert_service.set_bot(self, db=self.db)
 
             # データベース初期化 (WALモード・マイグレーション)
             await self.db.init_db()
             # レイテンシトラッカーへのDB連携 & 過去計測履歴の復元 (Profilerのウォームスタート含む)
-            from src.utils.latency_tracker import latency_tracker
-            from src.utils.latency_profiler import latency_profiler
             latency_tracker.set_db(self.db)
             saved_latencies = await self.db.get_recent_playback_latencies(limit=200)
             if saved_latencies:
@@ -174,7 +178,6 @@ class TTSBot(commands.Bot):
             if self.disaster_service:
                 self.disaster_service.start()
             # ワーカーノードログ自動集約サービス起動 (各Workerから定期ログ収集・ファイル保存)
-            from src.utils.worker_log_collector import worker_log_collector
             safe_create_task(worker_log_collector.start(), name="worker_log_collector_start")
             # 知能的プリキャッシュサービス起動 (アイドル時の自動キャッシュウォーム)
             if self.prewarm_service:
@@ -222,11 +225,9 @@ class TTSBot(commands.Bot):
 
     async def on_error(self, event_method: str, *args, **kwargs) -> None:
         """Discord.py イベント内の未処理エラーをキャッチして管理者DM通知"""
-        import traceback
         tb = traceback.format_exc()
         logging.error(f"Unhandled error in event {event_method}:\n{tb}")
         try:
-            from src.utils.alert_service import alert_service, CATEGORY_BOT, SEVERITY_ERROR
             alert_service.notify(
                 title=f"Botイベント未処理例外 ({event_method})",
                 message=f"Bot #{self.bot_index} のイベント `{event_method}` 処理中に未処理の例外が発生しました。",
@@ -239,12 +240,10 @@ class TTSBot(commands.Bot):
 
     async def on_tree_error(self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError) -> None:
         """スラッシュコマンド実行時エラーをキャッチして管理者DM通知"""
-        import traceback
         tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
         cmd_name = interaction.command.name if interaction.command else "不明なコマンド"
         logging.error(f"Slash command error in /{cmd_name}: {error}\n{tb}")
         try:
-            from src.utils.alert_service import alert_service, CATEGORY_BOT, SEVERITY_ERROR
             alert_service.notify(
                 title=f"スラッシュコマンド例外 (/{cmd_name})",
                 message=f"ユーザー `{interaction.user}` による `/{cmd_name}` の実行中にエラーが発生しました。\n**エラー**: {error}",
@@ -420,7 +419,6 @@ async def main():
     async def broadcast_pinned_models_to_workers():
         try:
             await asyncio.sleep(8.0)  # Worker自動登録の完了を待機
-            from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
             dyn_limit = get_dynamic_pin_limit()
             speaker_ids = await db.get_pinned_coeiroink_speaker_ids(limit=dyn_limit, active_days=30)
             pinned_models = set()
@@ -474,11 +472,9 @@ async def main():
     def loop_exception_handler(l, context):
         msg = context.get("message", "Unhandled asyncio exception")
         exc = context.get("exception")
-        import traceback
         details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else str(context)
         logging.error(f"Asyncio Loop Unhandled Exception: {msg}\n{details}")
         try:
-            from src.utils.alert_service import alert_service, CATEGORY_BOT, SEVERITY_ERROR
             alert_service.notify(
                 title="非同期タスク未処理例外",
                 message=f"イベントループで未処理例外が発生しました: {msg}",
@@ -563,7 +559,6 @@ async def main():
 
     # 形態素解析エンジン (SudachiPy / Janome) の事前ウォームアップを別スレッドで安全に実行 (PERF-WARMUP)
     try:
-        from src.utils.text_cleaner import warmup_morphological_tokenizers
         await asyncio.to_thread(warmup_morphological_tokenizers)
     except Exception as e:
         logging.warning(f"Failed to pre-warm morphological tokenizers: {e}")

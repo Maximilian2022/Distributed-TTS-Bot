@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import base64
 import logging
+from urllib.parse import urlencode
 from typing import Optional, Dict, Any, List
 import aiohttp
 from aiohttp import web
@@ -50,7 +51,6 @@ class DiscordAuth:
 
     def get_login_url(self, state: str = "") -> str:
         """Discord OAuth2 認可URLを生成"""
-        from urllib.parse import urlencode
         params = {
             "client_id": self.client_id,
             "redirect_uri": self.redirect_uri,

@@ -5,11 +5,18 @@ import time
 import logging
 import asyncio
 import urllib.parse
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from collections import deque
 from dataclasses import asdict
 import aiosqlite
+import sqlite3
+import gzip
+import zipfile
+import hmac
+import wave
+import shutil
 import base64
 import secrets
 from datetime import datetime
@@ -25,7 +32,7 @@ import aiohttp
 from aiohttp import web
 import discord
 
-from src.config import AppConfig, save_yaml_config
+from src.config import AppConfig, save_yaml_config, reload_config, TTSNodeConfig
 from src.database import Database
 from src.cache_manager import CacheManager
 from src.tts.manager import TTSManager
@@ -34,6 +41,25 @@ from src.tts.mycoeiroink import MyCoeiroinkManager
 from src.version import BUILD_VERSION, BUILD_DATE, AGENT_VERSION, sync_agent_py_version
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
+from src.utils.latency_profiler import latency_profiler
+from src.utils.alert_service import alert_service, SEVERITY_INFO, CATEGORY_BOT
+from src.utils.worker_log_collector import worker_log_collector
+from src.utils.model_manifest import build_all_models_summary, build_model_manifest
+from src.utils.text_cleaner import TextCleaner
+from src.cogs.vc_handler import QueueItem
+import src.tts.node_pool as node_pool
+from src.tts.node_pool import (
+    scan_local_coeiroink_models,
+    register_dynamic_coeiroink_models,
+    DRAINING_HOSTS,
+    get_all_tier_routing_orders,
+    DEFAULT_TIER_ROUTING_ORDER,
+    SUPPORTED_ROUTING_ENGINES,
+    TIER_METADATA,
+    save_tier_routing_to_disk,
+)
+from src.tts.ws_node_adapter import WSWorkerNode
+from src.tts.protocols.worker_protocol import unpack_binary_chunk, HeartbeatMessage
 from src.utils.avatar_manager import get_avatar_path, has_avatar
 from src.utils.security import validate_safe_worker_ip, sanitize_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script, sanitize_filename, is_private_or_local_ip
 from src.utils.system_info import get_host_system_info
@@ -591,7 +617,6 @@ class WebServer:
             dash_url = getattr(self.config, "web_dashboard_url", "")
             if dash_url:
                 try:
-                    from urllib.parse import urlparse
                     d_host = urlparse(dash_url).hostname
                     if d_host:
                         allowed_hosts.add(d_host.lower())
@@ -602,7 +627,6 @@ class WebServer:
             for check_url in (origin, referer):
                 if check_url:
                     try:
-                        from urllib.parse import urlparse
                         p_host = urlparse(check_url).hostname
                         if p_host and (p_host.lower() in allowed_hosts or p_host.startswith("192.168.") or p_host.startswith("10.") or p_host.startswith("172.")):
                             valid_csrf = True
@@ -957,7 +981,6 @@ class WebServer:
         if not ha_secret:
             ha_secret = await self.db.get_credential("ha_secret")
         if not ha_secret:
-            import secrets
             ha_secret = secrets.token_urlsafe(24)
             await self.db.set_credential("ha_secret", ha_secret, is_secret=True)
             self.config.ha_secret = ha_secret
@@ -1092,8 +1115,6 @@ class WebServer:
 
     async def handle_volunteer_zip(self, request: web.Request) -> web.Response:
         """Windows向けボランティアツール一式 (zip) をオンザフライ生成して配信"""
-        import io
-        import zipfile
         worker_dir = Path(__file__).resolve().parent / "static" / "volunteer"
         if not worker_dir.exists():
             worker_dir = Path("/app/worker")
@@ -1346,7 +1367,6 @@ class WebServer:
         loop = asyncio.get_running_loop()
 
         def _generate_compressed_snapshot():
-            import sqlite3, gzip, hashlib, tempfile
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_f:
                 tmp_path = tmp_f.name
             try:
@@ -1519,7 +1539,6 @@ class WebServer:
         loop = asyncio.get_running_loop()
 
         def _generate_cache_archive_file() -> Tuple[Optional[str], int, int]:
-            import sqlite3, tarfile, tempfile
             db_path = getattr(self.config, "db_path", "/app/data/bot.db")
             if not os.path.exists(db_path):
                 return None, 0, 0
@@ -1967,7 +1986,6 @@ class WebServer:
                 content_type="text/html",
                 status=500
             )
-        import secrets
         state = secrets.token_urlsafe(32)
         login_url = self.auth.get_login_url(state=state)
         response = web.HTTPFound(login_url)
@@ -1994,7 +2012,6 @@ class WebServer:
             raise resp
 
         # CSRF state パラメータ検証
-        import hmac
         if not expected_state or not received_state or not hmac.compare_digest(expected_state, received_state):
             logger.warning(
                 f"OAuth2 CSRF state mismatch. Expected={bool(expected_state)}, Received={bool(received_state)}"
@@ -2765,7 +2782,6 @@ class WebServer:
         await self._require_admin(request)
 
         try:
-            from src.config import reload_config
             reload_config(self.config)
 
             # DBキャッシュをクリア
@@ -2905,7 +2921,6 @@ class WebServer:
             metrics_data["latency"] = {}
 
         try:
-            from utils.latency_profiler import latency_profiler
             metrics_data["profiler"] = latency_profiler.get_all_stats()
         except Exception as e:
             logger.debug(f"Failed to get profiler stats: {e}")
@@ -2925,7 +2940,6 @@ class WebServer:
         if not (perms["is_admin"] or perms["has_role"]):
             return web.json_response({"error": "Access denied."}, status=403)
         try:
-            from utils.latency_profiler import latency_profiler
             stats = latency_profiler.get_all_stats()
             return web.json_response({
                 "success": True,
@@ -2956,11 +2970,6 @@ class WebServer:
         messages = body.get("messages", [])
         if not messages:
             return web.json_response({"error": "No messages provided"}, status=400)
-
-        import wave
-        import io
-        from src.cogs.vc_handler import QueueItem
-        from src.utils.text_cleaner import TextCleaner
 
         mode = body.get("mode", "streaming")
         test_queue = asyncio.Queue()
@@ -3669,7 +3678,6 @@ class WebServer:
                 return web.json_response({"error": "チャンクアップロードのパラメータが不足しています。"}, status=400)
 
             # パストラバーサル防止のため upload_id を検証
-            import re
             if not re.match(r"^[a-zA-Z0-9_\-]+$", upload_id):
                 return web.json_response({"error": "無効な upload_id です。"}, status=400)
 
@@ -3703,7 +3711,6 @@ class WebServer:
                 logger.info(f"[MYCOEIROINK Chunk Upload] 結合完了 ({len(combined_zip) / 1024 / 1024:.2f} MB)。安全展開を実施します...")
 
                 # 一時ディレクトリのクリーンアップ
-                import shutil
                 shutil.rmtree(chunk_dir, ignore_errors=True)
                 chunk_dir = None
 
@@ -3729,13 +3736,11 @@ class WebServer:
         except ValueError as ve:
             logger.warning(f"[MYCOEIROINK Chunk Upload Rejected] バリデーション失敗: {ve}")
             if chunk_dir and chunk_dir.exists():
-                import shutil
                 shutil.rmtree(chunk_dir, ignore_errors=True)
             return web.json_response({"error": str(ve)}, status=400)
         except Exception as e:
             logger.error(f"[MYCOEIROINK Chunk Upload Error] チャンク処理例外: {e}", exc_info=True)
             if chunk_dir and chunk_dir.exists():
-                import shutil
                 shutil.rmtree(chunk_dir, ignore_errors=True)
             return web.json_response({"error": f"アップロード処理中にエラーが発生しました: {e}"}, status=500)
 
@@ -4173,7 +4178,6 @@ class WebServer:
             bearer_token = auth_header[7:].strip()
 
         token = bearer_token or request.headers.get("X-Worker-Token") or request.query.get("token") or ""
-        import hmac
         if secret and token:
             if hmac.compare_digest(token, secret):
                 return True
@@ -4269,8 +4273,7 @@ class WebServer:
         - models_to_pull: Master にあり Worker に無いモデル名リスト (Worker が Master から Pull)
         - models_to_upload: Worker にあり Master に無いモデル名リスト (Worker が Master へ Push / Master が Pull)
         """
-        from src.tts.node_pool import scan_local_coeiroink_models, register_dynamic_coeiroink_models
-        master_map = scan_local_coeiroink_models()
+        master_map = node_pool.scan_local_coeiroink_models()
         master_models = {str(k).strip() for k in master_map.keys() if k and is_safe_identifier(str(k).strip())}
 
         if isinstance(worker_models_map_raw, dict) and worker_models_map_raw:
@@ -4354,7 +4357,6 @@ class WebServer:
             if not port:
                 continue
 
-            from src.config import TTSNodeConfig
             node_config = TTSNodeConfig(
                 id=f"{node_id}_{engine_name}",
                 url=f"http://{ip}:{port}",
@@ -4377,7 +4379,6 @@ class WebServer:
             registered_engines.append(engine_name)
 
         try:
-            from src.utils.worker_log_collector import worker_log_collector
             worker_log_collector.register_worker(node_id, ip)
         except Exception:
             pass
@@ -4704,7 +4705,6 @@ class WebServer:
         # 旧 Agent は update_available を無視するため、許可しても更新されずドレインだけが続いてしまう (従来の毎時チェックに任せる)
         piggyback_capable = bool(agent_version) and not _version_is_newer(self.PIGGYBACK_MIN_AGENT_VERSION, agent_version)
 
-        from src.tts.node_pool import DRAINING_HOSTS
         now = time.time()
         active_piggyback = getattr(self, "_piggyback_updating_host", None)
         piggyback_at = getattr(self, "_piggyback_updating_at", 0.0)
@@ -4914,7 +4914,6 @@ class WebServer:
             seen_ips = set()
             for pool in [self.tts_manager.voicevox_pool, self.tts_manager.sharevox_pool, self.tts_manager.coeiroink_pool]:
                 for node in pool.nodes:
-                    from urllib.parse import urlparse
                     parsed = urlparse(node.url)
                     ip = parsed.hostname
                     port = getattr(node, "agent_port", 50030) or 50030
@@ -4952,7 +4951,6 @@ class WebServer:
         if not targets:
             return web.json_response({"success": False, "error": "更新対象のワーカーノードが見つかりません。"}, status=404)
 
-        import aiohttp
         async def _notify_worker(t: Dict[str, Any]) -> Dict[str, Any]:
             ip = t["ip"]
             if not validate_safe_worker_ip(ip):
@@ -5009,7 +5007,6 @@ class WebServer:
 
     @staticmethod
     async def _agent_health(session, base: str) -> Optional[Dict[str, Any]]:
-        import aiohttp
         try:
             async with session.get(f"{base}/health", timeout=aiohttp.ClientTimeout(total=4.0)) as r:
                 if r.status == 200:
@@ -5071,8 +5068,6 @@ class WebServer:
 
     async def _rolling_process_host(self, host: Dict[str, Any], action: str, full: bool,
                                     state: Dict[str, Any]) -> Tuple[bool, str]:
-        import aiohttp
-        from src.tts.node_pool import DRAINING_HOSTS
         ip, base = host["ip"], f"http://{host['ip']}:{host['agent_port']}"
         DRAINING_HOSTS.add(ip)
         logger.info(f"🔁 [Rolling {action}] {host['label']} ({ip}) をドレインして処理を開始します。")
@@ -5202,8 +5197,6 @@ class WebServer:
             if not user:
                 return web.json_response({"error": "Unauthorized"}, status=401)
 
-        from src.utils.worker_log_collector import worker_log_collector
-
         node_id = request.query.get("node_id", "").strip()
         target = request.query.get("target", "agent").lower()
         lines = int(request.query.get("lines", request.query.get("tail", "100")))
@@ -5257,7 +5250,6 @@ class WebServer:
         # ファイルが未生成の場合は、直接ワーカーへHTTPフェッチを試みる (フォールバック)
         if safe_target_ip and validate_safe_worker_ip(safe_target_ip):
             try:
-                import aiohttp
                 safe_target = sanitize_filename(str(target))
                 if not safe_target:
                     safe_target = "agent"
@@ -5454,7 +5446,6 @@ class WebServer:
         if not model_dir.exists():
             return web.json_response({"models": [], "total_count": 0})
 
-        from src.utils.model_manifest import build_all_models_summary
         summaries = await asyncio.to_thread(build_all_models_summary, model_dir)
         models = []
         for s in summaries:
@@ -5483,7 +5474,6 @@ class WebServer:
         if not target_path or not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
             return web.Response(text="Model not found", status=404)
 
-        from src.utils.model_manifest import build_model_manifest
         manifest = await asyncio.to_thread(build_model_manifest, target_path)
         if not manifest:
             return web.Response(text="Failed to build manifest", status=500)
@@ -5637,7 +5627,6 @@ class WebServer:
         一時 tar ファイルから COEIROINK モデルをステージング展開・検証し、
         /app/coeiroink_models/{clean_model_name} へアトミック配置してボイスレジストリを更新する共通処理 (項目⑲)。
         """
-        import shutil
         model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
         model_dir.mkdir(parents=True, exist_ok=True)
         final_dir = validate_safe_path(model_dir, clean_model_name)
@@ -5698,8 +5687,7 @@ class WebServer:
 
         ok, msg = await asyncio.to_thread(_extract_and_promote)
         if ok:
-            from src.tts.node_pool import scan_local_coeiroink_models
-            scan_local_coeiroink_models(str(model_dir))
+            node_pool.scan_local_coeiroink_models(str(model_dir))
             if self.tts_manager and hasattr(self.tts_manager, "initialize_coeiroink"):
                 try:
                     await self.tts_manager.initialize_coeiroink()
@@ -5803,8 +5791,7 @@ class WebServer:
 
         # ディスク空き容量の事前確認 (最低 500MB 以上の空きを確保)
         try:
-            import shutil as _shutil
-            free_bytes = _shutil.disk_usage(str(model_dir)).free
+            free_bytes = shutil.disk_usage(str(model_dir)).free
             if free_bytes < 500 * 1024 * 1024:
                 return web.json_response({"error": "Insufficient disk space on Master"}, status=507)
         except Exception:
@@ -5885,7 +5872,6 @@ class WebServer:
                 "error": "管理者パスワードが未設定です。.env の ADMIN_PASSWORD を設定してください。"
             }, status=403)
 
-        import hmac
         if not hmac.compare_digest(password, expected):
             attempts.append(now)
             self._failed_password_attempts[client_ip] = attempts
@@ -6075,7 +6061,6 @@ class WebServer:
         # システム共通エラー通知先DiscordユーザーID
         system_contact_id = await self.db.get_credential("error_contact_user_id")
         if not system_contact_id:
-            from src.utils.alert_service import alert_service
             system_contact_id = str(alert_service.INITIAL_DEFAULT_CONTACT_ID)
 
         # HA共有認証シークレット (Master-Slave間)
@@ -6083,7 +6068,6 @@ class WebServer:
         if not ha_secret:
             ha_secret = await self.db.get_credential("ha_secret")
         if not ha_secret:
-            import secrets
             ha_secret = secrets.token_urlsafe(24)
             await self.db.set_credential("ha_secret", ha_secret, is_secret=True)
             self.config.ha_secret = ha_secret
@@ -6247,7 +6231,6 @@ class WebServer:
                 if raw_ec_id.isdigit():
                     await self.db.set_credential("error_contact_user_id", raw_ec_id)
                 elif not raw_ec_id:
-                    from src.utils.alert_service import alert_service
                     await self.db.set_credential("error_contact_user_id", str(alert_service.INITIAL_DEFAULT_CONTACT_ID))
 
             # ホットリロード
@@ -6292,8 +6275,6 @@ class WebServer:
 
             target_user_id_raw = data.get("target_user_id")
             explicit_target_id = int(target_user_id_raw) if target_user_id_raw and str(target_user_id_raw).isdigit() else None
-
-            from src.utils.alert_service import alert_service, SEVERITY_INFO, CATEGORY_BOT
 
             resolved_id = await alert_service.resolve_target_user_id(guild_id=guild_id, explicit_target_id=explicit_target_id)
             if not resolved_id or resolved_id <= 0:
@@ -6562,12 +6543,6 @@ class WebServer:
     async def api_system_get_tier_routing(self, request: web.Request) -> web.Response:
         """エンジン毎の動的 Tier ルーティング設定を取得 (管理者のみ)"""
         await self._require_admin(request)
-        from src.tts.node_pool import (
-            get_all_tier_routing_orders,
-            DEFAULT_TIER_ROUTING_ORDER,
-            SUPPORTED_ROUTING_ENGINES,
-            TIER_METADATA
-        )
         return web.json_response({
             "status": "ok",
             "engines": get_all_tier_routing_orders(),
@@ -6579,7 +6554,6 @@ class WebServer:
     async def api_system_save_tier_routing(self, request: web.Request) -> web.Response:
         """エンジン毎の動的 Tier ルーティング設定を保存 (管理者のみ)"""
         await self._require_admin(request)
-        from src.tts.node_pool import save_tier_routing_to_disk, get_all_tier_routing_orders
         try:
             body = await request.json()
         except Exception:
@@ -6634,12 +6608,6 @@ class WebServer:
         logger.info(f"🔌 [WorkerWS] New WebSocket connection from {request.remote}")
 
         try:
-            from src.tts.ws_node_adapter import WSWorkerNode
-            from src.tts.protocols.worker_protocol import (
-                unpack_binary_chunk,
-                HeartbeatMessage
-            )
-
             async for msg in ws:
                 if msg.type == web.WSMsgType.BINARY:
                     if ws_node is not None:
@@ -6746,7 +6714,6 @@ class WebServer:
                             if data.get("error"):
                                 ws_node.on_error(req_id, data["error"])
                             else:
-                                import base64
                                 audio_bytes = base64.b64decode(data.get("audio_b64", ""))
                                 ws_node.on_binary_chunk(req_id, 0, True, audio_bytes)
 

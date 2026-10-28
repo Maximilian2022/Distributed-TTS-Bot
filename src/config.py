@@ -1,6 +1,7 @@
 import os
 import re
 import yaml
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
@@ -359,7 +360,6 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.web_dashboard_url = base_url
     cfg.discord_redirect_uri = os.getenv("DISCORD_REDIRECT_URI", f"{base_url}/callback").strip()
 
-    import secrets
     cfg.web_session_secret = os.getenv("WEB_SESSION_SECRET", cfg.web_session_secret) or os.getenv("SESSION_SECRET", "")
     if not cfg.web_session_secret:
         cfg.web_session_secret = secrets.token_hex(32)

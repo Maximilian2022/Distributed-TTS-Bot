@@ -3,8 +3,10 @@ import json
 import asyncio
 import time
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
+from src.cache_manager import CacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +97,6 @@ class IntelligentPrewarmService:
                 await asyncio.sleep(15.0)
 
                 # 1. 早朝 (JST 04:30 〜 04:50) の日次投機的生成 (1日1回・最閑散時間帯に実行)
-                from datetime import datetime, timezone, timedelta
                 jst_now = datetime.now(timezone(timedelta(hours=9)))
                 today_str = jst_now.strftime("%Y-%m-%d")
                 if jst_now.hour == 4 and 30 <= jst_now.minute <= 50:
@@ -136,7 +137,6 @@ class IntelligentPrewarmService:
                         # キャッシュ有無を高速確認
                         voice_cfg = getattr(self.tts, "_get_voice_config", lambda s: None)(spk)
                         provider = voice_cfg.provider if voice_cfg else "edge"
-                        from src.cache_manager import CacheManager
                         cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
 
                         cached = await self.cache.get(cache_key, provider=provider)
@@ -214,8 +214,6 @@ class IntelligentPrewarmService:
                 target_speakers = self._get_target_speakers()
 
             logger.info(f"🎯 [Speculative Prewarm] Candidates: {len(target_phrases)} phrases, Speakers: {target_speakers}")
-
-            from src.cache_manager import CacheManager
 
             # プロバイダーごとにグループ化
             speakers_by_provider: Dict[str, List[str]] = {}

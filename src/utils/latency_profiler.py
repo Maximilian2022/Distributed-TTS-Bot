@@ -1,6 +1,7 @@
 import time
 import logging
 import re
+from urllib.parse import urlparse
 from typing import Dict, Any, Optional, Tuple, List
 
 logger = logging.getLogger(__name__)
@@ -218,7 +219,6 @@ class EngineLatencyProfiler:
         ip = ""
         if url:
             try:
-                from urllib.parse import urlparse
                 ip = urlparse(url).hostname or ""
             except Exception:
                 pass

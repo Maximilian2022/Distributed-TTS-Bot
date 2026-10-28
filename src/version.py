@@ -1,19 +1,20 @@
+import re
+from pathlib import Path
+
 # src/version.py
 """
 アプリケーションおよびWebUIのバージョン・ビルド番号管理。
 デプロイ・更新時に更新することで、ブラウザキャッシュの無効化と画面上でのバージョン確認を可能にします。
 """
 
-BUILD_VERSION = "v2026.10.28-1830"
-BUILD_DATE = "2026-10-28 18:30:00 JST"
+BUILD_VERSION = "v2026.10.28-1937"
+BUILD_DATE = "2026-10-28 19:37:00 JST"
 APP_NAME = "Distributed TTS Discord Bot"
 AGENT_VERSION = "3.13.4"  # 最新 Worker Agent バージョン (単一管理元: SSOT)
 
 
 def sync_agent_py_version() -> bool:
     """リポジトリ内の agent.py の AGENT_VERSION 定義を src/version.py と自動同期する"""
-    import re
-    from pathlib import Path
     agent_path = Path(__file__).resolve().parent / "web" / "static" / "agent.py"
     if not agent_path.exists():
         return False

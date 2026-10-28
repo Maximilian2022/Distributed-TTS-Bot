@@ -9,6 +9,7 @@ import asyncio
 import time
 import logging
 import uuid
+from dataclasses import asdict
 from typing import Dict, Any, Optional, List, Union
 from aiohttp import web
 
@@ -212,7 +213,6 @@ class WSWorkerNode(TTSNode):
         self.total_requests += 1
 
         try:
-            from dataclasses import asdict
             await self.ws.send_json(asdict(req))
             audio_data = await asyncio.wait_for(fut, timeout=timeout_seconds)
             latency_ms = (time.time() - t0) * 1000.0

@@ -13,8 +13,15 @@ import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Set, Tuple
 import aiohttp
+from urllib.parse import urlparse
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from src.utils.async_task import safe_create_task
+from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
+from src.tts.coeiroink_tts import build_coeiroink_warmup_payload
 
 logger = logging.getLogger(__name__)
 
@@ -482,7 +489,6 @@ class LocalEngineResourceManager:
                 for n in pool.nodes:
                     if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
                         try:
-                            from urllib.parse import urlparse
                             p = urlparse(n.url)
                             if p.hostname and p.hostname not in ("localhost", "127.0.0.1", LOCAL_HOST_IP):
                                 external_ips.add(p.hostname)
@@ -708,7 +714,6 @@ class LocalEngineResourceManager:
                 for n in pool.nodes:
                     if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
                         try:
-                            from urllib.parse import urlparse
                             p = urlparse(n.url)
                             if p.hostname and p.hostname not in ("localhost", "127.0.0.1"):
                                 worker_targets.append((p.hostname, prov, n))
@@ -804,7 +809,6 @@ class LocalEngineResourceManager:
         for n in nodes:
             if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
                 try:
-                    from urllib.parse import urlparse
                     p = urlparse(n.url)
                     if p.hostname and p.hostname not in ("localhost", "127.0.0.1"):
                         worker_ips.add(p.hostname)
@@ -831,7 +835,6 @@ class LocalEngineResourceManager:
 
         # 1. DB ピン留めモデル (直近30日アクティブ優先・ホストRAMに応じた動的上限)
         try:
-            from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
             mem_gb = self.get_system_memory_info().get("total_gb", 0.0)
             dyn_limit = get_dynamic_pin_limit(mem_gb)
             if hasattr(self.db, "get_pinned_coeiroink_speaker_ids"):
@@ -990,9 +993,7 @@ class LocalEngineResourceManager:
             return
 
         now = time.time()
-        from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
         for node in ext_nodes:
-            from urllib.parse import urlparse
             p = urlparse(node.url)
             ip = p.hostname
             if not ip or ip in ("localhost", "127.0.0.1"):
@@ -1162,7 +1163,6 @@ class LocalEngineResourceManager:
                         logger.info(f"✨ [Pre-warm] COEIROINK local container ready. Skipped local CPU dummy inference because external GPU worker is available.")
                         return True
 
-                    from src.tts.coeiroink_tts import build_coeiroink_warmup_payload
                     voice_name = getattr(voice_cfg, "voice_name", "")
                     payload = build_coeiroink_warmup_payload(voice_name)
                     if payload:
@@ -1438,8 +1438,8 @@ class LocalEngineResourceManager:
         bot_stat = containers_stats.get("bot")
         if not bot_stat or bot_stat.get("status") != "running" or (bot_stat.get("mem_mb", 0) == 0 and bot_stat.get("cpu_percent", 0) == 0):
             try:
-                import psutil, os
-                cur_proc = psutil.Process(os.getpid())
+                if psutil is not None:
+                    cur_proc = psutil.Process(os.getpid())
                 proc_mem_bytes = cur_proc.memory_info().rss
                 for child in cur_proc.children(recursive=True):
                     try:

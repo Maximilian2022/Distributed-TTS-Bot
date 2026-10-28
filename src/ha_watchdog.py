@@ -28,7 +28,12 @@ import socket
 import uuid
 import random
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, List, Dict, Any
+try:
+    from src.utils.system_info import get_host_system_info
+except ImportError:
+    get_host_system_info = lambda: {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,7 +171,6 @@ class HAWatchdog:
 
         # システム情報・ホスト実体検出
         try:
-            from src.utils.system_info import get_host_system_info
             self.host_info = get_host_system_info()
         except Exception:
             self.host_info = {}
@@ -810,13 +814,11 @@ class HAWatchdog:
                         return True
 
                     # 64KB チャンクで一時ファイルへストリーミング保存 (メモリ消費ゼロ & OOM防止)
-                    import tempfile
                     with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tf:
                         tmp_archive_file = tf.name
                         shutil.copyfileobj(resp, tf, length=64 * 1024)
 
                     extracted_count = 0
-                    import tarfile
                     with tarfile.open(tmp_archive_file, mode="r:gz") as tar:
                         for member in tar.getmembers():
                             safe_name = Path(member.name).name
@@ -1093,7 +1095,6 @@ class HAWatchdog:
                         await loop.run_in_executor(None, self._enforce_local_cache_limits)
 
                     # 早朝 (JST 05:00 〜 05:30) の日次キャッシュ自動同期 (1日1回)
-                    from datetime import datetime, timezone, timedelta
                     jst_now = datetime.now(timezone(timedelta(hours=9)))
                     today_str = jst_now.strftime("%Y-%m-%d")
                     if jst_now.hour == 5 and jst_now.minute <= 30:

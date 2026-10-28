@@ -18,7 +18,8 @@ from src.utils.text_cleaner import TextCleaner
 from src.utils.deduplicator import Deduplicator
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
-from src.utils.streaming_audio import StreamingAudioSource
+from src.utils.latency_profiler import latency_profiler
+from src.utils.streaming_audio import StreamingAudioSource, get_beep_pcm
 from src.utils.gemini_tutor import GeminiTutorClient
 from src.utils.avatar_manager import cache_member_info_and_avatar
 
@@ -1122,9 +1123,6 @@ class VCHandlerCog(commands.Cog):
         6. 全チャンク投入完了時に stream_source.finish()
         7. 再生完了待ち & 次世代レイテンシメトリクスを tracker に記録
         """
-        from src.utils.text_cleaner import TextCleaner
-        from src.utils.latency_tracker import latency_tracker
-
         vol = max(0.0, min(float(item.volume), 2.0))
         stream_source = StreamingAudioSource()
         volume_transformer = discord.PCMVolumeTransformer(stream_source, volume=vol)
@@ -1192,7 +1190,6 @@ class VCHandlerCog(commands.Cog):
         async def _synth_chunk(ch, is_longest: bool, chunk_idx: int = 0, est_headroom_sec: float = 0.0):
             t_s = time.time()
             if getattr(ch, "is_beep", False):
-                from src.utils.streaming_audio import get_beep_pcm
                 beep_pcm = get_beep_pcm(getattr(ch, "beep_duration_sec", 0.4))
                 t_e = time.time()
                 return ch, beep_pcm, "beep", "local", True, t_s, t_e, False, []
@@ -1203,7 +1200,6 @@ class VCHandlerCog(commands.Cog):
                 chunk_spec_timeout = spec_timeout
             else:
                 try:
-                    from src.utils.latency_profiler import latency_profiler
                     chunk_spec_timeout = latency_profiler.calculate_dynamic_speculative_timeout(
                         base_timeout=spec_timeout,
                         engine=engine_name,

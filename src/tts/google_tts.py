@@ -8,6 +8,17 @@ import logging
 from typing import Optional
 from .base import BaseTTSClient, RateLimitError, TTSConnectionError, TTSError
 
+try:
+    from google.cloud import texttospeech_v1 as texttospeech
+    from google.api_core.client_options import ClientOptions
+    from google.oauth2 import service_account
+    _GCP_SDK_AVAILABLE = True
+except ImportError:
+    texttospeech = None
+    ClientOptions = None
+    service_account = None
+    _GCP_SDK_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 class GoogleTTSClient(BaseTTSClient):
@@ -37,11 +48,9 @@ class GoogleTTSClient(BaseTTSClient):
         self._init_sdk()
 
     def _init_sdk(self) -> None:
+        if not _GCP_SDK_AVAILABLE or ClientOptions is None or service_account is None or texttospeech is None:
+            return
         try:
-            from google.cloud import texttospeech_v1 as texttospeech
-            from google.api_core.client_options import ClientOptions
-            from google.oauth2 import service_account
-
             client_options = ClientOptions(api_endpoint=self.endpoint)
 
             if self.credentials_json:
@@ -135,10 +144,8 @@ class GoogleTTSClient(BaseTTSClient):
             raise TTSConnectionError("Google Cloud TTS credentials / API key not configured.")
 
         # 1. SDK が利用可能な場合は SDK で非同期リクエスト
-        if self._async_client:
+        if self._async_client and texttospeech is not None:
             try:
-                from google.cloud import texttospeech_v1 as texttospeech
-
                 pitch_semitones = self._convert_pitch_to_semitones(pitch)
                 speaking_rate = max(0.25, min(4.0, float(speed)))
 

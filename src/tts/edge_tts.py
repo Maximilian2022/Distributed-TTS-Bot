@@ -3,6 +3,7 @@ import logging
 import time
 import edge_tts
 from src.tts.base import BaseTTSClient, TTSError, TTSConnectionError
+from src.cache_manager import fix_wav_header
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +177,6 @@ class EdgeTTSClient(BaseTTSClient):
 
             self._record_success()
             # パイプ出力による 0x7FFFFFFF 未確定ヘッダーサイズを実バイト数で補正
-            from src.cache_manager import fix_wav_header
             return fix_wav_header(stdout)
 
         except asyncio.TimeoutError:

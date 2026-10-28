@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 from contextlib import asynccontextmanager
+from src.utils.default_ng_words import DEFAULT_NG_WORDS
 
 logger = logging.getLogger(__name__)
 
@@ -1526,7 +1527,6 @@ class Database:
 
     async def import_default_ng_words(self, guild_id: int) -> int:
         """標準NGワードプリセットをギルドに一括インポート"""
-        from src.utils.default_ng_words import DEFAULT_NG_WORDS
         imported_count = 0
         async with self.get_connection() as db:
             for w in DEFAULT_NG_WORDS:

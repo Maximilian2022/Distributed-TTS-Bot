@@ -1,14 +1,26 @@
 import asyncio
-import discord
-from discord import app_commands
-from discord.ext import commands
+import re
 import logging
 from typing import Optional, List, Tuple
 
-from src.config import AppConfig
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from src.config import AppConfig, reload_config
 from src.database import Database
 from src.cache_manager import CacheManager
 from src.cogs.vc_handler import VCHandlerCog, VCConnectAborted
+from src.disaster.parser import format_scale_name
+from src.utils.alert_service import (
+    alert_service,
+    CATEGORY_BOT,
+    CATEGORY_MASTER_ENGINE,
+    CATEGORY_WORKER,
+    CATEGORY_WORKER_ENGINE,
+    SEVERITY_ERROR,
+    SEVERITY_WARNING
+)
 
 logger = logging.getLogger(__name__)
 
@@ -745,7 +757,6 @@ class CommandsCog(commands.Cog):
         settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
         enabled = bool(settings.get("disaster_alert_enabled", 1))
         min_scale = int(settings.get("disaster_min_scale", 30))
-        from src.disaster.parser import format_scale_name
         scale_name = format_scale_name(min_scale)
         pref = settings.get("disaster_pref_filter", "").strip() or "全国（絞り込みなし）"
         weather = bool(settings.get("disaster_alert_weather", 1))
@@ -848,7 +859,6 @@ class CommandsCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
         try:
-            from src.config import reload_config
             reload_config(self.config)
 
             if hasattr(self.db, "invalidate_guild_cache"):
@@ -991,7 +1001,6 @@ class CommandsCog(commands.Cog):
         if raw.lower() in ("none", "なし", "クリア", "clear"):
             new_prefixes = []
         else:
-            import re
             parts = [p.strip() for p in re.split(r'[,、\s]+', raw) if p.strip()]
             new_prefixes = []
             for p in parts:
@@ -1047,15 +1056,6 @@ class CommandsCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True)
-        from src.utils.alert_service import (
-            alert_service,
-            CATEGORY_BOT,
-            CATEGORY_MASTER_ENGINE,
-            CATEGORY_WORKER,
-            CATEGORY_WORKER_ENGINE,
-            SEVERITY_ERROR,
-            SEVERITY_WARNING,
-        )
 
         test_cases = {
             "bot": {

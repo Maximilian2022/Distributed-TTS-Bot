@@ -245,7 +245,6 @@ class StreamingAudioSource(discord.AudioSource):
                 and wav_bytes[34:36] == b"\x10\x00"          # BitsPerSample=16
                 and wav_bytes[36:40] == b"data"
             ):
-                import struct
                 data_size = struct.unpack("<I", wav_bytes[40:44])[0]
                 raw_pcm = wav_bytes[44:44 + data_size] if data_size > 0 else wav_bytes[44:]
                 pcm_48k_stereo = self._pcm_24k_mono_to_48k_stereo(raw_pcm)

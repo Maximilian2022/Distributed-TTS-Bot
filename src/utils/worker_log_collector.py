@@ -8,7 +8,9 @@ Worker ログ自動収集・集約マネージャー (WorkerLogCollector)
 """
 
 import os
+import json
 import time
+import threading
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Union
@@ -17,6 +19,7 @@ from pathlib import Path
 import aiohttp
 
 from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, sanitize_filename
+from src.utils.log_handler import compress_archive_worker
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +161,6 @@ class WorkerLogCollector:
         if meta_path:
             try:
                 with open(meta_path, "w", encoding="utf-8") as f:
-                    import json
                     json.dump({
                         "node_id": node_id,
                         "ip": target_ip,
@@ -222,8 +224,6 @@ class WorkerLogCollector:
                 # アーカイブが 100MB を超過した場合は別スレッドで zstd 圧縮を実行 (bot.log と同一)
                 if archive_path.exists() and archive_path.stat().st_size >= 100 * 1024 * 1024:
                     try:
-                        from src.utils.log_handler import compress_archive_worker
-                        import threading
                         t = threading.Thread(
                             target=compress_archive_worker,
                             args=(archive_path,),

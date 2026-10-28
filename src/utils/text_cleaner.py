@@ -6,6 +6,8 @@ import threading
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 import discord
+from src.utils.streaming_audio import calc_beep_duration
+from src.utils.latency_profiler import latency_profiler
 
 logger = logging.getLogger(__name__)
 
@@ -840,7 +842,6 @@ class TextCleaner:
 
         if effective_first_chars is None and resolved_engine:
             try:
-                from src.utils.latency_profiler import latency_profiler
                 effective_first_chars = latency_profiler.get_dynamic_max_chars(
                     engine=resolved_engine,
                     target_budget_ms=1750.0,
@@ -870,7 +871,6 @@ class TextCleaner:
                         m = _RE_BEEP_TAG.match(p_clean)
                         if m:
                             char_count = int(m.group(1)) if m.group(1) else 3
-                            from src.utils.streaming_audio import calc_beep_duration
                             beep_sec = calc_beep_duration(char_count)
                             chunks.append(TextChunk(text="", pause_after_ms=40, is_beep=True, beep_duration_sec=beep_sec, is_name_prefix=True))
                         else:
@@ -899,7 +899,6 @@ class TextCleaner:
                 m = _RE_BEEP_TAG.match(clean_s)
                 if m:
                     char_count = int(m.group(1)) if m.group(1) else 3
-                    from src.utils.streaming_audio import calc_beep_duration
                     beep_sec = calc_beep_duration(char_count)
                     # 連続するNGワードは1つの持続ピー音にマージして自然に発話
                     if chunks and chunks[-1].is_beep:

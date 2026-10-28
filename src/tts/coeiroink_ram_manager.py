@@ -1,10 +1,13 @@
 import os
+import json
 import time
 import shutil
+import subprocess
 import asyncio
 import logging
-from typing import Optional, Dict, Set, Tuple, List, Any, Set
+from typing import Optional, Dict, Set, Tuple, List, Any
 from pathlib import Path
+from src.tts.node_pool import register_dynamic_coeiroink_models
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +159,6 @@ class CoeiroinkRamManager:
                     metas_path = os.path.join(entry.path, "metas.json")
                     if os.path.exists(metas_path):
                         try:
-                            import json
                             with open(metas_path, "r", encoding="utf-8") as f:
                                 data = json.load(f)
                                 uuid_val = data.get("speakerUuid")
@@ -168,7 +170,6 @@ class CoeiroinkRamManager:
 
         self._uuid_to_model_dir = await asyncio.to_thread(_scan)
         try:
-            from src.tts.node_pool import register_dynamic_coeiroink_models
             register_dynamic_coeiroink_models(self._uuid_to_model_dir)
         except Exception:
             pass
@@ -323,7 +324,6 @@ class CoeiroinkRamManager:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
 
                 # 高速な Linux ネイティブ cp -r (copy_file_range 最適化) を実行
-                import subprocess
                 ret = subprocess.run(["cp", "-r", ssd_path, tmp_dir], check=False)
                 if ret.returncode != 0:
                     raise RuntimeError(f"cp -r failed with code {ret.returncode}")

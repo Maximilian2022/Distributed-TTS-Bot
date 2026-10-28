@@ -14,6 +14,7 @@ from src.config import AppConfig, VoiceConfig
 from src.utils.text_cleaner import TextCleaner, TextChunk
 from src.utils.async_task import safe_create_task
 from src.utils.latency_profiler import latency_profiler
+from src.utils.alert_service import alert_service, CATEGORY_MASTER_ENGINE, SEVERITY_WARNING, SEVERITY_CRITICAL
 from .base import BaseTTSClient, RateLimitError, TTSConnectionError, TTSError
 from .azure_tts import AzureTTSClient
 from .google_tts import GoogleTTSClient
@@ -22,7 +23,7 @@ from .sharevox_tts import SharevoxTTSClient
 from .coeiroink_tts import CoeiroinkTTSClient, build_coeiroink_warmup_payload
 from .edge_tts import EdgeTTSClient
 from .openjtalk_tts import OpenJTalkTTSClient
-from .node_pool import TTSNodePool
+from .node_pool import TTSNodePool, scan_local_coeiroink_models
 from src.resource_manager import HighLoadFallbackException, SynthesisTimeoutException
 
 logger = logging.getLogger(__name__)
@@ -342,7 +343,6 @@ class TTSManager:
         未実在スタイル（実機に物理モデルが存在しないもの）はキャッシュからも完全パージする。
         """
         try:
-            from src.tts.node_pool import scan_local_coeiroink_models
             scan_local_coeiroink_models()
 
             speakers_map: Dict[str, Dict[str, Any]] = {}
@@ -898,7 +898,6 @@ class TTSManager:
 
         def _notify_fallback(orig_prov: str, fb_prov: str):
             try:
-                from src.utils.alert_service import alert_service, CATEGORY_MASTER_ENGINE, SEVERITY_WARNING
                 alert_service.notify(
                     title=f"TTSエンジン障害・{fb_prov.upper()}退避",
                     message=f"エンジン `{orig_prov.upper()}` が応答不能となったため、`{fb_prov.upper()}` へフォールバック退避しました。\n対象テキスト: `{text[:30]}`",
@@ -1118,7 +1117,6 @@ class TTSManager:
 
         err_summary = f"All TTS providers (VOICEVOX, Edge-TTS, Azure, Google, OpenJTalk) failed for chunk '{text[:15]}...'"
         try:
-            from src.utils.alert_service import alert_service, CATEGORY_MASTER_ENGINE, SEVERITY_CRITICAL
             alert_service.notify(
                 title="全TTSエンジン完全停止・合成不能",
                 message=f"すべてのTTSエンジン（ローカルVOICEVOX/SHAREVOX/COEIROINK、Edge-TTS、Azure、Google、OpenJTalk）での音声生成に失敗しました。\n対象テキスト: `{text[:50]}`",

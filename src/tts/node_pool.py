@@ -5,17 +5,28 @@
 - 動的自動登録 & ハートビート監視: Workerからの自動接続と死活監視 (オフライン時自動切り離し)
 """
 
+import os
 import re
 import json
 import asyncio
 import time
 import logging
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 import aiohttp
 from src.config import TTSNodeConfig
 from src.tts.base import TTSConnectionError, TTSError
 from src.utils.latency_profiler import latency_profiler
+from src.utils.alert_service import (
+    alert_service,
+    CATEGORY_WORKER_ENGINE,
+    CATEGORY_MASTER_ENGINE,
+    CATEGORY_WORKER,
+    SEVERITY_ERROR,
+    SEVERITY_WARNING
+)
+from src.utils.system_info import get_host_system_info
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +210,6 @@ def scan_local_coeiroink_models(model_dir: Optional[str] = None) -> Dict[str, st
     ローカルの COEIROINK モデルディレクトリ配下の metas.json を走査し、
     {dir_name: speaker_uuid} の辞書を返すと同時に COEIROINK_MODEL_MAPPING を動的更新する。
     """
-    import os
     target_dir = Path(model_dir or os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models"))
     if not target_dir.exists():
         alt_dir = Path(__file__).resolve().parent.parent.parent / "coeiroink_models"
@@ -268,7 +278,6 @@ class TTSNode:
         self.last_start_attempt = 0.0
         self._session: Optional[aiohttp.ClientSession] = None
         try:
-            from urllib.parse import urlparse
             self._host = urlparse(self.url).hostname or ""
         except Exception:
             self._host = ""
@@ -301,7 +310,6 @@ class TTSNode:
             return False
         self.last_start_attempt = time.time()
         try:
-            from urllib.parse import urlparse
             p = urlparse(self.url)
             ip = p.hostname
             if not ip:
@@ -571,12 +579,6 @@ class TTSNode:
             return
 
         try:
-            from src.utils.alert_service import (
-                alert_service,
-                CATEGORY_WORKER_ENGINE,
-                CATEGORY_MASTER_ENGINE,
-                SEVERITY_ERROR
-            )
             cat = CATEGORY_WORKER_ENGINE if self.is_external else CATEGORY_MASTER_ENGINE
             alert_service.notify(
                 title=f"{self.engine_name} 推論失敗・一時隔離",
@@ -621,7 +623,6 @@ class TTSNode:
         # 自機マスターノード、または specs にホスト詳細が不足している場合の自動補完
         if not self.is_external or not merged_specs.get("os_name") or not merged_specs.get("docker_version"):
             try:
-                from src.utils.system_info import get_host_system_info
                 sys_info = get_host_system_info()
                 if not self.is_external:
                     if not merged_specs.get("hostname") or merged_specs.get("hostname") == "local_master":
@@ -797,7 +798,6 @@ class TTSNodePool:
                     n.unhealthy_until = now + 15.0
                     logger.warning(f"⚠️ [NodePool] Node '{n.id}' heartbeat timed out ({elapsed:.0f}s > {timeout_seconds}s). Marked offline.")
                     try:
-                        from src.utils.alert_service import alert_service, CATEGORY_WORKER, SEVERITY_WARNING
                         alert_service.notify(
                             title=f"Workerハートビート途絶 (オフライン隔離)",
                             message=f"ワーカーノード `{n.machine_name}` からの定期ハートビートが途絶えました ({elapsed:.0f}秒未達)。\n安全のため新規リクエスト割り当てから自動除外しました。",

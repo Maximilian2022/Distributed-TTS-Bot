@@ -8268,3 +8268,28 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   - サンドボックス隔離テスト（全49テスト）を実行し、100%合格を確認（`Ran 49 tests in 6.531s, OK`）。
 
 
+
+## [2026-10-28] 全PythonファイルにおけるUnboundLocalError・スコープ競合・ローカル多重インポートの網羅的根絶リファクタリング (v2026.10.28-1937 / v2026.10.28.82)
+- **背景**:
+  - `18:13:53`「えびちりこっこ、こえへん」にて、話者設定が `WaveNet 男声B (Google)` であるにもかかわらず、RTX 3090 VOICEVOX へフォールバック誤爆が発生。
+  - 原因はモジュールトップでインポート済みのシングルトン `latency_profiler` を関数内で重複してローカルインポートしていたため、Pythonコンパイラによりローカルシンボルと判定され `UnboundLocalError: cannot access free variable 'latency_profiler'` が発生していた。
+  - ユーザーより「他の.pyファイルでも同様のことが起きていないか念のため全件チェックしてほしい」との指示を受領し、リポジトリ全51ファイルに対するAST静的構文解析とスコープ解析を実施。
+- **発見された課題と抜本的改修**:
+  1. **スコープ競合・潜在的未束縛参照の解消**:
+     - `src/web/server.py`: `_execute_security_and_rate_limit`（`urlparse`）および `api_upload_mycoeiroink_chunk`（`shutil`）において、先行ロード後にローカルインポートが存在する構造を是正。
+     - その他 WebServer 内の全エンドポイント（`api_ha_db_snapshot`, `handle_volunteer_zip`, `handle_login`, `api_test_simulate`, `_register_worker_internal`, `_rolling_process_host`, `api_worker_logs`, `_install_coeiroink_model_from_tar_file`, `api_worker_ws` 等）に点在していたローカルインポート（`sqlite3`, `gzip`, `shutil`, `hmac`, `secrets`, `io`, `tarfile`, `base64`, `aiohttp`, `node_pool` 関連等）を全てモジュールトップレベルへ集約・一元化。
+     - テストの `patch("src.tts.node_pool.scan_local_coeiroink_models")` が確実に有効化されるよう、属性アクセス参照（`node_pool.scan_local_coeiroink_models`）を適用。
+  2. **主要TTS・コア制御モジュールのリファクタリング**:
+     - `src/tts/manager.py`: `_notify_fallback` および `_synthesize_single_chunk` の `alert_service`、`initialize_coeiroink` の `scan_local_coeiroink_models` をトップレベル化。
+     - `src/cogs/vc_handler.py`: `_stream_play_item` および `_synth_chunk` の `TextCleaner`, `latency_tracker`, `latency_profiler`, `get_beep_pcm` をトップレベル化。
+     - `src/utils/text_cleaner.py`: `split_into_chunks` で重複していた `calc_beep_duration`, `latency_profiler` をトップレベル化。
+     - `src/resource_manager.py`: `urlparse`, `get_dynamic_pin_limit`, `build_coeiroink_warmup_payload`, `psutil`, `os` のローカルインポートを撤廃しトップレベル化。
+     - `src/ha_watchdog.py`: `get_host_system_info`, `tempfile`, `tarfile`, `datetime` をトップレベル化。
+     - `src/utils/streaming_audio.py`: `feed_wav_bytes` の二重 `struct` インポートを削除。
+     - `src/tts/coeiroink_ram_manager.py`: `_scan` ループ内の `json`, `register_dynamic_coeiroink_models`, `subprocess` をトップレベル化。
+     - `src/main.py`: `__init__`, `setup_hook`, `on_error`, `on_tree_error`, `loop_exception_handler` 等の `alert_service`, `latency_tracker`, `latency_profiler`, `worker_log_collector`, `traceback`, `warmup_morphological_tokenizers` 等をトップレベル化。
+     - `src/tts/node_pool.py`: `os`, `urlparse`, `alert_service`, `get_host_system_info` をトップレベル化。
+     - `src/utils/latency_profiler.py`, `src/cache_prewarm.py`, `src/cogs/commands.py`, `src/config.py`, `src/tts/coeiroink_models.py`, `src/tts/edge_tts.py`, `src/tts/google_tts.py`, `src/tts/ws_node_adapter.py`, `src/utils/worker_log_collector.py`, `src/version.py`, `src/web/auth.py`, `src/database.py`: 全て同様に安全なトップレベル集約を実施。
+- **検証結果**:
+  - 全51ファイルのAST静的構文スキャンにより、未束縛参照リスク（`POTENTIAL_UNBOUND_LOCAL`）およびトップレベルインポートとの重複シャドーイングが **完全0件（0 potential UnboundLocalError）** であることを確認。
+  - サンドボックス隔離テスト（全74テスト）を実行し、**100% 合格（Ran 74 tests, OK）** を確認。一時コンテナは即座に完全破棄。
