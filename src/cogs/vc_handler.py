@@ -640,13 +640,12 @@ class VCHandlerCog(commands.Cog):
                     last_err = None
                     start_epoch = state.connect_epoch
                     for attempt in range(1, max_retries + 1):
-                        # 試行前ガード: 切断要求が入った / VCが無人化した場合は後追い接続しない
-                        if state.connect_epoch != start_epoch or self._count_humans(channel) == 0:
+                        # 試行前ガード: VCが無人化した場合は後追い接続しない (人間がいる場合は接続継続)
+                        if self._count_humans(channel) == 0:
                             logger.info(
-                                f"[Bot #{self.bot_index}] Aborting connect to '{channel.name}' before attempt {attempt}: "
-                                f"{'disconnect requested' if state.connect_epoch != start_epoch else 'no human members'}."
+                                f"[Bot #{self.bot_index}] Aborting connect to '{channel.name}' before attempt {attempt}: no human members."
                             )
-                            raise VCConnectAborted(f"connect to '{channel.name}' aborted")
+                            raise VCConnectAborted(f"connect to '{channel.name}' aborted (empty)")
                         try:
                             # 既存の接続状況を確認 (すでに目的VCに正常接続完了していれば破壊せず採用)
                             old_vc = channel.guild.voice_client
@@ -681,24 +680,16 @@ class VCHandlerCog(commands.Cog):
                     if self.bot_pool:
                         self.bot_pool.release_vc_reservation(guild_id, channel.id, self.bot_index)
 
-                # 接続完了後ガード: ハンドシェイク中に無人化/切断要求が入っていたら即切断
-                if state.connect_epoch != start_epoch or self._count_humans(channel) == 0:
+                # 接続完了後ガード: VCが無人化した場合は退出（人間がいる場合は絶対に切断しない）
+                if self._count_humans(channel) == 0:
                     logger.info(
-                        f"[Bot #{self.bot_index}] VC '{channel.name}' became empty or disconnect was requested during handshake. Leaving immediately."
+                        f"[Bot #{self.bot_index}] VC '{channel.name}' became empty during handshake. Leaving immediately."
                     )
                     try:
                         await vc.disconnect(force=True)
                     except Exception:
                         pass
-                    raise VCConnectAborted(f"connect to '{channel.name}' aborted after handshake")
-                logger.info(
-                    f"[Bot #{self.bot_index}] VC '{channel.name}' became empty or disconnect was requested during handshake. Leaving immediately."
-                )
-                try:
-                    await vc.disconnect(force=True)
-                except Exception:
-                    pass
-                raise VCConnectAborted(f"connect to '{channel.name}' aborted after handshake")
+                    raise VCConnectAborted(f"connect to '{channel.name}' aborted (empty channel)")
 
         state.empty_since = 0.0
         # 無人VC Watchdog を起動 (未起動 or 終了済みの場合のみ)
