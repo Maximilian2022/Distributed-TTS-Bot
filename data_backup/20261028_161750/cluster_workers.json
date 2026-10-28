@@ -1,0 +1,201 @@
+{
+  "workers": {
+    "worker_MASTEROMEN2017": {
+      "node_id": "worker_MASTEROMEN2017",
+      "node_name": "Worker (b144c838b040)",
+      "ip": "192.168.11.207",
+      "agent_port": 50030,
+      "rsync_port": 8730,
+      "specs": {
+        "hostname": "MASTEROMEN2017",
+        "host_hostname": "MASTEROMEN2017",
+        "platform": "Linux",
+        "os": "Debian GNU/Linux 13 (trixie)",
+        "os_name": "Debian GNU/Linux 13 (trixie)",
+        "docker_version": "29.9.2",
+        "cpu_count": 8,
+        "total_ram_gb": 15.6,
+        "gpu": true,
+        "gpu_name": "NVIDIA GeForce GTX 1080 Ti",
+        "gpu_vram_mb": 11264,
+        "recommended_max_concurrent": 2,
+        "recommended_priority": 1,
+        "alloc_cpus": 4,
+        "thread_num": 4,
+        "alloc_ram_gb": 7.8,
+        "ram_vv": 3,
+        "ram_sv": 2,
+        "ram_ci": 4
+      },
+      "engines": {
+        "voicevox": {
+          "port": 50021,
+          "priority": 1,
+          "max_concurrent": 2,
+          "running": true
+        },
+        "sharevox": {
+          "port": 50025,
+          "priority": 1,
+          "max_concurrent": 2,
+          "running": false
+        },
+        "coeiroink": {
+          "port": 50031,
+          "priority": 1,
+          "max_concurrent": 2,
+          "running": true
+        }
+      },
+      "last_seen": 1793157177.5346837,
+      "updated_at": 1793157177.5346842
+    },
+    "worker_MASTERSOMEN2022": {
+      "node_id": "worker_MASTERSOMEN2022",
+      "node_name": "worker_MASTERSOMEN2022",
+      "ip": "192.168.11.200",
+      "agent_port": 50030,
+      "rsync_port": 8730,
+      "specs": {
+        "hostname": "MASTERSOMEN2022",
+        "host_hostname": "MASTERSOMEN2022",
+        "platform": "Linux",
+        "os": "Debian GNU/Linux 13 (trixie)",
+        "os_name": "Debian GNU/Linux 13 (trixie)",
+        "docker_version": "29.9.2",
+        "cpu_count": 20,
+        "total_ram_gb": 31.3,
+        "gpu": true,
+        "gpu_name": "NVIDIA GeForce RTX 3090",
+        "gpu_vram_mb": 24576,
+        "recommended_max_concurrent": 3,
+        "recommended_priority": 1,
+        "alloc_cpus": 8,
+        "thread_num": 8,
+        "alloc_ram_gb": 15.65,
+        "ram_vv": 5,
+        "ram_sv": 5,
+        "ram_ci": 5
+      },
+      "engines": {
+        "voicevox": {
+          "running": false,
+          "port": 50021,
+          "healthy": true
+        },
+        "sharevox": {
+          "running": false,
+          "port": 50025,
+          "healthy": true
+        },
+        "coeiroink": {
+          "running": false,
+          "port": 50031,
+          "healthy": true
+        }
+      },
+      "last_seen": 1793157177.537194,
+      "updated_at": 1793157177.537194
+    },
+    "worker_MasterDebian": {
+      "node_id": "worker_MasterDebian",
+      "node_name": "Worker (MasterDebian)",
+      "ip": "192.168.11.248",
+      "agent_port": 50030,
+      "rsync_port": 8730,
+      "specs": {
+        "hostname": "MasterDebian",
+        "host_hostname": "MasterDebian",
+        "platform": "Linux",
+        "os": "Debian GNU/Linux 13 (trixie)",
+        "os_name": "Debian GNU/Linux 13 (trixie)",
+        "docker_version": "29.9.2",
+        "cpu_count": 8,
+        "total_ram_gb": 62.8,
+        "gpu": false,
+        "gpu_name": "",
+        "gpu_vram_mb": 0,
+        "recommended_max_concurrent": 2,
+        "recommended_priority": 2,
+        "alloc_cpus": 4,
+        "thread_num": 4,
+        "alloc_ram_gb": 8.0,
+        "ram_vv": 3,
+        "ram_sv": 2,
+        "ram_ci": 3
+      },
+      "engines": {
+        "voicevox": {
+          "port": 50021,
+          "priority": 2,
+          "max_concurrent": 2,
+          "running": false
+        },
+        "sharevox": {
+          "port": 50025,
+          "priority": 2,
+          "max_concurrent": 2,
+          "running": false
+        },
+        "coeiroink": {
+          "port": 50031,
+          "priority": 2,
+          "max_concurrent": 2,
+          "running": false
+        }
+      },
+      "last_seen": 1793157177.540967,
+      "updated_at": 1793157177.5409672
+    },
+    "worker_MasterUbuntu": {
+      "node_id": "worker_MasterUbuntu",
+      "node_name": "Worker (MasterUbuntu)",
+      "ip": "192.168.11.245",
+      "agent_port": 50030,
+      "rsync_port": 8730,
+      "specs": {
+        "hostname": "MasterUbuntu",
+        "host_hostname": "MasterUbuntu",
+        "platform": "Linux",
+        "os": "Debian GNU/Linux 13 (trixie)",
+        "os_name": "Debian GNU/Linux 13 (trixie)",
+        "docker_version": "N/A",
+        "cpu_count": 8,
+        "total_ram_gb": 60.8,
+        "gpu": false,
+        "gpu_name": "",
+        "gpu_vram_mb": 0,
+        "recommended_max_concurrent": 2,
+        "recommended_priority": 2,
+        "alloc_cpus": 4,
+        "thread_num": 4,
+        "alloc_ram_gb": 8.0,
+        "ram_vv": 3,
+        "ram_sv": 2,
+        "ram_ci": 3
+      },
+      "engines": {
+        "voicevox": {
+          "port": 50021,
+          "priority": 2,
+          "max_concurrent": 2,
+          "running": false
+        },
+        "sharevox": {
+          "port": 50025,
+          "priority": 2,
+          "max_concurrent": 2,
+          "running": false
+        },
+        "coeiroink": {
+          "port": 50031,
+          "priority": 2,
+          "max_concurrent": 2,
+          "running": true
+        }
+      },
+      "last_seen": 1793157209.152947,
+      "updated_at": 1793157209.152947
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "engines": {
+    "default": [
+      "gpu_ram",
+      "cpu_ram",
+      "gpu_ssd",
+      "cpu_ssd"
+    ],
+    "coeiroink": [
+      "cpu_ram",
+      "gpu_ram",
+      "gpu_ssd",
+      "cpu_ssd"
+    ],
+    "voicevox": [
+      "gpu_ram",
+      "cpu_ram",
+      "gpu_ssd",
+      "cpu_ssd"
+    ],
+    "sharevox": [
+      "gpu_ram",
+      "cpu_ram",
+      "gpu_ssd",
+      "cpu_ssd"
+    ]
+  },
+  "tier_order": [
+    "gpu_ram",
+    "cpu_ram",
+    "gpu_ssd",
+    "cpu_ssd"
+  ]
+}

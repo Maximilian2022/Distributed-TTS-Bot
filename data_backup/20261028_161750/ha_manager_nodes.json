@@ -1,0 +1,43 @@
+{
+  "slaves": {
+    "slave_f960592ba045_00af7ef3": {
+      "node_id": "slave_f960592ba045_00af7ef3",
+      "hostname": "MasterDebian",
+      "ip": "192.168.11.248",
+      "first_seen": 1792821202.6570828,
+      "last_seen": 1793171866.920293,
+      "last_sync": 1793171860.825831,
+      "status": "online",
+      "user_agent": "TTSBot-HA-Watchdog/slave_f960592ba045_00af7ef3",
+      "priority": 1,
+      "cpu_cores": 8,
+      "memory_gb": 62.8,
+      "os_name": "Debian GNU/Linux 13 (trixie)",
+      "is_direct_verified": true,
+      "container_hostname": "1db78fe76d5c",
+      "local_ip": "192.168.11.248",
+      "docker_version": "29.9.2",
+      "direct_url": "http://192.168.11.245:8088"
+    },
+    "slave_92db75a83282_e7fcf41e": {
+      "node_id": "slave_92db75a83282_e7fcf41e",
+      "hostname": "MasterCentos",
+      "ip": "192.168.11.244",
+      "first_seen": 1793018521.1655712,
+      "last_seen": 1793171865.366551,
+      "last_sync": 1793171865.366551,
+      "status": "online",
+      "user_agent": "TTSBot-HA-Watchdog/slave_92db75a83282_e7fcf41e",
+      "priority": 2,
+      "cpu_cores": 4,
+      "memory_gb": 9.5,
+      "os_name": "CentOS Stream 10 (Coughlan)",
+      "is_direct_verified": false,
+      "container_hostname": "a17094ad6a03",
+      "local_ip": "192.168.11.244",
+      "docker_version": "29.9.2",
+      "direct_url": "http://192.168.11.245:8088"
+    }
+  },
+  "revoked_node_ids": []
+}
