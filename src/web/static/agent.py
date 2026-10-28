@@ -256,6 +256,11 @@ class CoeiroinkWorkerRamManager:
         self._lock = asyncio.Lock()
         self._freeze_until: float = 0.0
 
+    @property
+    def persistent_dir(self) -> Path:
+        """SSD永続化モデルディレクトリを Path オブジェクトで取得"""
+        return Path(self.ssd_dir)
+
     def setup_hybrid_structure(self):
         os.makedirs(self.ssd_dir, exist_ok=True)
         os.makedirs(self.ram_dir, exist_ok=True)
@@ -1632,6 +1637,12 @@ hosts allow = *
         self.last_used_time[engine_name] = time.time()
 
         if is_container_running(cname):
+            if engine_name == "coeiroink":
+                cdata = docker_api.inspect_container(cname)
+                mounts_str = str(cdata.get("Mounts", [])) if cdata else ""
+                if "storage/ssd" not in mounts_str or "storage/ram" not in mounts_str:
+                    logger.warning(f"⚠️ [Engine Start] '{cname}' のマウント不整合 (storage/ssd 欠落) を検出。再作成します...")
+                    await self.fix_coeiroink_mount()
             return True
 
         self._starting_engines.add(engine_name)
@@ -1889,15 +1900,18 @@ hosts allow = *
             session = await self.get_session()
             spk_url = "http://127.0.0.1:50031/v1/speakers"
             try:
-                async with session.get(spk_url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                async with session.get(spk_url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
                     if resp.status == 200:
                         speakers = await resp.json()
                         ssd_count = len(getattr(self.ram_manager, "_uuid_to_model_dir", {}))
                         if len(speakers) == 0 and ssd_count > 0:
                             logger.warning(f"⚠️ [WorkerRAM] COEIROINK の認識話者数が0件です (SSD上には{ssd_count}件)。自律修復を発動します...")
                             await self.fix_coeiroink_mount()
-            except Exception:
-                pass
+                    elif resp.status in (500, 502, 503):
+                        logger.warning(f"⚠️ [WorkerRAM] COEIROINK が HTTP {resp.status} を返しました (マウント不整合またはエンジン破損の可能性)。自律修復を発動します...")
+                        await self.fix_coeiroink_mount()
+            except Exception as e:
+                logger.debug(f"[WorkerRAM] COEIROINK ヘルスチェック通信エラー: {e}")
 
     def _ensure_ws_tunnel_started(self) -> None:
         """Master への WebSocket リバーストンネルが未起動であれば開始する (項目⑱)"""
@@ -3706,11 +3720,11 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
     if not clean_model_name or not is_safe_identifier(clean_model_name):
         return web.Response(text="Invalid model name", status=400)
 
-    work_dir = resolve_work_dir()
+    work_dir = Path(resolve_work_dir())
     model_dir = work_dir / "coeiroink_models"
     agent = request.app.get("agent")
     if agent and getattr(agent, "ram_manager", None):
-        model_dir = agent.ram_manager.persistent_dir
+        model_dir = Path(agent.ram_manager.persistent_dir)
 
     target_path = (model_dir / clean_model_name).resolve()
     if not str(target_path).startswith(str(model_dir.resolve())):

@@ -86,3 +86,4 @@ coeiroink_models/
 # Agent configurations and skills
 .agents/
 
+data_backup/

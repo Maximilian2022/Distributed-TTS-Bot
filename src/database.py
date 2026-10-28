@@ -1731,7 +1731,7 @@ class Database:
                         prefixes = list(def_pref)
                     res["ignore_prefixes"] = prefixes
                     res["announce_vc_events"] = int(res.get("announce_vc_events", 0) or 0)
-                    res["speculative_timeout_seconds"] = float(res.get("speculative_timeout_seconds", 1.5) or 1.5)
+                    res["speculative_timeout_seconds"] = float(res.get("speculative_timeout_seconds", 2.5) or 2.5)
                     res["disaster_volume"] = float(res.get("disaster_volume", 1.0) if res.get("disaster_volume") is not None else 1.0)
                     res["error_contact_user_id"] = int(res.get("error_contact_user_id", 0) or 0)
 
@@ -1747,7 +1747,7 @@ class Database:
         auto_text = getattr(default_cfg, "auto_join_text_channel_id", 0) if default_cfg else 0
         def_speaker = getattr(default_cfg, "default_speaker", "nanami") if default_cfg else "nanami"
         def_prefixes = getattr(default_cfg, "ignore_prefixes", [";", "；"]) if default_cfg else [";", "；"]
-        def_spec_timeout = float(getattr(default_cfg, "speculative_timeout_seconds", 1.5)) if default_cfg else 1.5
+        def_spec_timeout = float(getattr(default_cfg, "speculative_timeout_seconds", 2.5)) if default_cfg else 2.5
 
         initial_pairs = [{"vc_id": auto_vc, "text_id": auto_text}] if auto_vc > 0 and auto_text > 0 else []
 
@@ -1886,7 +1886,7 @@ class Database:
                     current.get("default_speaker", "nanami"),
                     current.get("read_username", 0),
                     1 if current.get("announce_vc_events", 0) else 0,
-                    float(current.get("speculative_timeout_seconds", 1.5) or 1.5),
+                    float(current.get("speculative_timeout_seconds", 2.5) or 2.5),
                     json.dumps(current.get("ignore_prefixes", [";", "；"])),
                     1 if current.get("disaster_alert_enabled", 1) else 0,
                     int(current.get("disaster_min_scale", 30)),

@@ -4,8 +4,8 @@
 デプロイ・更新時に更新することで、ブラウザキャッシュの無効化と画面上でのバージョン確認を可能にします。
 """
 
-BUILD_VERSION = "v2026.10.28-1655"
-BUILD_DATE = "2026-10-28 16:55:00 JST"
+BUILD_VERSION = "v2026.10.28-1740"
+BUILD_DATE = "2026-10-28 17:40:00 JST"
 APP_NAME = "Distributed TTS Discord Bot"
 AGENT_VERSION = "3.13.4"  # 最新 Worker Agent バージョン (単一管理元: SSOT)
 

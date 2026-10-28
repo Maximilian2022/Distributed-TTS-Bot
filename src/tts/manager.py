@@ -1003,7 +1003,7 @@ class TTSManager:
             cloud_prov, cloud_param = chain[1]
 
             if speculative_timeout is None:
-                base_spec_timeout = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", getattr(self.config, "speculative_timeout_seconds", 1.5)))
+                base_spec_timeout = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", getattr(self.config, "speculative_timeout_seconds", 2.5)))
                 try:
                     from src.utils.latency_profiler import latency_profiler
                     pool = self._get_pool_for_provider(prim_prov) if hasattr(self, "_get_pool_for_provider") else None

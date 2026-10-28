@@ -82,7 +82,7 @@ class AppConfig:
     # TTS
     tts_primary: str = "azure"
     tts_fallback: str = "google"
-    speculative_timeout_seconds: float = 1.5
+    speculative_timeout_seconds: float = 2.5
     google_monthly_limit_chars: int = 950000  # 無料枠(100万文字)の95%
     azure_region: str = "japaneast"
     azure_timeout_seconds: float = 5.0

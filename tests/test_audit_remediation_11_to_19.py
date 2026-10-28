@@ -475,6 +475,50 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         # 既に同期済みなので False が返るはず
         self.assertFalse(sync_agent_py_version())
 
+    def test_dynamic_speculative_timeout_policy(self):
+        """投機的フォールバックの動的最適化と上限キャップ機能の検証"""
+        from src.utils.latency_profiler import latency_profiler
+
+        # 1. 高速エンジン (VOICEVOX): cap_timeout が大きくても、下限付近(0.8s〜1.2s)で即時ローカル優先になること
+        vv_timeout_cap25 = latency_profiler.calculate_dynamic_speculative_timeout(
+            base_timeout=2.5, engine="voicevox", text_len=10, chunk_index=0
+        )
+        vv_timeout_cap40 = latency_profiler.calculate_dynamic_speculative_timeout(
+            base_timeout=4.0, engine="voicevox", text_len=10, chunk_index=0
+        )
+        # 高速モデルは 4.0s まで無駄に待たず、下限0.8s〜1.2s前後で即座に返る
+        self.assertLessEqual(vv_timeout_cap25, 1.5)
+        self.assertLessEqual(vv_timeout_cap40, 1.5)
+        self.assertGreaterEqual(vv_timeout_cap25, 0.8)
+
+        # 2. 重いエンジン (COEIROINK): 上限キャップ (1.5s / 2.5s / 4.0s) まで粘り強くローカルを待つこと
+        # 1.5s テンポ優先モード: 1.5s でクランプ
+        ci_timeout_cap15 = latency_profiler.calculate_dynamic_speculative_timeout(
+            base_timeout=1.5, engine="coeiroink", text_len=20, chunk_index=0
+        )
+        self.assertEqual(ci_timeout_cap15, 1.5)
+
+        # 2.5s バランスモード: 2.5s でクランプ
+        ci_timeout_cap25 = latency_profiler.calculate_dynamic_speculative_timeout(
+            base_timeout=2.5, engine="coeiroink", text_len=20, chunk_index=0
+        )
+        self.assertEqual(ci_timeout_cap25, 2.5)
+
+        # 4.0s 声色優先モード: 2.5s を超えて 3秒以上粘る
+        ci_timeout_cap40 = latency_profiler.calculate_dynamic_speculative_timeout(
+            base_timeout=4.0, engine="coeiroink", text_len=20, chunk_index=0
+        )
+        self.assertGreater(ci_timeout_cap40, 2.5)
+        self.assertLessEqual(ci_timeout_cap40, 4.0)
+
+        # 3. 後続チャンク (chunk_index >= 1) でのバッファヘッドルーム連動
+        # ヘッドルームが 3.0秒ある場合、少なくとも 2.5秒以上ローカルを粘る
+        follow_timeout = latency_profiler.calculate_dynamic_speculative_timeout(
+            base_timeout=2.5, engine="coeiroink", text_len=15, chunk_index=1, buffer_headroom_sec=3.0
+        )
+        self.assertGreaterEqual(follow_timeout, 2.5)
+        self.assertLessEqual(follow_timeout, 6.0)
+
 
 if __name__ == "__main__":
     unittest.main()

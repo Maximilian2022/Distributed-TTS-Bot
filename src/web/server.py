@@ -2656,7 +2656,7 @@ class WebServer:
             "default_speaker": settings.get("default_speaker", self.config.default_speaker),
             "read_username": bool(settings.get("read_username", 0)),
             "announce_vc_events": bool(settings.get("announce_vc_events", 0)),
-            "speculative_timeout_seconds": float(settings.get("speculative_timeout_seconds", 1.5) or 1.5),
+            "speculative_timeout_seconds": float(settings.get("speculative_timeout_seconds", 2.5) or 2.5),
             "ignore_prefixes": settings.get("ignore_prefixes", [";", "；"]),
             "disaster_alert_enabled": bool(settings.get("disaster_alert_enabled", 1)),
             "disaster_min_scale": int(settings.get("disaster_min_scale", 30)),
@@ -2718,7 +2718,7 @@ class WebServer:
         if "speculative_timeout_seconds" in data:
             try:
                 val = float(data["speculative_timeout_seconds"])
-                update_fields["speculative_timeout_seconds"] = max(0.2, min(5.0, val))
+                update_fields["speculative_timeout_seconds"] = max(0.8, min(6.0, val))
                 self.config.speculative_timeout_seconds = update_fields["speculative_timeout_seconds"]
             except (ValueError, TypeError):
                 pass

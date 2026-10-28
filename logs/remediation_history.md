@@ -1,6 +1,44 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] 投機的フォールバックの動的最適化＆最大許容遅延キャップ化 ＆ MasterUbuntu COEIROINK マウント復旧・自律修復ガード配備
+
+- **ユーザーフィードバック & 課題**:
+  1. 「MasterUbuntuのCoeiroinkのログで以下のエラーがでている。発生した時刻はわからないが、、確認できないか調査してみてほしい: NameError: name 'meta_manager' is not defined」
+  2. 「サーバー管理 ボット設定 (サーバー固有) 投機的フォールバック待機時間 (秒) の設定って、今の統計的に1-2秒って適切かな。今の本番設定は4秒にしてるけど ちょっとここ議論したい。この設定を消すか、意味を変えて、動的なものに変えたほうがいいかもと思っている」
+  3. 「Aにした場合でも遅すぎる場合は切り替わるけど、待った時の最大秒がユーザー体感で耐えれるのかっていうのが問題としてでてくるよね。案Bもいいなと思うんだけど、案Bの1って実質案Aってことよね？」➔「うん、それでいこうか」
+
+- **原因分析 & 調査結果**:
+  1. **MasterUbuntu COEIROINK エラーの解明**:
+     - 発生時刻: `2026-10-28 17:02:57 JST`
+     - 原因: `ttsworker-coeiroink` コンテナのバインドマウントにおいて、`speaker_info` のみで `storage/ssd` と `storage/ram` がマウントされておらず、シンボリックリンクがすべてリンク切れ（Broken Symlinks）となっていた。
+     - これにより、COEIROINK公式の `engine.py` がモデルをロードできず、内部の `meta_manager` が初期化されないまま `GET /v1/speakers` が呼ばれ、`NameError: name 'meta_manager' is not defined` (HTTP 500) を吐いていた。
+  2. **Worker Agent 内部バグの検出**:
+     - `self.ram_manager.persistent_dir` が未定義（`AttributeError`）
+     - `handle_model_download` で `work_dir / "coeiroink_models"` と文字列型に対する `/` 演算子使用（`TypeError`）
+  3. **投機的フォールバック待機時間の不合理性**:
+     - 実機統計: VOICEVOX は 270〜1,150ms で完了するのに対し、COEIROINK は 3,800〜4,500ms を要する。
+     - 固定 1.5 秒だと COEIROINK で不要な声変わり（フォールバック）が 100% 発生し、固定 4.0 秒だとワーカー障害時や初動で 4 秒間も沈黙が続いて会話テンポが破綻する。
+     - さらに既存コードでは初動チャンクが内部で `min(2.5, ...)` により強制クランプされており、4秒設定が無効化されていた。
+
+- **対応内容**:
+  1. **MasterUbuntu COEIROINK マウント完全復旧 ＆ 自律修復機能**:
+     - `docker-compose.worker.yml` に従い 3 本のマウントを再適用（`GET /v1/speakers` 200 OK、17名認識復帰）。
+     - `src/web/static/agent.py`: `CoeiroinkWorkerRamManager` に `persistent_dir` プロパティを追加、`work_dir` パス結合バグを修正。
+     - `ensure_coeiroink_mount_healthy` および `start_engine` において、`storage/ssd` 欠落または HTTP 500 を検知した際に自律修復（`fix_coeiroink_mount` による `--force-recreate`）を発動する安全ネットを配備。
+  2. **投機的フォールバックの動的最適化 ＆ 上限キャップ化**:
+     - `src/utils/latency_profiler.py`: `calculate_dynamic_speculative_timeout` を改修。
+       - 推定推論時間（実績 EWMA）× 1.35倍を動的目標とし、下限 0.8秒、上限キャップとしてユーザー設定値（`cap_timeout`, 0.8〜6.0s）でクランプ。
+       - VOICEVOX（高速）なら無駄に待たず最速 0.8〜1.2秒 でローカル判定。COEIROINK（重め）なら上限キャップまで粘り強くローカルを待つ。
+       - ワーカー障害時は推定時間＋上限で確実にクラウドへ安全脱出。
+     - `src/config.py`, `src/database.py`, `src/tts/manager.py`, `src/cogs/vc_handler.py`: デフォルト値を `2.5` 秒（バランス推奨）に更新。
+  3. **WebUI の直感的プリセット＆動的設定 UI 刷新**:
+     - `src/web/templates/index.html`: 「⚡ 投機的フォールバック（動的最適化 ＆ 最大許容遅延）」へ刷新。
+       - ⚡ テンポ優先 (1.5s) / ⚖️ バランス (2.5s 推奨) / 🎙️ 声色維持優先 (4.0s) のワンクリックプリセットボタンと数値入力を連動。
+     - `src/web/static/app.js`: プリセットボタンのアクティブ同期および入力処理を実装。
+  4. **単体テストと検証**:
+     - `tests/test_audit_remediation_11_to_19.py`: 高速モデル・重いモデル・各プリセット上限キャップの挙動を検証する `test_dynamic_speculative_timeout_policy` を追加。全73テスト 100% PASS。
+
 ## [2026-10-28] MYCOEIROINK ZIPアップロード上限2GB拡張 ＆ Worker Agent v3.13.4 単一管理元(SSOT)統合・自動連動化 ＆ モデル同期後COEIROINK即時リロード
 
 - **ユーザーフィードバック & 課題**:

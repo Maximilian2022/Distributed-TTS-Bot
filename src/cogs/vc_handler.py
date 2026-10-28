@@ -1177,7 +1177,7 @@ class VCHandlerCog(commands.Cog):
             explicit_spec_timeout = True
         else:
             guild_settings = await self.db.get_guild_settings(guild.id, self.config)
-            spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
+            spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 2.5) or 2.5)
             explicit_spec_timeout = False
 
         def _estimate_chunk_play_sec(c_obj) -> float:
@@ -1770,7 +1770,7 @@ class VCHandlerCog(commands.Cog):
             safe_create_task(self.db.touch_ng_words(message.guild.id, detected_ng_words), name="touch_ng_words")
 
         # 5. 再生キューに追加 (本文と名前プレフィックスをスマート分離)
-        spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
+        spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 2.5) or 2.5)
         item = QueueItem(
             text=cleaned_body,
             user_id=message.author.id,
@@ -1977,7 +1977,7 @@ class VCHandlerCog(commands.Cog):
                 speaker_id = self.config.default_speaker
 
             t_now = time.time()
-            spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
+            spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 2.5) or 2.5)
             item = QueueItem(
                 text=announce_text,
                 user_id=member.id,

@@ -2276,10 +2276,12 @@ async function loadBotConfig(guildId) {
       announceVCCheckbox.checked = !!cfg.announce_vc_events;
     }
 
-    // 投機的フォールバック待機時間 (秒)
+    // 投機的フォールバック動的設定 (最大許容沈黙時間)
     const specTimeoutInput = document.getElementById("cfg-speculative-timeout");
     if (specTimeoutInput) {
-      specTimeoutInput.value = (cfg.speculative_timeout_seconds !== undefined && cfg.speculative_timeout_seconds !== null) ? cfg.speculative_timeout_seconds : 1.5;
+      const currentVal = (cfg.speculative_timeout_seconds !== undefined && cfg.speculative_timeout_seconds !== null) ? cfg.speculative_timeout_seconds : 2.5;
+      specTimeoutInput.value = currentVal;
+      updateSpecPresetButtons(currentVal);
     }
 
     // 防災速報設定
@@ -2373,6 +2375,36 @@ function resetIgnorePrefixesUI() {
   showToast("除外プレフィックスをデフォルト（; と ；）にリセットしました（保存ボタンで確定）", "info");
 }
 
+function selectSpecPreset(sec) {
+  const input = document.getElementById("cfg-speculative-timeout");
+  if (input) {
+    input.value = sec.toFixed(1);
+    updateSpecPresetButtons(sec);
+  }
+}
+
+function onSpeculativeTimeoutInput(val) {
+  const sec = parseFloat(val);
+  updateSpecPresetButtons(sec);
+}
+
+function updateSpecPresetButtons(sec) {
+  document.querySelectorAll(".preset-spec-btn").forEach(btn => {
+    const btnSec = parseFloat(btn.getAttribute("data-sec"));
+    if (!isNaN(sec) && Math.abs(sec - btnSec) < 0.05) {
+      btn.style.background = "#5865f2";
+      btn.style.color = "white";
+      btn.style.borderColor = "#5865f2";
+      btn.style.fontWeight = "700";
+    } else {
+      btn.style.background = "rgba(255,255,255,0.06)";
+      btn.style.color = "var(--text-main)";
+      btn.style.borderColor = "var(--border-color)";
+      btn.style.fontWeight = "500";
+    }
+  });
+}
+
 async function saveBotConfig(e) {
   e.preventDefault();
   if (!currentGuildId) {
@@ -2386,7 +2418,7 @@ async function saveBotConfig(e) {
   const adminRole = document.getElementById("cfg-admin-role")?.value || "0";
   const readUsername = document.getElementById("cfg-read-username")?.checked || false;
   const announceVCEvents = document.getElementById("cfg-announce-vc")?.checked || false;
-  const specTimeout = parseFloat(document.getElementById("cfg-speculative-timeout")?.value || 1.5);
+  const specTimeout = parseFloat(document.getElementById("cfg-speculative-timeout")?.value || 2.5);
 
   const disasterEnabled = document.getElementById("cfg-disaster-enabled")?.checked ?? true;
   const disasterMinScale = parseInt(document.getElementById("cfg-disaster-min-scale")?.value || "30");

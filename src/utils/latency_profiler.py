@@ -312,7 +312,7 @@ class EngineLatencyProfiler:
 
     def calculate_dynamic_speculative_timeout(
         self,
-        base_timeout: float = 1.5,
+        base_timeout: float = 2.5,
         engine: Optional[str] = None,
         text_len: int = 10,
         chunk_index: int = 0,
@@ -322,25 +322,28 @@ class EngineLatencyProfiler:
         """
         チャンク位置・先行再生バッファ残量・文字数・エンジン実測推論時間に応じた
         動的な Speculative TTS タイムアウト秒数を算出する。
+        - base_timeout は「最大許容沈黙時間 (上限キャップ)」として機能 (0.8s 〜 6.0s)。
         - chunk_index == 0 (初動チャンク):
-          会話のテンポ維持が最優先。推定推論時間×1.35 と base_timeout を比較し [0.8s, 2.5s] にクランプ。
+          推定推論時間×1.35倍を動的目標とし、下限0.8s、上限 cap_timeout でクランプ。
+          これにより、VOICEVOX等の高速モデルは無駄に待たず最速（0.8〜1.2秒）でローカル判定され、
+          COEIROINK等の重いモデルはユーザー許容上限（cap_timeout）まで粘り強くローカルを待つ。
         - chunk_index >= 1 (後続チャンク):
           先行チャンク群の再生猶予 (buffer_headroom_sec) からクラウドTTS合成マージン (0.45s) を引いた秒数まで
           ローカルエンジンの完了を粘り強く待ち、不必要な声変わり（クラウド投機混入）を防止する。
         """
-        safe_base = max(0.5, float(base_timeout or 1.5))
+        cap_timeout = max(0.8, min(6.0, float(base_timeout or 2.5)))
         est_ms = self.estimate_synthesis_ms(engine, max(1, text_len), candidate_nodes=candidate_nodes)
         est_sec = est_ms / 1000.0
 
         if chunk_index <= 0 and buffer_headroom_sec <= 0.2:
-            target = max(safe_base, est_sec * 1.35)
-            return round(min(2.5, max(0.8, target)), 2)
+            target = est_sec * 1.35
+            return round(min(cap_timeout, max(0.8, target)), 2)
 
         # 後続チャンクまたは十分な再生バッファ残量がある場合
         headroom_budget = max(0.0, float(buffer_headroom_sec) - 0.45)
-        target = max(safe_base, headroom_budget, est_sec * 1.5)
-        min_bound = min(safe_base, 6.0)
-        return round(min(6.0, max(min_bound, target)), 2)
+        target = max(headroom_budget, est_sec * 1.5)
+        upper_limit = max(cap_timeout, 4.0)
+        return round(min(6.0, max(0.8, min(upper_limit, target))), 2)
 
     def rank_nodes_by_power(self, nodes: List[Any]) -> List[Any]:
         """

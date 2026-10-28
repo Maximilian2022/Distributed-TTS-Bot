@@ -495,20 +495,34 @@
                     <small style="color:var(--text-dim);font-size:12px;">「おつ」「草」などの相槌短文の文字数上限（デフォルト: 10文字）</small>
                   </div>
 
-                  <!-- 投機的フォールバック待機時間 (秒) -->
-                  <div class="form-group" style="grid-column: 1 / -1;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:14px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
-                    <div style="flex:1;min-width:240px;">
-                      <label for="cfg-speculative-timeout" style="font-weight:600;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:6px;margin-bottom:2px;">
-                        ⚡ 投機的フォールバック待機時間 (秒)
-                        <span class="badge" style="background:#5865f2;color:white;font-size:10px;">超低遅延</span>
-                      </label>
-                      <small style="color:var(--text-dim);font-size:12px;">
-                        ローカルGPU推論が指定秒数を超過した際、高速なクラウド（Edge-TTS/Azure）へ並行投機リクエストを発行し、会話の詰まりを回避します（デフォルト: 1.5秒、推奨: 1.0〜2.0秒）
-                      </small>
+                  <!-- 投機的フォールバック動的設定 (最大許容沈黙時間) -->
+                  <div class="form-group" style="grid-column: 1 / -1;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:12px;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;">
+                      <div style="flex:1;min-width:240px;">
+                        <label for="cfg-speculative-timeout" style="font-weight:600;font-size:14px;cursor:pointer;display:flex;align-items:center;gap:6px;margin-bottom:2px;">
+                          ⚡ 投機的フォールバック（動的最適化 ＆ 最大許容遅延）
+                          <span class="badge" style="background:#5865f2;color:white;font-size:10px;">動的適応</span>
+                        </label>
+                        <small style="color:var(--text-dim);font-size:12px;">
+                          GPU/CPU性能と文字数の実績からミリ秒単位で動的判定。ここで指定した秒数は「これ以上沈黙を許容しない最大上限」として機能します。
+                        </small>
+                      </div>
+                      <div style="display:flex;align-items:center;gap:8px;">
+                        <input type="number" step="0.1" min="0.8" max="6.0" id="cfg-speculative-timeout" class="form-input" style="width:85px;text-align:center;font-weight:bold;font-size:14px;" oninput="onSpeculativeTimeoutInput(this.value)" required>
+                        <span style="font-size:13px;color:var(--text-muted);">秒</span>
+                      </div>
                     </div>
-                    <div style="display:flex;align-items:center;gap:8px;">
-                      <input type="number" step="0.1" min="0.2" max="5.0" id="cfg-speculative-timeout" class="form-input" style="width:100px;text-align:center;font-weight:bold;font-size:14px;" required>
-                      <span style="font-size:13px;color:var(--text-muted);">秒</span>
+                    <!-- プリセットボタングループ -->
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                      <button type="button" class="btn btn-secondary btn-sm preset-spec-btn" data-sec="1.5" onclick="selectSpecPreset(1.5)" style="font-size:11px;padding:4px 10px;border-radius:6px;transition:all 0.2s;">
+                        ⚡ テンポ優先 (1.5s)
+                      </button>
+                      <button type="button" class="btn btn-secondary btn-sm preset-spec-btn" data-sec="2.5" onclick="selectSpecPreset(2.5)" style="font-size:11px;padding:4px 10px;border-radius:6px;transition:all 0.2s;">
+                        ⚖️ バランス (2.5s 推奨)
+                      </button>
+                      <button type="button" class="btn btn-secondary btn-sm preset-spec-btn" data-sec="4.0" onclick="selectSpecPreset(4.0)" style="font-size:11px;padding:4px 10px;border-radius:6px;transition:all 0.2s;">
+                        🎙️ 声色維持優先 (4.0s)
+                      </button>
                     </div>
                   </div>
 
