@@ -566,7 +566,6 @@ class TTSManager:
                     is_loaded = best_node.has_model_in_ram(model_name) if model_name else bool(best_node.specs.get("ram_models"))
                 est_ms = None
                 try:
-                    from src.utils.latency_profiler import latency_profiler
                     prof = latency_profiler.get_or_create(best_node)
                     if prof.sample_count >= 2:
                         est_ms = prof.estimate(text_len)
@@ -789,7 +788,10 @@ class TTSManager:
                 )
                 if res:
                     dur_ms = (time.time() - t0) * 1000.0
-                    latency_profiler.record_synth_direct("edge", len(text), dur_ms)
+                    try:
+                        latency_profiler.record_synth_direct("edge", len(text), dur_ms)
+                    except Exception:
+                        pass
                     logger.info(f"☁️ [EDGE-TTS] 音声合成完了 ({dur_ms:.0f}ms): クラウドAPI | text='{preview_text}'")
                 return res
             except Exception as e:
@@ -809,7 +811,10 @@ class TTSManager:
                 )
                 if res:
                     dur_ms = (time.time() - t0) * 1000.0
-                    latency_profiler.record_synth_direct("azure", len(text), dur_ms)
+                    try:
+                        latency_profiler.record_synth_direct("azure", len(text), dur_ms)
+                    except Exception:
+                        pass
                     logger.info(f"☁️ [AZURE] 音声合成完了 ({dur_ms:.0f}ms): クラウドAPI | text='{preview_text}'")
                 return res
             except (RateLimitError, TTSConnectionError) as e:
@@ -853,7 +858,10 @@ class TTSManager:
                 )
                 if res:
                     dur_ms = (time.time() - t0) * 1000.0
-                    latency_profiler.record_synth_direct("google", len(text), dur_ms)
+                    try:
+                        latency_profiler.record_synth_direct("google", len(text), dur_ms)
+                    except Exception:
+                        pass
                     logger.info(f"☁️ [GOOGLE] 音声合成完了 ({dur_ms:.0f}ms): クラウドAPI | text='{preview_text}'")
                     # キャッシュ文字数をインクリメント
                     t_c, u_c = self._google_monthly_chars_cache
@@ -876,7 +884,10 @@ class TTSManager:
                 )
                 if res:
                     dur_ms = (time.time() - t0) * 1000.0
-                    latency_profiler.record_synth_direct("openjtalk", len(text), dur_ms)
+                    try:
+                        latency_profiler.record_synth_direct("openjtalk", len(text), dur_ms)
+                    except Exception:
+                        pass
                     logger.info(f"📢 [OPENJTALK] 音声合成完了 ({dur_ms:.0f}ms): ローカルエンジン | text='{preview_text}'")
                 return res
             except Exception as e:
@@ -1005,7 +1016,6 @@ class TTSManager:
             if speculative_timeout is None:
                 base_spec_timeout = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", getattr(self.config, "speculative_timeout_seconds", 2.5)))
                 try:
-                    from src.utils.latency_profiler import latency_profiler
                     pool = self._get_pool_for_provider(prim_prov) if hasattr(self, "_get_pool_for_provider") else None
                     cand_nodes = pool.nodes if pool and hasattr(pool, "nodes") else None
                     speculative_timeout = latency_profiler.calculate_dynamic_speculative_timeout(

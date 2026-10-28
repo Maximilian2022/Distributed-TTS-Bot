@@ -1,6 +1,34 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] Google Cloud TTS の UnboundLocalError による多段フォールバック誤爆の完全修正
+
+- **ユーザーフィードバック & 課題**:
+  - 「うーん？ Googleの声の設定なのにVoicevoxのタグがついて3090になってる？」
+  - 添付画像: `18:13:53`「えびちりこっこ、こえへん」話者 `WaveNet 男声B (Google)` なのにワーカーが `MASTERSOMEN2022 (RTX 3090) VOICEVOX` となり音飛び発生。
+
+- **原因分析 & 調査結果**:
+  1. **データベース (playback_latency_history) レコード分析**:
+     - 該当発話の `failed_providers` に `["google", "edge", "azure"]` が記録されていた。
+     - クラウドTTS（Google ➔ Edge ➔ Azure）がすべて失敗し、最後の砦であるローカル最速GPUノード（`MASTERSOMEN2022 (RTX 3090) VOICEVOX`）に多段フォールバックしていた。
+  2. **ログ (logs/bot.log) のエラー特定**:
+     - `Google Cloud TTS chunk synthesis failed: cannot access free variable 'latency_profiler' where it is not associated with a value in enclosing scope`
+     - `Edge-TTS chunk synthesis failed: cannot access free variable 'latency_profiler' where it is not associated with a value in enclosing scope`
+  3. **根本原因 (Pythonスコープ解決のバグ)**:
+     - `src/tts/manager.py` において、モジュールトップ（16行目）で `from src.utils.latency_profiler import latency_profiler` をインポートしていた。
+     - しかし、同ファイル下部の `get_chunk_audio` メソッド内（1008行目）に `from src.utils.latency_profiler import latency_profiler` というローカルインポートが存在していた。
+     - Pythonコンパイラはこのメソッド内の `latency_profiler` を「ローカルセル変数」と解釈するため、上部の `_try_edge`, `_try_azure`, `_try_google` で `latency_profiler.record_synth_direct` を呼ぼうとした時点で `UnboundLocalError` が発生し、クラウドTTSが合成成功直後のログ出力・プロファイラ記録時点でクラッシュしていた。
+
+- **対応内容**:
+  1. **冗長ローカルインポートの完全撤廃**:
+     - `src/tts/manager.py`: `get_chunk_audio` 内および `resolve_fastest_worker_estimate` 内の `from src.utils.latency_profiler import latency_profiler` を完全に削除し、モジュールトップのインポートを参照するように統一。
+  2. **プロファイラ記録の防御的例外ラップ**:
+     - `_try_edge`, `_try_azure`, `_try_google`, `_try_openjtalk` において、`record_synth_direct` 呼び出しを `try...except` で安全にラップ。万が一プロファイラ側でエラーが発生しても、生成された音声PCMバイトデータは確実に返却されるように安全網を配備。
+  3. **テスト検証**:
+     - 一時サンドボックスコンテナで全74件の単体テストを実行し、100% PASS を確認。終了後にテストコンテナは自動破棄済み。
+
+---
+
 ## [2026-10-28] レイテンシ モニター ＆ 推論統計機能 (LatencyTracker / EngineLatencyProfiler) 総合是正・物理的整合性確立
 
 - **ユーザーフィードバック & 課題**:
