@@ -1,6 +1,39 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] GitHub Code Scanning (CodeQL CWE-022 パスインジェクション) アラート #91〜#94 の完全解消
+
+- **ユーザーフィードバック & 課題**:
+  - 「GithubのCodescanningを確認して対処をお願い。」
+  - GitHub Code Scanning (CodeQL) にてオープン状態であった未解決アラート 4 件 (#91, #92, #93, #94: `py/path-injection`, High, CWE-022) の恒久修正。
+
+- **原因分析 & 調査結果**:
+  1. **アラート発生箇所の特定**:
+     - ファイル: `src/web/static/agent.py` 内 `handle_model_download` (3716〜3745行目付近)。
+     - Alert #91 (Line 3729): `target_path = (model_dir / clean_model_name).resolve()`
+     - Alert #92, #93, #94 (Line 3733): `target_path.exists()`, `target_path.is_dir()`, `(target_path / "metas.json").exists()`
+  2. **根本原因**:
+     - `request.match_info.get("model_name", "")` から生成した変数 `clean_model_name`（ユーザー入力Taint）が、パス結合式 `model_dir / clean_model_name` に直接渡されていた。
+     - その直後の `str(target_path).startswith(str(model_dir.resolve()))` によるプレフィックス検査は、CodeQL の Taint-Tracking 解析エンジンが公式に認める CWE-022 パスサニタイザーとして認識されず、ファイルシステム呼び出し（`exists`, `is_dir`）および `tar` 引数へ Taint が波及していた。
+
+- **対応内容**:
+  1. **CodeQL 準拠の `validate_safe_path` 関数の新設 (`src/web/static/agent.py`)**:
+     - `os.path.realpath` による正規化および `target_str == base_str or target_str.startswith(base_str + os.sep)` 判定に加え、絶対パス（`os.path.isabs` や `/`, `\`）や Windows ドライブレターを明示的に拒否する完全防護サニタイザを定義。
+     - 同時に `src/utils/security.py` の `validate_safe_path` にも同様の絶対パス明示的拒否ロジックを反映し、システム全体の堅牢性を統一。
+  2. **Taint-Free ホワイトリスト照合（Taint Cutoff Barrier）の実装 (`src/web/static/agent.py`)**:
+     - `handle_model_download` において、`clean_model_name` はディスク上に実在するディレクトリ名との等価比較（`entry.name == clean_model_name`）にのみ使用。
+     - ファイルシステム操作および `tar` コマンド引数には、ディスクから列挙された安全な実在ディレクトリ名 `matched_dir_name` を渡し、さらに `validate_safe_path(model_dir, matched_dir_name)` を通過させる二重防御を実装。
+     - これにより、ユーザー入力の Taint（汚染データ）がファイルシステムパス式に流入するルートを 100% 物理的に遮断。
+  3. **バージョン更新 & 自動同期**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.10.28-2015"`, `AGENT_VERSION = "3.13.5"` に更新。
+     - `src/web/static/agent.py`: フォールバック `AGENT_VERSION = "3.13.5"` に同期。
+  4. **単体テストの追加とサンドボックス検証**:
+     - `tests/test_audit_remediation_11_to_19.py` に `test_item_19_agent_model_download_path_traversal_protection` を新設。
+     - 不正な識別子（`....` 等）の 400 Bad Request、パストラバーサル試行（`../../etc/passwd`）および存在しないモデル名の 404 Not Found、実在モデルの 200 OK (application/x-tar) ストリーミングを網羅的に検証。
+     - 使い捨てテストコンテナ（`madpiero/ttsbot:latest`）にて全75件の単体テストを実行し、**100% PASS (OK)** を確認。テストコンテナは自動破棄済み（ゼロフットプリント維持）。
+
+---
+
 ## [2026-10-28] Google Cloud TTS の UnboundLocalError による多段フォールバック誤爆の完全修正
 
 - **ユーザーフィードバック & 課題**:

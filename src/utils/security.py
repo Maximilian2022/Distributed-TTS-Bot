@@ -99,8 +99,12 @@ def validate_safe_path(base_dir: Union[str, Path], subpath: Union[str, Path]) ->
     os.path.realpath で正規化し、base_dir で始まることを検証。
     """
     try:
+        raw_sub = str(subpath)
+        # 絶対パスやドライブレター付きパスは拒否
+        if os.path.isabs(raw_sub) or raw_sub.startswith(("/", "\\")) or (len(raw_sub) > 1 and raw_sub[1] == ":"):
+            return None
         base_str = os.path.realpath(str(base_dir))
-        sub_str = str(subpath).replace("\\", "/")
+        sub_str = raw_sub.replace("\\", "/")
         # トラバーサルセグメント '..' が含まれる場合は拒否
         segments = [s for s in sub_str.split("/") if s]
         if any(s == ".." for s in segments):

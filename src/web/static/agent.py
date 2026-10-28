@@ -29,7 +29,7 @@ import json
 import collections
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List, Union
 from pathlib import Path
 import aiohttp
 from aiohttp import web
@@ -46,6 +46,29 @@ def is_safe_identifier(name: str) -> bool:
     if not name or len(name) > 128:
         return False
     return bool(re.match(r'^[a-zA-Z0-9_\-\.]+$', name)) and ".." not in name
+
+def validate_safe_path(base_dir: Union[str, Path], subpath: Union[str, Path]) -> Optional[Path]:
+    """
+    指定されたサブパスがベースディレクトリ配下に安全に収まっているかを検証する (CodeQL CWE-22 推奨パターン)。
+    os.path.realpath で正規化し、base_dir 配下であることを検証。
+    """
+    try:
+        raw_sub = str(subpath)
+        # 絶対パスやドライブレター付きパスは拒否
+        if os.path.isabs(raw_sub) or raw_sub.startswith(("/", "\\")) or (len(raw_sub) > 1 and raw_sub[1] == ":"):
+            return None
+        base_str = os.path.realpath(str(base_dir))
+        sub_str = raw_sub.replace("\\", "/")
+        # トラバーサルセグメント '..' が含まれる場合は拒否
+        segments = [s for s in sub_str.split("/") if s]
+        if any(s == ".." for s in segments):
+            return None
+        target_str = os.path.realpath(os.path.join(base_str, *segments))
+        if target_str == base_str or target_str.startswith(base_str + os.sep):
+            return Path(target_str)
+    except Exception:
+        pass
+    return None
 
 # タイムゾーンをJST (UTC+9) に統一
 os.environ["TZ"] = "Asia/Tokyo"
@@ -161,7 +184,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.13.4"
+    AGENT_VERSION = "3.13.5"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -3721,30 +3744,45 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
         return web.Response(text="Invalid model name", status=400)
 
     work_dir = Path(resolve_work_dir())
-    model_dir = work_dir / "coeiroink_models"
+    model_dir = (work_dir / "coeiroink_models").resolve()
     agent = request.app.get("agent")
     if agent and getattr(agent, "ram_manager", None):
-        model_dir = Path(agent.ram_manager.persistent_dir)
+        model_dir = Path(agent.ram_manager.persistent_dir).resolve()
 
-    target_path = (model_dir / clean_model_name).resolve()
-    if not str(target_path).startswith(str(model_dir.resolve())):
-        return web.Response(text="Invalid model path", status=400)
+    if not model_dir.exists() or not model_dir.is_dir():
+        return web.Response(text="Model directory not found", status=404)
 
-    if not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
+    # ディスク上の実在ディレクトリ名と照合し Taint を完全に切断 (CWE-22 / CodeQL py/path-injection 対策)
+    matched_dir_name: Optional[str] = None
+    try:
+        for entry in model_dir.iterdir():
+            if entry.is_dir() and entry.name == clean_model_name:
+                matched_dir_name = entry.name
+                break
+    except Exception as e:
+        logger.error(f"Error scanning model directory: {e}")
+        return web.Response(text="Error accessing model directory", status=500)
+
+    if not matched_dir_name:
         return web.Response(text="Model not found", status=404)
 
+    target_path = validate_safe_path(model_dir, matched_dir_name)
+    if not target_path or not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
+        return web.Response(text="Model not found", status=404)
+
+    safe_filename_header = sanitize_filename(matched_dir_name)
     response = web.StreamResponse(
         status=200,
         headers={
             "Content-Type": "application/x-tar",
-            "Content-Disposition": f'attachment; filename="{clean_model_name}.tar"',
+            "Content-Disposition": f'attachment; filename="{safe_filename_header}.tar"',
         }
     )
     await response.prepare(request)
 
     if shutil.which("tar"):
         proc = await asyncio.create_subprocess_exec(
-            "tar", "-cf", "-", "-C", str(model_dir), clean_model_name,
+            "tar", "-cf", "-", "-C", str(model_dir), matched_dir_name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
@@ -3766,7 +3804,7 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
             tmp_tar = Path(tf.name)
         try:
             with tarfile.open(tmp_tar, "w") as tar:
-                tar.add(str(target_path), arcname=clean_model_name)
+                tar.add(str(target_path), arcname=matched_dir_name)
             with open(tmp_tar, "rb") as f:
                 while True:
                     chunk = f.read(64 * 1024)

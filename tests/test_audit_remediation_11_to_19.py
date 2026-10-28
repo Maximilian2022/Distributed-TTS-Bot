@@ -664,6 +664,63 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         self.assertIn("cloud_direct:EDGE", stats["nodes"])
         self.assertIn("cloud_direct:AZURE", stats["nodes"])
 
+    # =========================================================================
+    # 項目⑲: Worker Agent モデル配信エンドポイントのパストラバーサル防御テスト (CodeQL CWE-22)
+    # =========================================================================
+    async def test_item_19_agent_model_download_path_traversal_protection(self):
+        """Worker Agent の handle_model_download および validate_safe_path におけるパストラバーサル遮断の検証"""
+        import importlib.util
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        agent_spec = importlib.util.spec_from_file_location("worker_agent", "src/web/static/agent.py")
+        agent_module = importlib.util.module_from_spec(agent_spec)
+        agent_spec.loader.exec_module(agent_module)
+
+        # 1. validate_safe_path の直接検証
+        base_dir = Path(self.temp_dir) / "models"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        (base_dir / "safe_model").mkdir()
+
+        # 正常なサブパス
+        self.assertIsNotNone(agent_module.validate_safe_path(base_dir, "safe_model"))
+        # トラバーサル攻撃パターン
+        self.assertIsNone(agent_module.validate_safe_path(base_dir, "../../../etc/passwd"))
+        self.assertIsNone(agent_module.validate_safe_path(base_dir, "safe_model/../../.."))
+        self.assertIsNone(agent_module.validate_safe_path(base_dir, "/etc/passwd"))
+
+        # 2. handle_model_download の動作検証
+        app = web.Application()
+        app["agent"] = None
+
+        with patch.object(agent_module, "resolve_work_dir", return_value=str(self.temp_dir)):
+            models_root = Path(self.temp_dir) / "coeiroink_models"
+            models_root.mkdir(parents=True, exist_ok=True)
+            valid_m = models_root / "test_model_1"
+            valid_m.mkdir(parents=True, exist_ok=True)
+            (valid_m / "metas.json").write_text('{"characterName": "Test1"}')
+
+            # ケースA: 無効な識別子 (..を含む、または空) -> 400 Bad Request
+            req_invalid = make_mocked_request("GET", "/download/....", match_info={"model_name": "...."}, app=app)
+            res_invalid = await agent_module.handle_model_download(req_invalid)
+            self.assertEqual(res_invalid.status, 400)
+
+            # ケースB: パストラバーサル試行 (../../etc/passwd) -> basenameが無害化されるが実在しないため 404 Not Found
+            req_traversal = make_mocked_request("GET", "/download/..%2F..%2Fetc%2Fpasswd", match_info={"model_name": "../../etc/passwd"}, app=app)
+            res_traversal = await agent_module.handle_model_download(req_traversal)
+            self.assertEqual(res_traversal.status, 404)
+
+            # ケースC: 存在しないモデル名 -> 404 Not Found
+            req_not_found = make_mocked_request("GET", "/download/non_existent_model", match_info={"model_name": "non_existent_model"}, app=app)
+            res_not_found = await agent_module.handle_model_download(req_not_found)
+            self.assertEqual(res_not_found.status, 404)
+
+            # ケースD: 実在するモデル名 -> 200 OK (Content-Type: application/x-tar)
+            req_valid = make_mocked_request("GET", "/download/test_model_1", match_info={"model_name": "test_model_1"}, app=app)
+            res_valid = await agent_module.handle_model_download(req_valid)
+            self.assertEqual(res_valid.status, 200)
+            self.assertEqual(res_valid.headers.get("Content-Type"), "application/x-tar")
+
 
 if __name__ == "__main__":
     unittest.main()
