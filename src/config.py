@@ -17,8 +17,9 @@ class VoiceConfig:
     provider: str = "azure"  # "azure", "google", "voicevox", "edge"
     voice_name: str = ""     # メイン音声モデル名 (未指定時はproviderに応じてazure_voice/google_voiceを使用)
     style_id: Optional[int] = None  # VOICEVOX用スタイルID
-    fallback_provider: str = "google"
+    fallback_provider: str = "azure"
     fallback_voice: str = ""
+    hidden: bool = False
 
     def get_primary_voice(self) -> str:
         """メインの音声モデル名を取得"""

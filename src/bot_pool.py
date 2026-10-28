@@ -97,16 +97,17 @@ class BotPoolManager:
             if key in self._connecting_vcs:
                 existing_bot, ts = self._connecting_vcs[key]
                 # TTL内かつ別号機による予約の場合のみ拒否 (同一号機による再試行や期限切れゾンビは許可)
-                if existing_bot != bot_index and (now - ts) < self.RESERVATION_TTL_SECONDS:
+                age = now - ts
+                if existing_bot != bot_index and age < self.RESERVATION_TTL_SECONDS:
                     logger.warning(
                         f"[BotPool] Reserve rejected: VC {voice_channel_id} in guild {guild_id} "
-                        f"is currently being connected by Bot #{existing_bot} (age: {now - ts:.1f}s)."
+                        f"is currently being connected by Bot #{existing_bot} (age: {age:.1f}s)."
                     )
                     return False
-                elif (now - ts) >= self.RESERVATION_TTL_SECONDS:
+                elif age >= self.RESERVATION_TTL_SECONDS:
                     logger.info(
                         f"[BotPool] Overriding expired reservation for VC {voice_channel_id} in guild {guild_id} "
-                        f"(previous Bot #{existing_bot}, age: {now - ts:.1f}s)."
+                        f"(previous Bot #{existing_bot}, age: {age:.1f}s)."
                     )
 
             # 3. 予約を確保 (タイムスタンプ付き)

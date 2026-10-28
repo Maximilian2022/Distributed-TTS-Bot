@@ -2284,6 +2284,9 @@ class WebServer:
         self._require_auth(request)
         voices_list = []
         for v_id, v in self.config.voices.items():
+            # フォールバック専用話者 (Edge-TTS や hidden 指定) はユーザー選択肢から除外
+            if getattr(v, "hidden", False) or v.provider == "edge":
+                continue
             voices_list.append({
                 "id": v.id,
                 "name": v.name,

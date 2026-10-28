@@ -208,7 +208,7 @@ class TTSManager:
                         provider=item.get("provider", "edge"),
                         voice_name=item.get("voice_name", ""),
                         style_id=item.get("style_id"),
-                        fallback_provider=item.get("fallback_provider", "edge"),
+                        fallback_provider=item.get("fallback_provider", "azure"),
                         fallback_voice=item.get("fallback_voice", "ja-JP-NanamiNeural")
                     )
                     loaded_cnt += 1
@@ -323,7 +323,7 @@ class TTSManager:
                         provider="sharevox",
                         voice_name=str(style_id),
                         style_id=style_id,
-                        fallback_provider="edge",
+                        fallback_provider="azure",
                         fallback_voice="ja-JP-NanamiNeural"
                     )
                     count += 1
@@ -419,7 +419,7 @@ class TTSManager:
                         provider="coeiroink",
                         voice_name=f"{speaker_uuid}_{style_id}",
                         style_id=style_id,
-                        fallback_provider="edge",
+                        fallback_provider="azure",
                         fallback_voice="ja-JP-NanamiNeural"
                     )
                     registered_voice_ids.add(voice_id)
@@ -950,55 +950,57 @@ class TTSManager:
                 failed_providers.append(prov)
                 self._record_failure_bg(prov)
 
-        edge_fallback_voice = "ja-JP-KeitaNeural" if getattr(voice_cfg, "gender", "female") == "male" else "ja-JP-NanamiNeural"
+        is_male = getattr(voice_cfg, "gender", "female") == "male"
+        edge_fallback_voice = "ja-JP-KeitaNeural" if is_male else "ja-JP-NanamiNeural"
+        google_fallback_voice = "ja-JP-Neural2-C" if is_male else "ja-JP-Neural2-B"
 
-        # プライマリプロバイダーに応じたフォールバック計画テーブル (C-1)
+        # プライマリプロバイダーに応じたフォールバック計画テーブル (Azure -> Google -> Edge -> OpenJTalk)
         fallback_chains: Dict[str, List[Tuple[str, str]]] = {
             "voicevox": [
                 ("voicevox", voice_cfg.get_primary_voice()),
-                ("edge", edge_fallback_voice),
                 ("azure", voice_cfg.get_fallback_voice()),
-                ("google", "ja-JP-Neural2-B"),
+                ("google", google_fallback_voice),
+                ("edge", edge_fallback_voice),
                 ("openjtalk", "ojt_mei_normal"),
             ],
             "sharevox": [
                 ("sharevox", voice_cfg.get_primary_voice()),
-                ("edge", edge_fallback_voice),
                 ("azure", voice_cfg.get_fallback_voice()),
-                ("google", "ja-JP-Neural2-B"),
+                ("google", google_fallback_voice),
+                ("edge", edge_fallback_voice),
                 ("openjtalk", "ojt_mei_normal"),
             ],
             "coeiroink": [
                 ("coeiroink", voice_cfg.get_primary_voice()),
-                ("edge", edge_fallback_voice),
                 ("azure", voice_cfg.get_fallback_voice()),
-                ("google", "ja-JP-Neural2-B"),
+                ("google", google_fallback_voice),
+                ("edge", edge_fallback_voice),
                 ("openjtalk", "ojt_mei_normal"),
             ],
             "openjtalk": [
                 ("openjtalk", voice_cfg.get_primary_voice()),
-                ("edge", edge_fallback_voice),
                 ("azure", voice_cfg.get_fallback_voice()),
-                ("google", "ja-JP-Neural2-B"),
+                ("google", google_fallback_voice),
+                ("edge", edge_fallback_voice),
             ],
             "edge": [
                 ("edge", voice_cfg.get_primary_voice()),
                 ("azure", voice_cfg.get_fallback_voice()),
-                ("google", "ja-JP-Neural2-B"),
+                ("google", google_fallback_voice),
                 ("voicevox", default_vv_style),
                 ("openjtalk", "ojt_mei_normal"),
             ],
             "google": [
                 ("google", voice_cfg.get_primary_voice()),
-                ("edge", edge_fallback_voice),
                 ("azure", voice_cfg.get_fallback_voice()),
+                ("edge", edge_fallback_voice),
                 ("voicevox", default_vv_style),
                 ("openjtalk", "ojt_mei_normal"),
             ],
             "azure": [
                 ("azure", voice_cfg.get_primary_voice()),
-                ("edge", edge_fallback_voice),
                 ("google", voice_cfg.get_fallback_voice()),
+                ("edge", edge_fallback_voice),
                 ("voicevox", default_vv_style),
                 ("openjtalk", "ojt_mei_normal"),
             ],

@@ -298,6 +298,8 @@ class CommandsCog(commands.Cog):
         current_lower = current.lower().strip()
         choices = []
         for voice_id, voice in self.config.voices.items():
+            if getattr(voice, "hidden", False) or voice.provider == "edge":
+                continue
             name_full = f"{voice.name} ({voice.gender}) [{voice.provider}]"
             search_target = f"{voice.name} {voice.gender} {voice.provider} {voice.description}".lower()
             if not current_lower or current_lower in search_target:

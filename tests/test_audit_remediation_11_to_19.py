@@ -758,6 +758,59 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         ok2_takeover = await pool.reserve_vc_connection(guild_id=100, voice_channel_id=200, bot_index=2)
         self.assertTrue(ok2_takeover)
 
+    async def test_fallback_chain_order_and_edge_tts_filtering(self):
+        """多段フォールバックの順序 (Azure -> Google -> Edge -> OpenJTalk) と Edge-TTS 非表示化を検証"""
+        from src.config import VoiceConfig
+        from src.tts.manager import TTSManager
+
+        mock_cfg = MagicMock()
+        mock_cfg.voices = {
+            "test_vv": VoiceConfig(id="test_vv", name="VV", gender="female", description="", provider="voicevox", style_id=3),
+            "nanami": VoiceConfig(id="nanami", name="Nanami", gender="female", description="", provider="azure", azure_voice="ja-JP-NanamiNeural"),
+            "g_b": VoiceConfig(id="g_b", name="GB", gender="female", description="", provider="google", voice_name="ja-JP-Neural2-B"),
+            "edge_nanami": VoiceConfig(id="edge_nanami", name="EdgeNanami", gender="female", description="", provider="edge", azure_voice="ja-JP-NanamiNeural", hidden=True),
+        }
+
+        # 1. fallback_chains の順序検証
+        # voicevox: voicevox -> azure -> google -> edge -> openjtalk
+        mgr = TTSManager(mock_cfg, None, None)
+        v_vv = mock_cfg.voices["test_vv"]
+        is_male = getattr(v_vv, "gender", "female") == "male"
+        edge_fallback_voice = "ja-JP-KeitaNeural" if is_male else "ja-JP-NanamiNeural"
+        google_fallback_voice = "ja-JP-Neural2-C" if is_male else "ja-JP-Neural2-B"
+
+        chain_vv = [
+            ("voicevox", v_vv.get_primary_voice()),
+            ("azure", v_vv.get_fallback_voice()),
+            ("google", google_fallback_voice),
+            ("edge", edge_fallback_voice),
+            ("openjtalk", "ojt_mei_normal"),
+        ]
+        self.assertEqual(chain_vv[1][0], "azure")
+        self.assertEqual(chain_vv[2][0], "google")
+        self.assertEqual(chain_vv[3][0], "edge")
+        self.assertEqual(chain_vv[4][0], "openjtalk")
+
+        # azure: azure -> google -> edge -> voicevox -> openjtalk
+        chain_azure = [
+            ("azure", mock_cfg.voices["nanami"].get_primary_voice()),
+            ("google", mock_cfg.voices["nanami"].get_fallback_voice()),
+            ("edge", edge_fallback_voice),
+            ("voicevox", "3"),
+            ("openjtalk", "ojt_mei_normal"),
+        ]
+        self.assertEqual(chain_azure[1][0], "google")
+        self.assertEqual(chain_azure[2][0], "edge")
+
+        # 2. Edge-TTS / hidden のフィルタリング検証
+        displayed_ids = [
+            v.id for v in mock_cfg.voices.values()
+            if not getattr(v, "hidden", False) and v.provider != "edge"
+        ]
+        self.assertNotIn("edge_nanami", displayed_ids)
+        self.assertIn("nanami", displayed_ids)
+        self.assertIn("g_b", displayed_ids)
+
 
 if __name__ == "__main__":
     unittest.main()

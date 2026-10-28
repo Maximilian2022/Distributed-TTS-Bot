@@ -633,6 +633,27 @@ class Database:
                     await db.execute("INSERT INTO schema_migrations (version) VALUES ('20261003_fix_invalid_g_neural_f')")
                     logger.info("Migration '20261003_fix_invalid_g_neural_f' completed successfully.")
 
+            # マイグレーション: Edge-TTS話者を対応する高速Azure話者へ自動移行 (フォールバック専用化)
+            async with db.execute("SELECT 1 FROM schema_migrations WHERE version = '20261028_migrate_edge_to_azure'") as cur:
+                if not await cur.fetchone():
+                    logger.info("Applying migration: remapping edge_nanami / edge_keita to Azure nanami / keita...")
+                    edge_map = {"edge_nanami": "nanami", "edge_keita": "keita"}
+                    for old_spk, new_spk in edge_map.items():
+                        await db.execute(
+                            "UPDATE user_settings SET speaker_id = ?, updated_at = CURRENT_TIMESTAMP WHERE speaker_id = ?",
+                            (new_spk, old_spk)
+                        )
+                        await db.execute(
+                            "UPDATE guild_user_settings SET speaker_id = ?, updated_at = CURRENT_TIMESTAMP WHERE speaker_id = ?",
+                            (new_spk, old_spk)
+                        )
+                        await db.execute(
+                            "UPDATE guild_settings SET default_speaker = ?, updated_at = CURRENT_TIMESTAMP WHERE default_speaker = ?",
+                            (new_spk, old_spk)
+                        )
+                    await db.execute("INSERT INTO schema_migrations (version) VALUES ('20261028_migrate_edge_to_azure')")
+                    logger.info("Migration '20261028_migrate_edge_to_azure' completed successfully.")
+
             await db.commit()
         logger.info(f"Database initialized with guild isolation & usage tracking at {self.db_path}")
 

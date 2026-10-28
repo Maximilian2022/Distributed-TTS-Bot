@@ -1,6 +1,49 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] 多段フォールバック順序最適化 (Azure ➔ Google ➔ Edge ➔ OpenJTalk)、Edge-TTS 非表示化、および Bot 出入りループの恒久是正 (v2026.10.28-2250)
+
+- **ユーザーフィードバック & 課題**:
+  - 「多段フォールバックも順番かえて、Azure, Google, Edge, OpenJtalkにしよ」
+  - 「Edge TTSはFallback専用として、ユーザーにEdge TTSを選択できないようにして、既存のEdge TTSユーザーをAzureの対応するモデルに移し替える」
+  - 「Botがずっと永遠に出入りを繰り返している」
+  - 「Azure Speech 認証エラー (HTTP 401: ReadOnlyDisabledSubscription) による Edge-TTS への想定外フォールバックと音飛び (620ms) の発生」
+
+- **原因分析 & トリアージ調査結果**:
+  1. **Azure 認証エラー (401) と Edge-TTS フォールバックの連鎖**:
+     - Azure サブスクリプションが無効化（`ReadOnlyDisabledSubscription`）されたため Azure API が 401 エラーを返却。
+     - サーキットブレーカーにより Azure が 180秒間隔離され、フォールバックチェーンの先頭だった Edge-TTS へ自動ルーティング。
+     - Edge-TTS は WebSocket 通信で 1.6 秒〜4.7 秒の推論遅延を要するため、名前先行再生バッファが追いつかずアンダーラン（音飛び 620ms）が発生していた。
+  2. **Bot の永遠の出入りループのメカニズム**:
+     - `src/cogs/vc_handler.py` の `connect_vc` に排他ロック（`vc_lock`）が存在せず、`on_voice_state_update` の再接続タスクと `AutoJoinReconcile` が同時に `connect_vc` に突入。
+     - 2つ目のタスクが `old_vc.disconnect(force=True)` を実行し、先行タスクが確立中・接続済みの VoiceClient を自爆切断。
+     - さらに、回線瞬断や I/O 負荷時に Bot #1 が「どっこいしょ」VCへ移動したと誤認され、Bot #3 と Bot #1 が同一VC内で互いに切断・再接続を ping-pong 状態で奪い合うループが発生していた。
+
+- **対応内容**:
+  1. **出入りループの恒久根絶 (`src/cogs/vc_handler.py` & `src/bot_pool.py`)**:
+     - `connect_vc` のエントリポイント全体を `self.bot_pool.get_vc_lock(guild_id, channel.id)` で排他保護。
+     - ロック獲得後、目的VCにすでに正常接続中（`is_connected()`）であれば既存接続を破壊せずそのまま再利用（`vc = old_vc; break`）するよう強化。
+     - `src/bot_pool.py` の先頭に `import time` を補完。
+     - データベース（`data/bot.db`）の `active_vc_sessions` を正常マッピング（Bot #1: わっしょい、Bot #2: M2O、Bot #3: どっこいしょ）に即時復旧。
+  2. **多段フォールバックの順序最適化 (`src/tts/manager.py` & `config.yaml`)**:
+     - 全プロバイダーのフォールバックチェーンを **`Azure ➔ Google ➔ Edge ➔ OpenJTalk`** に統一。
+     - Azure 失敗時でも Edge（1.6秒）ではなく高速な **Google Cloud TTS（約400ms）** へ優先フォールバックされるため、アンダーランを確実に防止。
+     - ローカルGPUエンジン（VOICEVOX / SHAREVOX / COEIROINK）の投機的デュアルストリーミングの並行リクエスト先も Azure（200ms）に変更。
+     - OpenJTalk 各話者の `fallback_provider` を `azure` に更新。
+     - 防災速報（`speak_alert`）の最優先スピーカーを `nanami`（Azure）に変更。
+  3. **Edge-TTS のフォールバック専用化 & ユーザー非表示化 (`src/web/server.py` & `src/cogs/commands.py`)**:
+     - `config.yaml`: `edge_nanami`, `edge_keita` に `hidden: true` を付与。
+     - `src/web/server.py`: `/api/voices` API で `hidden` および `provider == "edge"` の話者をフィルタリングし、WebUI の選択肢から除外。
+     - `src/cogs/commands.py`: `/voice` コマンドのオートコンプリートから Edge 話者を除外。
+     - `src/database.py`: 起動時マイグレーション `20261028_migrate_edge_to_azure` を追加し、DB 内に残存する `edge_nanami` / `edge_keita` を対応する `nanami` / `keita` へ自動 UPDATE。
+  4. **単体テスト & サンドボックス検証**:
+     - `tests/test_audit_remediation_11_to_19.py`: 多段フォールバック順序および Edge-TTS 非表示化を検証する単体テスト `test_fallback_chain_order_and_edge_tts_filtering` を追加。
+     - 使い捨てテストコンテナにて全 77 件のテストを実行し、**100% PASS (OK)** を確認。テストコンテナは自動破棄済み。
+  5. **バージョン更新**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.10.28-2250"` に更新。
+
+---
+
 ## [2026-10-28] 孤児 tar プロセス暴走によるディスクI/O飽和・SQLite ロック・Discord 切断の連鎖障害の完全復旧と恒久対策
 
 - **ユーザーフィードバック & 課題**:

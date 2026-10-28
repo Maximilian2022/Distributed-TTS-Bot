@@ -282,19 +282,21 @@ voices:
     name: "Nanami (Edge)"
     provider: "edge"
     gender: "female"
-    description: "Microsoft Edge の高品位ニューラル女性音声 (完全無料)"
+    description: "Microsoft Edge の高品位ニューラル女性音声 (完全無料・フォールバック専用)"
     azure_voice: "ja-JP-NanamiNeural"
     fallback_provider: "azure"
     fallback_voice: "ja-JP-NanamiNeural"
+    hidden: true
   edge_keita:
     id: "edge_keita"
     name: "Keita (Edge)"
     provider: "edge"
     gender: "male"
-    description: "Microsoft Edge の落ち着いたニューラル男性音声 (完全無料)"
+    description: "Microsoft Edge の落ち着いたニューラル男性音声 (完全無料・フォールバック専用)"
     azure_voice: "ja-JP-KeitaNeural"
     fallback_provider: "azure"
     fallback_voice: "ja-JP-KeitaNeural"
+    hidden: true
 
   # ==========================================
   # OpenJTalk (名古屋工業大学 & ゆっくり風 完全ローカル合成)
@@ -306,7 +308,7 @@ voices:
     gender: "female"
     description: "OpenJTalk: 名工大 メイ (ノーマル) 超低遅延"
     voice_name: "ojt_mei_normal"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-NanamiNeural"
   ojt_mei_happy:
     id: "ojt_mei_happy"
@@ -315,7 +317,7 @@ voices:
     gender: "female"
     description: "OpenJTalk: 名工大 メイ (ハッピー)"
     voice_name: "ojt_mei_happy"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-NanamiNeural"
   ojt_mei_angry:
     id: "ojt_mei_angry"
@@ -324,7 +326,7 @@ voices:
     gender: "female"
     description: "OpenJTalk: 名工大 メイ (怒り)"
     voice_name: "ojt_mei_angry"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-NanamiNeural"
   ojt_mei_sad:
     id: "ojt_mei_sad"
@@ -333,7 +335,7 @@ voices:
     gender: "female"
     description: "OpenJTalk: 名工大 メイ (悲しみ)"
     voice_name: "ojt_mei_sad"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-NanamiNeural"
   ojt_mei_bashful:
     id: "ojt_mei_bashful"
@@ -342,7 +344,7 @@ voices:
     gender: "female"
     description: "OpenJTalk: 名工大 メイ (ツンツン)"
     voice_name: "ojt_mei_bashful"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-NanamiNeural"
   ojt_takumi_normal:
     id: "ojt_takumi_normal"
@@ -351,7 +353,7 @@ voices:
     gender: "male"
     description: "OpenJTalk: 名工大 たくみ (ノーマル)"
     voice_name: "ojt_takumi_normal"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-KeitaNeural"
   ojt_takumi_happy:
     id: "ojt_takumi_happy"
@@ -360,7 +362,7 @@ voices:
     gender: "male"
     description: "OpenJTalk: 名工大 たくみ (ハッピー)"
     voice_name: "ojt_takumi_happy"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-KeitaNeural"
   ojt_takumi_angry:
     id: "ojt_takumi_angry"
@@ -369,7 +371,7 @@ voices:
     gender: "male"
     description: "OpenJTalk: 名工大 たくみ (怒り)"
     voice_name: "ojt_takumi_angry"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-KeitaNeural"
   ojt_takumi_sad:
     id: "ojt_takumi_sad"
@@ -378,7 +380,7 @@ voices:
     gender: "male"
     description: "OpenJTalk: 名工大 たくみ (悲しみ)"
     voice_name: "ojt_takumi_sad"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-KeitaNeural"
   ojt_nitech:
     id: "ojt_nitech"
@@ -387,7 +389,7 @@ voices:
     gender: "male"
     description: "OpenJTalk: 名古屋工業大学 標準男声"
     voice_name: "ojt_nitech"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-KeitaNeural"
   ojt_yukkuri:
     id: "ojt_yukkuri"
@@ -396,7 +398,7 @@ voices:
     gender: "female"
     description: "OpenJTalk: ゆっくり風 (機械調・抑揚低め)"
     voice_name: "ojt_yukkuri"
-    fallback_provider: "edge"
+    fallback_provider: "azure"
     fallback_voice: "ja-JP-NanamiNeural"
 
 default_speaker: "nanami"

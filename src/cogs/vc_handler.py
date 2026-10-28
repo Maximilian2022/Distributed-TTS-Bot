@@ -588,96 +588,109 @@ class VCHandlerCog(commands.Cog):
         state = self.get_guild_state(guild_id)
         state.bound_text_channel_id = text_channel.id
 
-        vc = channel.guild.voice_client
+        vc_lock = self.bot_pool.get_vc_lock(guild_id, channel.id) if self.bot_pool else asyncio.Lock()
+        async with vc_lock:
+            vc = channel.guild.voice_client
 
-        # すでに接続中の場合
-        if vc is not None and vc.is_connected():
-            if vc.channel.id != channel.id:
+            # すでに接続中の場合
+            if vc is not None and vc.is_connected():
+                if vc.channel.id != channel.id:
+                    try:
+                        await vc.move_to(channel)
+                    except Exception as e:
+                        logger.warning(f"[Bot #{self.bot_index}] Failed to move VC: {e}. Reconnecting...")
+                        try:
+                            await vc.disconnect(force=True)
+                        except Exception:
+                            pass
+                        vc = None
+                else:
+                    return vc
+
+            # 新規または再接続が必要な場合 (リトライループ付き)
+            if vc is None or not vc.is_connected():
+                # 0. 自プール内重複接続ガード (同一VCに別号機が既に接続中または接続中なら接続を即座に拒否)
+                if self.bot_pool:
+                    existing = self.bot_pool.find_connected_or_connecting_bot_in_vc(guild_id, channel.id)
+                    if existing and existing[0] != self.bot_index:
+                        logger.warning(
+                            f"[Bot #{self.bot_index}] Aborting connect to '{channel.name}' in '{channel.guild.name}': "
+                            f"Bot #{existing[0]} is already connected or in-flight connecting."
+                        )
+                        raise VCConnectAborted(f"Bot #{existing[0]} is already in VC '{channel.name}'")
+
+                    # インフライト予約 (他号機および同一号機並列の割り込みを原子的に遮断)
+                    reserved = await self.bot_pool.reserve_vc_connection(guild_id, channel.id, self.bot_index)
+                    if not reserved:
+                        existing = self.bot_pool.find_connected_or_connecting_bot_in_vc(guild_id, channel.id)
+                        ext_idx = existing[0] if existing else "unknown"
+                        raise VCConnectAborted(f"VC '{channel.name}' is already reserved/connected by Bot #{ext_idx}")
+
                 try:
-                    await vc.move_to(channel)
-                except Exception as e:
-                    logger.warning(f"[Bot #{self.bot_index}] Failed to move VC: {e}. Reconnecting...")
+                    # 他ギルドでのVC接続競合ガード (他サーバーで通話中のBotを誤って多重接続させない)
+                    for other_vc in getattr(self.bot, "voice_clients", []):
+                        if other_vc and other_vc.channel and other_vc.channel.guild.id != guild_id and other_vc.is_connected():
+                            logger.warning(
+                                f"[Bot #{self.bot_index}] Cannot connect to '{channel.name}' in '{channel.guild.name}': "
+                                f"Already connected to '{other_vc.channel.name}' in '{other_vc.channel.guild.name}'."
+                            )
+                            raise VCConnectAborted(f"Bot #{self.bot_index} is busy in '{other_vc.channel.guild.name}'")
+
+                    max_retries = 3
+                    last_err = None
+                    start_epoch = state.connect_epoch
+                    for attempt in range(1, max_retries + 1):
+                        # 試行前ガード: 切断要求が入った / VCが無人化した場合は後追い接続しない
+                        if state.connect_epoch != start_epoch or self._count_humans(channel) == 0:
+                            logger.info(
+                                f"[Bot #{self.bot_index}] Aborting connect to '{channel.name}' before attempt {attempt}: "
+                                f"{'disconnect requested' if state.connect_epoch != start_epoch else 'no human members'}."
+                            )
+                            raise VCConnectAborted(f"connect to '{channel.name}' aborted")
+                        try:
+                            # 既存の接続状況を確認 (すでに目的VCに正常接続完了していれば破壊せず採用)
+                            old_vc = channel.guild.voice_client
+                            if old_vc is not None:
+                                if old_vc.is_connected() and old_vc.channel and old_vc.channel.id == channel.id:
+                                    vc = old_vc
+                                    break
+                                try:
+                                    await old_vc.disconnect(force=True)
+                                    await asyncio.sleep(0.3)
+                                except Exception:
+                                    pass
+
+                            vc = await channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
+                            break
+                        except VCConnectAborted:
+                            raise
+                        except Exception as e:
+                            last_err = e
+                            logger.warning(
+                                f"[Bot #{self.bot_index}] Voice connect attempt {attempt}/{max_retries} failed for '{channel.name}': {e}"
+                            )
+                            if attempt < max_retries:
+                                await asyncio.sleep(1.0 * attempt)
+                            else:
+                                logger.error(
+                                    f"[Bot #{self.bot_index}] All {max_retries} voice connect attempts failed for '{channel.name}' in '{channel.guild.name}': {e}"
+                                )
+                                raise last_err
+                finally:
+                    # ハンドシェイク完了/失敗に伴いインフライト予約を解放 (is_connected() が有効になるか失敗確定)
+                    if self.bot_pool:
+                        self.bot_pool.release_vc_reservation(guild_id, channel.id, self.bot_index)
+
+                # 接続完了後ガード: ハンドシェイク中に無人化/切断要求が入っていたら即切断
+                if state.connect_epoch != start_epoch or self._count_humans(channel) == 0:
+                    logger.info(
+                        f"[Bot #{self.bot_index}] VC '{channel.name}' became empty or disconnect was requested during handshake. Leaving immediately."
+                    )
                     try:
                         await vc.disconnect(force=True)
                     except Exception:
                         pass
-                    vc = None
-            else:
-                return vc
-
-        # 新規または再接続が必要な場合 (リトライループ付き)
-        if vc is None or not vc.is_connected():
-            # 0. 自プール内重複接続ガード (同一VCに別号機が既に接続中または接続中なら接続を即座に拒否)
-            if self.bot_pool:
-                existing = self.bot_pool.find_connected_or_connecting_bot_in_vc(guild_id, channel.id)
-                if existing and existing[0] != self.bot_index:
-                    logger.warning(
-                        f"[Bot #{self.bot_index}] Aborting connect to '{channel.name}' in '{channel.guild.name}': "
-                        f"Bot #{existing[0]} is already connected or in-flight connecting."
-                    )
-                    raise VCConnectAborted(f"Bot #{existing[0]} is already in VC '{channel.name}'")
-
-                # インフライト予約 (他号機の割り込みを原子的に遮断)
-                reserved = await self.bot_pool.reserve_vc_connection(guild_id, channel.id, self.bot_index)
-                if not reserved:
-                    existing = self.bot_pool.find_connected_or_connecting_bot_in_vc(guild_id, channel.id)
-                    ext_idx = existing[0] if existing else "unknown"
-                    raise VCConnectAborted(f"VC '{channel.name}' is already reserved/connected by Bot #{ext_idx}")
-
-            try:
-                # 他ギルドでのVC接続競合ガード (他サーバーで通話中のBotを誤って多重接続させない)
-                for other_vc in getattr(self.bot, "voice_clients", []):
-                    if other_vc and other_vc.channel and other_vc.channel.guild.id != guild_id and other_vc.is_connected():
-                        logger.warning(
-                            f"[Bot #{self.bot_index}] Cannot connect to '{channel.name}' in '{channel.guild.name}': "
-                            f"Already connected to '{other_vc.channel.name}' in '{other_vc.channel.guild.name}'."
-                        )
-                        raise VCConnectAborted(f"Bot #{self.bot_index} is busy in '{other_vc.channel.guild.name}'")
-
-                max_retries = 3
-                last_err = None
-                start_epoch = state.connect_epoch
-                for attempt in range(1, max_retries + 1):
-                    # 試行前ガード: 切断要求が入った / VCが無人化した場合は後追い接続しない
-                    if state.connect_epoch != start_epoch or self._count_humans(channel) == 0:
-                        logger.info(
-                            f"[Bot #{self.bot_index}] Aborting connect to '{channel.name}' before attempt {attempt}: "
-                            f"{'disconnect requested' if state.connect_epoch != start_epoch else 'no human members'}."
-                        )
-                        raise VCConnectAborted(f"connect to '{channel.name}' aborted")
-                    try:
-                        # 既存の不完全な接続が残っていれば安全に強制切断してクリーンアップ
-                        old_vc = channel.guild.voice_client
-                        if old_vc is not None:
-                            try:
-                                await old_vc.disconnect(force=True)
-                                await asyncio.sleep(0.3)
-                            except Exception:
-                                pass
-
-                        vc = await channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
-                        break
-                    except VCConnectAborted:
-                        raise
-                    except Exception as e:
-                        last_err = e
-                        logger.warning(
-                            f"[Bot #{self.bot_index}] Voice connect attempt {attempt}/{max_retries} failed for '{channel.name}': {e}"
-                        )
-                        if attempt < max_retries:
-                            await asyncio.sleep(1.0 * attempt)
-                        else:
-                            logger.error(
-                                f"[Bot #{self.bot_index}] All {max_retries} voice connect attempts failed for '{channel.name}' in '{channel.guild.name}': {e}"
-                            )
-                            raise last_err
-            finally:
-                # ハンドシェイク完了/失敗に伴いインフライト予約を解放 (is_connected() が有効になるか失敗確定)
-                if self.bot_pool:
-                    self.bot_pool.release_vc_reservation(guild_id, channel.id, self.bot_index)
-
-            # 接続完了後ガード: ハンドシェイク中に無人化/切断要求が入っていたら即切断
-            if state.connect_epoch != start_epoch or self._count_humans(channel) == 0:
+                    raise VCConnectAborted(f"connect to '{channel.name}' aborted after handshake")
                 logger.info(
                     f"[Bot #{self.bot_index}] VC '{channel.name}' became empty or disconnect was requested during handshake. Leaving immediately."
                 )
@@ -1619,8 +1632,8 @@ class VCHandlerCog(commands.Cog):
         if not vc or not vc.is_connected():
             return
 
-        # クリアで聞き取りやすい標準ボイスを選定 (Edge-TTS Nanami または初期話者)
-        alert_speaker = "edge_nanami" if "edge_nanami" in self.config.voices else list(self.config.voices.keys())[0]
+        # クリアで聞き取りやすい標準ボイスを選定 (Azure Nanami または初期話者)
+        alert_speaker = "nanami" if "nanami" in self.config.voices else ("edge_nanami" if "edge_nanami" in self.config.voices else list(self.config.voices.keys())[0])
 
         now_ts = time.time()
         vol = max(0.0, min(float(volume), 2.0))
