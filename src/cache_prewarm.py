@@ -215,35 +215,9 @@ class IntelligentPrewarmService:
 
             logger.info(f"🎯 [Speculative Prewarm] Candidates: {len(target_phrases)} phrases, Speakers: {target_speakers}")
 
-            # 1. ローカルプロバイダー（voicevox, coeiroink, sharevox）の事前一括起動
-            # 投機実行は最閑散時間帯（VC無人時）に実行されるため、ローカルエンジンがスリープ停止している。
-            # 合成前に外部GPU/CPUワーカーノードおよび自機コンテナを確実に起動・待機させ、Edge-TTSへの意図しないフォールバックを防止する。
-            rm = getattr(self.tts, "resource_manager", None)
-            local_providers_needed = {
-                self._resolve_speaker_provider(s) for s in target_speakers 
-                if self._resolve_speaker_provider(s) in ("voicevox", "coeiroink", "sharevox")
-            }
-            if local_providers_needed:
-                for prov in local_providers_needed:
-                    logger.info(f"⚡ [Speculative Prewarm] Ensuring engine '{prov}' nodes are awake before batch...")
-                    pool = getattr(self.tts, f"{prov}_pool", None)
-                    ready = False
-                    if pool and hasattr(pool, "wake_up_nodes"):
-                        try:
-                            ready = await pool.wake_up_nodes(wait_healthy=True, timeout=35.0)
-                        except Exception as e:
-                            logger.warning(f"⚠️ [Speculative Prewarm] NodePool wake-up error for '{prov}': {e}")
-                    # 外部ノードが利用不可の場合のみ自機コンテナを起動
-                    if not ready and rm:
-                        try:
-                            await rm.start_engine(prov, wait_healthy=True, timeout=30.0)
-                        except Exception as e:
-                            logger.warning(f"⚠️ [Speculative Prewarm] Failed to pre-start local container '{prov}': {e}")
-
             from src.cache_manager import CacheManager
 
-            # 2. プロバイダーごとにグループ化して合成（エンジン切替の負荷と競合を低減）
-            # クラウド（Azure, Google）を先に処理し、次にローカル（VOICEVOX, COEIROINK, SHAREVOX）
+            # プロバイダーごとにグループ化
             speakers_by_provider: Dict[str, List[str]] = {}
             for spk in target_speakers:
                 prov = self._resolve_speaker_provider(spk)
@@ -255,10 +229,53 @@ class IntelligentPrewarmService:
                 key=lambda p: provider_order.index(p) if p in provider_order else 99
             )
 
+            # 1. キャッシュ存在の先行スキャン（全件キャッシュヒット時の不要なローカルコンテナ起動・停止20秒浪費を防止）
+            uncached_tasks_by_provider: Dict[str, List[Tuple[str, str]]] = {}
+            for prov in sorted_providers:
+                prov_speakers = speakers_by_provider[prov]
+                for phrase in target_phrases:
+                    for spk in prov_speakers:
+                        cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
+                        cached = await self.cache.get(cache_key, provider=prov)
+                        if cached is not None:
+                            skipped_count += 1
+                        else:
+                            uncached_tasks_by_provider.setdefault(prov, []).append((phrase, spk))
+
+            # 2. 未キャッシュが存在するローカルプロバイダー（voicevox, coeiroink, sharevox）のみ事前一括起動
+            rm = getattr(self.tts, "resource_manager", None)
+            local_providers_needed = [
+                prov for prov in sorted_providers
+                if prov in ("voicevox", "coeiroink", "sharevox") and uncached_tasks_by_provider.get(prov)
+            ]
+            started_any_local = False
+            if local_providers_needed:
+                for prov in local_providers_needed:
+                    logger.info(f"⚡ [Speculative Prewarm] Ensuring engine '{prov}' nodes are awake before batch ({len(uncached_tasks_by_provider[prov])} uncached items)...")
+                    pool = getattr(self.tts, f"{prov}_pool", None)
+                    ready = False
+                    if pool and hasattr(pool, "wake_up_nodes"):
+                        try:
+                            ready = await pool.wake_up_nodes(wait_healthy=True, timeout=35.0)
+                            if ready:
+                                started_any_local = True
+                        except Exception as e:
+                            logger.warning(f"⚠️ [Speculative Prewarm] NodePool wake-up error for '{prov}': {e}")
+                    # 外部ノードが利用不可の場合のみ自機コンテナを起動
+                    if not ready and rm:
+                        try:
+                            await rm.start_engine(prov, wait_healthy=True, timeout=30.0)
+                            started_any_local = True
+                        except Exception as e:
+                            logger.warning(f"⚠️ [Speculative Prewarm] Failed to pre-start local container '{prov}': {e}")
+
+            # 3. 未キャッシュ分のみプロバイダーごとにグループ化して合成
             for prov in sorted_providers:
                 if not self._running:
                     break
-                prov_speakers = speakers_by_provider[prov]
+                tasks_for_prov = uncached_tasks_by_provider.get(prov, [])
+                if not tasks_for_prov:
+                    continue
 
                 # ローカルプロバイダー処理直前の再確認（外部ノード・自機コンテナの健全化待機）
                 if prov in ("voicevox", "coeiroink", "sharevox"):
@@ -270,56 +287,52 @@ class IntelligentPrewarmService:
                             is_ready = await pool.wake_up_nodes(wait_healthy=True, timeout=35.0)
                         if not is_ready and rm:
                             await rm.start_engine(prov, wait_healthy=True, timeout=30.0)
+                        started_any_local = True
 
-                for phrase in target_phrases:
+                for phrase, spk in tasks_for_prov:
                     if not self._running:
                         break
                     while self._busy:
                         await asyncio.sleep(2.0)
 
-                    for spk in prov_speakers:
-                        if not self._running:
-                            break
-                        while self._busy:
-                            await asyncio.sleep(2.0)
+                    # 実行直前の再確認（並行リクエスト等で既に生成された場合）
+                    cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
+                    cached = await self.cache.get(cache_key, provider=prov)
+                    if cached is not None:
+                        skipped_count += 1
+                        continue
 
-                        cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
-                        cached = await self.cache.get(cache_key, provider=prov)
-                        if cached is not None:
-                            skipped_count += 1
-                            continue
+                    try:
+                        spk_name = self.get_speaker_display_name(spk)
+                        logger.info(f"🌱 [Speculative Prewarm] Generating: '{phrase}' (speaker={spk_name} [{spk}], provider={prov})")
+                        await self.tts.get_audio_path(
+                            user_id=0,
+                            speaker_id=spk,
+                            pitch="0",
+                            speed=1.0,
+                            text=phrase,
+                            speculative_timeout=999.0
+                        )
 
-                        try:
-                            spk_name = self.get_speaker_display_name(spk)
-                            logger.info(f"🌱 [Speculative Prewarm] Generating: '{phrase}' (speaker={spk_name} [{spk}], provider={prov})")
-                            await self.tts.get_audio_path(
-                                user_id=0,
-                                speaker_id=spk,
-                                pitch="0",
-                                speed=1.0,
-                                text=phrase,
-                                speculative_timeout=999.0
+                        # フォールバック発生チェック (本来のローカル話者でなくEdge-TTS等に化けた場合はスキップ扱い)
+                        meta = getattr(self.tts, "last_synthesis_meta", {})
+                        if meta.get("is_fallback") or (meta.get("provider") and meta.get("provider") != prov):
+                            logger.warning(
+                                f"⚠️ [Speculative Prewarm] Fallback detected for '{phrase}' "
+                                f"(requested={prov}/{spk}, actual={meta.get('provider')}). Skipping count."
                             )
+                            skipped_count += 1
+                        else:
+                            generated_count += 1
 
-                            # フォールバック発生チェック (本来のローカル話者でなくEdge-TTS等に化けた場合はスキップ扱い)
-                            meta = getattr(self.tts, "last_synthesis_meta", {})
-                            if meta.get("is_fallback") or (meta.get("provider") and meta.get("provider") != prov):
-                                logger.warning(
-                                    f"⚠️ [Speculative Prewarm] Fallback detected for '{phrase}' "
-                                    f"(requested={prov}/{spk}, actual={meta.get('provider')}). Skipping count."
-                                )
-                                skipped_count += 1
-                            else:
-                                generated_count += 1
+                        # 最閑散時間帯はインターバル1.5秒、会話アイドル時は短め
+                        await asyncio.sleep(1.5)
+                    except Exception as e:
+                        logger.warning(f"Failed to generate speculative cache for '{phrase}' ({spk}): {e}")
+                        await asyncio.sleep(2.0)
 
-                            # 最閑散時間帯はインターバル1.5秒、会話アイドル時は短め
-                            await asyncio.sleep(1.5)
-                        except Exception as e:
-                            logger.warning(f"Failed to generate speculative cache for '{phrase}' ({spk}): {e}")
-                            await asyncio.sleep(2.0)
-
-            # 3. 投機事前生成完了後、VCが無人であればローカルエンジンを安全に停止しメモリ返却
-            if rm and not rm.is_any_human_in_vc():
+            # 4. 投機事前生成完了後、ローカルエンジンを起動していた場合かつVCが無人であれば安全に停止しメモリ返却
+            if started_any_local and rm and not rm.is_any_human_in_vc():
                 logger.info("💤 [Speculative Prewarm] VC is vacant. Stopping local engines to restore idle power/memory state...")
                 try:
                     await rm.stop_all_active_engines(reason="Speculative Prewarm Completed")
@@ -365,7 +378,7 @@ class IntelligentPrewarmService:
             return "google"
         return "azure"
 
-    async def _get_speculative_target_speakers(self) -> List[str]:
+    async def _get_speculative_target_speakers(self, quiet: bool = False) -> List[str]:
         """
         投機的キャッシュ生成用の対象話者を取得。
         クラウド・ローカル問わず、現在ユーザー（user_settings）またはサーバー別（guild_user_settings）で
@@ -394,7 +407,10 @@ class IntelligentPrewarmService:
             if p not in speakers:
                 speakers.append(p)
 
-        logger.info(f"🎙️ [Speculative Prewarm] Target configured speakers ({len(speakers)} models): {speakers}")
+        if quiet:
+            logger.debug(f"🎙️ [Speculative Prewarm] Target configured speakers ({len(speakers)} models): {speakers}")
+        else:
+            logger.info(f"🎙️ [Speculative Prewarm] Target configured speakers ({len(speakers)} models): {speakers}")
         return speakers
 
     def _get_target_speakers(self) -> List[str]:

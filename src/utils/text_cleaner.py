@@ -17,6 +17,8 @@ _sudachi_lock = threading.Lock()
 
 # 高速化: 辞書置換および文分割用の正規表現キャッシュ & 事前コンパイル定数 (PERF-1, PERF-2)
 _DICT_REGEX_CACHE: Dict[Tuple[str, str], re.Pattern] = {}
+_SPLIT_CONJ_REGEX_CACHE: Dict[int, re.Pattern] = {}
+_RE_ENGLISH_WORD = re.compile(r'\b[a-zA-Z]{2,}\b')
 _RE_SPLIT_PUNCT = re.compile(r'([。！？]+[）\)\]」』】]*[\s]*)')
 _RE_SPLIT_COMMA = re.compile(r'(、+)')
 _RE_STRIP_PUNCT_SPACES = re.compile(r'[、。！？\s]')
@@ -464,9 +466,8 @@ class TextCleaner:
                 unknown_words.append(raw_w)
             return raw_w
 
-        # 英単語境界にマッチ（英字2文字以上）
-        pattern = re.compile(r'\b[a-zA-Z]{2,}\b')
-        converted_text = pattern.sub(_replace_word, text)
+        # 英単語境界にマッチ（英字2文字以上・事前コンパイル定数を使用）
+        converted_text = _RE_ENGLISH_WORD.sub(_replace_word, text)
         return converted_text, unknown_words
 
     @staticmethod
@@ -613,10 +614,13 @@ class TextCleaner:
             except Exception as e:
                 logger.debug(f"Morphological tokenization error: {e}")
 
-        # 3. フォールバック: 接続助詞・接続詞の正規表現ルール分割
+        # 3. フォールバック: 接続助詞・接続詞の正規表現ルール分割 (事前コンパイルキャッシュ使用)
         min_p_match = max(3, min_tail_chars)
-        pattern = rf'(ので|から|けど|けれど|たら|なら)(?=[^、。！？\s]{{{min_p_match},}})'
-        parts = re.split(pattern, raw_text)
+        compiled_conj = _SPLIT_CONJ_REGEX_CACHE.get(min_p_match)
+        if compiled_conj is None:
+            compiled_conj = re.compile(rf'(ので|から|けど|けれど|たら|なら)(?=[^、。！？\s]{{{min_p_match},}})')
+            _SPLIT_CONJ_REGEX_CACHE[min_p_match] = compiled_conj
+        parts = compiled_conj.split(raw_text)
         if len(parts) > 1:
             temp = []
             buf = ""

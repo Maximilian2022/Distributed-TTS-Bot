@@ -1,6 +1,35 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] 全体監査に基づく不具合修正・フォールバック統計精緻化・OSS環境非依存化・高速化（全10項目）
+
+- **ユーザーフィードバック & 合意事項**:
+  1. **① 最長チャンク優先ルーティングと動的チャンク長の整合**: 並列解決時に「より長い文をパワーのあるNodeに任せる」本来の設計意図を守りつつ、1チャンクの動的最大長（`get_dynamic_max_chars`: 8〜30文字）と連動させる。また固定15文字制限や発言者名プレフィックス混入で本文最長チャンクが `is_longest_chunk=False` に潰される不整合を解消する。
+  2. **② Edge-TTS 動的タイムアウト ＆ クラウド3社サーキットブレーカー**: 要求文字数に応じた動的タイムアウト（4.0s〜9.0s）を導入し、ストリーム受信自体も `asyncio.wait_for` で保護する。さらに Edge / Azure / Google の3社すべてにサーキットブレーカーを導入する。
+  3. **③ 重複Bot調停時の `push_back` クラッシュ修正 & `QueueItem.speculative_timeout` 伝播**: 存在しない `target_state.push_back(item)` を `target_state.queue.put(item)` に修正し、`on_message` で取得済みの `speculative_timeout` を `QueueItem` に保持させて再生ホットパスでの重複DBアクセスを排除する。
+  4. **④ フォールバック時の失敗・成功統計の分離記録**: Aで失敗してBで成功した際、統計上も「Aの失敗（`failed_requests` / `fail_count`）」「Bの成功＆フォールバック生成（`fallback_requests` / `fallback_win_count`）」および `is_fallback=True` として正確に記録する。
+  5. **⑤ Adaptive Preroll の現在稼働ノード参照 ＆ GitHub公開OSSとしての環境非依存化**: 過去の `last_worker_label` ではなく現在利用可能な最優先ノード（`peek_best_node`）を参照して Preroll を算出し、さらに特定個人環境のホスト名・CPU/GPU型番ハードコード（`OMEN2022`, `OMEN2017`, `i7-7700K`, `MasterUbuntu` 等）を完全撤廃して VRAM 容量と EWMA 実測推論速度に基づく汎用ロジックへ刷新する。
+  6. **⑥ オフライン外部Workerへの無駄な起動・停止ブロードキャスト抑止**: `TTSNode.is_agent_reachable` を新設し、未接続・ハートビート途絶（90秒超）の外部PCへの無駄なHTTPリクエストとタイムアウト待ちを排除する。
+  7. **⑦ 投機的プリウォームのキャッシュ先行確認・不要同期スキップ・ログ静音化**: エンジン起動前に未キャッシュ有無をスキャンし、全件キャッシュヒット時はローカルエンジンの起動・停止（約20秒）および不要な Standby キャッシュ同期をスキップする。
+  8. **⑧ ホットパス正規表現の事前コンパイル化 ＆ `on_message` DB並列取得**: `text_cleaner.py`, `vc_handler.py`, `database.py` のインライン正規表現をモジュール定数化し、辞書とNGワード取得を `asyncio.gather` で並列化する。
+  9. **⑨ VC入退室アナウンス（`_enqueue_vc_event_announcement`）のクラッシュ修正**: 存在しない `state.is_active`, `db.get_dictionary`, `TextCleaner.clean_text` を正しい実装に修正する。
+  10. **⑩ 試聴サンプル生成（`ensure_preview_cached` / `precache_all_previews`）のフォールバック汚染防止**: `speculative_timeout=999.0` を指定し、万が一フォールバックが発生した場合は正規プレビューとして保存しないよう保護する。
+
+- **対応内容**:
+  - [latency_profiler.py](file:///root/ttsbot/src/utils/latency_profiler.py): `NodeLatencyProfile` の初期値および `gpu_power_score` を VRAM 容量（`vram_mb`）と EWMA 実測速度（`ms_per_char`）主軸の環境非依存ロジックに刷新。
+  - [latency_tracker.py](file:///root/ttsbot/src/utils/latency_tracker.py): 特定マシン名・CPU型番ハードコードを撤廃し、`has_gpu` と実測速度による汎用カテゴリ判定へ移行。`_worker_stats` に `fail_count` と `fallback_win_count` を追加。
+  - [database.py](file:///root/ttsbot/src/database.py): `tts_usage` テーブルに `failed_requests`, `fallback_requests` カラムを自動マイグレーション追加し、`record_tts_failure()` および `record_tts_usage(..., is_fallback)` を実装。プリウォーム用正規表現を事前コンパイル化。
+  - [edge_tts.py](file:///root/ttsbot/src/tts/edge_tts.py), [azure_tts.py](file:///root/ttsbot/src/tts/azure_tts.py), [google_tts.py](file:///root/ttsbot/src/tts/google_tts.py): `EdgeTTSClient.calc_dynamic_timeout()` 実装、ストリーム受信の `asyncio.wait_for` 保護、および3社共通のサーキットブレーカー（`is_available()`, `reset_circuit_breaker()`）を実装。
+  - [node_pool.py](file:///root/ttsbot/src/tts/node_pool.py): `is_agent_reachable`, `_order_available_nodes`（動的チャンク長60%閾値連動）, `peek_best_node` を実装。
+  - [manager.py](file:///root/ttsbot/src/tts/manager.py): チャンク単位メタデータ保持（`get_last_chunk_meta`）、失敗プロバイダーの `record_tts_failure` 記録、`get_expected_worker_info`、試聴サンプル生成時の `speculative_timeout=999.0` ＆フォールバック汚染防止を実装。
+  - [vc_handler.py](file:///root/ttsbot/src/cogs/vc_handler.py): 本文チャンクからの正確な `longest_idx` 特定、実フォールバック状態・失敗プロバイダーの記録、現在稼働ノードに基づく Adaptive Preroll 推定、`target_state.queue.put(item)` 修正、`_enqueue_vc_event_announcement` 修復、`asyncio.gather` 並列DB取得を実装。
+  - [resource_manager.py](file:///root/ttsbot/src/resource_manager.py): 外部Workerへの停止・プリウォーム・RAM昇格ブロードキャスト時に `is_agent_reachable` を確認。
+  - [cache_prewarm.py](file:///root/ttsbot/src/cache_prewarm.py), [server.py](file:///root/ttsbot/src/web/server.py): `run_speculative_prewarm` でキャッシュ存在を先行スキャンし、未キャッシュがあるプロバイダーのみエンジンを起動・停止するよう最適化。生成0件時の不要なHAキャッシュ同期スキップとステータスAPIのログ静音化を実装。
+  - [text_cleaner.py](file:///root/ttsbot/src/utils/text_cleaner.py): `_RE_ENGLISH_WORD` および `_SPLIT_CONJ_REGEX_CACHE` による事前コンパイル化。
+
+- **検証結果**:
+  - [test_audit_remediation_1_to_10.py](file:///root/ttsbot/tests/test_audit_remediation_1_to_10.py) を新設し、`./scripts/run_sandbox_test.sh` による隔離サンドボックス環境にて全59件の単体テストを実行、100% PASS（OK）を確認。一時コンテナおよび一時データの完全破棄を確認。
+
 ## [2026-10-28] リリースノート日本語自動適用パイプライン（RELEASE_NOTES.md / 履歴自動抽出）の構築
 
 - **ユーザーフィードバック & 課題**:

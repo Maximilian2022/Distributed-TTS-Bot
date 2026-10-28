@@ -59,9 +59,10 @@ CATEGORY_PRIORS: Dict[str, float] = {
 def get_synthesis_category(
     provider: str,
     worker_label: str = "",
-    is_model_loaded: Optional[bool] = None
+    is_model_loaded: Optional[bool] = None,
+    has_gpu: Optional[bool] = None,
 ) -> str:
-    """プロバイダー、Workerラベル、モデルロード状態から推論カテゴリを判定"""
+    """プロバイダー、WorkerのGPU有無・ラベル、モデルロード状態から推論カテゴリを環境非依存に判定"""
     prov = (provider or "").lower()
     if prov in ("edge", "google", "azure"):
         return CAT_CLOUD
@@ -75,11 +76,19 @@ def get_synthesis_category(
             return CAT_COEIROINK_WARM
         return CAT_COEIROINK_WARM
 
-    # VOICEVOX / SHAREVOX 等
-    w_clean = (worker_label or "").lower()
-    if any(k in w_clean for k in ("3090", "1080", "2022", "2017", "gpu")):
+    # 明示的な GPU フラグが渡されている場合は最優先で判定 (環境・ホスト名非依存)
+    if has_gpu is True:
         return CAT_GPU_FAST
-    elif any(k in w_clean for k in ("cpu", "ubuntu", "debian", "master", "7700k")):
+    if has_gpu is False:
+        return CAT_CPU
+
+    # VOICEVOX / SHAREVOX 等のラベル文字列からの汎用ハードウェア判定
+    w_clean = (worker_label or "").lower()
+    if "(cpu)" in w_clean:
+        return CAT_CPU
+    if any(k in w_clean for k in ("gpu", "rtx", "gtx", "radeon", "rx ", "arc", "cuda", "rocm", "mps", "quadro", "tesla", "titan")):
+        return CAT_GPU_FAST
+    if "cpu" in w_clean:
         return CAT_CPU
 
     return CAT_CPU
@@ -156,10 +165,10 @@ from src.utils.async_task import safe_create_task
 
 
 def parse_smart_worker_label(raw_label: str, provider: str = "") -> tuple[str, str]:
-    """生URLやノード名から (スマートマシン名, スマートエンジン名) を抽出"""
+    """生URLやノード名から (スマートマシン名, スマートエンジン名) を環境非依存に抽出"""
     if not raw_label:
         eng = (provider or "VOICEVOX").upper()
-        return ("Master (i7-7700K)", eng)
+        return ("Primary Node (CPU)", eng)
 
     raw_clean = raw_label.strip()
 
@@ -400,10 +409,19 @@ class LatencyTracker:
 
                 w_lbl = rec.worker_label or "unknown"
                 if w_lbl not in self._worker_stats:
-                    self._worker_stats[w_lbl] = {"count": 0, "total_synth_ms": 0.0, "avg_synth_ms": 0.0, "avg_synthesis_ms": 0.0}
+                    self._worker_stats[w_lbl] = {
+                        "count": 0,
+                        "total_synth_ms": 0.0,
+                        "avg_synth_ms": 0.0,
+                        "avg_synthesis_ms": 0.0,
+                        "fail_count": 0,
+                        "fallback_win_count": 0,
+                    }
                 w_stat = self._worker_stats[w_lbl]
                 w_stat["count"] += 1
                 w_stat["total_synth_ms"] += rec.synthesis_ms
+                if getattr(rec, "is_fallback", False):
+                    w_stat["fallback_win_count"] = w_stat.get("fallback_win_count", 0) + 1
                 avg_s = round(w_stat["total_synth_ms"] / w_stat["count"], 1)
                 w_stat["avg_synth_ms"] = avg_s
                 w_stat["avg_synthesis_ms"] = avg_s
@@ -580,15 +598,48 @@ class LatencyTracker:
         for ch in (chunks or []):
             self._add_chunk_sample(ch)
 
-        # ワーカー別統計の更新
+        # ワーカー別統計の更新 (Aで失敗しBでフォールバック成功した場合、Aの失敗とBの成功・フォールバック救済数を正確に記録)
         if smart_worker_label not in self._worker_stats:
-            self._worker_stats[smart_worker_label] = {"count": 0, "total_synth_ms": 0.0, "avg_synth_ms": 0.0, "avg_synthesis_ms": 0.0}
+            self._worker_stats[smart_worker_label] = {
+                "count": 0,
+                "total_synth_ms": 0.0,
+                "avg_synth_ms": 0.0,
+                "avg_synthesis_ms": 0.0,
+                "fail_count": 0,
+                "fallback_win_count": 0,
+            }
         w_stat = self._worker_stats[smart_worker_label]
         w_stat["count"] += 1
         w_stat["total_synth_ms"] += synthesis
+        if is_fallback:
+            w_stat["fallback_win_count"] = w_stat.get("fallback_win_count", 0) + 1
         avg_s = round(w_stat["total_synth_ms"] / w_stat["count"], 1)
         w_stat["avg_synth_ms"] = avg_s
         w_stat["avg_synthesis_ms"] = avg_s
+
+        # チャンクおよびインシデントコンテキストから失敗したプロバイダーの失敗カウントも記録
+        failed_provs: List[str] = []
+        for ch in (chunks or []):
+            for fp in (ch.get("failed_providers") or []):
+                if fp and fp not in failed_provs:
+                    failed_provs.append(fp)
+        if not failed_provs and is_fallback and incident_context:
+            exp_p = incident_context.get("expected_provider")
+            if exp_p and str(exp_p).lower() != str(provider).lower():
+                failed_provs.append(str(exp_p))
+        for fp in failed_provs:
+            fp_m, fp_e = parse_smart_worker_label(str(fp), str(fp))
+            fp_lbl = f"{fp_m} / {fp_e}"
+            if fp_lbl not in self._worker_stats:
+                self._worker_stats[fp_lbl] = {
+                    "count": 0,
+                    "total_synth_ms": 0.0,
+                    "avg_synth_ms": 0.0,
+                    "avg_synthesis_ms": 0.0,
+                    "fail_count": 0,
+                    "fallback_win_count": 0,
+                }
+            self._worker_stats[fp_lbl]["fail_count"] = self._worker_stats[fp_lbl].get("fail_count", 0) + 1
 
         logger.info(
             f"⚡ [Latency] Turn-TTFS: {calc_turn_ttfs:.0f}ms (Core: {calc_core_ttfs:.0f}ms + Preroll: {calc_preroll:.0f}ms | QueueWait: {queue_wait:.0f}ms | Total: {total_lat:.0f}ms) | "
@@ -764,6 +815,8 @@ class LatencyTracker:
         char_count: int = 10,
         worker_label: str = "",
         is_model_loaded: Optional[bool] = None,
+        has_gpu: Optional[bool] = None,
+        estimated_node_ms: Optional[float] = None,
     ) -> float:
         """
         カテゴリ判定と直近推論履歴から、第1文の推定合成所要時間 (秒) を動的に算出する。
@@ -772,8 +825,10 @@ class LatencyTracker:
         - 十分なサンプル (N >= 5) では実績 P90 を信頼採用
         - 文字数に応じたスケール時間を加算
         """
-        cat = get_synthesis_category(provider, worker_label, is_model_loaded)
+        cat = get_synthesis_category(provider, worker_label, is_model_loaded, has_gpu=has_gpu)
         prior_time = CATEGORY_PRIORS.get(cat, 0.40)
+        if estimated_node_ms is not None and estimated_node_ms > 0:
+            prior_time = max(0.08, min(estimated_node_ms / 1000.0, 2.50))
 
         # 物理的に未ロード初回確定の場合は、統計に関係なく確実に待機枠を確保 (アンダーラン完全防止)
         if cat == CAT_COEIROINK_COLD:

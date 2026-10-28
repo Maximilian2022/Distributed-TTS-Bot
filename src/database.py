@@ -14,6 +14,10 @@ from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
+# ホットワード抽出用の事前コンパイル正規表現 (PERF: ループ内再コンパイル排除)
+_RE_HAS_CONTENT = re.compile(r'[\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
+_RE_STRIP_NON_CONTENT = re.compile(r'[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
+
 # 初回自動選定用のクラウド話者プール (Azure & GCP)
 CLOUD_INITIAL_SPEAKER_POOL = [
     "nanami", "keita", "aoi", "daichi", "mayu", "naoki", "shiori",
@@ -394,16 +398,26 @@ class Database:
                     await db.execute("ALTER TABLE guild_settings ADD COLUMN error_contact_user_id INTEGER DEFAULT 0")
                     logger.info("Migrated guild_settings table: added error_contact_user_id column")
 
-            # 4. 月別TTS利用量トラッキング
+            # 4. 月別TTS利用量トラッキング (失敗数・フォールバック生成数も記録)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS tts_usage (
                     month TEXT NOT NULL,
                     provider TEXT NOT NULL,
                     characters INTEGER DEFAULT 0,
                     requests INTEGER DEFAULT 0,
+                    failed_requests INTEGER DEFAULT 0,
+                    fallback_requests INTEGER DEFAULT 0,
                     PRIMARY KEY (month, provider)
                 )
             """)
+            async with db.execute("PRAGMA table_info(tts_usage)") as cur:
+                u_cols = [row[1] for row in await cur.fetchall()]
+                if "failed_requests" not in u_cols:
+                    await db.execute("ALTER TABLE tts_usage ADD COLUMN failed_requests INTEGER DEFAULT 0")
+                    logger.info("Migrated tts_usage table: added failed_requests column")
+                if "fallback_requests" not in u_cols:
+                    await db.execute("ALTER TABLE tts_usage ADD COLUMN fallback_requests INTEGER DEFAULT 0")
+                    logger.info("Migrated tts_usage table: added fallback_requests column")
 
             # 5. 接続中VCセッション（再起動時の自動復旧用・マルチBot対応）
             async with db.execute("PRAGMA table_info(active_vc_sessions)") as cur:
@@ -1890,22 +1904,24 @@ class Database:
 
     # --- TTS 利用量 & キャッシュ節約トラッキング ---
 
-    async def record_tts_usage(self, provider: str, char_count: int) -> None:
-        """今月のTTS利用文字数を記録"""
+    async def record_tts_usage(self, provider: str, char_count: int, is_fallback: bool = False) -> None:
+        """今月のTTS利用文字数・成功リクエスト数（およびフォールバック救済数）を記録"""
         if self.is_closed:
             return
         month = datetime.now().strftime("%Y-%m")
+        fb_inc = 1 if is_fallback else 0
         try:
             async with self.get_connection() as db:
                 await db.execute(
                     """
-                    INSERT INTO tts_usage (month, provider, characters, requests)
-                    VALUES (?, ?, ?, 1)
+                    INSERT INTO tts_usage (month, provider, characters, requests, failed_requests, fallback_requests)
+                    VALUES (?, ?, ?, 1, 0, ?)
                     ON CONFLICT(month, provider) DO UPDATE SET
                         characters = characters + excluded.characters,
-                        requests = requests + 1
+                        requests = requests + 1,
+                        fallback_requests = COALESCE(fallback_requests, 0) + excluded.fallback_requests
                     """,
-                    (month, provider.lower(), char_count)
+                    (month, provider.lower(), char_count, fb_inc)
                 )
                 await db.commit()
         except RuntimeError as e:
@@ -1916,6 +1932,32 @@ class Database:
             if self.is_closed:
                 return
             logger.warning(f"Failed to record TTS usage: {e}")
+
+    async def record_tts_failure(self, provider: str) -> None:
+        """TTS合成失敗時（フォールバック発生元のプロバイダー）の失敗回数を記録"""
+        if self.is_closed or not provider:
+            return
+        month = datetime.now().strftime("%Y-%m")
+        try:
+            async with self.get_connection() as db:
+                await db.execute(
+                    """
+                    INSERT INTO tts_usage (month, provider, characters, requests, failed_requests, fallback_requests)
+                    VALUES (?, ?, 0, 0, 1, 0)
+                    ON CONFLICT(month, provider) DO UPDATE SET
+                        failed_requests = COALESCE(failed_requests, 0) + 1
+                    """,
+                    (month, provider.lower())
+                )
+                await db.commit()
+        except RuntimeError as e:
+            if "Connection pool is closed" in str(e):
+                return
+            raise
+        except Exception as e:
+            if self.is_closed:
+                return
+            logger.debug(f"Failed to record TTS failure for {provider}: {e}")
 
     async def record_cache_hit(self, arg: Any, is_local: bool = False) -> None:
         """
@@ -1986,13 +2028,13 @@ class Database:
 
         usage = {
             "month": month,
-            "azure": {"characters": 0, "requests": 0, "limit": 500000},
-            "google": {"characters": 0, "requests": 0, "limit": 1000000},
-            "edge": {"characters": 0, "requests": 0, "limit": 0},
-            "voicevox": {"characters": 0, "requests": 0, "limit": 0},  # 完全無料・無制限
-            "sharevox": {"characters": 0, "requests": 0, "limit": 0},
-            "coeiroink": {"characters": 0, "requests": 0, "limit": 0},
-            "openjtalk": {"characters": 0, "requests": 0, "limit": 0},
+            "azure": {"characters": 0, "requests": 0, "failed_requests": 0, "fallback_requests": 0, "limit": 500000},
+            "google": {"characters": 0, "requests": 0, "failed_requests": 0, "fallback_requests": 0, "limit": 1000000},
+            "edge": {"characters": 0, "requests": 0, "failed_requests": 0, "fallback_requests": 0, "limit": 0},
+            "voicevox": {"characters": 0, "requests": 0, "failed_requests": 0, "fallback_requests": 0, "limit": 0},  # 完全無料・無制限
+            "sharevox": {"characters": 0, "requests": 0, "failed_requests": 0, "fallback_requests": 0, "limit": 0},
+            "coeiroink": {"characters": 0, "requests": 0, "failed_requests": 0, "fallback_requests": 0, "limit": 0},
+            "openjtalk": {"characters": 0, "requests": 0, "failed_requests": 0, "fallback_requests": 0, "limit": 0},
             "savings": {
                 "saved_characters": 0,
                 "hits": 0,
@@ -2012,15 +2054,17 @@ class Database:
 
         async with self.get_connection() as db:
             async with db.execute(
-                "SELECT provider, characters, requests FROM tts_usage WHERE month = ?",
+                "SELECT provider, characters, requests, COALESCE(failed_requests, 0), COALESCE(fallback_requests, 0) FROM tts_usage WHERE month = ?",
                 (month,)
             ) as cursor:
                 rows = await cursor.fetchall()
-                for prov, chars, reqs in rows:
+                for prov, chars, reqs, fails, fallbacks in rows:
                     p = prov.lower()
                     if p in usage:
-                        usage[p]["characters"] = chars
-                        usage[p]["requests"] = reqs
+                        usage[p]["characters"] = chars or 0
+                        usage[p]["requests"] = reqs or 0
+                        usage[p]["failed_requests"] = fails or 0
+                        usage[p]["fallback_requests"] = fallbacks or 0
 
             async with db.execute(
                 """
@@ -2599,12 +2643,17 @@ class Database:
 
             # 今月のTTS利用量
             cur = await db.execute("""
-                SELECT provider, characters, requests
+                SELECT provider, characters, requests, COALESCE(failed_requests, 0), COALESCE(fallback_requests, 0)
                 FROM tts_usage
                 WHERE month = strftime('%Y-%m', 'now', 'localtime')
             """)
             monthly_usage = {
-                r[0]: {"characters": r[1], "requests": r[2]}
+                r[0]: {
+                    "characters": r[1] or 0,
+                    "requests": r[2] or 0,
+                    "failed_requests": r[3] or 0,
+                    "fallback_requests": r[4] or 0,
+                }
                 for r in await cur.fetchall()
             }
 
@@ -2630,9 +2679,6 @@ class Database:
         - recent: 直近トレンドTOP (直近 days 日間に作成・利用され、hit_count >= min_hits のホットワード TOP limit件)
         - combined: 上記2枠を重複なくマージした事前生成対象リスト (最大 limit*2 件)
         """
-        import re
-        re_has_content = re.compile(r'[\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]')
-
         async with self.get_connection() as db:
             # 1. 🏆 歴代定番枠: 直近 days 日以内に参照または作成され、全期間ヒット数が多い上位 limit 件
             query_alltime = """
@@ -2661,10 +2707,10 @@ class Database:
                 text = r[0]
                 if not text or text in seen_texts:
                     continue
-                sub_chars = re.sub(r'[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', text)
+                sub_chars = _RE_STRIP_NON_CONTENT.sub('', text)
                 if not sub_chars:
                     continue
-                if re_has_content.search(text):
+                if _RE_HAS_CONTENT.search(text):
                     seen_texts.add(text)
                     alltime_list.append({
                         "text": text,
@@ -2700,10 +2746,10 @@ class Database:
                 text = r[0]
                 if not text:
                     continue
-                sub_chars = re.sub(r'[^\w\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]', '', text)
+                sub_chars = _RE_STRIP_NON_CONTENT.sub('', text)
                 if not sub_chars:
                     continue
-                if re_has_content.search(text):
+                if _RE_HAS_CONTENT.search(text):
                     recent_list.append({
                         "text": text,
                         "total_hits": r[1] or 0,

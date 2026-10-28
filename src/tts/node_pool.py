@@ -337,6 +337,20 @@ class TTSNode:
         return self.id != "local_master" and not self.url.startswith("http://localhost") and not self.url.startswith("http://127.0.0.1")
 
     @property
+    def is_agent_reachable(self) -> bool:
+        """
+        Worker Agent (:50030) がオンラインで遠隔起動・制御リクエストを受信可能か判定。
+        - 自機マスター (not is_external) は常時 True
+        - 永続ファイルから初期復元されただけの未接続状態 (initial_standby=True) や
+          直近90秒以上ハートビートが途絶えている外部PC (電源OFF/Agent停止) は False
+        """
+        if not self.is_external:
+            return True
+        if self.specs.get("initial_standby"):
+            return False
+        return (time.time() - self.last_heartbeat) <= 90.0
+
+    @property
     def is_available(self) -> bool:
         """ノードが現在リクエスト受付可能か判定"""
         if not self.enabled:
@@ -463,6 +477,8 @@ class TTSNode:
     def update_heartbeat(self):
         """ハートビート受信時の生存更新"""
         self.last_heartbeat = time.time()
+        if isinstance(self.specs, dict) and self.specs.get("initial_standby"):
+            self.specs.pop("initial_standby", None)
         # エンジンが停止中 (False) の場合は、ハートビートを受信しても勝手に is_healthy = True に復帰させない
         is_eng_running = (self.engine_running is not False) and (self.specs.get("engine_running", True) is not False)
         if not self.is_healthy and self.unhealthy_until <= time.time():
@@ -493,8 +509,8 @@ class TTSNode:
                 sys_info = get_host_system_info()
                 if not self.is_external:
                     if not merged_specs.get("hostname") or merged_specs.get("hostname") == "local_master":
-                        merged_specs["hostname"] = sys_info.get("hostname", "MasterUbuntu")
-                        merged_specs["host_hostname"] = sys_info.get("hostname", "MasterUbuntu")
+                        merged_specs["hostname"] = sys_info.get("hostname", "PrimaryNode")
+                        merged_specs["host_hostname"] = sys_info.get("hostname", "PrimaryNode")
                     if not merged_specs.get("os_name") or merged_specs.get("os_name") == "Linux":
                         merged_specs["os_name"] = sys_info.get("os_name", "Linux")
                         merged_specs["os"] = sys_info.get("os_name", "Linux")
@@ -690,7 +706,7 @@ class TTSNodePool:
         if any(n.is_available for n in self.nodes):
             return True
 
-        candidates = [n for n in self.nodes if n.enabled and not n.draining]
+        candidates = [n for n in self.nodes if n.enabled and not n.draining and n.is_agent_reachable]
         if not candidates:
             return False
 
@@ -722,6 +738,75 @@ class TTSNodePool:
             logger.warning(f"⚠️ [NodePool] Wake-up for '{self.engine_name}' timed out after {timeout:.1f}s.")
         return ready
 
+    def _order_available_nodes(
+        self,
+        available: List[TTSNode],
+        text_len: int = 0,
+        is_longest_chunk: bool = False,
+        model_name: Optional[str] = None
+    ) -> List[TTSNode]:
+        """利用可能ノード一覧を Tier 設定およびエンジン別動的チャンク長・GPUパワースコアに従って整列"""
+        eng_key = self.engine_name.lower()
+        current_order = get_tier_routing_order(eng_key)
+
+        def is_node_in_ram(node: TTSNode) -> bool:
+            if model_name:
+                return node.has_model_in_ram(model_name)
+            return bool(node.specs.get("ram_models") or node.specs.get("is_ramdisk") or node.specs.get("in_ramdisk"))
+
+        buckets = {
+            "gpu_ram": [n for n in available if n.has_gpu and is_node_in_ram(n)],
+            "cpu_ram": [n for n in available if not n.has_gpu and is_node_in_ram(n)],
+            "gpu_ssd": [n for n in available if n.has_gpu and not is_node_in_ram(n)],
+            "cpu_ssd": [n for n in available if not n.has_gpu and not is_node_in_ram(n)],
+        }
+
+        # エンジン・稼働ノードに応じた動的最大チャンク長 (8〜30文字) の60%を長文閾値として連動
+        dyn_max = latency_profiler.get_dynamic_max_chars(self.engine_name, candidate_nodes=available)
+        long_threshold = max(8, int(dyn_max * 0.6))
+
+        if is_longest_chunk or text_len >= long_threshold:
+            gpu_sort_key = lambda n: (n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
+        else:
+            gpu_sort_key = lambda n: (n.active_count, latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
+
+        cpu_sort_key = lambda n: (n.active_count, n.priority, n.last_latency_ms)
+
+        buckets["gpu_ram"].sort(key=gpu_sort_key)
+        buckets["gpu_ssd"].sort(key=gpu_sort_key)
+        buckets["cpu_ram"].sort(key=cpu_sort_key)
+        buckets["cpu_ssd"].sort(key=cpu_sort_key)
+
+        ordered_nodes: List[TTSNode] = []
+        for tier_key in current_order:
+            ordered_nodes.extend(buckets.get(tier_key, []))
+        return ordered_nodes
+
+    def peek_best_node(
+        self,
+        is_longest_chunk: bool = True,
+        model_name: Optional[str] = None,
+        guild_id: Optional[Any] = None
+    ) -> Optional[TTSNode]:
+        """現在オンラインで利用可能な最優先候補ノードをロック取得なしで参照 (Adaptive Preroll 推定用)"""
+        target_gid_str = str(guild_id).strip() if guild_id is not None else None
+        available: List[TTSNode] = []
+        for n in self.nodes:
+            if not n.is_available:
+                continue
+            if not n.supports_model(self.engine_name, model_name):
+                continue
+            ex_gid = getattr(n, "exclusive_guild_id", None)
+            if ex_gid:
+                if target_gid_str and target_gid_str == str(ex_gid):
+                    available.append(n)
+            else:
+                available.append(n)
+        if not available:
+            return None
+        ordered = self._order_available_nodes(available, is_longest_chunk=is_longest_chunk, model_name=model_name)
+        return ordered[0] if ordered else None
+
     async def acquire_node(
         self,
         timeout: float = 6.0,
@@ -740,10 +825,10 @@ class TTSNodePool:
         current_order = get_tier_routing_order(eng_key)
 
         # 1. オンデマンド遠隔起動のトリガー判定
-        # 現在設定されている Tier 優先順位の上位 Tier に属するノードが停止中の場合、起動をトリガー
+        # 現在設定されている Tier 優先順位の上位 Tier に属し、かつ Agent が生存しているノードが停止中の場合のみ起動をトリガー
         candidates_to_start = []
         for n in self.nodes:
-            if n.enabled and not n.is_available and not n.draining:
+            if n.enabled and not n.is_available and not n.draining and n.is_agent_reachable:
                 candidates_to_start.append(n)
 
         if candidates_to_start:
@@ -756,7 +841,6 @@ class TTSNodePool:
                     return 99
 
             candidates_to_start.sort(key=lambda n: (get_node_tier_rank(n), n.priority))
-            # スリープ中のノードがあれば、Tier順位で足切りせず全ノードに対して並行して起動を試行
             for n in candidates_to_start:
                 if now_ts - getattr(n, "last_start_attempt", 0.0) > 10.0:
                     n.last_start_attempt = now_ts
@@ -787,43 +871,14 @@ class TTSNodePool:
                 await asyncio.sleep(0.1)
                 continue
 
-            # 4段階 Tier バケット分類
-            # ノードが対象モデルを RAMDisk に保持しているか（model_name 未指定時はエンジンの RAM 常駐フラグ判定）
-            def is_node_in_ram(node: TTSNode) -> bool:
-                if model_name:
-                    return node.has_model_in_ram(model_name)
-                return bool(node.specs.get("ram_models") or node.specs.get("is_ramdisk") or node.specs.get("in_ramdisk"))
-
-            buckets = {
-                "gpu_ram": [n for n in available if n.has_gpu and is_node_in_ram(n)],
-                "cpu_ram": [n for n in available if not n.has_gpu and is_node_in_ram(n)],
-                "gpu_ssd": [n for n in available if n.has_gpu and not is_node_in_ram(n)],
-                "cpu_ssd": [n for n in available if not n.has_gpu and not is_node_in_ram(n)],
-            }
-
-            # バケット内ソート:
-            # GPUノード: 長文 (text_len >= 18 または is_longest_chunk) の場合は最強GPU (gpu_power_score 最大) を最優先
-            # 短文の場合はサブGPU等を活かして最適化
-            if is_longest_chunk or text_len >= 18:
-                gpu_sort_key = lambda n: (n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
-            else:
-                gpu_sort_key = lambda n: (n.active_count, latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
-
-            cpu_sort_key = lambda n: (n.active_count, n.priority, n.last_latency_ms)
-
-            buckets["gpu_ram"].sort(key=gpu_sort_key)
-            buckets["gpu_ssd"].sort(key=gpu_sort_key)
-            buckets["cpu_ram"].sort(key=cpu_sort_key)
-            buckets["cpu_ssd"].sort(key=cpu_sort_key)
-
-            # 現在のエンジン設定に従ってノード順序を組み立て
-            ordered_nodes = []
-            for tier_key in current_order:
-                ordered_nodes.extend(buckets.get(tier_key, []))
-
-            tier_names_log = " | ".join(f"{k}={[n.machine_name for n in buckets[k]]}" for k in current_order)
+            ordered_nodes = self._order_available_nodes(
+                available,
+                text_len=text_len,
+                is_longest_chunk=is_longest_chunk,
+                model_name=model_name
+            )
             logger.debug(
-                f"🎯 [{self.engine_name} Dynamic Routing] model={model_name or 'any'} | {tier_names_log} | "
+                f"🎯 [{self.engine_name} Dynamic Routing] model={model_name or 'any'} | "
                 f"Candidate => {ordered_nodes[0].machine_name if ordered_nodes else 'None'}"
             )
 

@@ -24,6 +24,10 @@ from src.utils.avatar_manager import cache_member_info_and_avatar
 
 logger = logging.getLogger(__name__)
 
+# 発言者表示名の括弧除去用 事前コンパイル正規表現 (PERF: ホットパスでのインラインコンパイル排除)
+_RE_STRIP_NAME_BRACKETS = re.compile(r"[（\(【\[〔〈《「『][^）\)】\]〕〉》」』]*[）\)】\]〕〉》」』]")
+_RE_STRIP_TRAILING_BRACKETS = re.compile(r"[（\(【\[「][^）\)】\]」]*[）\)】\]」]?$")
+
 @dataclass
 class QueueItem:
     text: str
@@ -38,6 +42,7 @@ class QueueItem:
     received_at: float = 0.0
     queued_at: float = 0.0
     synth_task: Optional[asyncio.Task] = None
+    speculative_timeout: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -46,8 +51,9 @@ class QueueItem:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QueueItem":
-        data.pop("synth_task", None)
-        return cls(**data)
+        valid_keys = set(cls.__annotations__.keys()) - {"synth_task"}
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)
 
 class SafeAsyncQueue:
     """
@@ -545,7 +551,7 @@ class VCHandlerCog(commands.Cog):
                                     while not state.queue.empty():
                                         try:
                                             item = state.queue.get_nowait()
-                                            await target_state.push_back(item)
+                                            await target_state.queue.put(item)
                                         except Exception:
                                             break
                                 await self.disconnect_vc(guild)
@@ -886,12 +892,18 @@ class VCHandlerCog(commands.Cog):
             if not chunks:
                 return
 
-            longest_idx = max(range(len(chunks)), key=lambda i: len(chunks[i].text))
+            body_indices = [
+                i for i, ch in enumerate(chunks)
+                if not getattr(ch, "is_beep", False)
+                and not getattr(ch, "is_name_prefix", False)
+                and ch.text.strip()
+            ]
+            longest_idx = max(body_indices, key=lambda i: len(chunks[i].text)) if body_indices else -1
 
             async def _synth_one(idx: int, ch):
                 if getattr(ch, "is_beep", False):
                     return
-                is_long = (idx == longest_idx and len(ch.text) >= 15)
+                is_long = (idx == longest_idx)
                 try:
                     await self.tts_manager.get_chunk_audio(
                         text=ch.text,
@@ -1149,11 +1161,22 @@ class VCHandlerCog(commands.Cog):
         if not all_chunks:
             return False
 
-        # 分割パーツの中で最長のチャンクを特定（最強GPUへ優先ルーティングするため）
-        longest_idx = max(range(len(all_chunks)), key=lambda i: len(all_chunks[i].text))
+        # 分割パーツの中で推論対象となる本文チャンクの最長チャンクを特定（最強GPUへ優先ルーティングするため）
+        # ※ 発言者名プレフィックス (is_name_prefix=True) やピー音 (is_beep=True) は除外し、
+        #    エンジン別動的チャンク上限 (8〜30文字) に合わせて固定文字数足切りを行わず最長本文を特定する。
+        body_indices = [
+            i for i, ch in enumerate(all_chunks)
+            if not getattr(ch, "is_beep", False)
+            and not getattr(ch, "is_name_prefix", False)
+            and ch.text.strip()
+        ]
+        longest_idx = max(body_indices, key=lambda i: len(all_chunks[i].text)) if body_indices else 0
 
-        guild_settings = await self.db.get_guild_settings(guild.id, self.config)
-        spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
+        if getattr(item, "speculative_timeout", None) is not None:
+            spec_timeout = float(item.speculative_timeout)
+        else:
+            guild_settings = await self.db.get_guild_settings(guild.id, self.config)
+            spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
 
         async def _synth_chunk(ch, is_longest: bool):
             t_s = time.time()
@@ -1161,7 +1184,7 @@ class VCHandlerCog(commands.Cog):
                 from src.utils.streaming_audio import get_beep_pcm
                 beep_pcm = get_beep_pcm(getattr(ch, "beep_duration_sec", 0.4))
                 t_e = time.time()
-                return ch, beep_pcm, "beep", "local", True, t_s, t_e
+                return ch, beep_pcm, "beep", "local", True, t_s, t_e, False, []
 
             b, p, w, c = await self.tts_manager.get_chunk_audio(
                 text=ch.text,
@@ -1173,11 +1196,21 @@ class VCHandlerCog(commands.Cog):
                 speculative_timeout=spec_timeout
             )
             t_e = time.time()
-            return ch, b, p, w, c, t_s, t_e
+            c_meta = (
+                self.tts_manager.get_last_chunk_meta(ch.text, item.speaker_id)
+                if hasattr(self.tts_manager, "get_last_chunk_meta")
+                else {}
+            )
+            is_fb = (not c) and (
+                bool(c_meta.get("is_fallback"))
+                or (bool(engine_name) and p not in ("beep", engine_name))
+            )
+            failed_provs = list(c_meta.get("failed_providers", [])) if not c else []
+            return ch, b, p, w, c, t_s, t_e, is_fb, failed_provs
 
         # 最初のチャンク（プレフィックスまたは第1文）
         first_chunk = all_chunks[0]
-        first_is_longest = (longest_idx == 0 and len(first_chunk.text) >= 15)
+        first_is_longest = (longest_idx == 0)
 
         # チャンクが複数ある場合は、第1チャンクと並行して後続チャンクの合成タスクも直ちにバックグラウンド起動！
         remaining_tasks = []
@@ -1186,13 +1219,13 @@ class VCHandlerCog(commands.Cog):
         try:
             if len(all_chunks) > 1:
                 for idx, ch in enumerate(all_chunks[1:], start=1):
-                    is_long = (idx == longest_idx and len(ch.text) >= 15)
+                    is_long = (idx == longest_idx)
                     t = asyncio.create_task(_synth_chunk(ch, is_long))
                     remaining_tasks.append(t)
                     all_created_tasks.append(t)
 
             # 第1チャンクの取得
-            c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end = await _synth_chunk(
+            c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await _synth_chunk(
                 first_chunk, first_is_longest
             )
 
@@ -1217,7 +1250,8 @@ class VCHandlerCog(commands.Cog):
                 "provider": c0_prov,
                 "worker": c0_worker,
                 "is_cached": c0_cached,
-                "is_fallback": False,
+                "is_fallback": c0_fb,
+                "failed_providers": c0_failed_provs,
                 "synth_ms": c0_synth_duration,
                 "synthesis_ms": c0_synth_duration,
                 "duration_ms": c0_audio_duration,
@@ -1233,18 +1267,32 @@ class VCHandlerCog(commands.Cog):
             if remaining_tasks:
                 voice_cfg = self.tts_manager._get_voice_config(item.speaker_id)
                 target_prov = getattr(voice_cfg, "provider", "voicevox")
-                est_worker_label = self.tts_manager._get_worker_label_for_provider(target_prov) if hasattr(self.tts_manager, "_get_worker_label_for_provider") else ""
+                model_id = getattr(voice_cfg, "speaker_uuid", "") or getattr(voice_cfg, "voice_name", "") or str(item.speaker_id)
 
-                # 物理状態フラグ (COEIROINK RAM常駐など) の事前判定
-                is_loaded = None
-                if target_prov.lower() == "coeiroink":
-                    try:
-                        model_id = getattr(voice_cfg, "speaker_uuid", "") or getattr(voice_cfg, "voice_name", "") or str(item.speaker_id)
-                        c_pool = getattr(self.tts_manager, "coeiroink_pool", None)
-                        if c_pool and hasattr(c_pool, "nodes"):
-                            is_loaded = any(n.has_model_in_ram(model_id) for n in c_pool.nodes if getattr(n, "is_healthy", False))
-                    except Exception as e:
-                        logger.debug(f"Failed to check coeiroink model RAM state: {e}")
+                if hasattr(self.tts_manager, "get_expected_worker_info"):
+                    first_body_len = len(all_chunks[1].text) if len(all_chunks) > 1 else 10
+                    w_info = self.tts_manager.get_expected_worker_info(
+                        target_prov,
+                        model_name=model_id,
+                        text_len=first_body_len,
+                        guild_id=guild.id,
+                    )
+                    est_worker_label = w_info.get("worker_label", "")
+                    est_has_gpu = w_info.get("has_gpu")
+                    is_loaded = w_info.get("is_model_loaded")
+                    est_node_ms = w_info.get("estimated_node_ms")
+                else:
+                    est_worker_label = self.tts_manager._get_worker_label_for_provider(target_prov) if hasattr(self.tts_manager, "_get_worker_label_for_provider") else ""
+                    est_has_gpu = None
+                    est_node_ms = None
+                    is_loaded = None
+                    if target_prov.lower() == "coeiroink":
+                        try:
+                            c_pool = getattr(self.tts_manager, "coeiroink_pool", None)
+                            if c_pool and hasattr(c_pool, "nodes"):
+                                is_loaded = any(n.has_model_in_ram(model_id) for n in c_pool.nodes if getattr(n, "is_healthy", False))
+                        except Exception as e:
+                            logger.debug(f"Failed to check coeiroink model RAM state: {e}")
 
                 # 第0パーツの生成所要時間 (並行タスクがすでに消化したリードタイム)
                 l0_elapsed = max(0.0, c0_synth_end - c0_synth_start)
@@ -1267,12 +1315,14 @@ class VCHandlerCog(commands.Cog):
                 cum_est_audio_dur = dur0  # 第0パーツの実測再生時間からスタート
 
                 for idx, ch in enumerate(all_chunks[1:], start=1):
-                    # 推定推論時間 (本文プロバイダと優先ワーカーに基づいて正確に算出)
+                    # 推定推論時間 (本文プロバイダと現在稼働中の最優先ワーカーに基づいて正確に算出)
                     est_synth = latency_tracker.get_estimated_synthesis_time(
                         provider=target_prov,
                         char_count=len(ch.text),
                         worker_label=est_worker_label,
                         is_model_loaded=is_loaded,
+                        has_gpu=est_has_gpu,
+                        estimated_node_ms=est_node_ms if idx == 1 else None,
                     )
                     # 第0パーツ取得中にすでに並行して進んだ時間を控除
                     rem_synth = max(0.0, est_synth - l0_elapsed)
@@ -1305,7 +1355,7 @@ class VCHandlerCog(commands.Cog):
                 if dynamic_wait_timeout > 0.03:
                     # 不足分だけプレフィックス発声を遅らせて第1文を待機 (重い推論のアンダーラン完全防止)
                     try:
-                        ch1, b1, p1, w1, c1, ts1, te1 = await asyncio.wait_for(
+                        ch1, b1, p1, w1, c1, ts1, te1, fb1, fp1 = await asyncio.wait_for(
                             asyncio.shield(remaining_tasks[0]),
                             timeout=dynamic_wait_timeout
                         )
@@ -1329,7 +1379,8 @@ class VCHandlerCog(commands.Cog):
                             "provider": p1,
                             "worker": w1,
                             "is_cached": c1,
-                            "is_fallback": False,
+                            "is_fallback": fb1,
+                            "failed_providers": fp1,
                             "synth_ms": ch1_synth_dur,
                             "synthesis_ms": ch1_synth_dur,
                             "duration_ms": ch1_audio_dur,
@@ -1350,7 +1401,7 @@ class VCHandlerCog(commands.Cog):
                     # ただし既に第1文タスクが完了していれば直ちにストリームに投入
                     if remaining_tasks[0].done():
                         try:
-                            ch1, b1, p1, w1, c1, ts1, te1 = remaining_tasks[0].result()
+                            ch1, b1, p1, w1, c1, ts1, te1, fb1, fp1 = remaining_tasks[0].result()
                             if getattr(ch1, "is_beep", False):
                                 dur1 = stream_source.feed_raw_pcm(b1, pause_after_ms=ch1.pause_after_ms)
                             else:
@@ -1371,7 +1422,8 @@ class VCHandlerCog(commands.Cog):
                                 "provider": p1,
                                 "worker": w1,
                                 "is_cached": c1,
-                                "is_fallback": False,
+                                "is_fallback": fb1,
+                                "failed_providers": fp1,
                                 "synth_ms": ch1_synth_dur,
                                 "synthesis_ms": ch1_synth_dur,
                                 "duration_ms": ch1_audio_dur,
@@ -1392,7 +1444,7 @@ class VCHandlerCog(commands.Cog):
 
             # 残りの後続チャンクを完了次第、パイプライン逐次投入 (全タスク完了待ちによるアンダーランを完全防止)
             for task in remaining_tasks:
-                ch, b, p, w, c, t_s, t_e = await task
+                ch, b, p, w, c, t_s, t_e, is_fb, failed_provs = await task
 
                 # チャンクfeed前のバッファ余裕度 (正=余裕, 負=ギャップ/アンダーラン)
                 elapsed_play = time.time() - t_play_start
@@ -1421,7 +1473,8 @@ class VCHandlerCog(commands.Cog):
                     "provider": p,
                     "worker": w,
                     "is_cached": c,
-                    "is_fallback": False,
+                    "is_fallback": is_fb,
+                    "failed_providers": failed_provs,
                     "synth_ms": task_synth_dur,
                     "synthesis_ms": task_synth_dur,
                     "duration_ms": task_audio_dur,
@@ -1469,6 +1522,7 @@ class VCHandlerCog(commands.Cog):
 
                 # 全チャンクがキャッシュヒットしていた時のみ全体キャッシュ判定とする (名前のキャッシュで本文推論が隠蔽されないよう防止)
                 is_all_cached = all(c.get("is_cached", False) for c in chunks_meta) if chunks_meta else False
+                has_any_fallback = any(c.get("is_fallback", False) for c in chunks_meta) if chunks_meta else False
 
                 t_recv = getattr(item, "received_at", t_dequeued)
                 turn_ttfs = max(0.0, (t_play_start - t_dequeued) * 1000.0)
@@ -1493,7 +1547,7 @@ class VCHandlerCog(commands.Cog):
                     t_synth_end=c0_synth_end,
                     t_play_start=t_play_start,
                     is_cached=is_all_cached,
-                    is_fallback=False,
+                    is_fallback=has_any_fallback,
                     chunks=chunks_meta,
                     ttfs_ms=round(turn_ttfs, 1),
                     turn_ttfs_ms=round(turn_ttfs, 1),
@@ -1603,8 +1657,10 @@ class VCHandlerCog(commands.Cog):
             return
 
         max_length = guild_settings.get("max_text_length", self.config.max_text_length)
-        dict_words = await self.db.get_dictionary_words(message.guild.id)
-        ng_words = await self.db.get_ng_words(message.guild.id)
+        dict_words, ng_words = await asyncio.gather(
+            self.db.get_dictionary_words(message.guild.id),
+            self.db.get_ng_words(message.guild.id)
+        )
         read_username = bool(guild_settings.get("read_username", 0))
 
         # 本文のサニタイズ (NGワードはピー音プレースホルダー <<BEEP>> に置換)
@@ -1657,7 +1713,7 @@ class VCHandlerCog(commands.Cog):
             raw_display_name = message.author.display_name
             # 個人設定で「括弧除去 (【】（）等)」がONの場合 (デフォルトON: 例「【わ】チェインドベル【鈍器】」→「チェインドベル」)
             if user_settings.get("strip_name_brackets", True):
-                stripped = re.sub(r"[（\(【\[〔〈《「『][^）\)】\]〕〉》」』]*[）\)】\]〕〉》」』]", "", raw_display_name).strip()
+                stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
                 if stripped:
                     raw_display_name = stripped
 
@@ -1684,6 +1740,7 @@ class VCHandlerCog(commands.Cog):
             safe_create_task(self.db.touch_ng_words(message.guild.id, detected_ng_words), name="touch_ng_words")
 
         # 5. 再生キューに追加 (本文と名前プレフィックスをスマート分離)
+        spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
         item = QueueItem(
             text=cleaned_body,
             user_id=message.author.id,
@@ -1695,7 +1752,8 @@ class VCHandlerCog(commands.Cog):
             author_prefix=author_prefix,
             discord_created_at=discord_created,
             received_at=t_received,
-            queued_at=time.time()
+            queued_at=time.time(),
+            speculative_timeout=spec_timeout,
         )
 
         state.deduplicator.record_added(cleaned_body)
@@ -1709,7 +1767,6 @@ class VCHandlerCog(commands.Cog):
         #    文分割単位で並行先行合成してパーツキャッシュ（L1/L2）に温めておく。
         is_busy = state.is_playing or not state.queue.empty()
         if is_busy:
-            spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
             item.synth_task = safe_create_task(
                 self._prefetch_chunks(item, speculative_timeout=spec_timeout),
                 name=f"prefetch_chunks_{item.user_id}_{int(time.time()*1000)}"
@@ -1803,7 +1860,7 @@ class VCHandlerCog(commands.Cog):
 
                 raw_display_name = member.display_name
                 if settings.get("strip_name_brackets", True):
-                    stripped = re.sub(r"[（\(【\[〔〈《「『][^）\)】\]〕〉》」』]*[）\)】\]〕〉》」』]", "", raw_display_name).strip()
+                    stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
                     if stripped:
                         raw_display_name = stripped
                 ng_words = await self.db.get_ng_words(guild.id)
@@ -1863,19 +1920,22 @@ class VCHandlerCog(commands.Cog):
             if not guild_settings.get("announce_vc_events", 0):
                 return
 
-            state = self.get_guild_state(guild.id)
-            if not state.is_active:
+            vc = guild.voice_client
+            if vc is None or not vc.is_connected():
                 return
 
+            state = self.get_guild_state(guild.id)
+
             # 単語辞書を取得して名前に適用
-            dict_words = await self.db.get_dictionary(guild.id)
-            cleaned_name = TextCleaner.clean_text(
-                member.display_name,
+            dict_words = await self.db.get_dictionary_words(guild.id)
+            cleaned_name = self.text_cleaner.clean(
+                raw_text=member.display_name,
+                guild=guild,
                 dictionary_entries=dict_words,
                 max_length=20
             )
             cleaned_name = cleaned_name.replace(" 以下略", "").strip()
-            cleaned_name = re.sub(r"[（\(【\[「][^）\)】\]」]*[）\)】\]」]?$", "", cleaned_name).strip()
+            cleaned_name = _RE_STRIP_TRAILING_BRACKETS.sub("", cleaned_name).strip()
             if not cleaned_name:
                 cleaned_name = "誰か"
 
@@ -1887,6 +1947,7 @@ class VCHandlerCog(commands.Cog):
                 speaker_id = self.config.default_speaker
 
             t_now = time.time()
+            spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
             item = QueueItem(
                 text=announce_text,
                 user_id=member.id,
@@ -1898,14 +1959,16 @@ class VCHandlerCog(commands.Cog):
                 author_prefix="",
                 discord_created_at=t_now,
                 received_at=t_now,
-                queued_at=t_now
+                queued_at=t_now,
+                speculative_timeout=spec_timeout,
             )
 
-            # バックグラウンド先行合成
-            item.synth_task = safe_create_task(
-                self._prefetch_audio(item),
-                name=f"prefetch_vc_event_{item.user_id}_{int(t_now*1000)}"
-            )
+            # キュー待機が生じる場合のみバックグラウンド先行合成
+            if state.is_playing or not state.queue.empty():
+                item.synth_task = safe_create_task(
+                    self._prefetch_chunks(item, speculative_timeout=spec_timeout),
+                    name=f"prefetch_vc_event_{item.user_id}_{int(t_now*1000)}"
+                )
             await state.queue.put(item)
 
             if state.play_task is None or state.play_task.done():

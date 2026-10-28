@@ -479,7 +479,7 @@ class LocalEngineResourceManager:
         for pool in (self.tts_manager.voicevox_pool, self.tts_manager.sharevox_pool, self.tts_manager.coeiroink_pool):
             if pool:
                 for n in pool.nodes:
-                    if n.is_external and n.url:
+                    if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
                         try:
                             from urllib.parse import urlparse
                             p = urlparse(n.url)
@@ -675,7 +675,7 @@ class LocalEngineResourceManager:
             pool = getattr(self.tts_manager, f"{prov}_pool", None)
             if pool:
                 for n in pool.nodes:
-                    if n.is_external and n.url:
+                    if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
                         try:
                             from urllib.parse import urlparse
                             p = urlparse(n.url)
@@ -771,7 +771,7 @@ class LocalEngineResourceManager:
         nodes = self.tts_manager.coeiroink_pool.nodes
         worker_ips = set()
         for n in nodes:
-            if n.is_external and n.url:
+            if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
                 try:
                     from urllib.parse import urlparse
                     p = urlparse(n.url)

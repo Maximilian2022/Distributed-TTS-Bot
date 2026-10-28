@@ -49,12 +49,13 @@ class NodeLatencyProfile:
         self.machine_name = machine_name
         self.ip = ip
 
-        # エンジン別・ハードウェア別のコールドスタート初期値
+        # エンジン別・ハードウェア別のコールドスタート初期値 (VRAM容量ベース + 汎用識別子フォールバック)
         eng_priors = ENGINE_INITIAL_PRIORS.get(self.engine_name, ENGINE_INITIAL_PRIORS["VOICEVOX"])
         if has_gpu:
-            if "3090" in gpu_name or "4090" in gpu_name or vram_mb >= 20000:
+            g_upper = (gpu_name or "").upper()
+            if vram_mb >= 16000 or any(k in g_upper for k in ("4090", "4080", "3090", "3080", "7900", "A100", "H100")):
                 p = eng_priors["gpu_top"]
-            elif "1080" in gpu_name or "1060" in gpu_name or vram_mb >= 10000:
+            elif vram_mb >= 8000 or any(k in g_upper for k in ("4070", "3070", "3060", "2080", "1080", "1070", "6800", "6700", "7800", "7700")):
                 p = eng_priors["gpu_mid"]
             else:
                 p = eng_priors["gpu_gen"]
@@ -113,29 +114,30 @@ class NodeLatencyProfile:
     def gpu_power_score(self) -> float:
         """
         GPU性能スコア (数値が大きいほど高性能)
-        ハードウェアスペック (VRAM / 世代) + 実測推論速度を統合して格付け。
+        ハードウェアスペック (VRAM容量 / アーキテクチャ世代) + EWMA実測推論速度を統合して環境非依存に格付け。
         """
         if not self.has_gpu:
             return 0.0
 
-        score = float(self.vram_mb)  # 例: 24576 または 11264
+        score = float(self.vram_mb) if self.vram_mb > 0 else 8192.0
 
-        # GPU世代ボーナス
-        g_upper = self.gpu_name.upper()
-        if "4090" in g_upper or "4080" in g_upper:
+        # GPUアーキテクチャ・クラスボーナス (NVIDIA / AMD / Intel 汎用)
+        g_upper = (self.gpu_name or "").upper()
+        if any(k in g_upper for k in ("5090", "5080", "4090", "4080", "7900", "A100", "H100")):
             score += 35000.0
-        elif "3090" in g_upper or "3080" in g_upper:
+        elif any(k in g_upper for k in ("4070", "3090", "3080", "6900", "6800", "7800")):
             score += 25000.0
-        elif "2080" in g_upper or "TITAN" in g_upper:
+        elif any(k in g_upper for k in ("4060", "3070", "3060", "2080", "TITAN", "6700", "7700", "A770")):
             score += 15000.0
-        elif "1080" in g_upper:
+        elif any(k in g_upper for k in ("2070", "2060", "1080", "1070", "6600", "7600", "A750")):
             score += 8000.0
-        elif "1060" in g_upper:
+        elif any(k in g_upper for k in ("1660", "1650", "1060")):
             score += 4000.0
 
-        # 実測速度ボーナス (速いほど加点)
+        # 実測速度ボーナス (速いほど加点: サンプル蓄積時は実測性能を強く反映)
         if self.ms_per_char > 0:
-            speed_bonus = (50.0 / self.ms_per_char) * 5000.0
+            weight = 8000.0 if self.sample_count >= 3 else 5000.0
+            speed_bonus = (50.0 / max(3.0, self.ms_per_char)) * weight
             score += speed_bonus
 
         return score

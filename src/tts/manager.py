@@ -97,6 +97,8 @@ class TTSManager:
 
         # 直近の合成メタ情報 (レイテンシ計測・WebUI表示用)
         self.last_synthesis_meta: Dict[str, Any] = {}
+        self.last_chunk_meta: Dict[str, Any] = {}
+        self._recent_chunk_meta: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         # Google Cloud TTS 月間文字数キャッシュ (TTL: 60秒) (PERF-4)
         self._google_monthly_chars_cache: Tuple[float, int] = (0.0, 0)
@@ -534,6 +536,105 @@ class TTSManager:
             return getattr(client, "last_worker_label", provider)
         return provider
 
+    def get_expected_worker_info(
+        self,
+        provider: str,
+        model_name: Optional[str] = None,
+        text_len: int = 10,
+        guild_id: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        指定プロバイダーでこれから推論を行う際に選択される最優先稼働ノードの情報を取得 (Adaptive Preroll 推定用)。
+        過去の last_worker_label ではなく、現在オンラインな NodePool の最優先ノードをリアルタイム参照する。
+        """
+        prov = (provider or "").lower()
+        pool_map = {
+            "voicevox": self.voicevox_pool,
+            "sharevox": self.sharevox_pool,
+            "coeiroink": self.coeiroink_pool,
+        }
+        pool = pool_map.get(prov)
+        if pool and hasattr(pool, "peek_best_node"):
+            best_node = pool.peek_best_node(is_longest_chunk=True, model_name=model_name, guild_id=guild_id)
+            if best_node is not None:
+                is_loaded = None
+                if prov == "coeiroink":
+                    is_loaded = best_node.has_model_in_ram(model_name) if model_name else bool(best_node.specs.get("ram_models"))
+                est_ms = None
+                try:
+                    from src.utils.latency_profiler import latency_profiler
+                    prof = latency_profiler.get_or_create(best_node)
+                    if prof.sample_count >= 2:
+                        est_ms = prof.estimate(text_len)
+                except Exception:
+                    pass
+                return {
+                    "worker_label": best_node.short_label,
+                    "has_gpu": bool(best_node.has_gpu),
+                    "is_model_loaded": is_loaded,
+                    "estimated_node_ms": est_ms,
+                }
+
+        # クラウドまたは稼働ノード未検出時のフォールバック
+        lbl = self._get_worker_label_for_provider(prov)
+        is_loaded = False if prov == "coeiroink" else None
+        return {
+            "worker_label": lbl,
+            "has_gpu": False,
+            "is_model_loaded": is_loaded,
+            "estimated_node_ms": None,
+        }
+
+    def _store_chunk_meta(
+        self,
+        text: str,
+        speaker_id: str,
+        original_provider: str,
+        used_provider: str,
+        failed_providers: List[str],
+        pure_synth_ms: float,
+        worker_label: str = "",
+        is_cached: bool = False,
+    ) -> Dict[str, Any]:
+        meta = {
+            "text": text,
+            "speaker_id": speaker_id,
+            "original_provider": original_provider,
+            "provider": used_provider,
+            "is_fallback": (used_provider != original_provider) or bool(failed_providers),
+            "failed_providers": list(failed_providers),
+            "pure_synth_ms": round(pure_synth_ms, 1),
+            "worker": worker_label or self._get_worker_label_for_provider(used_provider),
+            "is_cached": is_cached,
+        }
+        self.last_chunk_meta = meta
+        if len(self._recent_chunk_meta) > 128:
+            self._recent_chunk_meta.clear()
+        self._recent_chunk_meta[(str(speaker_id), text)] = meta
+        return meta
+
+    def get_last_chunk_meta(self, text: str, speaker_id: str) -> Dict[str, Any]:
+        """直近に get_chunk_audio で処理されたチャンクの合成メタデータ（フォールバック有無・純粋推論時間等）を取得"""
+        return self._recent_chunk_meta.get((str(speaker_id), text)) or self.last_chunk_meta or {}
+
+    async def _record_usage_safe(self, provider: str, char_count: int, is_fallback: bool = False) -> None:
+        if not self.db or not provider:
+            return
+        try:
+            if is_fallback:
+                await self.db.record_tts_usage(provider, char_count, is_fallback=True)
+            else:
+                await self.db.record_tts_usage(provider, char_count)
+        except TypeError:
+            await self.db.record_tts_usage(provider, char_count)
+
+    def _record_failure_bg(self, failed_provider: str) -> None:
+        if self.db and failed_provider and hasattr(self.db, "record_tts_failure"):
+            safe_create_task(
+                self.db.record_tts_failure(failed_provider),
+                name=f"record_tts_fail_{failed_provider}"
+            )
+
     @staticmethod
     def concatenate_wavs(wav_bytes_list: List[bytes], pause_durations_ms: Optional[List[int]] = None) -> bytes:
         """
@@ -792,8 +893,12 @@ class TTSManager:
                 return False
             return True
 
-        # プロバイダーごとの合成呼び出しディスパッチャ (C-1)
+        # プロバイダーごとの合成呼び出しディスパッチャ (C-1) + 純粋推論時間計測
+        provider_synth_ms_map: Dict[str, float] = {}
+        failed_providers: List[str] = []
+
         async def _call_provider(prov: str, voice_val: str) -> Optional[bytes]:
+            t_p_start = time.time()
             res: Optional[bytes] = None
             if prov == "voicevox":
                 res = await _try_voicevox(voice_val)
@@ -810,10 +915,18 @@ class TTSManager:
             elif prov == "openjtalk":
                 res = await _try_openjtalk(voice_val)
 
+            elapsed_p_ms = (time.time() - t_p_start) * 1000.0
             if res is not None and not _is_valid_wav(res):
                 logger.warning(f"⚠️ Provider '{prov}' returned empty or invalid WAV ({len(res)} bytes). Treating as failure.")
-                return None
+                res = None
+            if res is not None:
+                provider_synth_ms_map[prov] = elapsed_p_ms
             return res
+
+        def _mark_prov_failed(prov: str) -> None:
+            if prov and prov not in failed_providers:
+                failed_providers.append(prov)
+                self._record_failure_bg(prov)
 
         edge_fallback_voice = "ja-JP-KeitaNeural" if getattr(voice_cfg, "gender", "female") == "male" else "ja-JP-NanamiNeural"
 
@@ -886,6 +999,14 @@ class TTSManager:
                 if prim_task in done:
                     audio = prim_task.result()
                     if audio is not None and _is_valid_wav(audio):
+                        self._store_chunk_meta(
+                            text=text,
+                            speaker_id=speaker_id,
+                            original_provider=primary_provider,
+                            used_provider=prim_prov,
+                            failed_providers=failed_providers,
+                            pure_synth_ms=provider_synth_ms_map.get(prim_prov, 0.0),
+                        )
                         return audio, prim_prov, prim_param
             except Exception:
                 pass
@@ -913,18 +1034,30 @@ class TTSManager:
                             winner_prov, winner_param = (prim_prov, prim_param) if finished_task is prim_task else (cloud_prov, cloud_param)
                             if finished_task is cloud_task:
                                 logger.info(f"🚀 [Speculative TTS] Cloud fallback ({cloud_prov.upper()}) responded first! Adopting to eliminate conversation stall.")
+                                _mark_prov_failed(prim_prov)
                                 if not prim_task.done():
                                     prim_task.cancel()
                             else:
                                 if not cloud_task.done():
                                     cloud_task.cancel()
+                            self._store_chunk_meta(
+                                text=text,
+                                speaker_id=speaker_id,
+                                original_provider=primary_provider,
+                                used_provider=winner_prov,
+                                failed_providers=failed_providers,
+                                pure_synth_ms=provider_synth_ms_map.get(winner_prov, 0.0),
+                            )
                             return res_audio, winner_prov, winner_param
 
                 # 両方並行実行して両方失敗した場合は、上位2プロバイダを消費して次へ
+                _mark_prov_failed(prim_prov)
+                _mark_prov_failed(cloud_prov)
                 chain = chain[2:]
             else:
                 # プライマリが即座に失敗（None/例外/無効WAV）した場合:
                 # プライマリのみを消費し、cloud_prov（Edge-TTS）を含む以降のチェーンへ進む（スキップ防止）
+                _mark_prov_failed(prim_prov)
                 chain = chain[1:]
 
         for step_idx, (prov, voice_param) in enumerate(chain):
@@ -936,7 +1069,16 @@ class TTSManager:
 
             audio = await _call_provider(prov, voice_param)
             if audio is not None:
+                self._store_chunk_meta(
+                    text=text,
+                    speaker_id=speaker_id,
+                    original_provider=primary_provider,
+                    used_provider=prov,
+                    failed_providers=failed_providers,
+                    pure_synth_ms=provider_synth_ms_map.get(prov, 0.0),
+                )
                 return audio, prov, voice_param
+            _mark_prov_failed(prov)
 
         err_summary = f"All TTS providers (VOICEVOX, Edge-TTS, Azure, Google, OpenJTalk) failed for chunk '{text[:15]}...'"
         try:
@@ -975,6 +1117,16 @@ class TTSManager:
         # 1. キャッシュ確認
         cached_bytes = await self.cache_manager.get_bytes(cache_key, provider=provider)
         if cached_bytes is not None:
+            self._store_chunk_meta(
+                text=text,
+                speaker_id=speaker_id,
+                original_provider=provider,
+                used_provider=provider,
+                failed_providers=[],
+                pure_synth_ms=0.0,
+                worker_label="L1/L2 キャッシュ",
+                is_cached=True,
+            )
             if self.db:
                 safe_create_task(
                     self.db.record_cache_hit(len(text), is_local=self._is_local_provider(provider)),
@@ -987,12 +1139,13 @@ class TTSManager:
             text, speaker_id, pitch, speed, is_longest_chunk=is_longest_chunk, speculative_timeout=speculative_timeout
         )
         worker_lbl = self._get_worker_label_for_provider(used_provider)
+        is_fb = (used_provider != provider)
 
         # 3. キャッシュ保存 & 利用量記録
         # Speculative TTSまたはフォールバックでクラウドが採用された場合 (used_provider != provider):
         # 元のモデル (provider) のキャッシュキー・ローカルキャッシュには絶対に保存しない。
         # 実際に合成されたクラウド話者 (used_param) のキーでクラウドキャッシュ (used_provider) として保存する。
-        if used_provider != provider:
+        if is_fb:
             fb_cache_key = CacheManager.generate_cache_key(used_param, pitch, speed, text, user_id=user_id)
             safe_create_task(
                 self.cache_manager.save(
@@ -1022,7 +1175,7 @@ class TTSManager:
             )
         if self.db and used_provider:
             safe_create_task(
-                self.db.record_tts_usage(used_provider, len(text)),
+                self._record_usage_safe(used_provider, len(text), is_fallback=is_fb),
                 name="record_tts_usage_chunk"
             )
 
@@ -1097,17 +1250,21 @@ class TTSManager:
                 return self.cache_manager.get_file_path(chunk_cache_key, provider=provider)
 
             audio_bytes, used_provider, used_param = await self._synthesize_single_chunk(
-                single_chunk.text, speaker_id, pitch, speed, speculative_timeout=speculative_timeout
+                single_chunk.text, speaker_id, pitch, speed, is_longest_chunk=True, speculative_timeout=speculative_timeout
             )
             worker_lbl = self._get_worker_label_for_provider(used_provider)
+            is_fb_single = (used_provider != provider)
             self.last_synthesis_meta = {
                 "worker": worker_lbl,
                 "is_cached": False,
-                "is_fallback": (used_provider != provider),
+                "is_fallback": is_fb_single,
                 "provider": used_provider
             }
             if self.db and used_provider:
-                safe_create_task(self.db.record_tts_usage(used_provider, len(single_chunk.text)), name="record_tts_usage_single")
+                safe_create_task(
+                    self._record_usage_safe(used_provider, len(single_chunk.text), is_fallback=is_fb_single),
+                    name="record_tts_usage_single"
+                )
 
             # 投機またはフォールバックでクラウドが採用された場合は、クラウド話者のキーでクラウドキャッシュへ保存
             if used_provider != provider:
@@ -1157,14 +1314,20 @@ class TTSManager:
             logger.info(
                 f"Synthesizing {len(missed_indices)} missed chunk(s) in parallel (total chunks: {len(chunks)})..."
             )
-            longest_idx = max(missed_indices, key=lambda idx: len(chunks[idx].text))
+            body_missed = [
+                idx for idx in missed_indices
+                if not getattr(chunks[idx], "is_beep", False)
+                and not getattr(chunks[idx], "is_name_prefix", False)
+                and chunks[idx].text.strip()
+            ]
+            longest_idx = max(body_missed or missed_indices, key=lambda idx: len(chunks[idx].text))
             synth_tasks = [
                 self._synthesize_single_chunk(
                     chunks[i].text,
                     speaker_id,
                     pitch,
                     speed,
-                    is_longest_chunk=(i == longest_idx and len(chunks[i].text) >= 15),
+                    is_longest_chunk=(i == longest_idx),
                     speculative_timeout=speculative_timeout
                 )
                 for i in missed_indices
@@ -1175,9 +1338,10 @@ class TTSManager:
             for i, (audio_bytes, used_provider, used_param) in zip(missed_indices, synth_results):
                 chunk_results[i] = audio_bytes
                 last_used_provider = used_provider
+                is_fb_chunk = (used_provider != provider)
                 # 個別チャンクをキャッシュに保存 (将来のヒット用、メタデータ付き)
                 # 投機またはフォールバックでクラウドが採用された場合は、クラウド話者のキーでクラウドキャッシュへ保存
-                if used_provider != provider:
+                if is_fb_chunk:
                     has_fallback_chunk = True
                     fb_key = CacheManager.generate_cache_key(used_param, pitch, speed, chunks[i].text, user_id=user_id)
                     safe_create_task(self.cache_manager.save(
@@ -1201,7 +1365,10 @@ class TTSManager:
                         is_chunk=True
                     ), name=f"save_chunk_cache_{i}")
                 if self.db and used_provider:
-                    safe_create_task(self.db.record_tts_usage(used_provider, len(chunks[i].text)), name=f"record_tts_usage_chunk_{i}")
+                    safe_create_task(
+                        self._record_usage_safe(used_provider, len(chunks[i].text), is_fallback=is_fb_chunk),
+                        name=f"record_tts_usage_chunk_{i}"
+                    )
         worker_lbl = self._get_worker_label_for_provider(last_used_provider) if missed_indices else "L1/L2 キャッシュ"
         self.last_synthesis_meta = {
             "worker": worker_lbl,
@@ -1332,7 +1499,7 @@ class TTSManager:
     PREVIEW_USER_ID = 0
 
     async def ensure_preview_cached(self, speaker_id: str) -> Optional[Path]:
-        """指定された話者の試聴用サンプル音声がキャッシュになければ事前生成"""
+        """指定された話者の試聴用サンプル音声がキャッシュになければ事前生成 (投機的Edge-TTS誤爆防止のため speculative_timeout=999.0)"""
         voice_cfg = self._get_voice_config(speaker_id)
         if not voice_cfg:
             return None
@@ -1343,13 +1510,23 @@ class TTSManager:
         if cached_file is not None and os.path.exists(cached_file):
             return cached_file
         try:
-            return await self.get_audio_path(
+            res_path = await self.get_audio_path(
                 user_id=self.PREVIEW_USER_ID,
                 speaker_id=speaker_id,
                 pitch=self.PREVIEW_PITCH,
                 speed=self.PREVIEW_SPEED,
-                text=self.PREVIEW_SAMPLE_TEXT
+                text=self.PREVIEW_SAMPLE_TEXT,
+                speculative_timeout=999.0
             )
+            meta = getattr(self, "last_synthesis_meta", {})
+            req_prov = getattr(voice_cfg, "provider", "")
+            if meta.get("is_fallback") or (req_prov and meta.get("provider") and meta.get("provider") != req_prov):
+                logger.warning(
+                    f"⚠️ [Preview Cache] Fallback detected while generating preview for '{speaker_id}' "
+                    f"(expected={req_prov}, actual={meta.get('provider')}). Rejecting fallback audio."
+                )
+                return None
+            return res_path
         except Exception as e:
             logger.debug(f"Failed to pre-cache preview for {speaker_id}: {e}")
             return None
@@ -1377,35 +1554,41 @@ class TTSManager:
                 spk_id, self.PREVIEW_PITCH, self.PREVIEW_SPEED, self.PREVIEW_SAMPLE_TEXT, user_id=self.PREVIEW_USER_ID
             )
             cached_file = await self.cache_manager.get(cache_key, provider=prov)
-            if cached_file is None:
-                # フォールバック先プロバイダー (Edge/Google等) のキャッシュも確認
-                fb_prov = getattr(voice_cfg, "fallback_provider", "edge")
-                if fb_prov and fb_prov != prov:
-                    cached_file = await self.cache_manager.get(cache_key, provider=fb_prov)
             if cached_file is not None and os.path.exists(cached_file):
                 skip_cnt += 1
                 continue
 
             try:
-                # ローカルエンジンの場合、必要に応じて起動確認
-                if self.resource_manager and prov in self.resource_manager.LOCAL_ENGINES:
-                    is_running = await self.resource_manager.is_engine_running(prov)
-                    if not is_running:
-                        started = await self.resource_manager.start_engine(prov, wait_healthy=True, timeout=25.0)
-                        if not started:
-                            unhealthy_providers.add(prov)
-                            logger.warning(f"Engine '{prov}' failed to start. Skipping remaining models for this provider.")
-                            fail_cnt += 1
-                            continue
+                # ローカルエンジンの場合、外部ノードプールおよびローカルコンテナの起動確認
+                if prov in ("voicevox", "sharevox", "coeiroink"):
+                    pool = getattr(self, f"{prov}_pool", None)
+                    node_ready = bool(pool and any(n.is_available for n in pool.nodes))
+                    if not node_ready and pool and hasattr(pool, "wake_up_nodes"):
+                        node_ready = await pool.wake_up_nodes(wait_healthy=True, timeout=25.0)
+                    if not node_ready and self.resource_manager and prov in self.resource_manager.LOCAL_ENGINES:
+                        is_running = await self.resource_manager.is_engine_running(prov)
+                        if not is_running:
+                            started = await self.resource_manager.start_engine(prov, wait_healthy=True, timeout=25.0)
+                            if not started:
+                                unhealthy_providers.add(prov)
+                                logger.warning(f"Engine '{prov}' failed to start. Skipping remaining models for this provider.")
+                                fail_cnt += 1
+                                continue
 
                 await self.get_audio_path(
                     user_id=self.PREVIEW_USER_ID,
                     speaker_id=spk_id,
                     pitch=self.PREVIEW_PITCH,
                     speed=self.PREVIEW_SPEED,
-                    text=self.PREVIEW_SAMPLE_TEXT
+                    text=self.PREVIEW_SAMPLE_TEXT,
+                    speculative_timeout=999.0
                 )
-                gen_cnt += 1
+                meta = getattr(self, "last_synthesis_meta", {}) or {}
+                if meta.get("is_fallback") or (meta.get("provider") and meta.get("provider") != prov):
+                    logger.warning(f"Preview generation for {spk_id} ({prov}) fell back to {meta.get('provider')}. Counting as failed.")
+                    fail_cnt += 1
+                else:
+                    gen_cnt += 1
             except Exception as e:
                 fail_cnt += 1
                 logger.debug(f"Pre-cache preview failed for {spk_id}: {e}")

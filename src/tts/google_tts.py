@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import base64
 import asyncio
@@ -13,6 +14,7 @@ class GoogleTTSClient(BaseTTSClient):
     """
     Google Cloud Text-to-Speech クライアント (東京リージョン asia-northeast1)
     SDK (TextToSpeechAsyncClient) および REST API の両対応で高いフォールバック耐性を提供。
+    クォータ超過・認証エラー・連続タイムアウト時のサーキットブレーカー搭載。
     """
 
     def __init__(
@@ -30,6 +32,8 @@ class GoogleTTSClient(BaseTTSClient):
         self.timeout_seconds = timeout_seconds
         self._async_client = None
         self._session: Optional[aiohttp.ClientSession] = None
+        self._cooldown_until: float = 0.0
+        self._consecutive_failures: int = 0
         self._init_sdk()
 
     def _init_sdk(self) -> None:
@@ -65,13 +69,38 @@ class GoogleTTSClient(BaseTTSClient):
         return "Google Cloud Text-to-Speech"
 
     def is_available(self) -> bool:
-        return bool(
+        has_creds = bool(
             self._async_client or
             self.api_key or
             self.credentials_path or
             self.credentials_json or
             os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         )
+        return has_creds and (time.time() >= self._cooldown_until)
+
+    def reset_circuit_breaker(self) -> None:
+        self._cooldown_until = 0.0
+        self._consecutive_failures = 0
+
+    def _record_failure(self, is_quota: bool = False, is_auth: bool = False) -> None:
+        self._consecutive_failures += 1
+        now = time.time()
+        if is_auth:
+            self._cooldown_until = max(self._cooldown_until, now + 180.0)
+            logger.warning("🛡️ [CircuitBreaker] Google Cloud TTS auth error. Cooling down for 180s.")
+        elif is_quota:
+            self._cooldown_until = max(self._cooldown_until, now + 120.0)
+            logger.warning("🛡️ [CircuitBreaker] Google Cloud TTS quota/rate limit (429). Cooling down for 120s.")
+        elif self._consecutive_failures >= 2:
+            self._cooldown_until = max(self._cooldown_until, now + 45.0)
+            logger.warning(
+                f"🛡️ [CircuitBreaker] Google Cloud TTS failed {self._consecutive_failures} times consecutively. "
+                f"Cooling down for 45s."
+            )
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._cooldown_until = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -137,13 +166,19 @@ class GoogleTTSClient(BaseTTSClient):
                     ),
                     timeout=self.timeout_seconds
                 )
+                self._record_success()
                 return response.audio_content
             except asyncio.TimeoutError:
+                self._record_failure()
                 raise TTSConnectionError(f"Google Cloud TTS SDK request timed out after {self.timeout_seconds}s")
             except Exception as e:
                 err_str = str(e)
                 if "429" in err_str or "ResourceExhausted" in err_str or "Quota" in err_str:
+                    self._record_failure(is_quota=True)
                     raise RateLimitError(f"Google Cloud TTS quota exceeded: {err_str}")
+                if not self.api_key:
+                    is_auth = any(k in err_str for k in ("401", "403", "Unauthenticated", "PermissionDenied"))
+                    self._record_failure(is_auth=is_auth)
                 logger.warning(f"Google Cloud TTS SDK error, attempting REST fallback if available: {e}")
 
         # 2. REST API (APIキーがある場合やSDKフォールバック)
@@ -188,14 +223,24 @@ class GoogleTTSClient(BaseTTSClient):
                 if resp.status == 200:
                     data = await resp.json()
                     audio_content_b64 = data.get("audioContent", "")
-                    return base64.b64decode(audio_content_b64)
+                    decoded = base64.b64decode(audio_content_b64)
+                    self._record_success()
+                    return decoded
                 elif resp.status == 429:
                     text_err = await resp.text()
+                    self._record_failure(is_quota=True)
                     raise RateLimitError(f"Google TTS 429 Rate Limit: {text_err}")
+                elif resp.status in (401, 403):
+                    text_err = await resp.text()
+                    self._record_failure(is_auth=True)
+                    raise TTSConnectionError(f"Google TTS Auth Error ({resp.status}): {text_err}")
                 else:
                     text_err = await resp.text()
+                    self._record_failure()
                     raise TTSError(f"Google TTS HTTP {resp.status}: {text_err}")
         except asyncio.TimeoutError:
+            self._record_failure()
             raise TTSConnectionError(f"Google TTS REST timed out ({self.timeout_seconds}s)")
         except aiohttp.ClientError as e:
+            self._record_failure()
             raise TTSConnectionError(f"Google TTS REST network error: {e}")

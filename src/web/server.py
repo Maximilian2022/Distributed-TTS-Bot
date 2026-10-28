@@ -1606,6 +1606,8 @@ class WebServer:
         target_speakers = []
         if prewarm and hasattr(prewarm, "_get_speculative_target_speakers"):
             try:
+                target_speakers = await prewarm._get_speculative_target_speakers(quiet=True)
+            except TypeError:
                 target_speakers = await prewarm._get_speculative_target_speakers()
             except Exception as e:
                 logger.warning(f"Error fetching speculative target speakers: {e}")
@@ -1679,10 +1681,13 @@ class WebServer:
 
         async def _run_and_sync():
             try:
-                await prewarm.run_speculative_prewarm(days=days, min_hits=min_hits, max_candidates=30)
-                if sync_standby:
-                    logger.info("📢 [Speculative Prewarm] Triggering follow-up HA cache sync to Standby nodes...")
+                res = await prewarm.run_speculative_prewarm(days=days, min_hits=min_hits, max_candidates=30)
+                generated = res.get("generated", 0) if isinstance(res, dict) else 0
+                if sync_standby and generated > 0:
+                    logger.info(f"📢 [Speculative Prewarm] Triggering follow-up HA cache sync to Standby nodes ({generated} new files)...")
                     self.ha_force_cache_sync_time = time.time()
+                elif sync_standby:
+                    logger.info("⏭️ [Speculative Prewarm] 0 new files generated (all cached); skipping redundant HA Standby cache sync.")
             except Exception as e:
                 logger.error(f"Error in manual speculative prewarm: {e}", exc_info=True)
 
