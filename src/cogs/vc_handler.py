@@ -2143,16 +2143,14 @@ class VCHandlerCog(commands.Cog):
                                 f"🔄 [AutoJoinReconcile] Detected {human_count} human(s) in auto-join VC '{bot_vc.name}' of '{guild.name}' without Bot. "
                                 f"Auto-joining with Bot #{assigned_idx} (bound text: #{bot_text.name})..."
                             )
-                            vc_lock = self.bot_pool.get_vc_lock(guild.id, target_vc_id) if self.bot_pool else asyncio.Lock()
-                            async with vc_lock:
-                                try:
-                                    await target_vc_cog.connect_vc(bot_vc, bot_text)
-                                except VCConnectAborted as e:
-                                    logger.info(f"[AutoJoinReconcile] Join to VC '{bot_vc.name}' with Bot #{assigned_idx} cancelled: {e}")
-                                    continue
-                                except Exception as e:
-                                    logger.error(f"[AutoJoinReconcile] Failed to join VC '{bot_vc.name}' with Bot #{assigned_idx}: {e}")
-                                    continue
+                            try:
+                                await target_vc_cog.connect_vc(bot_vc, bot_text)
+                            except VCConnectAborted as e:
+                                logger.info(f"[AutoJoinReconcile] Join to VC '{bot_vc.name}' with Bot #{assigned_idx} cancelled: {e}")
+                                continue
+                            except Exception as e:
+                                logger.error(f"[AutoJoinReconcile] Failed to join VC '{bot_vc.name}' with Bot #{assigned_idx}: {e}")
+                                continue
 
                             dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
                             bot_label = f" (Bot {assigned_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
@@ -2310,69 +2308,66 @@ class VCHandlerCog(commands.Cog):
                         logger.debug(f"[AutoJoin] Auto-join suppressed for VC {target_vc_id} in '{guild.name}' (manually disconnected).")
                         return
 
-                    # VC単位の排他ロックを取得してアサイン・接続処理を完全同期 (多重発火の完全排他)
-                    vc_lock = self.bot_pool.get_vc_lock(guild.id, target_vc_id) if self.bot_pool else asyncio.Lock()
-                    async with vc_lock:
-                        # 対象VCにいずれかのBotがすでに接続中、またはインフライト接続中かチェック
-                        already_connected = False
+                    # 対象VCにいずれかのBotがすでに接続中、またはインフライト接続中かチェック
+                    already_connected = False
+                    if self.bot_pool:
+                        if self.bot_pool.find_connected_or_connecting_bot_in_vc(guild.id, target_vc_id):
+                            already_connected = True
+                    else:
+                        if vc is not None and vc.is_connected() and vc.channel and vc.channel.id == target_vc_id:
+                            already_connected = True
+
+                    if not already_connected:
+                        assigned_bot = None
+                        assigned_idx = 1
                         if self.bot_pool:
-                            if self.bot_pool.find_connected_or_connecting_bot_in_vc(guild.id, target_vc_id):
-                                already_connected = True
-                        else:
-                            if vc is not None and vc.is_connected() and vc.channel and vc.channel.id == target_vc_id:
-                                already_connected = True
-
-                        if not already_connected:
-                            assigned_bot = None
-                            assigned_idx = 1
-                            if self.bot_pool:
-                                avail = self.bot_pool.find_available_bot(guild.id, target_vc_id=target_vc_id)
-                                if avail:
-                                    assigned_idx, assigned_bot = avail
-                                else:
-                                    logger.warning(f"All bots in pool are busy. Cannot auto-join VC '{after.channel.name}' in '{guild.name}'.")
+                            avail = self.bot_pool.find_available_bot(guild.id, target_vc_id=target_vc_id)
+                            if avail:
+                                assigned_idx, assigned_bot = avail
                             else:
-                                if vc is None or not vc.is_connected():
-                                    assigned_bot = self.bot
-                                    assigned_idx = 1
+                                logger.warning(f"All bots in pool are busy. Cannot auto-join VC '{after.channel.name}' in '{guild.name}'.")
+                        else:
+                            if vc is None or not vc.is_connected():
+                                assigned_bot = self.bot
+                                assigned_idx = 1
 
-                            if assigned_bot:
-                                target_vc_cog = assigned_bot.get_cog("VCHandlerCog") if assigned_bot else self
-                                target_guild = assigned_bot.get_guild(guild.id) if assigned_bot else guild
-                                bot_vc = target_guild.get_channel(target_vc_id) if target_guild else after.channel
-                                bot_text = target_guild.get_channel(target_text_id) if target_guild else guild.get_channel(target_text_id)
+                        if assigned_bot:
+                            target_vc_cog = assigned_bot.get_cog("VCHandlerCog") if assigned_bot else self
+                            target_guild = assigned_bot.get_guild(guild.id) if assigned_bot else guild
+                            bot_vc = target_guild.get_channel(target_vc_id) if target_guild else after.channel
+                            bot_text = target_guild.get_channel(target_text_id) if target_guild else guild.get_channel(target_text_id)
 
-                                if isinstance(bot_vc, (discord.VoiceChannel, discord.StageChannel)) and isinstance(bot_text, discord.TextChannel):
-                                    logger.info(
-                                        f"User {member.display_name} joined auto-join target VC '{bot_vc.name}' in '{guild.name}'. "
-                                        f"Auto-joining with Bot #{assigned_idx} (bound text: #{bot_text.name})..."
-                                    )
-                                    try:
-                                        await target_vc_cog.connect_vc(bot_vc, bot_text)
-                                    except VCConnectAborted as e:
-                                        logger.info(f"Auto-join to VC '{bot_vc.name}' with Bot #{assigned_idx} cancelled: {e}")
-                                        return
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Failed to auto-join VC '{bot_vc.name}' with Bot #{assigned_idx}: {e}"
-                                        )
-                                        return
-
-                                dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
-                                bot_label = f" (Bot {assigned_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
-                                embed = discord.Embed(
-                                    title=f"🔊 ボイスチャンネル自動接続完了{bot_label}",
-                                    description=(
-                                        f"**{bot_vc.name}** に自動接続しました！\n"
-                                        f"**#{bot_text.name}** のテキストを読み上げます。\n\n"
-                                        f"💡 [Webダッシュボード]({dashboard_url}) から声質のカスタマイズや単語辞書の登録が可能です。"
-                                    ),
-                                    color=discord.Color.green()
+                            if isinstance(bot_vc, (discord.VoiceChannel, discord.StageChannel)) and isinstance(bot_text, discord.TextChannel):
+                                logger.info(
+                                    f"User {member.display_name} joined auto-join target VC '{bot_vc.name}' in '{guild.name}'. "
+                                    f"Auto-joining with Bot #{assigned_idx} (bound text: #{bot_text.name})..."
                                 )
                                 try:
-                                    await bot_text.send(embed=embed)
+                                    await target_vc_cog.connect_vc(bot_vc, bot_text)
+                                except VCConnectAborted as e:
+                                    logger.info(f"Auto-join to VC '{bot_vc.name}' with Bot #{assigned_idx} cancelled: {e}")
+                                    return
                                 except Exception as e:
-                                    logger.warning(f"Failed to send auto-join announcement in {bot_text.name}: {e}")
+                                    logger.error(
+                                        f"Failed to auto-join VC '{bot_vc.name}' with Bot #{assigned_idx}: {e}"
+                                    )
+                                    return
+
+                            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
+                            bot_label = f" (Bot {assigned_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
+                            embed = discord.Embed(
+                                title=f"🔊 ボイスチャンネル自動接続完了{bot_label}",
+                                description=(
+                                    f"**{bot_vc.name}** に自動接続しました！\n"
+                                    f"**#{bot_text.name}** のテキストを読み上げます。\n\n"
+                                    f"💡 [Webダッシュボード]({dashboard_url}) から声質のカスタマイズや単語辞書の登録が可能です。"
+                                ),
+                                color=discord.Color.green()
+                            )
+                            try:
+                                await bot_text.send(embed=embed)
+                            except Exception as e:
+                                logger.warning(f"Failed to send auto-join announcement in {bot_text.name}: {e}")
 
     # --- 起動時VC復旧リスナー ---
 

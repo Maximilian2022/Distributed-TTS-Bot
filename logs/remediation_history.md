@@ -8410,3 +8410,39 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 - **検証結果**:
   - 全51ファイルのAST静的構文スキャンにより、未束縛参照リスク（`POTENTIAL_UNBOUND_LOCAL`）およびトップレベルインポートとの重複シャドーイングが **完全0件（0 potential UnboundLocalError）** であることを確認。
   - サンドボックス隔離テスト（全74テスト）を実行し、**100% 合格（Ran 74 tests, OK）** を確認。一時コンテナは即座に完全破棄。
+
+## [2026-10-28] 多段フォールバック刷新、VC出入りループ（自爆切断＆デッドロック）根絶、Worker Agent Cloudflare 413 / 子プロセス増殖抑止 & 起動時バージョンアップ先行調停 (v2026.10.28-2342 / Agent v3.13.7)
+- **背景**:
+  1. フォールバック順序の改修要望: `Azure ➔ Google ➔ Edge ➔ OpenJTalk` への刷新、および Edge-TTS をフォールバック専用（裏方）として UI / コマンドから非表示化。
+  2. Bot が VC 出入りを永遠に繰り返すインシデント（自爆切断とデッドロック）の発生。
+  3. Worker Agent (`ttsworker-agent`) にて `⚠️ [ModelSync] Master へのモデルPushアップロード失敗 (413): 413 Payload Too Large (cloudflare)` が多発し、子プロセス（`tar`）が大量増殖して CPU / I/O を圧迫する事象が発生。
+  4. クラスタ Worker 起動時にバージョンアップと Model Sync のどちらが先行するかに関する競合リスク。
+- **原因分析**:
+  1. `connect_vc` にて多重ロック取得によるデッドロック、および直後に無条件切断する `await vc.disconnect(force=True); raise VCConnectAborted` が残存していた。
+  2. Worker Agent が同一ホスト（MasterUbuntu）または LAN 内にいるにもかかわらず `MASTER_URL=https://ttsbot.kenko.land` (Cloudflare Tunnel) 固定でアクセスしており、COEIROINK モデル（2.2GB）の Push アップロード時に Cloudflare の 100MB 上限に抵触（413）。
+  3. Master でモデルが未受信のため毎回のハートビート（25秒）で `models_to_upload` が返され、Worker が毎回 `tar` 圧縮して POST 送信を試みる無限ループに突入。Master 側からの Pull でも Worker 側で `tar` 子プロセスが生成され続け、子プロセス増殖と高負荷を引き起こしていた。
+  4. 起動シーケンス上、`register` で即時に Model Sync がキックされ、バージョンアップは25秒後のハートビートでしか判定されないため、古い Agent のまま Sync が先行して再び 413 エラーを起こす構造になっていた。
+- **改修内容**:
+  1. **多段フォールバック順序 & Edge-TTS 非表示化**:
+     - `src/tts/manager.py` & `config.yaml`: フォールバック順序を `Azure ➔ Google ➔ Edge ➔ OpenJTalk` に統一。防災速報の優先話者を `nanami` に変更。
+     - `src/web/server.py` & `src/cogs/commands.py`: `v.hidden` または `provider == 'edge'` の話者を UI およびコマンド選択肢から完全除外。
+     - `src/database.py`: 既存の Edge 話者設定ユーザーを Azure（`nanami`, `keita`）へ自動マイグレーション。
+  2. **VC 出入りループの完全根絶 (`src/cogs/vc_handler.py`, `src/cogs/commands.py`)**:
+     - `connect_vc` 呼び出し側の二重ロック取得を全廃し、`connect_vc` 内部の `asyncio.Lock` 一本化でデッドロックを完全解消。
+     - 接続直後に無条件実行されていた `await vc.disconnect(force=True); raise VCConnectAborted` を完全削除。
+  3. **Worker Agent の Master URL 自律昇格 & 413 回避 & クーリングタイム (`src/web/static/agent.py`)**:
+     - `is_private_or_local_url` および `probe_and_promote_local_master` を実装: 起動時および通信時に `127.0.0.1:8088` や LAN IP をプローブし、ローカル疎通可能であれば最優先 Master URL に自動昇格。
+     - `upload_missing_models_to_master`: Cloudflare Tunnel / WAN 経由で 95MB を超える大容量モデルの Push を安全にスキップ（413 防止）。失敗時に 10 分間のクーリングタイムを設け、ハートビートごとの無限再試行・子プロセス（tar）増殖を完全に根絶。
+     - `pull_missing_models_from_master`: 失敗時のクーリングタイム（10分間）を追加。
+  4. **Master 側の LAN URL 配信 & モデル上限拡張 (`src/web/server.py`)**:
+     - `_get_master_lan_url` を実装し、`/api/worker/register` および `/api/worker/heartbeat` のレスポンスに `master_lan_url` を含めて Worker に配布。
+     - `_pull_missing_models_from_worker`: クーリングタイム（10分間）を導入し、受信上限 `max_bytes` を 1GB から 5GB に拡張。
+  5. **起動時バージョンアップ先行調停機構**:
+     - Master 側の `api_worker_register` にて、Worker のバージョンが古い場合はモデル同期（`models_to_pull`, `models_to_upload`）を空リストにして一時保留し、`update_available: True` を即時返却。
+     - Worker Agent の `register_to_master` にて、起動時レスポンスに `update_available` がある場合は Model Sync を行わず直ちに自己アップデートを実行して再起動。最新バージョンになってから安全に Sync を行わせる順序制御を確立。
+  6. **ストリーミング配信切断 (ClientConnectionResetError) の安全捕捉 & Master Pull タイムアウト拡大**:
+     - `src/web/static/agent.py`: `handle_model_download` でクライアント（Master）切断時に発生する `ClientConnectionResetError` / `ConnectionResetError` / `CancelledError` を `try...except` で適切に捕捉し、子プロセス（`tar`）を即座に `kill()` して未処理例外スタックトレースを抑止。
+     - `src/web/server.py`: `_pull_missing_models_from_worker` のタイムアウトを大容量（2.2GB）対応として `sock_read=300.0`, `total=1800.0` に拡張。さらにハートビートごとの重複 Pull タスク生成を排他ガード。
+- **検証結果**:
+  - サンドボックス隔離テスト（全79テスト）を実行し、**100% 合格（Ran 79 tests in 0.823s, OK）** を確認。一時コンテナは即座に完全破棄。
+

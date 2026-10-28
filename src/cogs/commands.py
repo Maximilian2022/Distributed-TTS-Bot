@@ -138,36 +138,33 @@ class CommandsCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=False)
         try:
-            # VC単位の排他ロックを取得してアサイン・接続処理を完全同期
-            vc_lock = self.bot_pool.get_vc_lock(interaction.guild_id, voice_channel.id) if self.bot_pool else asyncio.Lock()
-            async with vc_lock:
-                assigned_bot = None
-                assigned_bot_idx = 1
-                if self.bot_pool:
-                    # 既に接続済みまたは接続処理中のBotを探索
-                    found = self.bot_pool.find_connected_or_connecting_bot_in_vc(interaction.guild_id, voice_channel.id)
-                    if found:
-                        assigned_bot_idx, assigned_bot = found
-                    else:
-                        avail = self.bot_pool.find_available_bot(interaction.guild_id, target_vc_id=voice_channel.id)
-                        if avail:
-                            assigned_bot_idx, assigned_bot = avail
-                        else:
-                            total_bots = len(self.bot_pool.bots) if hasattr(self.bot_pool, "bots") and self.bot_pool.bots else 5
-                            await interaction.followup.send(
-                                f"⚠️ 現在利用可能なBot（最大{total_bots}台）はすべて他のVCに接続中です。\n空きができるまでお待ちいただくか、使っていないVCで `/leave` を実行してください。",
-                                ephemeral=True
-                            )
-                            return
+            assigned_bot = None
+            assigned_bot_idx = 1
+            if self.bot_pool:
+                # 既に接続済みまたは接続処理中のBotを探索
+                found = self.bot_pool.find_connected_or_connecting_bot_in_vc(interaction.guild_id, voice_channel.id)
+                if found:
+                    assigned_bot_idx, assigned_bot = found
                 else:
-                    assigned_bot = self.bot
+                    avail = self.bot_pool.find_available_bot(interaction.guild_id, target_vc_id=voice_channel.id)
+                    if avail:
+                        assigned_bot_idx, assigned_bot = avail
+                    else:
+                        total_bots = len(self.bot_pool.bots) if hasattr(self.bot_pool, "bots") and self.bot_pool.bots else 5
+                        await interaction.followup.send(
+                            f"⚠️ 現在利用可能なBot（最大{total_bots}台）はすべて他のVCに接続中です。\n空きができるまでお待ちいただくか、使っていないVCで `/leave` を実行してください。",
+                            ephemeral=True
+                        )
+                        return
+            else:
+                assigned_bot = self.bot
 
-                target_vc_cog = assigned_bot.get_cog("VCHandlerCog") if assigned_bot else self.vc_handler
-                target_guild = assigned_bot.get_guild(interaction.guild_id) if assigned_bot else interaction.guild
-                target_vc = target_guild.get_channel(voice_channel.id) if target_guild else voice_channel
-                target_text = target_guild.get_channel(text_channel.id) if target_guild else text_channel
+            target_vc_cog = assigned_bot.get_cog("VCHandlerCog") if assigned_bot else self.vc_handler
+            target_guild = assigned_bot.get_guild(interaction.guild_id) if assigned_bot else interaction.guild
+            target_vc = target_guild.get_channel(voice_channel.id) if target_guild else voice_channel
+            target_text = target_guild.get_channel(text_channel.id) if target_guild else text_channel
 
-                await target_vc_cog.connect_vc(target_vc, target_text)
+            await target_vc_cog.connect_vc(target_vc, target_text)
 
             if self.bot_pool and interaction.guild_id:
                 self.bot_pool.clear_vc_manual_disconnect(interaction.guild_id, voice_channel.id)

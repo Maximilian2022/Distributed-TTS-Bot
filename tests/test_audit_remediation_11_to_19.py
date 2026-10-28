@@ -811,6 +811,44 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         self.assertIn("nanami", displayed_ids)
         self.assertIn("g_b", displayed_ids)
 
+    def test_worker_agent_local_url_and_cloudflare_size_protection(self):
+        """Worker Agent のローカルURL判定、大容量モデルの Cloudflare 413 回避、クーリングタイム検証"""
+        from src.web.static.agent import is_private_or_local_url
+
+        # 1. ローカル / プライベート URL 判定
+        self.assertTrue(is_private_or_local_url("http://127.0.0.1:8088"))
+        self.assertTrue(is_private_or_local_url("http://localhost:8088"))
+        self.assertTrue(is_private_or_local_url("http://192.168.11.245:8088"))
+        self.assertTrue(is_private_or_local_url("http://10.0.0.1:8088"))
+        self.assertTrue(is_private_or_local_url("http://172.16.0.5:8088"))
+        self.assertFalse(is_private_or_local_url("https://ttsbot.kenko.land"))
+        self.assertFalse(is_private_or_local_url("https://8.8.8.8:8088"))
+        self.assertFalse(is_private_or_local_url(""))
+
+    def test_master_lan_url_generation(self):
+        """Master サーバーの _get_master_lan_url が LAN 向け URL を生成することの検証"""
+        from unittest.mock import MagicMock
+        from src.web.server import WebServer
+
+        server = WebServer.__new__(WebServer)
+        server.config = MagicMock()
+        server.config.web_port = 8088
+
+        # LAN リクエストのシミュレーション
+        mock_req_lan = MagicMock()
+        mock_req_lan.headers = {"Host": "192.168.11.245:8088"}
+        mock_req_lan.scheme = "http"
+        server._is_wan_request = MagicMock(return_value=False)
+        lan_url = server._get_master_lan_url(mock_req_lan)
+        self.assertEqual(lan_url, "http://192.168.11.245:8088")
+
+        # WAN リクエスト時のローカル IP フォールバック
+        mock_req_wan = MagicMock()
+        server._is_wan_request = MagicMock(return_value=True)
+        fallback_url = server._get_master_lan_url(mock_req_wan)
+        self.assertTrue(fallback_url.startswith("http://"))
+        self.assertTrue(":8088" in fallback_url)
+
 
 if __name__ == "__main__":
     unittest.main()

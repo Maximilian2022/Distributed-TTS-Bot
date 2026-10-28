@@ -28,6 +28,7 @@ import http.client
 import json
 import collections
 import urllib.parse
+import ipaddress
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List, Union
 from pathlib import Path
@@ -112,12 +113,72 @@ _raw_master_urls = os.getenv("MASTER_URLS", os.getenv("MASTER_URL", "http://loca
 MASTER_CANDIDATE_URLS: List[str] = [u.strip().rstrip("/") for u in _raw_master_urls.split(",") if u.strip()]
 if not MASTER_CANDIDATE_URLS:
     MASTER_CANDIDATE_URLS = ["http://localhost:8088"]
+# 安全網: WAN URL しか指定されていない場合でもローカルループバックを末尾候補に保持
+for _fb in ["http://127.0.0.1:8088", "http://localhost:8088"]:
+    if _fb not in MASTER_CANDIDATE_URLS:
+        MASTER_CANDIDATE_URLS.append(_fb)
+
 _current_master_idx: int = 0
+
+
+def is_private_or_local_url(url: str) -> bool:
+    """指定された URL がプライベート IP またはローカルループバックかを判定"""
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return False
+        if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return True
+        if hostname.endswith(".local"):
+            return True
+        ip = ipaddress.ip_address(hostname)
+        return ip.is_private or ip.is_loopback
+    except Exception:
+        return False
+
 
 def get_master_url() -> str:
     """現在アクティブに接続している Master URL を取得"""
     global _current_master_idx
     return MASTER_CANDIDATE_URLS[_current_master_idx % len(MASTER_CANDIDATE_URLS)]
+
+
+async def probe_and_promote_local_master(candidate_urls: Optional[List[str]] = None) -> bool:
+    """
+    ローカル (127.0.0.1 / localhost / 同一LAN) の Master に接続可能かをプローブし、
+    疎通可能であれば MASTER_CANDIDATE_URLS の最優先 (インデックス0) に昇格させる。
+    """
+    global MASTER_CANDIDATE_URLS, _current_master_idx
+    to_probe = candidate_urls or ["http://127.0.0.1:8088", "http://localhost:8088"]
+    headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
+    for raw_url in to_probe:
+        if not raw_url:
+            continue
+        url_clean = raw_url.strip().rstrip("/")
+        if not is_private_or_local_url(url_clean):
+            continue
+        # 現在すでにこの URL を最優先で使用しているならスキップ
+        if _current_master_idx == 0 and MASTER_CANDIDATE_URLS and MASTER_CANDIDATE_URLS[0] == url_clean:
+            return True
+        try:
+            timeout = aiohttp.ClientTimeout(total=2.0)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{url_clean}/health", headers=headers) as resp:
+                    if resp.status == 200:
+                        # 疎通成功！この URL を最優先に昇格
+                        if url_clean in MASTER_CANDIDATE_URLS:
+                            MASTER_CANDIDATE_URLS.remove(url_clean)
+                        MASTER_CANDIDATE_URLS.insert(0, url_clean)
+                        _current_master_idx = 0
+                        logger.info(f"🚀 [Multi-Master] ローカル/LAN Master ({url_clean}) への直接通信に成功したため最優先に採用します")
+                        return True
+        except Exception:
+            pass
+    return False
+
 
 def switch_to_next_master() -> str:
     """切断時に次の Master 候補へ切り替え"""
@@ -129,10 +190,12 @@ def switch_to_next_master() -> str:
         return new_url
     return get_master_url()
 
+
 def is_using_primary_master() -> bool:
     """第1優先 (Primary) Master を使用中かどうか"""
     global _current_master_idx
     return _current_master_idx == 0
+
 
 def try_switch_to_primary_master() -> str:
     """第1優先 Master への自動復帰 (Preempt 追従)"""
@@ -184,7 +247,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.13.6"
+    AGENT_VERSION = "3.13.7"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -1509,6 +1572,8 @@ class WorkerAgent:
         self._models_sync_lock = asyncio.Lock()                              # モデルPull同期排他ロック (項目⑲)
         self._models_upload_lock = asyncio.Lock()                            # モデルPushアップロード排他ロック (項目⑲)
         self._uploading_models: set = set()                                  # アップロード中モデル名セット
+        self._model_upload_cooldowns: Dict[str, float] = {}                  # Push失敗時クーリングタイム (再試行抑止・子プロセス増殖防止)
+        self._model_pull_cooldowns: Dict[str, float] = {}                    # Pull失敗時クーリングタイム (再試行抑止)
 
         # Compose プロジェクト完全物理分離の自己点検・補完
         try:
@@ -1958,9 +2023,15 @@ hosts allow = *
             return
         async with self._models_upload_lock:
             models_dir = self.ram_manager.persistent_dir
+            now = time.time()
             for name in model_names:
                 clean_name = sanitize_filename(name)
                 if not clean_name or not is_safe_identifier(clean_name):
+                    continue
+                # クーリングタイム判定 (失敗・拒否から一定時間は再試行をスキップし子プロセス増殖・帯域浪費を防止)
+                cooldown_until = self._model_upload_cooldowns.get(clean_name, 0)
+                if now < cooldown_until:
+                    logger.debug(f"[ModelSync] モデル {clean_name} はクーリングタイム中のためアップロードをスキップ (残り {int(cooldown_until - now)}秒)")
                     continue
                 model_path = models_dir / clean_name
                 if not model_path.exists() or not (model_path / "metas.json").exists():
@@ -1969,8 +2040,14 @@ hosts allow = *
                     continue
                 self._uploading_models.add(clean_name)
                 try:
-                    logger.info(f"📦 [ModelSync] Master へのモデルPushアップロードを開始: {clean_name}")
                     master_url = get_master_url()
+                    # もし現在の Master URL が WAN/Cloudflare 経由の場合、ローカル直接疎通をプローブ
+                    if not is_private_or_local_url(master_url):
+                        promoted = await probe_and_promote_local_master()
+                        if promoted:
+                            master_url = get_master_url()
+
+                    is_wan = not is_private_or_local_url(master_url)
                     url = f"{master_url}/api/worker/models/upload/{urllib.parse.quote(clean_name)}"
                     session = await self.get_session()
                     headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
@@ -1984,18 +2061,34 @@ hosts allow = *
                             tar.add(str(model_path), arcname=clean_name)
 
                         file_size = tmp_tar_path.stat().st_size
+                        # Cloudflare Tunnel / WAN 経由の 100MB 制限保護:
+                        # 95MB を超えるモデルを Cloudflare Tunnel 経由で POST すると 413 Payload Too Large で即死するためスキップ
+                        if is_wan and file_size > 95 * 1024 * 1024:
+                            logger.warning(
+                                f"⚠️ [ModelSync] Cloudflare Tunnel / WAN経由のため大容量モデル Push を安全にスキップ "
+                                f"({file_size / 1024 / 1024:.1f} MB > 95MB, 413防止): {clean_name} "
+                                f"(Master からの直接 Pull または LAN 接続経由を待機します)"
+                            )
+                            # 10分間再試行を抑止
+                            self._model_upload_cooldowns[clean_name] = time.time() + 600.0
+                            continue
+
+                        logger.info(f"📦 [ModelSync] Master へのモデルPushアップロードを開始: {clean_name} ({file_size / 1024 / 1024:.1f} MB ➔ {master_url})")
                         with open(tmp_tar_path, "rb") as f:
                             async with session.post(
                                 url,
                                 data=f,
                                 headers=headers,
-                                timeout=aiohttp.ClientTimeout(total=300.0)
+                                timeout=aiohttp.ClientTimeout(total=600.0)
                             ) as resp:
                                 if resp.status in (200, 201, 202):
                                     logger.info(f"✅ [ModelSync] Master へのモデルPushアップロード完了: {clean_name} ({file_size / 1024 / 1024:.1f} MB)")
+                                    self._model_upload_cooldowns.pop(clean_name, None)
                                 else:
                                     txt = await resp.text()
-                                    logger.warning(f"⚠️ [ModelSync] Master へのモデルPushアップロード失敗 ({resp.status}): {txt}")
+                                    logger.warning(f"⚠️ [ModelSync] Master へのモデルPushアップロード失敗 ({resp.status}): {txt[:200]}")
+                                    # 失敗したモデルは 10 分間再試行を抑止 (子プロセス・CPU浪費防止)
+                                    self._model_upload_cooldowns[clean_name] = time.time() + 600.0
                     finally:
                         if tmp_tar_path.exists():
                             try:
@@ -2004,6 +2097,7 @@ hosts allow = *
                                 pass
                 except Exception as e:
                     logger.error(f"❌ [ModelSync] モデル {clean_name} のアップロード中に例外発生: {e}")
+                    self._model_upload_cooldowns[clean_name] = time.time() + 600.0
                 finally:
                     self._uploading_models.discard(clean_name)
 
@@ -2016,9 +2110,14 @@ hosts allow = *
         async with self._models_sync_lock:
             models_dir = self.ram_manager.persistent_dir
             pulled_count = 0
+            now = time.time()
             for name in model_names:
                 clean_name = sanitize_filename(name)
                 if not clean_name or not is_safe_identifier(clean_name):
+                    continue
+                cooldown_until = self._model_pull_cooldowns.get(clean_name, 0)
+                if now < cooldown_until:
+                    logger.debug(f"[ModelSync] モデル {clean_name} はクーリングタイム中のためPullスキップ (残り {int(cooldown_until - now)}秒)")
                     continue
                 target_dir = models_dir / clean_name
                 if (target_dir / "metas.json").exists():
@@ -2048,6 +2147,7 @@ hosts allow = *
                         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=300.0)) as resp:
                             if resp.status != 200:
                                 logger.warning(f"⚠️ [ModelSync] Master からのモデルダウンロード失敗 ({resp.status}): {clean_name}")
+                                self._model_pull_cooldowns[clean_name] = time.time() + 600.0
                                 continue
                             with open(tmp_tar_path, "wb") as f:
                                 async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -2074,6 +2174,7 @@ hosts allow = *
                                 shutil.rmtree(target_dir, ignore_errors=True)
                             shutil.move(str(extracted_model), str(target_dir))
                             shutil.rmtree(staging_dir, ignore_errors=True)
+                            self._model_pull_cooldowns.pop(clean_name, None)
                             logger.info(f"🎉 [ModelSync] モデル {clean_name} を正常にMasterから同期・配置しました")
                             pulled_count += 1
                             if self.ram_manager:
@@ -2089,6 +2190,7 @@ hosts allow = *
                                 pass
                 except Exception as e:
                     logger.error(f"❌ [ModelSync] モデル {clean_name} のPull同期中に例外発生: {e}")
+                    self._model_pull_cooldowns[clean_name] = time.time() + 600.0
 
             if pulled_count > 0:
                 logger.info(f"📊 [ModelSync] {pulled_count}件の新規COEIROINKモデルをMasterから同期・配置しました。")
@@ -2143,6 +2245,15 @@ hosts allow = *
                     logger.info(f"🎉 Master への自動登録成功！ (url={master_url}, concurrent={mac}, priority={pri})")
                     if data.get("ws_tunnel_required"):
                         self._ensure_ws_tunnel_started()
+                    master_lan_url = data.get("master_lan_url")
+                    if master_lan_url:
+                        asyncio.create_task(probe_and_promote_local_master([master_lan_url]))
+                    # Master から更新指示が出ている場合は、Model Sync を保留して最優先で自己アップデートを実行
+                    if data.get("update_available"):
+                        self._master_coordinates_updates = True
+                        logger.info("🚀 [AutoUpdate] 起動時登録レスポンスでバージョンアップが指示されたため、モデル同期を保留して先に自己アップデートを実行します。")
+                        self._maybe_start_coordinated_update(data)
+                        return True
                     models_to_upload = data.get("models_to_upload")
                     if models_to_upload:
                         asyncio.create_task(self.upload_missing_models_to_master(models_to_upload))
@@ -2236,6 +2347,9 @@ hosts allow = *
                             self.any_human_in_vc = hb_res.get("any_human_in_vc", False)
                             if hb_res.get("ws_tunnel_required"):
                                 self._ensure_ws_tunnel_started()
+                            master_lan_url = hb_res.get("master_lan_url")
+                            if master_lan_url:
+                                asyncio.create_task(probe_and_promote_local_master([master_lan_url]))
                             models_to_upload = hb_res.get("models_to_upload")
                             if models_to_upload:
                                 asyncio.create_task(self.upload_missing_models_to_master(models_to_upload))
@@ -3805,6 +3919,10 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
                     await response.write(chunk)
                 await proc.wait()
                 await response.write_eof()
+            except (ConnectionResetError, aiohttp.ClientConnectionResetError, asyncio.CancelledError) as disconn_err:
+                logger.info(f"ℹ️ [ModelDownload] クライアント切断検知のためモデル配信を中断・クリーン終了しました: {matched_dir_name} ({disconn_err})")
+            except Exception as stream_err:
+                logger.warning(f"⚠️ [ModelDownload] モデル配信中にエラー発生: {matched_dir_name} ({stream_err})")
             finally:
                 if proc.returncode is None:
                     try:
@@ -3826,6 +3944,10 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
                             break
                         await response.write(chunk)
                 await response.write_eof()
+            except (ConnectionResetError, aiohttp.ClientConnectionResetError, asyncio.CancelledError) as disconn_err:
+                logger.info(f"ℹ️ [ModelDownload] クライアント切断検知のためモデル配信を中断・クリーン終了しました: {matched_dir_name} ({disconn_err})")
+            except Exception as stream_err:
+                logger.warning(f"⚠️ [ModelDownload] モデル配信中にエラー発生: {matched_dir_name} ({stream_err})")
             finally:
                 if tmp_tar.exists():
                     try:
@@ -3837,6 +3959,12 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
 
 
 async def main():
+    # 起動直後にローカル/同一ホストの Master への直接疎通をプローブ
+    try:
+        await probe_and_promote_local_master()
+    except Exception as e:
+        logger.debug(f"Initial local Master probe: {e}")
+
     agent = WorkerAgent()
     agent.start_rsync_daemon()
 

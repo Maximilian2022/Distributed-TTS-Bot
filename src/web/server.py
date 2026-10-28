@@ -167,6 +167,7 @@ class WebServer:
         self._code_hash_cache = None
         self._code_hash_cache_time = 0.0
         self._syncing_models: set = set()
+        self._model_sync_cooldowns: Dict[str, float] = {}
         self._worker_reachability_cache: Dict[Tuple[str, int, str], Tuple[float, bool]] = {}
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
@@ -983,6 +984,27 @@ class WebServer:
             "localhost:8088"
         )
         return f"{proto}://{host}".rstrip("/")
+
+    def _get_master_lan_url(self, request: Optional[web.Request] = None) -> str:
+        """Master サーバーの LAN / ローカル内部向けベース URL を取得 (Worker の直接低遅延通信用)"""
+        # 1. リクエストが LAN / ローカルから来ている場合はその Host / IP を利用
+        if request and not self._is_wan_request(request):
+            proto = request.headers.get("X-Forwarded-Proto") or request.scheme or "http"
+            host = request.headers.get("Host") or request.host or "localhost:8088"
+            return f"{proto}://{host}".rstrip("/")
+
+        # 2. WAN からのリクエストの場合、Master 自身のプライベート IPv4 アドレスを探索
+        web_port = getattr(self.config, "web_port", 8088) or 8088
+        try:
+            from src.utils.system_info import get_local_ip_candidates
+            candidates = get_local_ip_candidates()
+            for cand in candidates:
+                if is_private_or_local_ip(cand) and cand not in ("127.0.0.1", "localhost"):
+                    return f"http://{cand}:{web_port}"
+        except Exception:
+            pass
+
+        return f"http://127.0.0.1:{web_port}"
 
     async def _ensure_ha_secret(self) -> str:
         """HA共有認証シークレットの取得（未設定時は自動生成＆永続化）"""
@@ -4462,9 +4484,19 @@ class WebServer:
             initial_standby=False
         )
 
+        worker_agent_ver = str(data.get("agent_version") or specs.get("agent_version") or "").strip()
+        target_agent_ver = AGENT_VERSION
+        needs_agent_update = bool(worker_agent_ver) and _version_is_newer(target_agent_ver, worker_agent_ver)
+
         models_to_pull, models_to_upload = self._compute_coeiroink_model_diff(
             installed_models, installed_models_map
         )
+        if needs_agent_update:
+            # Worker Agent の更新が最優先。古い Agent で大容量モデルを Sync しないよう保留する
+            logger.info(f"🔄 [WorkerAPI] Worker '{node_id}' は旧バージョン ({worker_agent_ver} < {target_agent_ver}) のため、モデル同期を保留して先にバージョンアップを指示します。")
+            models_to_pull = []
+            models_to_upload = []
+
         if models_to_upload and is_direct_reachable:
             safe_create_task(
                 self._pull_missing_models_from_worker(str(ip), int(agent_port or 50030), models_to_upload),
@@ -4505,6 +4537,9 @@ class WebServer:
             "ws_tunnel_required": not is_direct_reachable,
             "models_to_pull": models_to_pull,
             "models_to_upload": models_to_upload,
+            "update_available": needs_agent_update,
+            "target_agent_version": target_agent_ver,
+            "master_lan_url": self._get_master_lan_url(request),
         })
 
     async def api_worker_heartbeat(self, request: web.Request) -> web.Response:
@@ -4772,10 +4807,16 @@ class WebServer:
         )
         pull_target_ip = cand_ip or worker_ip
         if models_to_upload and is_direct_reachable and pull_target_ip and pull_target_ip not in ("127.0.0.1", "localhost"):
-            safe_create_task(
-                self._pull_missing_models_from_worker(pull_target_ip, cand_port, models_to_upload),
-                name=f"pull_worker_models_hb_{node_id}"
+            now_ts = time.time()
+            has_unsynced = any(
+                m not in self._syncing_models and (now_ts >= self._model_sync_cooldowns.get(m, 0))
+                for m in models_to_upload
             )
+            if has_unsynced:
+                safe_create_task(
+                    self._pull_missing_models_from_worker(pull_target_ip, cand_port, models_to_upload),
+                    name=f"pull_worker_models_hb_{node_id}"
+                )
 
         return web.json_response({
             "registered": True,
@@ -4789,6 +4830,7 @@ class WebServer:
             "ws_tunnel_required": not is_direct_reachable,
             "models_to_pull": models_to_pull,
             "models_to_upload": models_to_upload,
+            "master_lan_url": self._get_master_lan_url(request),
         })
 
     async def api_worker_nodes(self, request: web.Request) -> web.Response:
@@ -5725,9 +5767,14 @@ class WebServer:
             return
 
         model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        now = time.time()
         for raw_name in models_to_pull:
             clean_name = sanitize_filename(str(raw_name))
             if not clean_name or not is_safe_identifier(clean_name):
+                continue
+            cooldown_until = self._model_sync_cooldowns.get(clean_name, 0)
+            if now < cooldown_until:
+                logger.debug(f"[ModelSync] モデル {clean_name} はクーリングタイム中のため Pull スキップ (残り {int(cooldown_until - now)}秒)")
                 continue
             final_dir = validate_safe_path(model_dir, clean_name)
             if final_dir and (final_dir / "metas.json").exists():
@@ -5754,26 +5801,31 @@ class WebServer:
                 if secret:
                     headers["X-Worker-Token"] = secret
                 logger.info(f"📥 [ModelSync] Worker ({safe_worker_ip}:{safe_port}) から未保有モデル '{clean_name}' を Pull 取得中...")
-                timeout = aiohttp.ClientTimeout(total=300.0, connect=5.0, sock_read=60.0)
+                timeout = aiohttp.ClientTimeout(total=1800.0, connect=10.0, sock_read=300.0)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(dl_url, headers=headers) as resp:
                         if resp.status != 200:
                             logger.debug(f"[ModelSync] Worker pull returned HTTP {resp.status} for {clean_name}")
+                            self._model_sync_cooldowns[clean_name] = time.time() + 600.0
                             continue
                         total_bytes = 0
-                        max_bytes = 1024 * 1024 * 1024  # 1GB上限
+                        max_bytes = 5 * 1024 * 1024 * 1024  # 5GB上限
                         with open(tmp_tar, "wb") as f:
                             async for chunk in resp.content.iter_chunked(64 * 1024):
                                 total_bytes += len(chunk)
                                 if total_bytes > max_bytes:
-                                    raise ValueError("Model archive exceeds 1GB safety limit")
+                                    raise ValueError("Model archive exceeds 5GB safety limit")
                                 await asyncio.to_thread(f.write, chunk)
 
                 ok, msg = await self._install_coeiroink_model_from_tar_file(clean_name, tmp_tar)
                 if not ok:
                     logger.warning(f"⚠️ [ModelSync] Worker からの Pull モデル '{clean_name}' 展開失敗: {msg}")
+                    self._model_sync_cooldowns[clean_name] = time.time() + 600.0
+                else:
+                    self._model_sync_cooldowns.pop(clean_name, None)
             except Exception as e:
                 logger.debug(f"[ModelSync] Pull model '{clean_name}' from {safe_worker_ip} skipped/failed: {e}")
+                self._model_sync_cooldowns[clean_name] = time.time() + 600.0
             finally:
                 self._syncing_models.discard(clean_name)
                 try:
@@ -5819,12 +5871,12 @@ class WebServer:
         tmp_tar = Path(tempfile.gettempdir()) / f"upload_worker_model_{uuid.uuid4().hex}.tar"
         try:
             total_bytes = 0
-            max_bytes = 1024 * 1024 * 1024  # 1GB上限
+            max_bytes = 5 * 1024 * 1024 * 1024  # 5GB上限
             with open(tmp_tar, "wb") as f:
                 async for chunk in request.content.iter_chunked(64 * 1024):
                     total_bytes += len(chunk)
                     if total_bytes > max_bytes:
-                        return web.json_response({"error": "Model archive exceeds 1GB limit"}, status=413)
+                        return web.json_response({"error": "Model archive exceeds 5GB limit"}, status=413)
                     await asyncio.to_thread(f.write, chunk)
 
             if total_bytes == 0:
@@ -5833,6 +5885,8 @@ class WebServer:
             ok, msg = await self._install_coeiroink_model_from_tar_file(clean_model_name, tmp_tar)
             if not ok:
                 return web.json_response({"error": msg, "model_name": clean_model_name}, status=400)
+
+            self._model_sync_cooldowns.pop(clean_model_name, None)
 
             return web.json_response({
                 "status": "ok",
