@@ -2732,7 +2732,7 @@ function renderWorkerNodes(nodesData) {
     let workerHostDisplay = cleanCandidate;
     if (isHexHost) {
       if (isMaster) {
-        workerHostDisplay = "MasterUbuntu";
+        workerHostDisplay = specs.hostname || "MasterNode";
       } else if (specs.gpu_name) {
         const cleanGpu = String(specs.gpu_name).replace(/NVIDIA (GeForce )?/i, '').trim();
         workerHostDisplay = `Worker (${cleanGpu})`;
@@ -2742,7 +2742,7 @@ function renderWorkerNodes(nodesData) {
         workerHostDisplay = `Worker (${cleanCandidate.substring(0, 6)})`;
       }
     } else if (!cleanCandidate || cleanCandidate === "local_master") {
-      workerHostDisplay = isMaster ? "MasterUbuntu" : (nodeIp ? `Worker (${nodeIp})` : "Worker Node");
+      workerHostDisplay = isMaster ? (specs.hostname || "MasterNode") : (nodeIp ? `Worker (${nodeIp})` : "Worker Node");
     }
 
     // クラスタWorker (HTTP直接ポートを持つノード) が存在する場合、ボランティア判定に優先
@@ -3830,7 +3830,7 @@ function renderAllWorkerSparklines() {
 function formatSmartWorker(rawLabel, provider) {
   if (!rawLabel) {
     const eng = (provider || "VOICEVOX").toUpperCase();
-    return { machine: "MasterDebian", engine: eng };
+    return { machine: "PrimaryNode", engine: eng };
   }
   let str = String(rawLabel).trim();
   if (str.includes(" / ")) {
@@ -4093,7 +4093,7 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
 
       workerContainer.innerHTML = workerEntries.map(([lbl, stat]) => {
         const sw = formatSmartWorker(lbl, "");
-        const isGpu = sw.machine.includes("2022") || sw.machine.includes("2017") || lbl.includes("GPU") || lbl.includes("3090") || lbl.includes("1080");
+        const isGpu = lbl.toUpperCase().includes("GPU") || /(RTX|GTX|RADEON|ARC|GEFORCE|TITAN|NV_|[0-9]{4})/i.test(sw.machine + " " + lbl);
         const isCache = lbl.includes("キャッシュ");
         const icon = isCache ? "⚡" : (isGpu ? "🎮" : "🏢");
         const color = isCache ? "#a8ff78" : (isGpu ? "#50e6ff" : "#f39c12");

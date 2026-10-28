@@ -418,7 +418,9 @@ async def main():
     async def broadcast_pinned_models_to_workers():
         try:
             await asyncio.sleep(8.0)  # Worker自動登録の完了を待機
-            speaker_ids = await db.get_pinned_coeiroink_speaker_ids(limit=4, active_days=30)
+            from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
+            dyn_limit = get_dynamic_pin_limit()
+            speaker_ids = await db.get_pinned_coeiroink_speaker_ids(limit=dyn_limit, active_days=30)
             pinned_models = set()
             for spk_id in speaker_ids:
                 v_info = config.voices.get(spk_id)
@@ -528,6 +530,9 @@ async def main():
     standby_trigger_file = Path("/app/data/standby_trigger")
     has_standby_trigger = standby_trigger_file.exists()
     env_standby = os.getenv("TTSBOT_STANDBY", "0").lower() in ("1", "true", "yes")
+    ha_role = os.getenv("TTSBOT_HA_ROLE", "master").strip().lower()
+    if ha_role == "slave" and os.getenv("TTSBOT_MASTER_URL", "").strip():
+        env_standby = True
 
     current_node = os.getenv("TTSBOT_NODE", "ubuntu").lower()
     current_slot = os.getenv("TTSBOT_SLOT", "").lower()
@@ -541,7 +546,7 @@ async def main():
     elif env_standby:
         # 環境変数のみでスタンバイ指定されている場合: ホストOS再起動時の巻き込まれトラップを検証
         is_standby = True
-        if current_target_id and active_slot_file.exists():
+        if ha_role != "slave" and current_target_id and active_slot_file.exists():
             try:
                 saved_active = active_slot_file.read_text(encoding="utf-8").strip().lower()
                 # 副系ノード（Debian等）は環境変数 TTSBOT_STANDBY=1 の場合は常にスタンバイ起動とする (Ubuntu主系のみ自動復旧)

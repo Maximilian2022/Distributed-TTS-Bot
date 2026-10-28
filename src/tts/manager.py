@@ -341,6 +341,9 @@ class TTSManager:
         未実在スタイル（実機に物理モデルが存在しないもの）はキャッシュからも完全パージする。
         """
         try:
+            from src.tts.node_pool import scan_local_coeiroink_models
+            scan_local_coeiroink_models()
+
             speakers_map: Dict[str, Dict[str, Any]] = {}
             api_reachable = False
 

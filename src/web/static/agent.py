@@ -27,11 +27,25 @@ import re
 import http.client
 import json
 import collections
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List
 from pathlib import Path
 import aiohttp
 from aiohttp import web
+
+def sanitize_filename(name: str) -> str:
+    """ディレクトリトラバーサルを防ぐファイル名サニタイズ (CWE-22対策)"""
+    if not name:
+        return ""
+    name = os.path.basename(name.replace("\\", "/"))
+    return re.sub(r'[^a-zA-Z0-9_\-\.]', '_', name)
+
+def is_safe_identifier(name: str) -> bool:
+    """モデル名やコンテナ名などの安全な識別子チェック"""
+    if not name or len(name) > 128:
+        return False
+    return bool(re.match(r'^[a-zA-Z0-9_\-\.]+$', name)) and ".." not in name
 
 # タイムゾーンをJST (UTC+9) に統一
 os.environ["TZ"] = "Asia/Tokyo"
@@ -299,6 +313,45 @@ class CoeiroinkWorkerRamManager:
                 return d
         return None
 
+    @staticmethod
+    def _get_dir_size_bytes(path_str: str) -> int:
+        """ディレクトリ配下の実ファイルサイズ合計(bytes)を算出"""
+        total = 0
+        try:
+            for root, _, files in os.walk(path_str):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    if not os.path.islink(fp):
+                        try:
+                            total += os.path.getsize(fp)
+                        except OSError:
+                            pass
+        except Exception:
+            pass
+        return total
+
+    def can_safely_promote_model(self, ssd_path: str) -> Tuple[bool, float]:
+        """
+        指定モデルをRAMDiskへ昇格させた場合の予想メモリ使用率を事前シミュレーションし、
+        WARNING_THRESHOLD_PERCENT (85%) を超える場合は事前に昇格をブロックする (項目⑭)。
+        """
+        usage = get_resource_usage()
+        mem_percent = usage.get("mem_percent") or 0.0
+        if mem_percent >= self.WARNING_THRESHOLD_PERCENT:
+            return False, mem_percent
+
+        total_gb = usage.get("mem_total_gb") or 0.0
+        used_gb = usage.get("mem_used_gb") or 0.0
+        if total_gb > 0 and os.path.exists(ssd_path):
+            model_bytes = self._get_dir_size_bytes(ssd_path)
+            model_gb = model_bytes / (1024.0 ** 3)
+            projected_percent = round(((used_gb + model_gb) / total_gb) * 100.0, 1)
+            if projected_percent >= self.WARNING_THRESHOLD_PERCENT:
+                return False, projected_percent
+            return True, projected_percent
+
+        return True, mem_percent
+
     async def promote_model(self, uuid_or_dir: str) -> bool:
         model_dir = self.resolve_model_dir(uuid_or_dir)
         if not model_dir:
@@ -306,10 +359,16 @@ class CoeiroinkWorkerRamManager:
         now = time.time()
         if self._freeze_until > now:
             return False
-        usage = get_resource_usage()
-        mem_percent = usage.get("mem_percent") or 0.0
-        if mem_percent >= self.WARNING_THRESHOLD_PERCENT:
-            logger.warning(f"⚠️ [WorkerRAM] ホストメモリ警戒域 ({mem_percent:.1f}%) のため昇格をブロック: {model_dir}")
+        ssd_path = os.path.join(self.ssd_dir, model_dir)
+        if not os.path.exists(ssd_path):
+            return False
+
+        safe_to_promote, projected_pct = await asyncio.to_thread(self.can_safely_promote_model, ssd_path)
+        if not safe_to_promote:
+            logger.warning(
+                f"⚠️ [WorkerRAM] 昇格前サイズ検証: メモリ警戒域超過予測 ({projected_pct:.1f}% >= {self.WARNING_THRESHOLD_PERCENT}%) "
+                f"のため昇格をブロック: {model_dir}"
+            )
             return False
 
         async with self._lock:
@@ -319,9 +378,6 @@ class CoeiroinkWorkerRamManager:
                 if "../storage/ram/" in os.readlink(link_path):
                     self._active_ram_models[model_dir] = now
                     return True
-            ssd_path = os.path.join(self.ssd_dir, model_dir)
-            if not os.path.exists(ssd_path):
-                return False
 
             def _copy():
                 tmp_dir = os.path.join(self.ram_dir, f"{model_dir}.tmp")
@@ -455,6 +511,18 @@ class CoeiroinkWorkerRamManager:
                 res.append(u)
         return res
 
+    def get_installed_models_map(self, rescan: bool = False) -> Dict[str, str]:
+        """SSD上にインストール済みの COEIROINK モデル {dir_name: speaker_uuid} マップを返す (項目⑲)"""
+        if rescan or not self._uuid_to_model_dir:
+            self._scan_ssd_models()
+        return {d: u for u, d in self._uuid_to_model_dir.items() if d and u}
+
+    def get_installed_model_names(self, rescan: bool = False) -> List[str]:
+        """SSD上にインストール済みの COEIROINK モデルディレクトリ名一覧を返す (項目⑲)"""
+        if rescan or not self._uuid_to_model_dir:
+            self._scan_ssd_models()
+        return sorted({d for d in self._uuid_to_model_dir.values() if d})
+
     def get_status(self) -> Dict[str, Any]:
         """RAMDisk状態サマリーの取得"""
         usage = get_resource_usage()
@@ -501,6 +569,12 @@ async def synthesize_local(
 ) -> bytes:
     """ローカル稼働エンジン (VOICEVOX / SHAREVOX / COEIROINK) を呼び出してWAV音声バイナリを生成"""
     engine_lower = engine.lower()
+    char_len = max(1, len(text or ""))
+    # 項目⑬: 音素解析 (/audio_query) は短タイムアウト (3.0s)、波形合成 (/synthesis) は文字数連動 (6.0s〜30.0s)
+    query_timeout = aiohttp.ClientTimeout(total=3.0, connect=1.5)
+    synth_timeout_sec = min(30.0, max(6.0, 4.0 + char_len * 0.25))
+    synth_timeout = aiohttp.ClientTimeout(total=synth_timeout_sec, connect=2.0)
+
     async with aiohttp.ClientSession() as session:
         if engine_lower in ("voicevox", "sharevox"):
             port = 50021 if engine_lower == "voicevox" else 50025
@@ -509,7 +583,7 @@ async def synthesize_local(
             # 1. audio_query
             query_url = f"{base_url}/audio_query"
             params = {"text": text, "speaker": speaker_id}
-            async with session.post(query_url, params=params, timeout=aiohttp.ClientTimeout(total=5.0)) as resp:
+            async with session.post(query_url, params=params, timeout=query_timeout) as resp:
                 if resp.status != 200:
                     err = await resp.text()
                     raise RuntimeError(f"{engine} audio_query failed ({resp.status}): {err}")
@@ -523,15 +597,15 @@ async def synthesize_local(
 
             # 2. synthesis
             synth_url = f"{base_url}/synthesis"
-            async with session.post(synth_url, params={"speaker": speaker_id}, json=query_data, timeout=aiohttp.ClientTimeout(total=10.0)) as resp:
+            async with session.post(synth_url, params={"speaker": speaker_id}, json=query_data, timeout=synth_timeout) as resp:
                 if resp.status != 200:
                     err = await resp.text()
                     raise RuntimeError(f"{engine} synthesis failed ({resp.status}): {err}")
                 return await resp.read()
 
         elif engine_lower == "coeiroink":
-            # COEIROINK v2 (port 50032)
-            base_url = "http://127.0.0.1:50032"
+            # COEIROINK v2 (port 50032 or 50031)
+            base_url = "http://127.0.0.1:50031"
             synth_url = f"{base_url}/v1/synthesis"
             payload = {
                 "speakerUuid": speaker_uuid or "3cda4742-1cb1-433d-9ce6-209fa0952c0e",
@@ -542,7 +616,7 @@ async def synthesize_local(
                 "pitchScale": pitch,
                 "intonationScale": intonation
             }
-            async with session.post(synth_url, json=payload, timeout=aiohttp.ClientTimeout(total=10.0)) as resp:
+            async with session.post(synth_url, json=payload, timeout=synth_timeout) as resp:
                 if resp.status != 200:
                     err = await resp.text()
                     raise RuntimeError(f"COEIROINK synthesis failed ({resp.status}): {err}")
@@ -591,8 +665,8 @@ async def _handle_ws_synth_request(ws, req_id: str, data: dict):
             "error": str(e)
         })
 
-async def ws_client_loop(master_ws_url: str, secret: str, node_id: str):
-    """Master との双方向常時接続 WebSocket クライアントループ (NAT/WAN越え用)"""
+async def ws_client_loop(master_ws_url: str, secret: str, node_id: str, agent: Optional[Any] = None):
+    """Master との双方向常時接続 WebSocket クライアントループ (NAT/WAN/異拠点サブネット越え用)"""
     logger.info(f"🚀 [WS-Client] Starting WebSocket client loop to {master_ws_url}")
     reconnect_delay = 3.0
 
@@ -608,11 +682,25 @@ async def ws_client_loop(master_ws_url: str, secret: str, node_id: str):
                     logger.info(f"🔌 [WS-Client] Connected to Master WebSocket: {master_ws_url}")
                     reconnect_delay = 3.0
 
+                    specs = dict(agent.specs) if (agent and hasattr(agent, "specs")) else {}
+                    installed_names = agent.ram_manager.get_installed_model_names() if (agent and getattr(agent, "ram_manager", None)) else []
+                    installed_map = agent.ram_manager.get_installed_models_map() if (agent and getattr(agent, "ram_manager", None)) else {}
+                    if installed_names:
+                        specs["installed_models"] = installed_names
+                    if installed_map:
+                        specs["installed_models_map"] = installed_map
+
                     reg_payload = {
                         "type": "register",
                         "node_id": node_id,
-                        "node_name": f"Worker ({socket.gethostname()})",
-                        "engines": list(ENGINES.keys())
+                        "node_name": f"Worker ({get_effective_hostname()})",
+                        "engines": list(ENGINES.keys()),
+                        "supported_engines": list(ENGINES.keys()),
+                        "supported_models": {"coeiroink": installed_names} if installed_names else {},
+                        "specs": specs,
+                        "capacity": int(specs.get("recommended_max_concurrent", 2)),
+                        "priority": int(specs.get("recommended_priority", 2)),
+                        "is_cluster_worker": True,
                     }
                     await ws.send_json(reg_payload)
 
@@ -620,7 +708,11 @@ async def ws_client_loop(master_ws_url: str, secret: str, node_id: str):
                         while not ws.closed:
                             await asyncio.sleep(20.0)
                             try:
-                                await ws.send_json({"type": "heartbeat"})
+                                cur_names = agent.ram_manager.get_installed_model_names() if (agent and getattr(agent, "ram_manager", None)) else []
+                                await ws.send_json({
+                                    "type": "heartbeat",
+                                    "supported_models": {"coeiroink": cur_names} if cur_names else {}
+                                })
                             except Exception:
                                 break
 
@@ -635,8 +727,8 @@ async def ws_client_loop(master_ws_url: str, secret: str, node_id: str):
                                     continue
 
                                 m_type = data.get("type")
-                                if m_type == "registered":
-                                    logger.info(f"✅ [WS-Client] Registered to Master as {data.get('node_id')}")
+                                if m_type in ("registered", "register_ack"):
+                                    logger.info(f"✅ [WS-Client] Registered to Master via WS Tunnel as {data.get('node_id')}")
 
                                 elif m_type == "synthesize_request":
                                     req_id = data.get("req_id")
@@ -1382,6 +1474,10 @@ class WorkerAgent:
         self.engine_healthy: Dict[str, bool] = {k: True for k in ENGINES}  # 直近ヘルスプローブ結果
         self.engine_fail_count: Dict[str, int] = {k: 0 for k in ENGINES}   # 連続失敗カウンタ (3回で再起動)
         self.engine_restart_count: Dict[str, int] = {k: 0 for k in ENGINES} # 連続再起動カウンタ (2回でLevel-2クリーン再作成)
+        self._ws_tunnel_task: Optional[asyncio.Task] = None                  # WebSocket トンネルタスク (項目⑱)
+        self._models_sync_lock = asyncio.Lock()                              # モデルPull同期排他ロック (項目⑲)
+        self._models_upload_lock = asyncio.Lock()                            # モデルPushアップロード排他ロック (項目⑲)
+        self._uploading_models: set = set()                                  # アップロード中モデル名セット
 
         # Compose プロジェクト完全物理分離の自己点検・補完
         try:
@@ -1800,14 +1896,168 @@ hosts allow = *
             except Exception:
                 pass
 
+    def _ensure_ws_tunnel_started(self) -> None:
+        """Master への WebSocket リバーストンネルが未起動であれば開始する (項目⑱)"""
+        if self._ws_tunnel_task is not None and not self._ws_tunnel_task.done():
+            return
+        master_url = get_master_url()
+        if master_url.startswith("https://"):
+            ws_url = "wss://" + master_url[8:] + "/api/worker/ws"
+        else:
+            ws_url = "ws://" + master_url.replace("http://", "") + "/api/worker/ws"
+        logger.info(f"🔌 [WSTunnel] Master からの要請により WebSocket リバーストンネルを開始: {ws_url}")
+        self._ws_tunnel_task = asyncio.create_task(
+            ws_client_loop(ws_url, WORKER_TOKEN or "", self.node_id, agent=self)
+        )
+
+    async def upload_missing_models_to_master(self, model_names: List[str]) -> None:
+        """Master に不足している COEIROINK モデルを Push アップロードする (項目⑲)"""
+        if not model_names or not self.ram_manager:
+            return
+        if self._models_upload_lock.locked():
+            return
+        async with self._models_upload_lock:
+            models_dir = self.ram_manager.persistent_dir
+            for name in model_names:
+                clean_name = sanitize_filename(name)
+                if not clean_name or not is_safe_identifier(clean_name):
+                    continue
+                model_path = models_dir / clean_name
+                if not model_path.exists() or not (model_path / "metas.json").exists():
+                    continue
+                if clean_name in self._uploading_models:
+                    continue
+                self._uploading_models.add(clean_name)
+                try:
+                    logger.info(f"📦 [ModelSync] Master へのモデルPushアップロードを開始: {clean_name}")
+                    master_url = get_master_url()
+                    url = f"{master_url}/api/worker/models/upload/{urllib.parse.quote(clean_name)}"
+                    session = await self.get_session()
+                    headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
+
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
+                        tmp_tar_path = Path(tf.name)
+
+                    try:
+                        with tarfile.open(tmp_tar_path, "w") as tar:
+                            tar.add(str(model_path), arcname=clean_name)
+
+                        file_size = tmp_tar_path.stat().st_size
+                        with open(tmp_tar_path, "rb") as f:
+                            async with session.post(
+                                url,
+                                data=f,
+                                headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=300.0)
+                            ) as resp:
+                                if resp.status in (200, 201, 202):
+                                    logger.info(f"✅ [ModelSync] Master へのモデルPushアップロード完了: {clean_name} ({file_size / 1024 / 1024:.1f} MB)")
+                                else:
+                                    txt = await resp.text()
+                                    logger.warning(f"⚠️ [ModelSync] Master へのモデルPushアップロード失敗 ({resp.status}): {txt}")
+                    finally:
+                        if tmp_tar_path.exists():
+                            try:
+                                tmp_tar_path.unlink()
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.error(f"❌ [ModelSync] モデル {clean_name} のアップロード中に例外発生: {e}")
+                finally:
+                    self._uploading_models.discard(clean_name)
+
+    async def pull_missing_models_from_master(self, model_names: List[str]) -> None:
+        """Master から不足している COEIROINK モデルをダウンロードして自律同期する (項目⑲)"""
+        if not model_names or not self.ram_manager:
+            return
+        if self._models_sync_lock.locked():
+            return
+        async with self._models_sync_lock:
+            models_dir = self.ram_manager.persistent_dir
+            for name in model_names:
+                clean_name = sanitize_filename(name)
+                if not clean_name or not is_safe_identifier(clean_name):
+                    continue
+                target_dir = models_dir / clean_name
+                if (target_dir / "metas.json").exists():
+                    continue
+
+                # ディスク空き容量チェック (最低 500MB)
+                try:
+                    free_bytes = shutil.disk_usage(str(models_dir)).free
+                    if free_bytes < 500 * 1024 * 1024:
+                        logger.warning(f"⚠️ [ModelSync] ディスク空き容量不足のためモデル {clean_name} の同期をスキップ")
+                        break
+                except Exception:
+                    pass
+
+                try:
+                    logger.info(f"📥 [ModelSync] Master からモデルPullダウンロードを開始: {clean_name}")
+                    master_url = get_master_url()
+                    url = f"{master_url}/api/worker/models/download/{urllib.parse.quote(clean_name)}"
+                    session = await self.get_session()
+                    headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
+
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
+                        tmp_tar_path = Path(tf.name)
+
+                    try:
+                        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=300.0)) as resp:
+                            if resp.status != 200:
+                                logger.warning(f"⚠️ [ModelSync] Master からのモデルダウンロード失敗 ({resp.status}): {clean_name}")
+                                continue
+                            with open(tmp_tar_path, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(64 * 1024):
+                                    f.write(chunk)
+
+                        staging_dir = models_dir / f".staging_{clean_name}_{int(time.time())}"
+                        if staging_dir.exists():
+                            shutil.rmtree(staging_dir, ignore_errors=True)
+                        staging_dir.mkdir(parents=True, exist_ok=True)
+
+                        with tarfile.open(tmp_tar_path, "r") as tar:
+                            for member in tar.getmembers():
+                                member_path = (staging_dir / member.name).resolve()
+                                if not str(member_path).startswith(str(staging_dir.resolve())):
+                                    raise ValueError(f"Path traversal detected in tar: {member.name}")
+                            tar.extractall(path=staging_dir)
+
+                        extracted_model = staging_dir / clean_name
+                        if not extracted_model.exists():
+                            extracted_model = staging_dir
+
+                        if (extracted_model / "metas.json").exists():
+                            if target_dir.exists():
+                                shutil.rmtree(target_dir, ignore_errors=True)
+                            shutil.move(str(extracted_model), str(target_dir))
+                            shutil.rmtree(staging_dir, ignore_errors=True)
+                            logger.info(f"🎉 [ModelSync] モデル {clean_name} を正常にMasterから同期・配置しました")
+                            if self.ram_manager:
+                                self.ram_manager.setup_hybrid_structure()
+                        else:
+                            shutil.rmtree(staging_dir, ignore_errors=True)
+                            logger.warning(f"⚠️ [ModelSync] 展開モデルに metas.json が見つかりませんでした: {clean_name}")
+                    finally:
+                        if tmp_tar_path.exists():
+                            try:
+                                tmp_tar_path.unlink()
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.error(f"❌ [ModelSync] モデル {clean_name} のPull同期中に例外発生: {e}")
+
     async def register_to_master(self) -> bool:
-        """Master サーバーに自分自身を自動登録（ハードウェアスペックも送信）"""
+        """Master サーバーに自分自身を自動登録（ハードウェアスペック・保有モデルも送信）"""
         session = await self.get_session()
         master_url = get_master_url()
         url = f"{master_url}/api/worker/register"
 
         mac = self.specs["recommended_max_concurrent"]
         pri = self.specs["recommended_priority"]
+        installed_models = self.ram_manager.get_installed_model_names() if self.ram_manager else []
+        installed_models_map = self.ram_manager.get_installed_models_map() if self.ram_manager else {}
 
         payload = {
             "node_id": self.node_id,
@@ -1816,6 +2066,8 @@ hosts allow = *
             "agent_port": AGENT_PORT,
             "rsync_port": RSYNC_PORT,
             "specs": self.specs,
+            "installed_models": installed_models,
+            "installed_models_map": installed_models_map,
             "engines": {
                 k: {
                     "port": v["port"],
@@ -1833,6 +2085,14 @@ hosts allow = *
                     data = await resp.json()
                     self.registered_to_master = True
                     logger.info(f"🎉 Master への自動登録成功！ (url={master_url}, concurrent={mac}, priority={pri})")
+                    if data.get("ws_tunnel_required"):
+                        self._ensure_ws_tunnel_started()
+                    models_to_upload = data.get("models_to_upload")
+                    if models_to_upload:
+                        asyncio.create_task(self.upload_missing_models_to_master(models_to_upload))
+                    models_to_pull = data.get("models_to_pull")
+                    if models_to_pull:
+                        asyncio.create_task(self.pull_missing_models_from_master(models_to_pull))
                     return True
                 else:
                     self.registered_to_master = False
@@ -1889,6 +2149,8 @@ hosts allow = *
                 "specs": self.specs,
                 "resources": resource_info,
                 "ram_models": self.ram_manager.get_active_model_identifiers() if self.ram_manager else [],
+                "installed_models": self.ram_manager.get_installed_model_names() if self.ram_manager else [],
+                "installed_models_map": self.ram_manager.get_installed_models_map() if self.ram_manager else {},
                 "manifest_version": read_local_manifest_version(),
                 "updating": self._update_lock.locked(),
                 "engines": {
@@ -1916,6 +2178,14 @@ hosts allow = *
                         try:
                             hb_res = await resp.json()
                             self.any_human_in_vc = hb_res.get("any_human_in_vc", False)
+                            if hb_res.get("ws_tunnel_required"):
+                                self._ensure_ws_tunnel_started()
+                            models_to_upload = hb_res.get("models_to_upload")
+                            if models_to_upload:
+                                asyncio.create_task(self.upload_missing_models_to_master(models_to_upload))
+                            models_to_pull = hb_res.get("models_to_pull")
+                            if models_to_pull:
+                                asyncio.create_task(self.pull_missing_models_from_master(models_to_pull))
                             # Master 調停型の自動更新 (ハートビート相乗り)
                             if "update_available" in hb_res:
                                 self._master_coordinates_updates = True
@@ -3410,6 +3680,77 @@ async def handle_ram_flush(request: web.Request) -> web.Response:
     return web.json_response({"success": True, "message": "Emergency flush triggered"})
 
 
+async def handle_model_download(request: web.Request) -> web.StreamResponse:
+    """Master からの要請に応じて、Worker 保有の COEIROINK モデルを tar ストリームで高速配信 (項目⑲)"""
+    model_name = request.match_info.get("model_name", "")
+    clean_model_name = sanitize_filename(model_name)
+    if not clean_model_name or not is_safe_identifier(clean_model_name):
+        return web.Response(text="Invalid model name", status=400)
+
+    work_dir = resolve_work_dir()
+    model_dir = work_dir / "coeiroink_models"
+    agent = request.app.get("agent")
+    if agent and getattr(agent, "ram_manager", None):
+        model_dir = agent.ram_manager.persistent_dir
+
+    target_path = (model_dir / clean_model_name).resolve()
+    if not str(target_path).startswith(str(model_dir.resolve())):
+        return web.Response(text="Invalid model path", status=400)
+
+    if not target_path.exists() or not target_path.is_dir() or not (target_path / "metas.json").exists():
+        return web.Response(text="Model not found", status=404)
+
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "application/x-tar",
+            "Content-Disposition": f'attachment; filename="{clean_model_name}.tar"',
+        }
+    )
+    await response.prepare(request)
+
+    if shutil.which("tar"):
+        proc = await asyncio.create_subprocess_exec(
+            "tar", "-cf", "-", "-C", str(model_dir), clean_model_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        try:
+            while True:
+                chunk = await proc.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                await response.write(chunk)
+            await proc.wait()
+            await response.write_eof()
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+            raise
+    else:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
+            tmp_tar = Path(tf.name)
+        try:
+            with tarfile.open(tmp_tar, "w") as tar:
+                tar.add(str(target_path), arcname=clean_model_name)
+            with open(tmp_tar, "rb") as f:
+                while True:
+                    chunk = f.read(64 * 1024)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+            await response.write_eof()
+        finally:
+            if tmp_tar.exists():
+                try:
+                    tmp_tar.unlink()
+                except Exception:
+                    pass
+
+    return response
+
+
 async def main():
     agent = WorkerAgent()
     agent.start_rsync_daemon()
@@ -3430,6 +3771,7 @@ async def main():
     app.router.add_get("/models/ram_status", handle_ram_status)
     app.router.add_post("/models/ram_demote", handle_ram_demote)
     app.router.add_post("/models/ram_flush", handle_ram_flush)
+    app.router.add_get("/models/download/{model_name}", handle_model_download)
 
     runner = web.AppRunner(app)
     await runner.setup()

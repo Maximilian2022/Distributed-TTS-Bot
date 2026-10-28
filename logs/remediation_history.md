@@ -1,7 +1,55 @@
 
 # 修正・作業履歴 (Remediation History)
 
-## [2026-10-28] 全体監査に基づく不具合修正・フォールバック統計精緻化・OSS環境非依存化・高速化（全10項目）
+## [2026-10-28] 全体監査第2フェーズ（項目⑪〜⑲および HA Slave Standby 対策）の実装 ＆ 完全自動モデル差分同期・Active Handshake到逹性検証
+
+- **ユーザーフィードバック & 合意事項**:
+  1. **⑮ キャッシュ容量上限 & HA Slave Standby 側の安全対策**:
+     - 「キャッシュ容量上限だけど、HA同期しているSlave Standby側で何も対策してないんじゃないかと心配になった。一緒に確認しておいてほしい。同様にHA同期のSlave Standby側で考慮する必要があるものが抜けてないかはダブルチェックしてほしい」
+     - ➔ Master/Slave 双方向でのホスト空き容量に基づく動的上限クランプ、`ha_watchdog.py` での自律ディスク監視・緊急LRU削除・OOM防止、各種設定テンプレートへの環境変数追加を実装。
+  2. **⑱ 同一サブネット前提の撤廃・物理的異サイト対応 (Active Handshake)**:
+     - 「同じサブネットだからといって、通信できるとは限らないし、物理的に異なるサイトかもしれない前提であることに注意してほしい」
+     - ➔ ローカルIP同士であっても拠点間疎通不可やポート閉塞、サブネット衝突が存在するため、Master から `candidate_ip:agent_port/health` へアクティブ疎通照会し、返却された `node_id` が期待値と完全一致する場合のみ直接HTTP通信を許可。不一致または不通時は即座に `ws_tunnel_required: True` を返し、WebSocket リバーストンネルへ自動強制切替。
+  3. **⑲ COEIROINK モデル保有検証 ＆ 双方向モデル差分自動同期**:
+     - 「これ、モデルの差異があった時にある所からもってくる、というのも追加できないかな？」
+     - ➔ 未保有ノードへの誤ルーティング完全遮断に加え、Master と Worker のモデルインベントリをハートビートで常時相互照合。Worker 保有・Master 未保有時は LAN 直通なら Master から Pull、NAT 配下なら Worker から Push アップロードし、Master 保有・Worker 未保有時は Worker が Master から Pull する双方向モデル自律同期パイプラインを構築。
+
+- **対応内容詳細**:
+  - **項目⑪: Speculative TTS 再生バッファ残量連動タイムアウト**:
+    - [streaming_audio.py](file:///root/ttsbot/src/utils/streaming_audio.py): `StreamingAudioSource.buffer_remaining_seconds` プロパティを実装（PCMキュー内の未再生秒数をリアルタイム算出）。
+    - [latency_profiler.py](file:///root/ttsbot/src/utils/latency_profiler.py): `calculate_dynamic_speculative_timeout` にバッファ残量スケーリングを導入。初動チャンクは会話テンポ優先（0.8〜2.5s）、後続チャンクはバッファ猶予に応じた適応待機（最大6.0s）により無用なクラウド投機混入を防止。
+    - [vc_handler.py](file:///root/ttsbot/src/cogs/vc_handler.py), [manager.py](file:///root/ttsbot/src/tts/manager.py): 再生バッファ秒数をTTSマネージャーへ引き渡し。
+  - **項目⑫: テキスト分割・動的チャンク長スケーリング**:
+    - [text_cleaner.py](file:///root/ttsbot/src/utils/text_cleaner.py): `_split_plain_text` 内の分割閾値（読点・スペース・スラング・語尾・形態素）を動的上限文字数 `cur_limit` に完全連動。低速CPUや高遅延環境でも適切な短文スライスを実現。
+  - **項目⑬: ローカルエンジン通信タイムアウト分離＆文字数連動**:
+    - [voicevox_tts.py](file:///root/ttsbot/src/tts/voicevox_tts.py), [sharevox_tts.py](file:///root/ttsbot/src/tts/sharevox_tts.py), [coeiroink_tts.py](file:///root/ttsbot/src/tts/coeiroink_tts.py): 軽量な前処理（`/audio_query`）を 3.0s 固定タイムアウトで早期ハング検知し、波形合成（`/synthesis`）を文字数とGPU/CPU連動（`calculate_synthesis_timeout`: 6.0s〜25.0s）に分離。
+    - [agent.py](file:///root/ttsbot/src/web/static/agent.py): Worker ローカル合成（`synthesize_local`）にも同様のタイムアウト分離を適用。
+  - **項目⑭: RAMDiskモデル昇格判定・実サイズ事前シミュレーション**:
+    - [coeiroink_ram_manager.py](file:///root/ttsbot/src/tts/coeiroink_ram_manager.py), [agent.py](file:///root/ttsbot/src/web/static/agent.py): `can_safely_promote_model` を実装。昇格対象モデルディレクトリの事前実サイズ計測と動的空きRAMシミュレーションにより、警戒域（85%）超過や空きRAM枯渇（<1.2GB）を事前にブロックしてOOMを完全防止。
+  - **項目⑮: キャッシュ容量上限の動的クランプ＆HA Slave Standby 対策**:
+    - [cache_manager.py](file:///root/ttsbot/src/cache_manager.py): `calculate_effective_cache_limits` によりホストディスク残量に応じた安全マージン（3GBまたは10%）を確保する動的クランプを実装。
+    - [server.py](file:///root/ttsbot/src/web/server.py): `/api/ha/status` にキャッシュ使用量および上限を公開。
+    - [ha_watchdog.py](file:///root/ttsbot/src/ha_watchdog.py): Slave Standby 監視ループでの自律キャッシュ容量監視・緊急LRU削除・ディスク保護を実装。
+    - [docker-compose.slave.yml](file:///root/ttsbot/docker-compose.slave.yml), [setup-standby.ps1](file:///root/ttsbot/src/web/static/setup-standby.ps1), [portainer-stack.yml](file:///root/ttsbot/src/web/static/portainer-stack.yml): `TTS_CACHE_MAX_SIZE_MB`, `TTS_CACHE_DISK_MIN_FREE_MB` の環境変数定義を追加。
+  - **項目⑯: 動的並列数＆TTS異常閾値**:
+    - [resource_manager.py](file:///root/ttsbot/src/resource_manager.py): `get_dynamic_max_concurrent` で論理CPUコア数・RAM容量に応じた動的並列数（1〜4並列、環境変数時最大8並列）を算出。`get_dynamic_tts_anomaly_threshold_bytes` で総RAMの45%を基準とした動的メモリ肥大検知閾値（2GB〜10GB）を算出。
+    - [main.py](file:///root/ttsbot/src/main.py): 動的並列数算出とTTS出力サイズ妥当性上限 (`100 * 1024 * 1024` = 100MB) を反映。
+  - **項目⑰: WebUI app.js ハードコード撤廃**:
+    - [app.js](file:///root/ttsbot/src/web/static/app.js): `_getRecommendedConcurrency` を論理コア数連動に、`getPriorityScore` を物理メモリ・コア動的重み付けに刷新し、特定マシン名依存を完全排除。
+  - **項目⑱: IP境界判定の汎用化＆Active Handshake 到達性検証・WS自動誘導**:
+    - [security.py](file:///root/ttsbot/src/utils/security.py): `is_private_or_local_ip` により RFC1918、Loopback、IPv6 ULA、CGNAT/Tailscale（`100.64.0.0/10`）を網羅。
+    - [server.py](file:///root/ttsbot/src/web/server.py): `_verify_worker_direct_reachability`（Active Handshake）を実装。`candidate_ip:agent_port/health` へ照会し、`node_id` が期待値と完全一致しない場合は直接HTTP通信を拒否し `ws_tunnel_required: True` を返却。
+    - [agent.py](file:///root/ttsbot/src/web/static/agent.py): `ws_tunnel_required` 受信時に WebSocket リバーストンネル（`ws_client_loop`）を自律起動。
+  - **項目⑲: COEIROINK モデル保有検証＆双方向モデル差分自動同期**:
+    - [node_pool.py](file:///root/ttsbot/src/tts/node_pool.py): `TTSNode.supports_model` を実装し、未保有ノードへの誤ルーティングを完全遮断。スタイルIDサフィックス除去の正規表現化（`re.sub(r'[_\:]\d+$', '', raw)`）により部分一致誤爆バグを完全解消。
+    - [server.py](file:///root/ttsbot/src/web/server.py): `_compute_coeiroink_model_diff`、Master からの直接 Pull（`_pull_missing_models_from_worker`）、Worker からの Push アップロード受信（`api_worker_models_upload`）、Worker へのモデル配信（`api_worker_models_download`）を実装。
+    - [agent.py](file:///root/ttsbot/src/web/static/agent.py): モデルインベントリのハートビート相乗り、Master への Push（`upload_missing_models_to_master`）、Master からの Pull（`pull_missing_models_from_master`）、Worker 配信エンドポイント（`handle_model_download`）を実装。
+
+- **検証結果**:
+  - [test_audit_remediation_11_to_19.py](file:///root/ttsbot/tests/test_audit_remediation_11_to_19.py) を新設し、隔離サンドボックスコンテナ環境にて第2フェーズ全10テストケースおよび既存テストスイート全69件を実行。**Ran 69 tests in 2.337s - OK (100% PASS)** を確認。
+  - 本番コンテナ `ttsbot-app-1` の無停止・健全稼働継続を確認。
+
+
 
 - **ユーザーフィードバック & 合意事項**:
   1. **① 最長チャンク優先ルーティングと動的チャンク長の整合**: 並列解決時に「より長い文をパワーのあるNodeに任せる」本来の設計意図を守りつつ、1チャンクの動的最大長（`get_dynamic_max_chars`: 8〜30文字）と連動させる。また固定15文字制限や発言者名プレフィックス混入で本文最長チャンクが `is_longest_chunk=False` に潰される不整合を解消する。

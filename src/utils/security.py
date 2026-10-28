@@ -15,6 +15,31 @@ logger = logging.getLogger(__name__)
 
 # 英数字とハイフン・アンダースコアのみ許可する正規表現
 _SAFE_IDENTIFIER_RE = re.compile(r'^[a-zA-Z0-9_\-]+$')
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def is_private_or_local_ip(ip_str: str) -> bool:
+    """
+    指定されたIPアドレス（またはホスト名 'localhost'）が RFC1918 プライベートIP、
+    ループバック、IPv6 ULA、または Tailscale/CGNAT (100.64.0.0/10) 空間に属するかを汎用判定する。
+    """
+    if not ip_str or not isinstance(ip_str, str):
+        return False
+    clean = ip_str.strip().lower()
+    if clean == "localhost":
+        return True
+    # IPv6 ブラケット表現 [::1] の除去
+    if clean.startswith("[") and clean.endswith("]"):
+        clean = clean[1:-1]
+    try:
+        addr = ipaddress.ip_address(clean)
+        if addr.is_loopback or addr.is_private:
+            return True
+        if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT_NETWORK:
+            return True
+        return False
+    except ValueError:
+        return False
 
 
 def validate_safe_worker_ip(ip_str: str) -> bool:

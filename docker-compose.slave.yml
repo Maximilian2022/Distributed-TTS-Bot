@@ -30,7 +30,7 @@ services:
       - TTSBOT_HA_PRIORITY=${TTSBOT_HA_PRIORITY:-1}
       - TTSBOT_PEER_URLS=${TTSBOT_PEER_URLS:-}
       - TTSBOT_CHECK_INTERVAL=${TTSBOT_CHECK_INTERVAL:-5}
-      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-6}
+      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-18}
       - TTSBOT_SYNC_INTERVAL=${TTSBOT_SYNC_INTERVAL:-60}
       - TTSBOT_LOCAL_DB_PATH=/app/data/bot.db
       - TTSBOT_IMAGE=${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
@@ -42,8 +42,12 @@ services:
       - TZ=Asia/Tokyo
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./src:/app/src
       - ./data:/app/data
       - ./logs:/app/logs
+      - tts_cache:/app/cache
+      - voicevox_cache:/app/cache_voicevox
+      - coeiroink_models:/app/coeiroink_models
       - ./.env:/app/.env
     deploy:
       resources:

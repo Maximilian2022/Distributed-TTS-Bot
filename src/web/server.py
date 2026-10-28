@@ -34,7 +34,7 @@ from src.version import BUILD_VERSION, BUILD_DATE, AGENT_VERSION
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
 from src.utils.avatar_manager import get_avatar_path, has_avatar
-from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script, sanitize_filename
+from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script, sanitize_filename, is_private_or_local_ip
 from src.utils.system_info import get_host_system_info
 from .auth import DiscordAuth
 
@@ -134,6 +134,8 @@ class WebServer:
         self.ha_slave_delivered_cache_sync_nodes: Dict[str, float] = {}
         self._code_hash_cache = None
         self._code_hash_cache_time = 0.0
+        self._syncing_models: set = set()
+        self._worker_reachability_cache: Dict[Tuple[str, int, str], Tuple[float, bool]] = {}
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
         self._setup_routes()
@@ -435,6 +437,7 @@ class WebServer:
         self.app.router.add_get("/api/worker/models/manifest/{model_name}", self.api_worker_models_manifest)
         self.app.router.add_get("/api/worker/models/file/{model_name}/{file_path:.+}", self.api_worker_models_file)
         self.app.router.add_get("/api/worker/models/download/{model_name}", self.api_worker_models_download)
+        self.app.router.add_post("/api/worker/models/upload/{model_name}", self.api_worker_models_upload)
 
         # パスワード認証 & Bot管理 & クレデンシャル管理 API (OSS動的管理)
         self.app.router.add_post("/api/auth/login_password", self.api_auth_login_password)
@@ -485,8 +488,8 @@ class WebServer:
         """
         リクエストが Cloudflare Tunnel (WAN / インターネット) 経由で到達したかを厳密判定。
         - CF-Connecting-IP, CF-Ray, CF-Visitor がある場合は確実に Cloudflare 経由
-        - X-Forwarded-For があり、かつパブリックIPを含む場合
-        - クライアントIPがプライベートIPでない場合
+        - X-Forwarded-For があり、かつプライベート/VPN/ローカルIP以外を含む場合
+        - クライアントIPがプライベート/VPN/ローカルIP (RFC1918, Loopback, ULA, CGNAT/Tailscale 100.64.0.0/10) でない場合
         """
         headers = request.headers
         if "CF-Connecting-IP" in headers or "CF-Ray" in headers or "CF-Visitor" in headers:
@@ -501,23 +504,17 @@ class WebServer:
             orig_ip = forwarded_ips[0]
             last_ip = forwarded_ips[-1]
             for ip_chk in (orig_ip, last_ip):
-                # プライベート/ループバックIP以外が含まれていればWAN経由と判定
-                if not (ip_chk in ("127.0.0.1", "::1", "localhost") or
-                        ip_chk.startswith("192.168.") or
-                        ip_chk.startswith("10.") or
-                        ip_chk.startswith("172.")):
+                if not is_private_or_local_ip(ip_chk):
                     return True
             return False
 
         peername = request.transport.get_extra_info('peername') if request.transport else None
         client_ip = peername[0] if peername else (request.remote or "")
 
-        # 宅内LAN IP (192.168.11.*), ループバック (127.0.0.1, ::1) の場合は LAN 直接通信
-        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168."):
+        if is_private_or_local_ip(client_ip):
             return False
 
-        # Docker 内部ネットワーク (172.x) の場合、CFヘッダーがなければローカルコンテナ間通信
-        return bool("CF-Connecting-IP" in headers)
+        return True
 
     def _is_local_request(self, request: web.Request) -> bool:
         """ローカルホストまたはLAN内部からのリクエストかを判定"""
@@ -1487,10 +1484,11 @@ class WebServer:
             logger.info("📢 [HA Update] Broadcasted auto-update signal to all HA Standby Slave nodes.")
             return web.json_response({"status": "ok", "message": "HA Standby update broadcasted."})
 
-    async def api_ha_frequent_cache_snapshot(self, request: web.Request) -> web.Response:
+    async def api_ha_frequent_cache_snapshot(self, request: web.Request) -> web.StreamResponse:
         """
         Masterノードから再利用実績のある音声キャッシュ (hit_count >= 2) を tar.gz 形式で配信。
         Slaveノードの早朝自動同期および手動即時同期用。
+        メモリ枯渇 (OOM) を防止するため、一時ファイル経由のストリーミング配信と件数・サイズ上限を適用。
         """
         if not self._verify_ha_auth(request):
             return web.json_response({"error": "Unauthorized: Invalid or missing HA shared secret"}, status=403)
@@ -1500,63 +1498,116 @@ class WebServer:
         if node_id and hasattr(self, "ha_slave_delivered_cache_sync_nodes"):
             self.ha_slave_delivered_cache_sync_nodes[node_id] = time.time()
 
+        # クライアント(Slave)側から通知されたディスク空き容量（安全マージン考慮用）
+        client_disk_free = 0
+        raw_free = request.headers.get("X-HA-Disk-Free-Bytes", "").strip()
+        if raw_free and raw_free.isdigit():
+            client_disk_free = int(raw_free)
+
+        # 安全上限: 最大500ファイル、非圧縮合計150MB、またはSlave空き容量の30%
+        MAX_FILES = 500
+        MAX_UNCOMPRESSED_BYTES = 150 * 1024 * 1024
+        if client_disk_free > 0:
+            MAX_UNCOMPRESSED_BYTES = min(MAX_UNCOMPRESSED_BYTES, max(10 * 1024 * 1024, int(client_disk_free * 0.30)))
+
         loop = asyncio.get_running_loop()
 
-        def _generate_cache_archive():
-            import sqlite3, io, tarfile
+        def _generate_cache_archive_file() -> Tuple[Optional[str], int, int]:
+            import sqlite3, tarfile, tempfile
             db_path = getattr(self.config, "db_path", "/app/data/bot.db")
             if not os.path.exists(db_path):
                 return None, 0, 0
 
-            # 1. hit_count >= 2 のキャッシュレコードを取得
+            # 1. hit_count >= 2 のキャッシュレコードを優先度順に取得 (上限500件)
             con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             cur = con.cursor()
-            cur.execute("SELECT cache_key, provider FROM cache_metadata WHERE hit_count >= 2;")
+            cur.execute(
+                "SELECT cache_key, provider FROM cache_metadata "
+                "WHERE hit_count >= 2 ORDER BY hit_count DESC, created_at DESC LIMIT ?;",
+                (MAX_FILES,)
+            )
             rows = cur.fetchall()
             con.close()
 
             if not rows:
                 return None, 0, 0
 
-            buf = io.BytesIO()
-            file_count = 0
-            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-                for cache_key, provider in rows:
-                    file_path = self.cache_manager.get_file_path(cache_key, provider)
-                    if not file_path.exists():
-                        alt_dir = self.cache_manager.cache_dir if self.cache_manager.get_cache_dir(provider) == self.cache_manager.voicevox_cache_dir else self.cache_manager.voicevox_cache_dir
-                        alt_path = alt_dir / cache_key
-                        if alt_path.exists():
-                            file_path = alt_path
-                        else:
-                            continue
+            # 一時ファイルへストリーミング書き込み (メモリ消費ゼロ)
+            tmp_f = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+            tmp_path = tmp_f.name
+            tmp_f.close()
 
+            file_count = 0
+            uncompressed_bytes = 0
+
+            try:
+                with tarfile.open(tmp_path, mode="w:gz") as tar:
+                    for cache_key, provider in rows:
+                        if uncompressed_bytes >= MAX_UNCOMPRESSED_BYTES:
+                            break
+
+                        file_path = self.cache_manager.get_file_path(cache_key, provider)
+                        if not file_path.exists():
+                            alt_dir = self.cache_manager.cache_dir if self.cache_manager.get_cache_dir(provider) == self.cache_manager.voicevox_cache_dir else self.cache_manager.voicevox_cache_dir
+                            alt_path = alt_dir / cache_key
+                            if alt_path.exists():
+                                file_path = alt_path
+                            else:
+                                continue
+
+                        try:
+                            stat = file_path.stat()
+                            if stat.st_size <= 44:
+                                continue
+                            cat = "local" if (str(provider).lower() in self.cache_manager.LOCAL_PROVIDERS or str(provider).lower().startswith("vv_")) else "cloud"
+                            tar.add(str(file_path), arcname=f"{cat}/{cache_key}")
+                            file_count += 1
+                            uncompressed_bytes += stat.st_size
+                        except OSError:
+                            pass
+
+                archive_size = os.path.getsize(tmp_path)
+                if file_count == 0 or archive_size == 0:
                     try:
-                        stat = file_path.stat()
-                        if stat.st_size <= 44:
-                            continue
-                        cat = "local" if (str(provider).lower() in self.cache_manager.LOCAL_PROVIDERS or str(provider).lower().startswith("vv_")) else "cloud"
-                        tar.add(str(file_path), arcname=f"{cat}/{cache_key}")
-                        file_count += 1
+                        os.unlink(tmp_path)
                     except OSError:
                         pass
+                    return None, 0, 0
 
-            buf.seek(0)
-            data = buf.getvalue()
-            return data, file_count, len(data)
+                return tmp_path, file_count, archive_size
+            except Exception:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                raise
 
-        archive_data, file_count, archive_size = await loop.run_in_executor(None, _generate_cache_archive)
-        if not archive_data or file_count == 0:
+        tmp_path, file_count, archive_size = await loop.run_in_executor(None, _generate_cache_archive_file)
+        if not tmp_path or file_count == 0:
             return web.json_response({"message": "No frequent cache files found to sync", "file_count": 0}, status=200)
 
-        headers = {
-            "Content-Type": "application/gzip",
-            "Content-Disposition": 'attachment; filename="frequent_cache.tar.gz"',
-            "X-Cache-Count": str(file_count),
-            "X-Archive-Size": str(archive_size)
-        }
-        logger.info(f"✨ [HA] Generated frequent cache archive: {file_count} files ({archive_size} bytes) for Slave '{node_id or 'unknown'}'")
-        return web.Response(body=archive_data, headers=headers)
+        response = web.FileResponse(
+            tmp_path,
+            headers={
+                "Content-Type": "application/gzip",
+                "Content-Disposition": 'attachment; filename="frequent_cache.tar.gz"',
+                "X-Cache-Count": str(file_count),
+                "X-Archive-Size": str(archive_size)
+            }
+        )
+        logger.info(f"✨ [HA] Streaming frequent cache archive: {file_count} files ({archive_size} bytes) for Slave '{node_id or 'unknown'}'")
+
+        # レスポンス送信完了後に一時ファイルを削除するクリーンアップコールバック
+        async def _cleanup_tmp(_resp):
+            try:
+                if os.path.exists(tmp_path):
+                    await asyncio.to_thread(os.unlink, tmp_path)
+            except Exception:
+                pass
+
+        response.on_finish.append(_cleanup_tmp)
+        return response
 
     async def api_system_trigger_cache_sync(self, request: web.Request) -> web.Response:
         """WebUIからStandbyノードへのキャッシュ同期シグナルを発行"""
@@ -4127,13 +4178,122 @@ class WebServer:
         if self._is_wan_request(request):
             return False
 
-        # ローカルプライベートIPは互換性のために許可
+        # ローカルプライベートIP / VPN (RFC1918, Loopback, ULA, CGNAT/Tailscale 100.64.0.0/10) は互換性のために許可
         peername = request.transport.get_extra_info('peername') if request.transport else None
         client_ip = peername[0] if peername else (request.remote or "")
-        if client_ip in ("127.0.0.1", "::1", "localhost") or client_ip.startswith("192.168.") or client_ip.startswith("10."):
+        if is_private_or_local_ip(client_ip):
             return True
 
         return False
+
+    async def _verify_worker_direct_reachability(
+        self,
+        candidate_ip: str,
+        agent_port: int,
+        expected_node_id: str,
+        is_wan: bool = False,
+        timeout: float = 1.5,
+        force_refresh: bool = False
+    ) -> bool:
+        """
+        Active Handshake による Worker 直接到達性およびノード同一性の検証 (項目⑱):
+        - 同一サブネット (例: 192.168.1.x) を名乗っていても、物理的に異なる拠点や
+          ファイアウォール・VLAN分離により Master から直接 HTTP 到達できないケース、
+          あるいは Master 側のローカル LAN にたまたま同じ IP の別マシンが存在するケースを厳密に判別する。
+        - Master から http://{candidate_ip}:{agent_port}/health へ照会し、
+          HTTP 200 かつ node_id が一致した場合のみ直接 HTTP ルーティングを許可する。
+        """
+        if not candidate_ip or not expected_node_id:
+            return False
+        ip_clean = str(candidate_ip).strip()
+        if ip_clean in ("127.0.0.1", "::1", "localhost"):
+            return not is_wan
+
+        if not validate_safe_worker_ip(ip_clean):
+            return False
+
+        safe_port = int(agent_port or 50030)
+        if not (1 <= safe_port <= 65535):
+            return False
+
+        cache_key = (ip_clean, safe_port, str(expected_node_id).strip())
+        now = time.time()
+        if not force_refresh and cache_key in self._worker_reachability_cache:
+            ts, cached_ok = self._worker_reachability_cache[cache_key]
+            ttl = 60.0 if cached_ok else 25.0
+            if now - ts < ttl:
+                return cached_ok
+
+        health_url = f"http://{ip_clean}:{safe_port}/health"
+        reachable = False
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout)) as session:
+                async with session.get(health_url) as resp:
+                    if resp.status == 200:
+                        h_data = await resp.json()
+                        if isinstance(h_data, dict):
+                            resp_node_id = str(h_data.get("node_id") or "").strip()
+                            if resp_node_id:
+                                # node_id が返却された場合は expected_node_id との完全一致を必須とする (別拠点の同IP誤爆防止)
+                                reachable = (resp_node_id == str(expected_node_id).strip())
+                                if not reachable:
+                                    logger.warning(
+                                        f"⚠️ [ActiveHandshake] IP {ip_clean}:{safe_port} responded with node_id='{resp_node_id}', "
+                                        f"which does NOT match expected '{expected_node_id}' (subnet collision across sites). "
+                                        f"Disabling direct HTTP and requiring WS tunnel."
+                                    )
+                            else:
+                                # 旧バージョンの Agent (node_id 未返却) の場合、WAN経由でなければ status=='ok' で許可
+                                reachable = (not is_wan) and (h_data.get("status") == "ok" or "agent_version" in h_data)
+        except Exception as e:
+            logger.debug(f"[ActiveHandshake] Worker {expected_node_id} at {health_url} is not directly reachable: {e}")
+            reachable = False
+
+        self._worker_reachability_cache[cache_key] = (now, reachable)
+        return reachable
+
+    def _compute_coeiroink_model_diff(
+        self,
+        worker_models_raw: Any,
+        worker_models_map_raw: Any = None
+    ) -> Tuple[List[str], List[str]]:
+        """
+        Master 保有モデルと Worker 保有モデルの双方向差分を計算する (項目⑲):
+        - models_to_pull: Master にあり Worker に無いモデル名リスト (Worker が Master から Pull)
+        - models_to_upload: Worker にあり Master に無いモデル名リスト (Worker が Master へ Push / Master が Pull)
+        """
+        from src.tts.node_pool import scan_local_coeiroink_models, register_dynamic_coeiroink_models
+        master_map = scan_local_coeiroink_models()
+        master_models = {str(k).strip() for k in master_map.keys() if k and is_safe_identifier(str(k).strip())}
+
+        if isinstance(worker_models_map_raw, dict) and worker_models_map_raw:
+            register_dynamic_coeiroink_models(worker_models_map_raw)
+
+        if worker_models_raw is None and worker_models_map_raw is None:
+            return [], []
+
+        worker_models = set()
+        if isinstance(worker_models_raw, dict):
+            register_dynamic_coeiroink_models(worker_models_raw)
+            for k in worker_models_raw.keys():
+                k_str = str(k).strip()
+                if k_str and is_safe_identifier(k_str):
+                    worker_models.add(k_str)
+        elif isinstance(worker_models_raw, (list, tuple, set)):
+            for x in worker_models_raw:
+                x_str = str(x).strip()
+                if x_str and is_safe_identifier(x_str):
+                    worker_models.add(x_str)
+
+        if isinstance(worker_models_map_raw, dict):
+            for k in worker_models_map_raw.keys():
+                k_str = str(k).strip()
+                if k_str and is_safe_identifier(k_str):
+                    worker_models.add(k_str)
+
+        models_to_pull = sorted(m for m in master_models if m not in worker_models)
+        models_to_upload = sorted(m for m in worker_models if m not in master_models)
+        return models_to_pull, models_to_upload
 
     def _register_worker_internal(
         self,
@@ -4254,6 +4414,23 @@ class WebServer:
         if not node_id or not ip:
             return web.json_response({"error": "node_id and ip are required"}, status=400)
 
+        installed_models = data.get("installed_models") if "installed_models" in data else specs.get("installed_models")
+        installed_models_map = data.get("installed_models_map") if "installed_models_map" in data else specs.get("installed_models_map")
+        if installed_models is not None:
+            specs["installed_models"] = installed_models
+        if installed_models_map is not None:
+            specs["installed_models_map"] = installed_models_map
+
+        is_wan = self._is_wan_request(request)
+        is_direct_reachable = await self._verify_worker_direct_reachability(
+            candidate_ip=str(ip),
+            agent_port=int(agent_port or 50030),
+            expected_node_id=str(node_id),
+            is_wan=is_wan,
+            force_refresh=True
+        )
+        specs["is_direct_reachable"] = is_direct_reachable
+
         registered_engines = self._register_worker_internal(
             node_id=node_id,
             ip=ip,
@@ -4265,18 +4442,27 @@ class WebServer:
             initial_standby=False
         )
 
+        models_to_pull, models_to_upload = self._compute_coeiroink_model_diff(
+            installed_models, installed_models_map
+        )
+        if models_to_upload and is_direct_reachable:
+            safe_create_task(
+                self._pull_missing_models_from_worker(str(ip), int(agent_port or 50030), models_to_upload),
+                name=f"pull_worker_models_{node_id}"
+            )
+
         mac = specs.get("recommended_max_concurrent", 1)
         pri = specs.get("recommended_priority", 2)
 
         logger.info(
             f"✨ [WorkerAPI] Worker '{node_id}' ({ip}) 登録完了: engines={registered_engines}, "
             f"GPU={'あり' if specs.get('gpu') else 'なし'}, RAM={specs.get('total_ram_gb', '?')}GB, "
-            f"concurrent={mac}, priority={pri}"
+            f"concurrent={mac}, priority={pri}, direct_reachable={is_direct_reachable}"
         )
 
         # Worker 再接続時: 古いウォームアップキャッシュを無効化し、現在必要なモデルを即時同期
         rm = getattr(self, "resource_manager", None) or (getattr(self.tts_manager, "resource_manager", None) if self.tts_manager else None)
-        if rm:
+        if rm and is_direct_reachable:
             if hasattr(rm, "invalidate_worker_warmed_models"):
                 rm.invalidate_worker_warmed_models(ip)
             if "coeiroink" in registered_engines and hasattr(rm, "sync_desired_ram_models_to_worker"):
@@ -4294,7 +4480,11 @@ class WebServer:
             "success": True,
             "node_id": node_id,
             "registered_engines": registered_engines,
-            "applied": {"max_concurrent": mac, "priority": pri}
+            "applied": {"max_concurrent": mac, "priority": pri},
+            "is_direct_reachable": is_direct_reachable,
+            "ws_tunnel_required": not is_direct_reachable,
+            "models_to_pull": models_to_pull,
+            "models_to_upload": models_to_upload,
         })
 
     async def api_worker_heartbeat(self, request: web.Request) -> web.Response:
@@ -4321,6 +4511,22 @@ class WebServer:
         engines_status = data.get("engines", {})
         resources = data.get("resources", {})
         agent_version = data.get("agent_version", "")
+        hb_specs = data.get("specs") if isinstance(data.get("specs"), dict) else {}
+        installed_models = data.get("installed_models") if "installed_models" in data else hb_specs.get("installed_models")
+        installed_models_map = data.get("installed_models_map") if "installed_models_map" in data else hb_specs.get("installed_models_map")
+
+        cand_ip = str(data.get("ip") or "").strip()
+        cand_port = int(data.get("agent_port") or 50030)
+        is_wan = self._is_wan_request(request)
+        is_direct_reachable = True
+        if cand_ip:
+            is_direct_reachable = await self._verify_worker_direct_reachability(
+                candidate_ip=cand_ip,
+                agent_port=cand_port,
+                expected_node_id=str(node_id),
+                is_wan=is_wan,
+                force_refresh=False
+            )
 
         for engine_name, pool in pool_map.items():
             full_node_id = f"{node_id}_{engine_name}"
@@ -4335,6 +4541,9 @@ class WebServer:
                         node.specs["engine_running"] = eng_running
                         is_eng_healthy = eng_info.get("healthy", True)
                         node.specs["engine_healthy"] = is_eng_healthy
+                        if cand_ip:
+                            node.is_direct_reachable = is_direct_reachable
+                            node.specs["is_direct_reachable"] = is_direct_reachable
                         # エンジン停止中 (スリープ等) は健全フラグも明示的にFalseにしてリクエスト誤送信を防止
                         if not eng_running:
                             node.is_healthy = False
@@ -4351,12 +4560,15 @@ class WebServer:
                         # Agent バージョン
                         if agent_version:
                             node.specs["agent_version"] = agent_version
-                        # RAMDisk 常駐モデル一覧
+                        # RAMDisk 常駐モデル一覧 & インストール済みモデル一覧
                         if "ram_models" in data:
                             node.specs["ram_models"] = data["ram_models"]
+                        if installed_models is not None:
+                            node.specs["installed_models"] = installed_models
+                        if installed_models_map is not None:
+                            node.specs["installed_models_map"] = installed_models_map
                         # Agent からの最新スペック (OS詳細名, Dockerバージョン, ホスト名等) をマージ
-                        hb_specs = data.get("specs")
-                        if isinstance(hb_specs, dict) and hb_specs:
+                        if hb_specs:
                             for sk, sv in hb_specs.items():
                                 if sv not in (None, "", "N/A") or sk not in node.specs:
                                     node.specs[sk] = sv
@@ -4379,10 +4591,16 @@ class WebServer:
         # 💡 ハートビート相乗りオートレジスター (Master再起動直後の404往復遅延を解消)
         if not found_any and data.get("ip") and engines_status:
             logger.info(f"⚡ [WorkerAPI] Auto-recovering unregistered worker '{node_id}' ({data.get('ip')}) directly from heartbeat...")
+            auto_specs = dict(data.get("specs", {}) or {})
+            auto_specs["is_direct_reachable"] = is_direct_reachable
+            if installed_models is not None:
+                auto_specs["installed_models"] = installed_models
+            if installed_models_map is not None:
+                auto_specs["installed_models_map"] = installed_models_map
             auto_engines = self._register_worker_internal(
                 node_id=node_id,
                 ip=data.get("ip"),
-                specs=data.get("specs", {}) or {},
+                specs=auto_specs,
                 engines_data=engines_status,
                 agent_port=data.get("agent_port", 50030),
                 initial_standby=False
@@ -4397,6 +4615,8 @@ class WebServer:
                         for n in p.nodes:
                             if n.id == full_node_id:
                                 n.is_healthy = True
+                                n.is_direct_reachable = is_direct_reachable
+                                n.specs["is_direct_reachable"] = is_direct_reachable
                                 n.engine_running = engines_status.get(engine_name, {}).get("running", True)
                                 if resources:
                                     n.specs["resources"] = resources
@@ -4528,6 +4748,16 @@ class WebServer:
                         f"Manifest: {client_manifest or '-'} → {target_manifest_ver})。ノードをドレインします。"
                     )
 
+        models_to_pull, models_to_upload = self._compute_coeiroink_model_diff(
+            installed_models, installed_models_map
+        )
+        pull_target_ip = cand_ip or worker_ip
+        if models_to_upload and is_direct_reachable and pull_target_ip and pull_target_ip not in ("127.0.0.1", "localhost"):
+            safe_create_task(
+                self._pull_missing_models_from_worker(pull_target_ip, cand_port, models_to_upload),
+                name=f"pull_worker_models_hb_{node_id}"
+            )
+
         return web.json_response({
             "registered": True,
             "node_id": node_id,
@@ -4536,6 +4766,10 @@ class WebServer:
             "target_agent_version": target_agent_ver,
             "target_manifest_version": target_manifest_ver,
             "require_full": need_full,
+            "is_direct_reachable": is_direct_reachable,
+            "ws_tunnel_required": not is_direct_reachable,
+            "models_to_pull": models_to_pull,
+            "models_to_upload": models_to_upload,
         })
 
     async def api_worker_nodes(self, request: web.Request) -> web.Response:
@@ -4955,12 +5189,7 @@ class WebServer:
         """指定 Worker または全 Worker のログを取得して返却 (ローカルファイルキャッシュ & オンデマンド取得対応)"""
         peername = request.transport.get_extra_info('peername')
         client_ip = peername[0] if peername else ""
-        is_local = (
-            client_ip in ("127.0.0.1", "::1", "localhost") or
-            client_ip.startswith("172.") or
-            client_ip.startswith("10.") or
-            client_ip.startswith("192.168.")
-        )
+        is_local = is_private_or_local_ip(client_ip)
         if not is_local:
             user = self.auth.get_current_user(request)
             if not user:
@@ -5395,6 +5624,216 @@ class WebServer:
             else:
                 logger.error(f"❌ [ModelDownload] 予期しないエラー ({err_name}): {e}", exc_info=True)
         return response
+
+    async def _install_coeiroink_model_from_tar_file(self, clean_model_name: str, tar_path: Path) -> Tuple[bool, str]:
+        """
+        一時 tar ファイルから COEIROINK モデルをステージング展開・検証し、
+        /app/coeiroink_models/{clean_model_name} へアトミック配置してボイスレジストリを更新する共通処理 (項目⑲)。
+        """
+        import shutil
+        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        model_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = validate_safe_path(model_dir, clean_model_name)
+        if not final_dir:
+            return False, "Invalid target model path"
+
+        staging_dir = model_dir / f".staging_sync_{clean_model_name}_{uuid.uuid4().hex[:8]}"
+
+        def _extract_and_promote() -> Tuple[bool, str]:
+            try:
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(tar_path, "r:*") as tf:
+                    # パストラバーサルおよび危険なシンボリックリンクの厳格検査 (CWE-22)
+                    staging_real = os.path.realpath(str(staging_dir))
+                    for member in tf.getmembers():
+                        m_name = member.name.replace("\\", "/")
+                        if not m_name or m_name.startswith("/") or ".." in m_name.split("/"):
+                            return False, f"Unsafe tar member path rejected: {member.name}"
+                        if member.issym() or member.islnk():
+                            return False, f"Symlink/hardlink in model archive rejected: {member.name}"
+                        dest_real = os.path.realpath(os.path.join(staging_real, m_name))
+                        if dest_real != staging_real and not dest_real.startswith(staging_real + os.sep):
+                            return False, f"Path traversal detected in tar member: {member.name}"
+                    tf.extractall(path=staging_dir)
+
+                # {staging_dir}/{clean_model_name}/metas.json または {staging_dir}/metas.json を特定
+                candidate_sub = staging_dir / clean_model_name
+                if candidate_sub.is_dir() and (candidate_sub / "metas.json").is_file():
+                    extracted_root = candidate_sub
+                elif (staging_dir / "metas.json").is_file():
+                    extracted_root = staging_dir
+                else:
+                    # 1階層下に単一ディレクトリがあり metas.json を持つ場合
+                    subdirs = [p for p in staging_dir.iterdir() if p.is_dir() and (p / "metas.json").is_file()]
+                    if len(subdirs) == 1:
+                        extracted_root = subdirs[0]
+                    else:
+                        return False, "metas.json not found in uploaded model archive"
+
+                # metas.json が有効な JSON かつ speakerUuid を含むか検証
+                meta_obj = json.loads((extracted_root / "metas.json").read_text(encoding="utf-8"))
+                if not isinstance(meta_obj, dict) or not meta_obj.get("speakerUuid"):
+                    return False, "Invalid metas.json: missing speakerUuid"
+
+                # アトミック配置
+                old_backup = model_dir / f".old_{clean_model_name}_{int(time.time() * 1000)}"
+                if final_dir.exists():
+                    os.replace(str(final_dir), str(old_backup))
+                os.replace(str(extracted_root), str(final_dir))
+                if old_backup.exists():
+                    shutil.rmtree(old_backup, ignore_errors=True)
+                return True, "ok"
+            except Exception as ex:
+                return False, str(ex)
+            finally:
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+        ok, msg = await asyncio.to_thread(_extract_and_promote)
+        if ok:
+            from src.tts.node_pool import scan_local_coeiroink_models
+            scan_local_coeiroink_models(str(model_dir))
+            if self.tts_manager and hasattr(self.tts_manager, "initialize_coeiroink"):
+                try:
+                    await self.tts_manager.initialize_coeiroink()
+                except Exception as init_err:
+                    logger.warning(f"[ModelSync] initialize_coeiroink warning after model sync: {init_err}")
+            logger.info(f"🎉 [ModelSync] Worker から新規 COEIROINK モデル '{clean_model_name}' の逆同期・登録が完了しました！")
+        return ok, msg
+
+    async def _pull_missing_models_from_worker(self, worker_ip: str, agent_port: int, models_to_pull: List[str]) -> None:
+        """
+        Worker 側にのみ存在する未保有モデルを Master から直接 HTTP Pull して同期するバックグラウンドタスク (項目⑲)。
+        """
+        if not validate_safe_worker_ip(worker_ip):
+            return
+        safe_port = int(agent_port or 50030)
+        if not (1 <= safe_port <= 65535):
+            return
+
+        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        for raw_name in models_to_pull:
+            clean_name = sanitize_filename(str(raw_name))
+            if not clean_name or not is_safe_identifier(clean_name):
+                continue
+            final_dir = validate_safe_path(model_dir, clean_name)
+            if final_dir and (final_dir / "metas.json").exists():
+                continue
+            if clean_name in self._syncing_models:
+                continue
+
+            # Worker からの Push と競合しないよう少し待機してから再確認
+            await asyncio.sleep(2.0)
+            if final_dir and (final_dir / "metas.json").exists():
+                continue
+            if clean_name in self._syncing_models:
+                continue
+
+            self._syncing_models.add(clean_name)
+            tmp_tar = Path(f"/tmp/pull_worker_model_{clean_name}_{uuid.uuid4().hex[:8]}.tar")
+            try:
+                dl_url = f"http://{worker_ip}:{safe_port}/models/download/{clean_name}"
+                headers = {}
+                secret = getattr(self.config, "worker_shared_secret", "").strip()
+                if secret:
+                    headers["X-Worker-Token"] = secret
+                logger.info(f"📥 [ModelSync] Worker ({worker_ip}:{safe_port}) から未保有モデル '{clean_name}' を Pull 取得中...")
+                timeout = aiohttp.ClientTimeout(total=300.0, connect=5.0, sock_read=60.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(dl_url, headers=headers) as resp:
+                        if resp.status != 200:
+                            logger.debug(f"[ModelSync] Worker pull returned HTTP {resp.status} for {clean_name}")
+                            continue
+                        total_bytes = 0
+                        max_bytes = 1024 * 1024 * 1024  # 1GB上限
+                        with open(tmp_tar, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(64 * 1024):
+                                total_bytes += len(chunk)
+                                if total_bytes > max_bytes:
+                                    raise ValueError("Model archive exceeds 1GB safety limit")
+                                await asyncio.to_thread(f.write, chunk)
+
+                ok, msg = await self._install_coeiroink_model_from_tar_file(clean_name, tmp_tar)
+                if not ok:
+                    logger.warning(f"⚠️ [ModelSync] Worker からの Pull モデル '{clean_name}' 展開失敗: {msg}")
+            except Exception as e:
+                logger.debug(f"[ModelSync] Pull model '{clean_name}' from {worker_ip} skipped/failed: {e}")
+            finally:
+                self._syncing_models.discard(clean_name)
+                try:
+                    if tmp_tar.exists():
+                        tmp_tar.unlink()
+                except Exception:
+                    pass
+
+    async def api_worker_models_upload(self, request: web.Request) -> web.Response:
+        """
+        Worker が保有し Master に存在しない COEIROINK モデルを tar ストリームで受信・登録する (項目⑲)。
+        """
+        if not self._verify_worker_auth(request):
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
+
+        model_name = request.match_info.get("model_name", "")
+        clean_model_name = sanitize_filename(model_name)
+        if not clean_model_name or not is_safe_identifier(clean_model_name):
+            return web.json_response({"error": "Invalid model name"}, status=400)
+
+        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        model_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = validate_safe_path(model_dir, clean_model_name)
+        if not final_dir:
+            return web.json_response({"error": "Invalid model path"}, status=400)
+
+        if (final_dir / "metas.json").exists():
+            return web.json_response({"status": "already_exists", "model_name": clean_model_name})
+
+        if clean_model_name in self._syncing_models:
+            return web.json_response({"status": "syncing", "model_name": clean_model_name}, status=202)
+
+        # ディスク空き容量の事前確認 (最低 500MB 以上の空きを確保)
+        try:
+            import shutil as _shutil
+            free_bytes = _shutil.disk_usage(str(model_dir)).free
+            if free_bytes < 500 * 1024 * 1024:
+                return web.json_response({"error": "Insufficient disk space on Master"}, status=507)
+        except Exception:
+            pass
+
+        self._syncing_models.add(clean_model_name)
+        tmp_tar = Path(f"/tmp/upload_worker_model_{clean_model_name}_{uuid.uuid4().hex[:8]}.tar")
+        try:
+            total_bytes = 0
+            max_bytes = 1024 * 1024 * 1024  # 1GB上限
+            with open(tmp_tar, "wb") as f:
+                async for chunk in request.content.iter_chunked(64 * 1024):
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        return web.json_response({"error": "Model archive exceeds 1GB limit"}, status=413)
+                    await asyncio.to_thread(f.write, chunk)
+
+            if total_bytes == 0:
+                return web.json_response({"error": "Empty model archive"}, status=400)
+
+            ok, msg = await self._install_coeiroink_model_from_tar_file(clean_model_name, tmp_tar)
+            if not ok:
+                return web.json_response({"error": msg, "model_name": clean_model_name}, status=400)
+
+            return web.json_response({
+                "status": "ok",
+                "success": True,
+                "model_name": clean_model_name,
+                "received_bytes": total_bytes
+            })
+        except Exception as e:
+            logger.error(f"❌ [ModelUpload] Error receiving model '{clean_model_name}': {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
+            self._syncing_models.discard(clean_model_name)
+            try:
+                if tmp_tar.exists():
+                    tmp_tar.unlink()
+            except Exception:
+                pass
 
     # --- OSS 動的Bot管理 & クレデンシャル & WebSocket API ---
 
@@ -6208,7 +6647,7 @@ class WebServer:
                     if msg_type == "register":
                         worker_node_id = data.get("node_id", f"ws_worker_{int(time.time())}")
                         node_name = data.get("node_name", worker_node_id)
-                        supported_engines = data.get("supported_engines", ["voicevox"])
+                        supported_engines = data.get("supported_engines") or data.get("engines") or ["voicevox"]
                         supported_models = data.get("supported_models", {})
                         capacity = int(data.get("capacity", 2))
                         specs = data.get("specs", {})
@@ -6216,13 +6655,17 @@ class WebServer:
                         exclusive_guild_id = data.get("exclusive_guild_id")
                         is_cluster_worker = bool(data.get("is_cluster_worker") or str(worker_node_id).startswith("worker_"))
 
-                        # 既に常設 HTTP クラスタノードとしてプール内に登録されているかチェック
+                        # 既に常設 HTTP クラスタノードとして「直接HTTP到達可能な状態で」プール内に登録されているかチェック
                         has_active_http_node = False
                         for p in (self.tts_manager.voicevox_pool, self.tts_manager.sharevox_pool, self.tts_manager.coeiroink_pool):
                             if hasattr(p, "nodes"):
                                 for n in p.nodes:
                                     nid = getattr(n, "id", "")
-                                    if (nid == worker_node_id or nid.startswith(f"{worker_node_id}_")) and not getattr(n, "is_ws", False):
+                                    if (
+                                        (nid == worker_node_id or nid.startswith(f"{worker_node_id}_"))
+                                        and not getattr(n, "is_ws", False)
+                                        and getattr(n, "is_direct_reachable", True)
+                                    ):
                                         has_active_http_node = True
                                         break
                             if has_active_http_node:

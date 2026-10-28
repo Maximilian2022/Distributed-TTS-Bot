@@ -167,6 +167,11 @@ class CoeiroinkRamManager:
             return mapping
 
         self._uuid_to_model_dir = await asyncio.to_thread(_scan)
+        try:
+            from src.tts.node_pool import register_dynamic_coeiroink_models
+            register_dynamic_coeiroink_models(self._uuid_to_model_dir)
+        except Exception:
+            pass
         logger.info(f"🔍 [CoeiroinkRamManager] SSDモデルスキャン完了: {len(self._uuid_to_model_dir)} キャラクター検出")
 
     def resolve_model_dir(self, uuid_or_dir: str) -> Optional[str]:
@@ -225,6 +230,37 @@ class CoeiroinkRamManager:
         await asyncio.to_thread(_heal)
         logger.info("🛡️ [CoeiroinkRamManager] 起動時オートヒーリング完了 (全モデルをSSD参照に安全接続)")
 
+    def can_safely_promote_model(
+        self,
+        ssd_path: str,
+        mem_stats: Optional[Tuple[float, float, float]] = None
+    ) -> Tuple[bool, str]:
+        """
+        昇格対象モデルの実サイズとホスト空きメモリを比較し、
+        昇格後に警戒ライン (85%) 超過や空きメモリ枯渇 (< 1.2GB) を招かないか事前検証する。
+        """
+        mem_percent, used_gb, total_gb = mem_stats if mem_stats is not None else get_host_memory_usage()
+        if mem_percent >= self.WARNING_THRESHOLD_PERCENT:
+            return False, f"現在のメモリ使用率が警戒域 ({mem_percent:.1f}% >= {self.WARNING_THRESHOLD_PERCENT}%)"
+
+        if total_gb <= 0:
+            return True, "ok"
+
+        model_bytes = get_dir_size_bytes(ssd_path)
+        model_gb = model_bytes / (1024 ** 3)
+        projected_used_gb = used_gb + model_gb
+        projected_percent = (projected_used_gb / total_gb) * 100.0
+        remaining_free_gb = max(0.0, total_gb - projected_used_gb)
+        min_safe_free_gb = min(1.2, total_gb * 0.15)
+
+        if projected_percent >= self.WARNING_THRESHOLD_PERCENT or remaining_free_gb < min_safe_free_gb:
+            return (
+                False,
+                f"昇格後の推定メモリ使用率が危険域 (推定={projected_percent:.1f}%, "
+                f"残り空き={remaining_free_gb:.2f}GB, モデル実サイズ={model_gb:.2f}GB)"
+            )
+        return True, "ok"
+
     async def promote_model(self, uuid_or_dir: str) -> bool:
         """
         指定モデルを SSD から RAMDisk へ昇格 (アトミック配置 & リンク差し替え)
@@ -243,7 +279,7 @@ class CoeiroinkRamManager:
             return False
 
         # メモリ使用率チェック (警戒ライン 85% 以上なら昇格見送り)
-        mem_percent, _, _ = get_host_memory_usage()
+        mem_percent, used_gb, total_gb = get_host_memory_usage()
         if mem_percent >= self.WARNING_THRESHOLD_PERCENT:
             logger.warning(
                 f"⚠️ [CoeiroinkRamManager] ホストメモリ警戒域 ({mem_percent:.1f}% >= {self.WARNING_THRESHOLD_PERCENT}%) "
@@ -265,6 +301,16 @@ class CoeiroinkRamManager:
             ssd_path = os.path.join(self.ssd_dir, model_dir)
             if not os.path.exists(ssd_path):
                 logger.error(f"[CoeiroinkRamManager] SSD上に実体モデルが存在しません: {ssd_path}")
+                return False
+
+            # モデル実サイズに基づく昇格後メモリシミュレーションチェック
+            ok_promote, reason_msg = await asyncio.to_thread(
+                self.can_safely_promote_model, ssd_path, (mem_percent, used_gb, total_gb)
+            )
+            if not ok_promote:
+                logger.warning(
+                    f"⚠️ [CoeiroinkRamManager] モデル '{model_dir}' のRAM昇格を安全抑止しました: {reason_msg}"
+                )
                 return False
 
             logger.info(f"🚀 [CoeiroinkRamManager] モデル昇格開始 (SSD ➔ RAMDisk): {model_dir}")
@@ -407,12 +453,13 @@ class CoeiroinkRamManager:
                 logger.warning(f"[CoeiroinkRamManager] アラート送信失敗: {e}")
 
     async def sync_pinned_models(self) -> None:
-        """DBから個人設定された COEIROINK モデルを取得しピン留め・昇格 (直近30日アクティブ優先・上限4モデル)"""
+        """DBから個人設定された COEIROINK モデルを取得しピン留め・昇格 (直近30日アクティブ優先・ホストRAMに応じた動的上限)"""
         if not self.db:
             return
         try:
+            dyn_limit = get_dynamic_pin_limit()
             if hasattr(self.db, "get_pinned_coeiroink_speaker_ids"):
-                speaker_ids = await self.db.get_pinned_coeiroink_speaker_ids(limit=4, active_days=30)
+                speaker_ids = await self.db.get_pinned_coeiroink_speaker_ids(limit=dyn_limit, active_days=30)
             else:
                 async with self.db.get_connection() as conn:
                     async with conn.execute(
@@ -423,7 +470,7 @@ class CoeiroinkRamManager:
                         ")"
                     ) as cursor:
                         rows = await cursor.fetchall()
-                speaker_ids = [r[0] for r in rows if r[0]]
+                speaker_ids = [r[0] for r in rows if r[0]][:dyn_limit]
 
             new_pinned: Set[str] = set()
             for spk_id in speaker_ids:

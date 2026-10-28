@@ -91,8 +91,9 @@ class _AdaptiveSynthesisContext:
                     )
                     raise HighLoadFallbackException(f"Host CPU {current_cpu:.1f}% >= {CPU_FALLBACK_THRESHOLD}%")
 
-                # 2. 許容最大並列数（70%未満なら2、70%以上なら1）
-                max_concurrent = MAX_CONCURRENT_NORMAL if current_cpu < CPU_PARALLEL_THRESHOLD else MAX_CONCURRENT_HIGH_LOAD
+                # 2. 許容最大並列数（70%未満ならホストCPU/RAMに応じた動的並列数、70%以上なら1）
+                normal_concurrent = self.rm.get_dynamic_max_concurrent() if hasattr(self.rm, "get_dynamic_max_concurrent") else MAX_CONCURRENT_NORMAL
+                max_concurrent = normal_concurrent if current_cpu < CPU_PARALLEL_THRESHOLD else MAX_CONCURRENT_HIGH_LOAD
 
                 # 3. スロット空き判定（全体上限以内 かつ 同一エンジン空き）
                 engine_in_use = self.rm._engine_active_count.get(self.provider, 0)
@@ -516,6 +517,36 @@ class LocalEngineResourceManager:
                 logger.info(f"🔄 [{reason}] Restarting running engine '{prov}'...")
                 await self.restart_engine(prov)
 
+    def get_dynamic_max_concurrent(self) -> int:
+        """
+        ホストの論理CPUコア数および総RAM容量に基づき、通常時 (CPU < 70%) の最大並列推論数を動的算出。
+        - 2〜3コア または RAM < 6GB: 1並列
+        - 4〜5コア: 2並列
+        - 6〜7コア: 3並列
+        - 8コア以上: 4並列
+        """
+        env_val = os.getenv("TTS_MAX_CONCURRENT_NORMAL")
+        if env_val and env_val.isdigit():
+            return max(1, min(8, int(env_val)))
+        cores = os.cpu_count() or 2
+        mem_gb = self.get_system_memory_info().get("total_gb", 0.0)
+        if 0.0 < mem_gb < 6.0:
+            return 1
+        return max(1, min(4, cores // 2))
+
+    def get_dynamic_tts_anomaly_threshold_bytes(self) -> int:
+        """
+        ホスト総RAM容量に基づき、TTSコンテナ群の異常メモリ肥大判定閾値 (bytes) を動的算出。
+        総RAMの45%を基準とし、[2.0GB, 10.0GB] の範囲にクランプする。
+        """
+        mem_info = self.get_system_memory_info()
+        total_bytes = int(mem_info.get("total_bytes", 0) or 0)
+        if total_bytes <= 0:
+            return MEMORY_TTS_ANOMALY_THRESHOLD_BYTES
+        min_b = 2 * 1024 * 1024 * 1024
+        max_b = MEMORY_TTS_ANOMALY_THRESHOLD_BYTES
+        return max(min_b, min(max_b, int(total_bytes * 0.45)))
+
     def get_system_memory_info(self) -> Dict[str, float]:
         """
         /proc/meminfo からホスト全体のメモリ使用状況を取得
@@ -798,10 +829,13 @@ class LocalEngineResourceManager:
         if not self.db or not self.config:
             return desired
 
-        # 1. DB ピン留めモデル (直近30日アクティブ優先・上限4モデル)
+        # 1. DB ピン留めモデル (直近30日アクティブ優先・ホストRAMに応じた動的上限)
         try:
+            from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
+            mem_gb = self.get_system_memory_info().get("total_gb", 0.0)
+            dyn_limit = get_dynamic_pin_limit(mem_gb)
             if hasattr(self.db, "get_pinned_coeiroink_speaker_ids"):
-                speaker_ids = await self.db.get_pinned_coeiroink_speaker_ids(limit=4, active_days=30)
+                speaker_ids = await self.db.get_pinned_coeiroink_speaker_ids(limit=dyn_limit, active_days=30)
             else:
                 async with self.db.get_connection() as conn:
                     async with conn.execute(
@@ -812,7 +846,7 @@ class LocalEngineResourceManager:
                         ")"
                     ) as cursor:
                         rows = await cursor.fetchall()
-                speaker_ids = [r[0] for r in rows if r[0]]
+                speaker_ids = [r[0] for r in rows if r[0]][:dyn_limit]
 
             for spk_id in speaker_ids:
                 v_info = self.config.voices.get(spk_id)
@@ -956,6 +990,7 @@ class LocalEngineResourceManager:
             return
 
         now = time.time()
+        from src.tts.coeiroink_ram_manager import get_dynamic_pin_limit
         for node in ext_nodes:
             from urllib.parse import urlparse
             p = urlparse(node.url)
@@ -963,7 +998,28 @@ class LocalEngineResourceManager:
             if not ip or ip in ("localhost", "127.0.0.1"):
                 continue
 
-            missing_models = [m for m in desired if not node.has_model_in_ram(m)]
+            # Workerのメモリ使用率が警戒域 (>= 82%) またはWorkerのRAM上限に達している場合は再プロモートを抑止 (スラッシング防止)
+            w_specs = getattr(node, "specs", {}) or {}
+            w_ram_pct = float(w_specs.get("ram_percent", 0.0) or 0.0)
+            w_ram_total_gb = float(w_specs.get("ram_total_gb", 0.0) or 0.0)
+            w_ram_models = w_specs.get("ram_models", []) or []
+            if w_ram_pct >= 82.0:
+                logger.debug(
+                    f"[WorkerRAM Reconcile] Worker '{node.machine_name}' ({ip}) memory is high ({w_ram_pct:.1f}%). Skipping auto-promote."
+                )
+                continue
+            if w_ram_total_gb > 0 and len(w_ram_models) >= get_dynamic_pin_limit(w_ram_total_gb):
+                logger.debug(
+                    f"[WorkerRAM Reconcile] Worker '{node.machine_name}' ({ip}) already holds {len(w_ram_models)} RAM models "
+                    f"(limit for {w_ram_total_gb:.1f}GB RAM). Skipping auto-promote."
+                )
+                continue
+
+            missing_models = [
+                m for m in desired
+                if not node.has_model_in_ram(m)
+                and (not hasattr(node, "supports_model") or node.supports_model("coeiroink", m))
+            ]
             for m in missing_models:
                 cd_key = (ip, m)
                 last_try = self._ram_reconcile_cooldown.get(cd_key, 0.0)
@@ -1205,7 +1261,9 @@ class LocalEngineResourceManager:
                     f"TTS containers consuming {tts_total_gb:.2f}GB."
                 )
 
-                if tts_total_bytes >= MEMORY_TTS_ANOMALY_THRESHOLD_BYTES:
+                anomaly_threshold_bytes = self.get_dynamic_tts_anomaly_threshold_bytes()
+                anomaly_threshold_gb = anomaly_threshold_bytes / (1024 ** 3)
+                if tts_total_bytes >= anomaly_threshold_bytes:
                     if not any_human_in_vc:
                         logger.warning("⚠️ [Memory Guard] VC is empty. Executing immediate emergency engine container reset...")
                         await self.restart_all_active_engines(reason="Memory Guard Reset")
@@ -1214,7 +1272,7 @@ class LocalEngineResourceManager:
                         logger.warning("⚠️ [Memory Guard] Humans in VC. Deferring emergency reset until VC is empty.")
                 else:
                     logger.info(
-                        f"ℹ️ [Memory Guard] TTS containers are using normal memory ({tts_total_gb:.2f}GB < 10GB). "
+                        f"ℹ️ [Memory Guard] TTS containers are using normal memory ({tts_total_gb:.2f}GB < {anomaly_threshold_gb:.1f}GB). "
                         "High host memory is caused by external processes. Skipping TTS reset to prevent false alarms."
                     )
 
@@ -1474,8 +1532,8 @@ class LocalEngineResourceManager:
             mode_label = "🔒 直列安全モード (1並列)"
         else:
             concurrency_mode = "parallel"
-            max_concurrent = MAX_CONCURRENT_NORMAL
-            mode_label = f"⚡ 並列稼働モード (最大{MAX_CONCURRENT_NORMAL}並列)"
+            max_concurrent = self.get_dynamic_max_concurrent()
+            mode_label = f"⚡ 並列稼働モード (最大{max_concurrent}並列)"
 
         concurrency_info = {
             "mode": concurrency_mode,

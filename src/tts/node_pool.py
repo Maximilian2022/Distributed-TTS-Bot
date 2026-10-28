@@ -172,6 +172,67 @@ COEIROINK_MODEL_MAPPING: Dict[str, str] = {
 }
 
 
+def register_dynamic_coeiroink_models(mapping: Dict[str, str]) -> int:
+    """
+    Workerのハートビートやローカルの metas.json スキャンから得られた
+    COEIROINK キャラクターUUID <-> モデルディレクトリ名 のマッピングを動的に双方向登録する。
+    """
+    if not mapping or not isinstance(mapping, dict):
+        return 0
+    added = 0
+    for k, v in mapping.items():
+        k_clean = str(k).strip().lower()
+        v_clean = str(v).strip().lower()
+        if not k_clean or not v_clean:
+            continue
+        if COEIROINK_MODEL_MAPPING.get(k_clean) != v_clean:
+            COEIROINK_MODEL_MAPPING[k_clean] = v_clean
+            added += 1
+        if COEIROINK_MODEL_MAPPING.get(v_clean) != k_clean:
+            COEIROINK_MODEL_MAPPING[v_clean] = k_clean
+            added += 1
+    return added
+
+
+def scan_local_coeiroink_models(model_dir: Optional[str] = None) -> Dict[str, str]:
+    """
+    ローカルの COEIROINK モデルディレクトリ配下の metas.json を走査し、
+    {dir_name: speaker_uuid} の辞書を返すと同時に COEIROINK_MODEL_MAPPING を動的更新する。
+    """
+    import os
+    target_dir = Path(model_dir or os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models"))
+    if not target_dir.exists():
+        alt_dir = Path(__file__).resolve().parent.parent.parent / "coeiroink_models"
+        if alt_dir.exists():
+            target_dir = alt_dir
+    discovered: Dict[str, str] = {}
+    if not target_dir.exists() or not target_dir.is_dir():
+        return discovered
+    try:
+        for entry in target_dir.iterdir():
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            dir_name = entry.name.strip()
+            meta_file = entry / "metas.json"
+            speaker_uuid = ""
+            if meta_file.exists():
+                try:
+                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    speaker_uuid = str(meta.get("speakerUuid", "")).strip().lower()
+                except Exception:
+                    pass
+            discovered[dir_name] = speaker_uuid or dir_name.lower()
+        if discovered:
+            register_dynamic_coeiroink_models(discovered)
+    except Exception as e:
+        logger.debug(f"Failed to scan local coeiroink models: {e}")
+    return discovered
+
+
+# 起動時にローカルモデルディレクトリを一度スキャンしてマッピングを自動補完
+scan_local_coeiroink_models()
+
+
 
 # 更新/再起動のため新規割り当てを止めているワーカーホスト(IP)集合 (ローリング更新・自動更新用)
 DRAINING_HOSTS: set = set()
@@ -190,6 +251,11 @@ class TTSNode:
         self.specs = specs or {}
         self.hostname = hostname
         self.engine_running = bool(self.specs.get("engine_running", True)) if "engine_running" in self.specs else True
+        self.is_direct_reachable: bool = bool(self.specs.get("is_direct_reachable", True))
+        if isinstance(self.specs.get("installed_models_map"), dict):
+            register_dynamic_coeiroink_models(self.specs["installed_models_map"])
+        elif isinstance(self.specs.get("installed_models"), dict):
+            register_dynamic_coeiroink_models(self.specs["installed_models"])
 
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
         self.active_count = 0
@@ -367,8 +433,67 @@ class TTSNode:
         # ワーカー側でヘルスチェック異常 (False) の場合も除外
         if self.specs.get("engine_healthy") is False:
             return False
+        # Active Handshake により直接HTTP到達不可と判定されたノードは除外 (WSトンネル側を利用)
+        if getattr(self, "is_direct_reachable", True) is False or self.specs.get("is_direct_reachable") is False:
+            return False
         return True
 
+
+    @staticmethod
+    def _match_coeiroink_model_identifier(model_name: str, target_collection: Any) -> bool:
+        """
+        指定された model_name (UUID, uuid_styleId, ディレクトリ名等) が
+        target_collection (リストまたは {dir_name: uuid} 辞書) に含まれるか照合する共通ヘルパー。
+        """
+        if not model_name or not target_collection:
+            return False
+
+        raw = str(model_name).strip().lower()
+        # スタイルIDサフィックス (_0, _10 等) やポート等の除去
+        # 単純な split('_')[0] は 'model_a' などの名前を 'model' に破壊するため正規表現で末尾の数値のみ除去
+        uuid_or_key = re.sub(r'[_\:]\d+$', '', raw).strip()
+
+        candidates = {raw, uuid_or_key}
+        mapped = COEIROINK_MODEL_MAPPING.get(uuid_or_key) or COEIROINK_MODEL_MAPPING.get(raw)
+        if mapped:
+            candidates.add(mapped.lower())
+            mapped_short = mapped.split("-")[0].lower()
+            if len(mapped_short) >= 3:
+                candidates.add(mapped_short)
+
+        if "-" in uuid_or_key:
+            prefix_uuid = uuid_or_key.split("-")[0]
+            if len(prefix_uuid) >= 6:
+                candidates.add(prefix_uuid)
+
+        items_to_check = []
+        if isinstance(target_collection, dict):
+            for k, v in target_collection.items():
+                if k:
+                    items_to_check.append(str(k))
+                if v:
+                    items_to_check.append(str(v))
+        elif isinstance(target_collection, (list, tuple, set)):
+            items_to_check.extend(str(x) for x in target_collection if x)
+
+        for item in items_to_check:
+            item_lower = item.strip().lower()
+            item_stripped = re.sub(r'[_\:]\d+$', '', item_lower).strip()
+            item_mapped = COEIROINK_MODEL_MAPPING.get(item_lower, "") or COEIROINK_MODEL_MAPPING.get(item_stripped, "")
+            item_mapped = item_mapped.lower() if item_mapped else ""
+
+            for cand in candidates:
+                if (
+                    cand == item_lower
+                    or cand == item_stripped
+                    or (item_mapped and (cand == item_mapped or cand == item_mapped.split("-")[0]))
+                ):
+                    return True
+                # UUIDなどのプレフィックスマッチ (ハイフン区切りの第1セグメント同士の一致)
+                if "-" in cand and "-" in item_lower:
+                    if cand.split("-")[0] == item_lower.split("-")[0]:
+                        return True
+        return False
 
     def has_model_in_ram(self, model_name: Optional[str]) -> bool:
         """指定モデル（UUIDやディレクトリ名）がノードのRAMDiskに常駐しているか判定"""
@@ -377,41 +502,32 @@ class TTSNode:
         ram_models = self.specs.get("ram_models", [])
         if not ram_models:
             return False
-
-        # model_name は "d312d0fb-d38d-434e-825d-cbcbfd105ad0_72" や "ginga-2.2.0" などの形式
-        raw = str(model_name).strip().lower()
-        uuid_or_key = raw.split("_")[0].split(":")[0].strip()
-
-        # 照合候補のセットを作成（元の文字列、アンダースコア前、およびマッピング先の名前/UUID）
-        candidates = {raw, uuid_or_key}
-        mapped = COEIROINK_MODEL_MAPPING.get(uuid_or_key) or COEIROINK_MODEL_MAPPING.get(raw)
-        if mapped:
-            candidates.add(mapped.lower())
-            mapped_short = mapped.split("-")[0].lower()
-            candidates.add(mapped_short)
-
-        if "-" in uuid_or_key:
-            candidates.add(uuid_or_key.split("-")[0])
-
-        for rm in ram_models:
-            rm_lower = str(rm).strip().lower()
-            rm_short = rm_lower.split("-")[0]
-            rm_mapped = COEIROINK_MODEL_MAPPING.get(rm_lower, "").lower()
-
-            for cand in candidates:
-                if (
-                    cand == rm_lower
-                    or cand == rm_mapped
-                    or cand == rm_short
-                    or (len(cand) >= 4 and cand in rm_lower)
-                    or (len(rm_short) >= 4 and rm_short in cand)
-                ):
-                    return True
-        return False
+        return self._match_coeiroink_model_identifier(model_name, ram_models)
 
     def supports_model(self, engine: str, model_name: Optional[str]) -> bool:
-        """指定されたモデル（話者UUID等）をこのノードがサポートしているか"""
-        return True
+        """指定されたモデル（話者UUID等）をこのノードが保有・サポートしているか判定"""
+        if not model_name:
+            return True
+        eng_clean = str(engine or self.engine_name).strip().lower()
+        if eng_clean != "coeiroink":
+            return True
+
+        # specs に installed_models / installed_models_map が明示されている場合は保有チェックを実施
+        installed_map = self.specs.get("installed_models_map")
+        installed_list = self.specs.get("installed_models")
+
+        if installed_map is None and installed_list is None:
+            # 未報告の旧バージョンWorkerまたはlocal_masterは後方互換のためTrue
+            return True
+
+        if installed_map:
+            if self._match_coeiroink_model_identifier(model_name, installed_map):
+                return True
+        if installed_list:
+            if self._match_coeiroink_model_identifier(model_name, installed_list):
+                return True
+
+        return False
 
     def mark_success(self, latency_ms: float = 0.0):
         """リクエスト成功時の状態更新"""
@@ -611,6 +727,12 @@ class TTSNodePool:
                 existing.specs = dict(specs)
                 if "engine_running" in specs:
                     existing.engine_running = bool(specs["engine_running"])
+                if "is_direct_reachable" in specs:
+                    existing.is_direct_reachable = bool(specs["is_direct_reachable"])
+                if isinstance(specs.get("installed_models_map"), dict):
+                    register_dynamic_coeiroink_models(specs["installed_models_map"])
+                elif isinstance(specs.get("installed_models"), dict):
+                    register_dynamic_coeiroink_models(specs["installed_models"])
             if hostname:
                 existing.hostname = hostname
             existing.update_heartbeat()

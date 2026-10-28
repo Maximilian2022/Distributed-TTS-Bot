@@ -211,6 +211,7 @@ class HAWatchdog:
         self.last_code_update_time = self._load_last_code_update_time()
         self.last_cache_sync_time = 0.0
         self.last_cache_sync_date = ""
+        self.last_cache_enforce_time = 0.0
         self.running = True
 
         logger.info(
@@ -600,10 +601,95 @@ class HAWatchdog:
         self.running = False
         sys.exit(0)
 
+    def _get_cache_dirs(self) -> Tuple[Path, Path]:
+        base_dir = self.db_path.parent.parent
+        cloud_dir = base_dir / "cache"
+        local_dir = base_dir / "cache_voicevox"
+        cloud_dir.mkdir(parents=True, exist_ok=True)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        return cloud_dir, local_dir
+
+    def _enforce_local_cache_limits(self, emergency: bool = False) -> int:
+        """
+        Slave Standby 待機中であってもディスク空き容量枯渇を自律的に防止する LRU クリーンアップ。
+        ホストディスク空き容量 (shutil.disk_usage) を常時監視し、安全マージンを下回る場合や
+        設定上限 (Cloud: 10GB / Local: 20GB) を超過した場合に古い .wav を削除する。
+        """
+        total_deleted = 0
+        cloud_dir, local_dir = self._get_cache_dirs()
+        target_dirs = [("Cloud", cloud_dir, 10 * 1024**3, int(8.5 * 1024**3)),
+                       ("Local", local_dir, 20 * 1024**3, int(17 * 1024**3))]
+
+        check_path = self.db_path.parent if self.db_path.parent.exists() else Path("/")
+        try:
+            usage = shutil.disk_usage(check_path)
+            disk_total = usage.total
+            disk_free = usage.free
+        except Exception:
+            disk_total, disk_free = 0, 0
+
+        # 緊急時: 少なくとも1.5GBまたは総容量の8%の空きを強制確保
+        min_reserve = max(1536 * 1024 * 1024, int(disk_total * 0.08)) if emergency else max(3 * 1024**3, int(disk_total * 0.10))
+
+        for label, d_path, cfg_max, cfg_target in target_dirs:
+            if not d_path.exists():
+                continue
+            try:
+                entries: List[Tuple[Path, float, int]] = []
+                cur_size = 0
+                with os.scandir(d_path) as it:
+                    for entry in it:
+                        if entry.is_file(follow_symlinks=False) and entry.name.endswith(".wav"):
+                            try:
+                                st = entry.stat()
+                                cur_size += st.st_size
+                                entries.append((Path(entry.path), st.st_mtime, st.st_size))
+                            except OSError:
+                                pass
+
+                # ディスク空き容量に基づく動的上限
+                if disk_total > 0:
+                    usable = max(64 * 1024 * 1024, cur_size + disk_free - min_reserve)
+                    eff_max = min(cfg_max, usable)
+                    ratio = cfg_target / float(cfg_max) if cfg_max > 0 else 0.85
+                    eff_target = min(cfg_target, int(eff_max * ratio))
+                else:
+                    eff_max, eff_target = cfg_max, cfg_target
+
+                if cur_size > eff_max or (emergency and disk_free < min_reserve):
+                    logger.warning(
+                        f"🧹 [HA Cache Guard] {label} cache ({cur_size / (1024**3):.2f}GB) exceeded effective limit "
+                        f"({eff_max / (1024**3):.2f}GB). Pruning to {eff_target / (1024**3):.2f}GB (Free: {disk_free / (1024**3):.2f}GB)..."
+                    )
+                    entries.sort(key=lambda x: x[1])  # 古い順
+                    for fpath, _mtime, fsize in entries:
+                        if cur_size <= eff_target and disk_free >= min_reserve:
+                            break
+                        try:
+                            fpath.unlink(missing_ok=True)
+                            cur_size -= fsize
+                            disk_free += fsize
+                            total_deleted += 1
+                        except OSError:
+                            pass
+            except Exception as e:
+                logger.debug(f"[HA Cache Guard] Error checking {label} cache: {e}")
+
+        return total_deleted
+
     def sync_db_snapshot(self) -> bool:
         """Master の /api/ha/db_snapshot から SQLite バックアップをプル同期 (LAN直通優先 & WAN自動フォールバック)"""
         if not self.master_url or not self.ha_secret:
             return False
+
+        # 事前空き容量チェック: 1GB 未満なら先にキャッシュを緊急削減して DB 用領域を死守
+        try:
+            usage = shutil.disk_usage(self.db_path.parent if self.db_path.parent.exists() else Path("/"))
+            if usage.free < 1024 * 1024 * 1024:
+                logger.warning(f"⚠️ [HA DB Guard] Disk free space low ({usage.free / (1024**2):.1f}MB). Running emergency cache prune before DB sync.")
+                self._enforce_local_cache_limits(emergency=True)
+        except Exception:
+            pass
 
         # LAN直通接続が検証済みならローカルURLを優先、未検証またはエラー時は外部マスターURLを使用
         primary_url = self.direct_master_url if (self.is_direct_verified and self.direct_master_url) else self.master_url
@@ -635,6 +721,12 @@ class HAWatchdog:
 
                     compressed = resp.read()
                     raw_bytes = gzip.decompress(compressed)
+
+                    # SQLite3 有効性検証 (破損ファイルの誤上書き防止)
+                    if not raw_bytes.startswith(b"SQLite format 3\x00"):
+                        logger.error(f"❌ Corrupted DB payload received from {base_url} (header mismatch). Aborting sync.")
+                        continue
+
                     sha256 = hashlib.sha256(raw_bytes).hexdigest()
 
                     # ハッシュが同じなら書き込みスキップ
@@ -678,8 +770,8 @@ class HAWatchdog:
 
     def sync_frequent_cache_snapshot(self) -> bool:
         """
-        Master の /api/ha/frequent_cache_snapshot から再利用実績のある音声キャッシュ (hit_count >= 2) をプル同期。
-        早朝自動同期および手動シグナル実行用。
+        Master の /api/ha/frequent_cache_snapshot から再利用実績のある音声キャッシュをストリーミング同期。
+        256MB コンテナでも安全に動作するよう一時ファイル経由で展開し、ディスク空き容量を厳格管理。
         """
         if not self.master_url or not self.ha_secret:
             return False
@@ -690,19 +782,21 @@ class HAWatchdog:
             candidate_urls.append(self.master_url)
 
         headers = self._get_common_headers()
+        cloud_cache_dir, local_cache_dir = self._get_cache_dirs()
 
-        # キャッシュディレクトリの特定 (/app/cache, /app/cache_voicevox または 相対パス)
-        base_dir = self.db_path.parent.parent  # /app
-        cloud_cache_dir = base_dir / "cache"
-        local_cache_dir = base_dir / "cache_voicevox"
-        cloud_cache_dir.mkdir(parents=True, exist_ok=True)
-        local_cache_dir.mkdir(parents=True, exist_ok=True)
+        # 現在の空き容量をヘッダーでMasterへ通知
+        try:
+            usage = shutil.disk_usage(cloud_cache_dir)
+            headers["X-HA-Disk-Free-Bytes"] = str(usage.free)
+        except Exception:
+            pass
 
         for base_url in candidate_urls:
             sync_url = f"{base_url}/api/ha/frequent_cache_snapshot"
             req = urllib.request.Request(sync_url, headers=headers)
+            tmp_archive_file = None
             try:
-                with urllib.request.urlopen(req, timeout=30.0) as resp:
+                with urllib.request.urlopen(req, timeout=45.0) as resp:
                     if resp.status == 410:
                         self._handle_revocation()
                         return False
@@ -715,12 +809,16 @@ class HAWatchdog:
                         self.last_cache_sync_time = time.time()
                         return True
 
-                    raw_archive = resp.read()
-                    import tarfile, io
+                    # 64KB チャンクで一時ファイルへストリーミング保存 (メモリ消費ゼロ & OOM防止)
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tf:
+                        tmp_archive_file = tf.name
+                        shutil.copyfileobj(resp, tf, length=64 * 1024)
+
                     extracted_count = 0
-                    with tarfile.open(fileobj=io.BytesIO(raw_archive), mode="r:gz") as tar:
+                    import tarfile
+                    with tarfile.open(tmp_archive_file, mode="r:gz") as tar:
                         for member in tar.getmembers():
-                            # セキュリティ: ディレクトリトラバーサル防止 (CWE-22)
                             safe_name = Path(member.name).name
                             if not safe_name or ".." in safe_name:
                                 continue
@@ -738,10 +836,20 @@ class HAWatchdog:
                                 extracted_count += 1
 
                     self.last_cache_sync_time = time.time()
-                    logger.info(f"✨ [HA Watchdog] Synced {extracted_count} frequent cache files ({len(raw_archive)} bytes) successfully via {base_url}!")
+                    archive_sz = os.path.getsize(tmp_archive_file) if os.path.exists(tmp_archive_file) else 0
+                    logger.info(f"✨ [HA Watchdog] Synced {extracted_count} frequent cache files ({archive_sz} bytes) via {base_url}!")
+
+                    # 同期完了後に自律 LRU クリーンアップを実行
+                    self._enforce_local_cache_limits()
                     return True
             except Exception as e:
                 logger.warning(f"Frequent cache sync error via {base_url}: {e}")
+            finally:
+                if tmp_archive_file and os.path.exists(tmp_archive_file):
+                    try:
+                        os.unlink(tmp_archive_file)
+                    except OSError:
+                        pass
 
         return False
 
@@ -978,6 +1086,11 @@ class HAWatchdog:
                     now = time.time()
                     if now - self.last_sync_time >= self.sync_interval:
                         await loop.run_in_executor(None, self.sync_db_snapshot)
+
+                    # 定期キャッシュ容量ガード (1時間ごと): Standby 待機中でも Slave ディスク容量を自律保全
+                    if now - getattr(self, "last_cache_enforce_time", 0.0) >= 3600.0:
+                        self.last_cache_enforce_time = now
+                        await loop.run_in_executor(None, self._enforce_local_cache_limits)
 
                     # 早朝 (JST 05:00 〜 05:30) の日次キャッシュ自動同期 (1日1回)
                     from datetime import datetime, timezone, timedelta

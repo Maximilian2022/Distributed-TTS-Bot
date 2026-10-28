@@ -3,6 +3,7 @@ import io
 import time
 import wave
 import array
+import shutil
 import struct
 import hashlib
 import uuid
@@ -17,6 +18,76 @@ from src.utils.async_task import safe_create_task
 from src.utils.security import sanitize_filename, validate_safe_path
 
 logger = logging.getLogger(__name__)
+
+
+def detect_effective_ram_bytes() -> int:
+    """
+    ホスト物理メモリ (/proc/meminfo) およびコンテナ cgroup メモリ上限の小さい方を取得 (bytes)。
+    少メモリVPSやコンテナメモリ制限環境でのOOMを防止する。
+    """
+    host_total = 0
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    host_total = int(line.split()[1]) * 1024
+                    break
+    except Exception:
+        pass
+
+    cgroup_limit = 0
+    for cg_path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        if os.path.exists(cg_path):
+            try:
+                raw = Path(cg_path).read_text(encoding="utf-8").strip()
+                if raw and raw != "max" and raw.isdigit():
+                    val = int(raw)
+                    # 無制限を表す巨大値 (例: > 1PB) は除外
+                    if 0 < val < (1 << 50):
+                        cgroup_limit = val
+                        break
+            except Exception:
+                pass
+
+    if host_total > 0 and cgroup_limit > 0:
+        return min(host_total, cgroup_limit)
+    return cgroup_limit or host_total or (4 * 1024 * 1024 * 1024)
+
+
+def calculate_effective_cache_limits(
+    directory: Union[str, Path],
+    configured_max_bytes: int,
+    configured_target_bytes: int,
+    current_cache_size_bytes: int = 0
+) -> Tuple[int, int]:
+    """
+    対象ディレクトリのディスク空き容量 (shutil.disk_usage) に基づき、
+    OSやDBを圧迫しない実効キャッシュ上限 (effective_max_bytes, effective_target_bytes) を動的算出。
+    """
+    target_path = Path(directory)
+    check_path = target_path if target_path.exists() else target_path.parent
+    try:
+        usage = shutil.disk_usage(check_path)
+        disk_total = usage.total
+        disk_free = usage.free
+        if disk_total <= 0:
+            return configured_max_bytes, configured_target_bytes
+
+        # 最低限残すべき空き容量安全マージン (通常: max(3GB, 総容量の10%)、小容量ディスクでは総容量の15%)
+        if disk_total <= 20 * (1024 ** 3):
+            min_free_reserve = max(512 * (1024 ** 2), int(disk_total * 0.15))
+        else:
+            min_free_reserve = max(3 * (1024 ** 3), int(disk_total * 0.10))
+
+        # キャッシュが使用可能な実質上限 = 現在のキャッシュ使用量 + (現在の空き容量 - 安全マージン)
+        max_usable_for_dir = max(64 * (1024 ** 2), current_cache_size_bytes + disk_free - min_free_reserve)
+        effective_max = min(configured_max_bytes, max_usable_for_dir)
+        ratio = (configured_target_bytes / float(configured_max_bytes)) if configured_max_bytes > 0 else 0.85
+        ratio = max(0.5, min(0.95, ratio))
+        effective_target = min(configured_target_bytes, int(effective_max * ratio))
+        return effective_max, effective_target
+    except Exception:
+        return configured_max_bytes, configured_target_bytes
 
 def _format_utc_to_jst(dt_raw: Any) -> str:
     """UTCタイムスタンプ文字列をJST (+9時間) に変換して 'YYYY-MM-DD HH:MM:SS' を返す"""
@@ -161,9 +232,11 @@ class CacheManager:
         self._save_counter: Dict[str, int] = {}
 
         # L1 インメモリ LRU キャッシュ (定型文・短文のゼロI/O高速化)
+        # ホストRAMおよびcgroupメモリ制限に応じて [16MB, 128MB] の範囲で自動スケーリング
         # key: cache_key, value: (provider, audio_bytes, file_path)
         self._l1_cache: collections.OrderedDict = collections.OrderedDict()
-        self._l1_max_bytes: int = 100 * 1024 * 1024  # 100MB
+        eff_ram = detect_effective_ram_bytes()
+        self._l1_max_bytes: int = max(16 * 1024 * 1024, min(128 * 1024 * 1024, eff_ram // 32))
         self._l1_current_bytes: int = 0
         self._l1_max_single_file_bytes: int = 256 * 1024  # 256KB以下の音声のみオンメモリ保持
 
@@ -499,12 +572,17 @@ class CacheManager:
                         except OSError:
                             continue
 
-            if total_size <= max_bytes:
+            eff_max_bytes, eff_target_bytes = calculate_effective_cache_limits(
+                directory, max_bytes, target_bytes, current_cache_size_bytes=total_size
+            )
+
+            if total_size <= eff_max_bytes:
                 return deleted_keys
 
             logger.warning(
-                f"[{label} Cache] size ({total_size / (1024**3):.2f} GB) exceeded limit "
-                f"({max_bytes / (1024**3):.2f} GB). Starting LRU cleanup to {target_bytes / (1024**3):.2f} GB..."
+                f"[{label} Cache] size ({total_size / (1024**3):.2f} GB) exceeded effective limit "
+                f"({eff_max_bytes / (1024**3):.2f} GB, configured={max_bytes / (1024**3):.2f} GB). "
+                f"Starting LRU cleanup to {eff_target_bytes / (1024**3):.2f} GB..."
             )
 
             # st_mtime が古い順（昇順）にソート
@@ -514,10 +592,11 @@ class CacheManager:
             deleted_bytes = 0
 
             for file_path, mtime, size in entries:
-                if total_size <= target_bytes:
+                if total_size <= eff_target_bytes:
                     break
                 try:
                     file_path.unlink(missing_ok=True)
+                    self._invalidate_l1(file_path.name)
                     total_size -= size
                     deleted_bytes += size
                     deleted_count += 1
@@ -618,10 +697,11 @@ class CacheManager:
         return total
 
     def get_stats(self) -> dict:
-        """両キャッシュディレクトリの容量統計を取得"""
-        def _dir_stats(d: Path, max_b: int):
+        """両キャッシュディレクトリの容量統計を取得 (ディスク空き容量に応じた実効上限も併記)"""
+        def _dir_stats(d: Path, max_b: int, target_b: int):
             if not d.exists():
-                return {"size_bytes": 0, "max_bytes": max_b, "count": 0}
+                eff_max, _ = calculate_effective_cache_limits(d, max_b, target_b, 0)
+                return {"size_bytes": 0, "max_bytes": eff_max, "configured_max_bytes": max_b, "count": 0}
             size = 0
             cnt = 0
             for f in d.iterdir():
@@ -631,11 +711,12 @@ class CacheManager:
                         cnt += 1
                     except OSError:
                         pass
-            return {"size_bytes": size, "max_bytes": max_b, "count": cnt}
+            eff_max, _ = calculate_effective_cache_limits(d, max_b, target_b, size)
+            return {"size_bytes": size, "max_bytes": eff_max, "configured_max_bytes": max_b, "count": cnt}
 
         return {
-            "cloud": _dir_stats(self.cache_dir, self.max_size_bytes),
-            "voicevox": _dir_stats(self.voicevox_cache_dir, self.voicevox_max_size_bytes)
+            "cloud": _dir_stats(self.cache_dir, self.max_size_bytes, self.target_size_bytes),
+            "voicevox": _dir_stats(self.voicevox_cache_dir, self.voicevox_max_size_bytes, self.voicevox_target_size_bytes)
         }
 
     def get_explorer_file_path(self, target: str, filename: str) -> Optional[Path]:
