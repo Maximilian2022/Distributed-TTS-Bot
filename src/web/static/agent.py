@@ -157,8 +157,11 @@ AGENT_COMPOSE_FILE = os.getenv("AGENT_COMPOSE_FILE", os.path.join(WORK_DIR, "doc
 AGENT_SCRIPT_PATH = os.getenv("AGENT_SCRIPT_PATH", os.path.abspath(__file__))
 # 自動バージョンチェック間隔 (分)
 AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
-# エージェントバージョン (定数 - 定義変更で自動アップデート判定に使用)
-AGENT_VERSION = "3.13.3"
+# エージェントバージョン (単一管理元: src.version.AGENT_VERSION を参照、単体実行時はフォールバック)
+try:
+    from src.version import AGENT_VERSION
+except ImportError:
+    AGENT_VERSION = "3.13.4"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -1975,6 +1978,7 @@ hosts allow = *
             return
         async with self._models_sync_lock:
             models_dir = self.ram_manager.persistent_dir
+            pulled_count = 0
             for name in model_names:
                 clean_name = sanitize_filename(name)
                 if not clean_name or not is_safe_identifier(clean_name):
@@ -2034,6 +2038,7 @@ hosts allow = *
                             shutil.move(str(extracted_model), str(target_dir))
                             shutil.rmtree(staging_dir, ignore_errors=True)
                             logger.info(f"🎉 [ModelSync] モデル {clean_name} を正常にMasterから同期・配置しました")
+                            pulled_count += 1
                             if self.ram_manager:
                                 self.ram_manager.setup_hybrid_structure()
                         else:
@@ -2047,6 +2052,20 @@ hosts allow = *
                                 pass
                 except Exception as e:
                     logger.error(f"❌ [ModelSync] モデル {clean_name} のPull同期中に例外発生: {e}")
+
+            if pulled_count > 0:
+                logger.info(f"📊 [ModelSync] {pulled_count}件の新規COEIROINKモデルをMasterから同期・配置しました。")
+                cname = ENGINES.get("coeiroink", {}).get("container_name", "ttsworker-coeiroink")
+                is_running = is_container_running(cname) if "is_container_running" in globals() else (docker_api.is_running(cname) if docker_api.is_available() else False)
+                if is_running:
+                    logger.info("🔄 [ModelSync] 新規モデル反映のため、COEIROINK エンジンを再起動してモデルをリロードします...")
+                    try:
+                        self.stop_engine("coeiroink")
+                        await asyncio.sleep(2)
+                        await self.start_engine("coeiroink")
+                        logger.info("✅ [ModelSync] COEIROINK エンジン再起動完了 (新モデルリロード済)")
+                    except Exception as r_err:
+                        logger.warning(f"⚠️ [ModelSync] COEIROINK 再起動エラー: {r_err}")
 
     async def register_to_master(self) -> bool:
         """Master サーバーに自分自身を自動登録（ハードウェアスペック・保有モデルも送信）"""

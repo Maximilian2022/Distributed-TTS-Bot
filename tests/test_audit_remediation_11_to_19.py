@@ -434,6 +434,47 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         clean_name = sanitize_filename(dangerous_model_name)
         self.assertEqual(clean_name, "passwd")  # トラバーサル除去確認
 
+    def test_mycoeiroink_upload_2gb_limit_and_worker_agent_version(self):
+        """MYCOEIROINK 2GBアップロード拡張および Worker Agent バージョン単一管理元(SSOT)の検証"""
+        import re
+        from src.tts.mycoeiroink import MAX_UPLOAD_SIZE, MAX_EXTRACT_SIZE, MAX_SINGLE_FILE_SIZE
+        from src.version import AGENT_VERSION as SERVER_AGENT_VERSION, sync_agent_py_version
+
+        # 1. 2GB アップロード上限の検証
+        self.assertEqual(MAX_UPLOAD_SIZE, 2048 * 1024 * 1024)
+        self.assertEqual(MAX_EXTRACT_SIZE, 5120 * 1024 * 1024)
+        self.assertEqual(MAX_SINGLE_FILE_SIZE, 2048 * 1024 * 1024)
+
+        # 2. Worker Agent と Server 間バージョン整合性 & SSOT の検証
+        agent_py_path = Path(__file__).resolve().parent.parent / "src" / "web" / "static" / "agent.py"
+        self.assertTrue(agent_py_path.exists())
+        agent_content = agent_py_path.read_text(encoding="utf-8")
+        agent_ver_match = re.search(r'^\s*AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', agent_content, re.MULTILINE)
+        self.assertIsNotNone(agent_ver_match)
+        agent_py_version = agent_ver_match.group(1)
+
+        self.assertEqual(SERVER_AGENT_VERSION, "3.13.4")
+        self.assertEqual(agent_py_version, "3.13.4")
+        self.assertEqual(SERVER_AGENT_VERSION, agent_py_version)
+
+        # 3. HTML テンプレートの単一管理元プレースホルダー検証 (ハードコード廃止)
+        index_html_path = Path(__file__).resolve().parent.parent / "src" / "web" / "templates" / "index.html"
+        self.assertTrue(index_html_path.exists())
+        index_html_text = index_html_path.read_text(encoding="utf-8")
+        self.assertIn("最新 Agent v{{AGENT_VERSION}} (自律同期対応)", index_html_text)
+        self.assertIn('"agent_version": "{{AGENT_VERSION}}"', index_html_text)
+        self.assertNotIn("最新 Agent v3.13.2", index_html_text)
+
+        # 4. JS 側のハードコード廃止検証
+        app_js_path = Path(__file__).resolve().parent.parent / "src" / "web" / "static" / "app.js"
+        self.assertTrue(app_js_path.exists())
+        app_js_text = app_js_path.read_text(encoding="utf-8")
+        self.assertNotIn('|| "3.13.2"', app_js_text)
+
+        # 5. sync_agent_py_version 関数の動作検証
+        # 既に同期済みなので False が返るはず
+        self.assertFalse(sync_agent_py_version())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 CACHE_FILE_PATH = os.getenv("MYCOEIROINK_CACHE_FILE", "/app/data/mycoeiroink_cache.json" if os.path.exists("/app/data") else "data/mycoeiroink_cache.json")
 BASE_URL = "https://coeiroink.com"
-MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500MB
-MAX_EXTRACT_SIZE = 1500 * 1024 * 1024  # 1500MB (1.5GB)
-MAX_SINGLE_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+MAX_UPLOAD_SIZE = 2048 * 1024 * 1024  # 2GB (2048MB)
+MAX_EXTRACT_SIZE = 5120 * 1024 * 1024  # 5GB (5120MB)
+MAX_SINGLE_FILE_SIZE = 2048 * 1024 * 1024  # 2GB (2048MB)
 
 # セキュリティ対策: 実行可能・スクリプトファイルの拒否リスト
 FORBIDDEN_EXTENSIONS = {
@@ -382,11 +382,11 @@ class MyCoeiroinkManager:
         ZIPバイナリを厳格にセキュリティ検証して展開・配置する。
         - Zip Slip 対策 (パストラバーサル防止)
         - 危険拡張子の遮断 (.exe, .sh, .py, .dll 等)
-        - サイズ上限チェック (最大 500MB / 展開後最大 1.5GB)
+        - サイズ上限チェック (最大 2GB / 展開後最大 5GB)
         - metas.json の構造検証
         """
         if len(zip_data) > MAX_UPLOAD_SIZE:
-            raise ValueError(f"ZIPファイルサイズが上限 (500MB) を超えています: {len(zip_data) / 1024 / 1024:.1f}MB")
+            raise ValueError(f"ZIPファイルサイズが上限 (2GB) を超えています: {len(zip_data) / 1024 / 1024:.1f}MB")
 
         if not zip_data.startswith(b"PK\x03\x04"):
             raise ValueError("有効なZIPアーカイブではありません（シグネチャ不一致）。")
@@ -562,13 +562,13 @@ class MyCoeiroinkManager:
                     if "text/html" in content_type:
                         raise RuntimeError("ダウンロードリンクではなくWebページ（HTML）が返却されました。")
 
-                    # ストリーミングダウンロード（最大 500MB）
+                    # ストリーミングダウンロード（最大 2GB）
                     chunks = []
                     downloaded = 0
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         downloaded += len(chunk)
                         if downloaded > MAX_UPLOAD_SIZE:
-                            raise RuntimeError("ファイルサイズが上限 (500MB) を超過しました。")
+                            raise RuntimeError("ファイルサイズが上限 (2GB) を超過しました。")
                         chunks.append(chunk)
 
                     zip_data = b"".join(chunks)

@@ -15,7 +15,8 @@
       "is_logged_in": {{IS_LOGGED_IN}},
       "client_configured": {{CLIENT_CONFIGURED}},
       "user_data": {{USER_DATA}},
-      "worker_token": "{{WORKER_TOKEN}}"
+      "worker_token": "{{WORKER_TOKEN}}",
+      "agent_version": "{{AGENT_VERSION}}"
     }
   </script>
   <script>
@@ -25,6 +26,7 @@
     window.APP_CLIENT_CONFIGURED = serverData.client_configured;
     window.APP_USER_DATA = serverData.user_data;
     window.VOLUNTEER_WORKER_TOKEN = serverData.worker_token || "";
+    window.latestAgentVersion = serverData.agent_version || "";
     window.switchMetricsNode = function(nodeKey) {
       if (typeof window.doSwitchMetricsNode === 'function') {
         window.doSwitchMetricsNode(nodeKey);
@@ -1113,7 +1115,7 @@
                     <span>🔄</span> 全ワーカー再起動 (ローリング)
                   </button>
                   <span id="worker-latest-version-badge" class="badge" style="background:rgba(88,101,242,0.2);color:#8ea1e1;font-weight:600;padding:5px 10px;border-radius:12px;font-size:11px;border:1px solid rgba(88,101,242,0.3);">
-                    最新 Agent v3.13.2 (自律同期対応)
+                    最新 Agent v{{AGENT_VERSION}} (自律同期対応)
                   </span>
                 </div>
               </div>
@@ -2461,7 +2463,7 @@
       <div id="mycoe-drop-zone" style="border:2px dashed rgba(255,255,255,0.2);border-radius:10px;padding:32px 20px;text-align:center;background:rgba(0,0,0,0.2);cursor:pointer;transition:border-color 0.2s, background 0.2s;" onclick="document.getElementById('mycoe-zip-input').click()" ondragover="onMyCoeDragOver(event)" ondragleave="onMyCoeDragLeave(event)" ondrop="onMyCoeDrop(event)">
         <div style="font-size:36px;margin-bottom:8px;">📦</div>
         <div style="font-weight:600;font-size:14px;margin-bottom:4px;color:var(--text-main);">ZIPファイルをここにドラッグ＆ドロップ</div>
-        <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">またはクリックしてファイルを選択 (最大 500MB)</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">またはクリックしてファイルを選択 (最大 2GB)</div>
         <button type="button" class="btn btn-secondary btn-sm" style="pointer-events:none;">ファイルを選択 📂</button>
         <input type="file" id="mycoe-zip-input" accept=".zip" style="display:none;" onchange="onMyCoeFileSelected(this.files)">
       </div>

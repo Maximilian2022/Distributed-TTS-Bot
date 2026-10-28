@@ -2652,14 +2652,18 @@ function renderWorkerNodes(nodesData) {
 
   const latestBadge = document.getElementById("worker-latest-version-badge");
   if (latestBadge) {
-    let maxVer = window.latestAgentVersion || "3.13.2";
-    for (const [engine, nodes] of Object.entries(nodesData || {})) {
-      if (!Array.isArray(nodes)) continue;
-      nodes.forEach(n => {
-        if (n.agent_version && n.agent_version > maxVer) maxVer = n.agent_version;
-      });
+    let maxVer = window.latestAgentVersion || "";
+    if (!maxVer) {
+      for (const [engine, nodes] of Object.entries(nodesData || {})) {
+        if (!Array.isArray(nodes)) continue;
+        nodes.forEach(n => {
+          if (n.agent_version && (!maxVer || n.agent_version > maxVer)) maxVer = n.agent_version;
+        });
+      }
     }
-    latestBadge.textContent = `最新 Agent v${maxVer} (自律同期対応)`;
+    if (maxVer) {
+      latestBadge.textContent = `最新 Agent v${maxVer} (自律同期対応)`;
+    }
   }
 
   container.innerHTML = "";
@@ -5685,8 +5689,8 @@ async function uploadMyCoeZip(file) {
     showToast("アップロードできるのはZIP形式のファイルのみです (.zip)", "error");
     return;
   }
-  if (file.size > 500 * 1024 * 1024) {
-    showToast("ファイルサイズが上限 (500MB) を超過しています", "error");
+  if (file.size > 2048 * 1024 * 1024) {
+    showToast("ファイルサイズが上限 (2GB) を超過しています", "error");
     return;
   }
 

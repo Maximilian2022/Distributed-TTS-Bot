@@ -1,5 +1,11 @@
 ## 🚀 アップデート内容 (Distributed-TTS-Bot)
 
+### 📦 MYCOEIROINK ZIPアップロード上限2GB拡張 ＆ Worker Agent v3.13.4 単一管理元(SSOT)統合・自動更新
+- **ZIPアップロード上限拡張**: 単一ZIPアップロードおよびチャンク分割アップロードの上限を従来の 500MB から **最大 2GB (2048MB)** へ大幅拡張（展開後上限 5GB）。大容量・高音質モデルの直接導入に対応。
+- **Agent バージョンの単一管理元 (SSOT) 統合**: `src/version.py` を唯一の正本として定義。WebUI (HTMLバッジ・`window.latestAgentVersion`)、Master配信ハンドラー、Worker Agent フォールバック値の自動同期機構を確立し、複数ファイルへのハードコードを完全撤廃。
+- **Worker Agent v3.13.4 配信**: 全接続中 Worker への自律自己アップデート（Piggyback AutoUpdate）を発行。
+- **モデル同期後 COEIROINK 即時リロード**: Worker 側で新モデルの Pull 受信・配置が完了した際、COEIROINK エンジンコンテナが稼働中であれば自動的に安全再起動を行い、新モデルを即時リロード。
+
 ### 🛡️ GitHub Code Scanning (CodeQL) 全8件のアラート完全修復 (SSRF & Path Injection)
 - **SSRF (CWE-918) 防御**: `src/utils/security.py` に `sanitize_worker_ip` を新設。整数キャスト（`packed`/`exploded`）を経由したIP再構築により CodeQL taint を完全に遮断。クラウドメタデータ (169.254.169.254)、ループバック、マルチキャスト等を確実に拒否。
 - **Path Injection (CWE-22) 防護**: `_pull_missing_models_from_worker` および `api_worker_models_upload` の一時ファイル名パスからユーザー入力・モデル名を完全排除し、純粋な UUID 一時ファイルパスへ改修。

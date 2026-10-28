@@ -31,7 +31,7 @@ from src.cache_manager import CacheManager
 from src.tts.manager import TTSManager
 from src.tts.coeiroink_models import CoeiroinkModelManager
 from src.tts.mycoeiroink import MyCoeiroinkManager
-from src.version import BUILD_VERSION, BUILD_DATE, AGENT_VERSION
+from src.version import BUILD_VERSION, BUILD_DATE, AGENT_VERSION, sync_agent_py_version
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
 from src.utils.avatar_manager import get_avatar_path, has_avatar
@@ -113,9 +113,14 @@ class WebServer:
         self._piggyback_cooldown_until: Dict[str, float] = {}  # ホストIP -> 再許可可能になる時刻
         self._piggyback_updating_host: Optional[str] = None
         self._piggyback_updating_at: float = 0.0
-        # 大容量モデルZIP (最大500MB) のアップロードを許可するため、client_max_size を 1GB に設定
+        # static/agent.py の定義バージョンを src.version.AGENT_VERSION と自動同期
+        try:
+            sync_agent_py_version()
+        except Exception as _sync_err:
+            logger.debug(f"[AgentSync] sync_agent_py_version notice: {_sync_err}")
+        # 大容量モデルZIP (最大2GB) のアップロードを許可するため、client_max_size を 2.5GB に設定
         self.app = web.Application(
-            client_max_size=1024 * 1024 * 1024,
+            client_max_size=2560 * 1024 * 1024,
             middlewares=[self._security_and_rate_limit_middleware]
         )
         self._start_time = time.time()
@@ -1947,7 +1952,7 @@ class WebServer:
             if p.exists():
                 content = p.read_text(encoding="utf-8")
                 # AGENT_VERSION を src.version.AGENT_VERSION (単一管理元) と確実に同期して配信
-                content = re.sub(r'AGENT_VERSION\s*=\s*"[^"]*"', f'AGENT_VERSION = "{AGENT_VERSION}"', content)
+                content = re.sub(r'AGENT_VERSION\s*=\s*["\'][^"\']*["\']', f'AGENT_VERSION = "{AGENT_VERSION}"', content)
                 resp = web.Response(text=content, content_type="text/plain", charset="utf-8")
                 resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
                 return resp
@@ -3596,15 +3601,15 @@ class WebServer:
 
             chunks = []
             size = 0
-            max_size = 500 * 1024 * 1024  # 500MB
+            max_size = 2048 * 1024 * 1024  # 2GB
             while True:
                 chunk = await field.read_chunk()
                 if not chunk:
                     break
                 size += len(chunk)
                 if size > max_size:
-                    logger.warning(f"[MYCOEIROINK Upload Rejected] ファイルサイズ上限超過 ({filename}): {size / 1024 / 1024:.1f}MB > 500MB")
-                    return web.json_response({"error": "ファイルサイズが上限 (500MB) を超過しています。"}, status=400)
+                    logger.warning(f"[MYCOEIROINK Upload Rejected] ファイルサイズ上限超過 ({filename}): {size / 1024 / 1024:.1f}MB > 2048MB")
+                    return web.json_response({"error": "ファイルサイズが上限 (2GB) を超過しています。"}, status=400)
                 chunks.append(chunk)
 
             zip_bytes = b"".join(chunks)
@@ -3690,8 +3695,8 @@ class WebServer:
                         raise ValueError(f"チャンク欠落を検知しました (chunk_{i:05d} が見つかりません)")
                     c_bytes = cf.read_bytes()
                     total_size += len(c_bytes)
-                    if total_size > 500 * 1024 * 1024:
-                        raise ValueError(f"結合後のファイルサイズが上限 (500MB) を超過しています: {total_size / 1024 / 1024:.1f}MB")
+                    if total_size > 2048 * 1024 * 1024:
+                        raise ValueError(f"結合後のファイルサイズが上限 (2GB) を超過しています: {total_size / 1024 / 1024:.1f}MB")
                     combined_chunks.append(c_bytes)
 
                 combined_zip = b"".join(combined_chunks)

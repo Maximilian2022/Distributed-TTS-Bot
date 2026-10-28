@@ -1,6 +1,45 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] MYCOEIROINK ZIPアップロード上限2GB拡張 ＆ Worker Agent v3.13.4 単一管理元(SSOT)統合・自動連動化 ＆ モデル同期後COEIROINK即時リロード
+
+- **ユーザーフィードバック & 課題**:
+  1. 「MYCOEIROINK 配布音声ライブラリからZIPで導入した後なんですが 前に作ってもらったクラスタやボランティアワーカーのCoeiroinkへの配布ってどのタイミングで動くんですかね」
+  2. 「この機能、もともとManagerとローカルエンジンが同居してた頃の機能なので、別居した今ちゃんと動くのか心配になっております」
+  3. 「ついでにZIPアップロードの制限である最大500MBを2GBまで拡張してほしい」
+  4. 「Agentバージョンだけどさ、複数ファイルで管理してるじゃん？ これ1か所にまとめられないかな？ WebUIの分散コンピュートワーカー (マルチノード推論)も最新Agentバージョンを表示してるし、1か所で管理して、他は参照する感じで、バージョンアップ時の抜け漏れを削減したい」
+
+- **原因分析 & 調査結果**:
+  1. **Worker Agent のバージョン未更新による同期停止**:
+     - 項目⑲（双方向モデル差分同期 `pull_missing_models_from_master`）は `agent.py` v3.13.3 で実装されていたが、Master側の `src/version.py` 内 `AGENT_VERSION` が `3.13.2` のまま据え置かれていたため、Piggyback AutoUpdate が発動せず、実機の全Workerが古い v3.13.2 で稼働し続けていた。
+  2. **COEIROINK公式エンジンのメモリキャッシュ仕様**:
+     - COEIROINK公式コンテナは起動時にモデルをメモリ上に読み込むため、稼働中（Running）のコンテナに新モデルを認識させるにはエンジンの再起動（リロード）が必要だが、Pull 完了時の再起動処理が抜けていた。
+  3. **ZIPアップロード上限**:
+     - 単一ZIPおよびチャンク結合上限が 500MB に制限されており、高音質大容量モデル（1GB超）の導入ができなかった。また aiohttp の `client_max_size` が 1GB だった。
+  4. **Agent バージョン定義の分散・ハードコードによる乖離リスク**:
+     - `src/version.py` (`AGENT_VERSION`), `src/web/static/agent.py` (`AGENT_VERSION`), `src/web/templates/index.html` (バッジ内 `v3.13.2`), `src/web/static/app.js` (`let maxVer = window.latestAgentVersion || "3.13.2"`) の 4 箇所にバージョン値が分散・ハードコードされていた。
+     - `server.py` は `html.replace("{{AGENT_VERSION}}", AGENT_VERSION)` を行っていたが、`index.html` 側にプレースホルダーではなく `v3.13.2` が直書きされていたため、テンプレート置換が機能していなかった。
+
+- **対応内容**:
+  1. **MYCOEIROINK ZIPアップロード上限の2GB拡張**:
+     - `src/web/server.py`: `client_max_size` を 2.5GB (`2560 * 1024 * 1024`)、単一ZIPおよびチャンク結合上限を 2GB (`2048 * 1024 * 1024`) に拡張。
+     - `src/tts/mycoeiroink.py`: `MAX_UPLOAD_SIZE = 2GB`、`MAX_EXTRACT_SIZE = 5GB`、`MAX_SINGLE_FILE_SIZE = 2GB` に拡張。
+     - `src/web/static/app.js`, `src/web/templates/index.html`: WebUIフロントエンド側のファイルサイズバリデーションおよび表示を 2GB に更新。
+  2. **Worker Agent v3.13.4 の COEIROINK 自動リロード実装**:
+     - `src/web/static/agent.py`: `pull_missing_models_from_master` において、モデル配置完了後に COEIROINK コンテナが稼働中（`is_container_running` / `docker_api.is_running`）であれば、`stop_engine("coeiroink")` ➔ `start_engine("coeiroink")` を自動実行して最新モデルを即時リロード。
+  3. **Agent バージョンの単一管理元 (SSOT) 統合 ＆ 全参照箇所の自動連動化**:
+     - **単一管理元の確立 (`src/version.py`)**: `AGENT_VERSION = "3.13.4"` を唯一の定義元とし、リポジトリ内 `agent.py` への自動同期関数 `sync_agent_py_version()` を提供。
+     - **Worker Agent の透過参照 & フォールバック保護 (`src/web/static/agent.py`)**:
+       `try: from src.version import AGENT_VERSION except ImportError: AGENT_VERSION = "3.13.4"` 構造を導入。開発・テスト・リポジトリ環境では `src/version.py` を自動直接インポートし、Worker機スタンドアローン稼働時はフォールバックを使用。
+     - **Master 配信時の動的自動置換 & 起動時自動同期 (`src/web/server.py`)**:
+       サーバー起動時に `sync_agent_py_version()` を実行して静的スクリプトを自動同期。さらに Worker がスクリプトをダウンロードするエンドポイント (`handle_worker_agent_script`) で正規表現 `re.sub(r'AGENT_VERSION\s*=\s*["\'][^"\']*["\']', ...)` により、常に Master の最新バージョンを動的注入して配信。
+     - **WebUI テンプレートへの完全連動 (`src/web/templates/index.html`)**:
+       ハードコード `v3.13.2` を撤廃し、`最新 Agent v{{AGENT_VERSION}} (自律同期対応)` および `server-data` 内の `"agent_version": "{{AGENT_VERSION}}"` に置換。HTML読み込み時に `window.latestAgentVersion` を初期化。
+     - **WebUI フロントエンドの単一参照化 (`src/web/static/app.js`)**:
+       ハードコード `"3.13.2"` を完全排除。Master が配信する `window.latestAgentVersion` を正本としてバッジ表示とバージョン追跡を実行。
+  4. **単体テストと検証**:
+     - `tests/test_audit_remediation_11_to_19.py`: 2GB上限の検証に加え、HTMLテンプレートの `{{AGENT_VERSION}}` 置換、JS側のハードコード排除、`sync_agent_py_version()` の正常性、Server/Agent 間のバージョン完全整合性を自動検証する単体テストを強化。全72テスト 100% PASS。
+
 ## [2026-10-28] GitHub Code Scanning (CodeQL) アラート全8件の修正 (SSRF & Path Injection)
 
 - **ユーザーフィードバック & 課題**:
