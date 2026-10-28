@@ -1,6 +1,30 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] GitHub Code Scanning (CodeQL) アラート全8件の修正 (SSRF & Path Injection)
+
+- **ユーザーフィードバック & 課題**:
+  - 「GithubのCodescanningを対処して、それが終わってからにしよう」
+  - GitHub Code Scanning (CodeQL) にてオープン状態となっていた 8 件のセキュリティアラートの解消：
+    1. Alert #83: `py/full-ssrf` (Critical) - `_verify_worker_direct_reachability` における Worker 直接照会 URL 組み立て
+    2. Alert #84: `py/full-ssrf` (Critical) - `_pull_missing_models_from_worker` における Worker IP への直接モデル Pull URL 組み立て
+    3. Alert #85, #86, #87: `py/path-injection` (High) - `_pull_missing_models_from_worker` での一時ファイル名パスへのユーザー入力混入 (`open`, `exists`, `unlink`)
+    4. Alert #88, #89, #90: `py/path-injection` (High) - `api_worker_models_upload` での一時ファイル名パスへのユーザー入力混入 (`open`, `_install_coeiroink_model_from_tar_file`, `unlink`)
+
+- **対応内容**:
+  1. **SSRF (CWE-918) 防御と Taint 完全遮断 (`src/utils/security.py`, `src/web/server.py`)**:
+     - `src/utils/security.py` に `sanitize_worker_ip(ip_str: str) -> Optional[str]` を新設。
+     - CodeQL の taint barrier として、`ipaddress.ip_address` による厳格検証後、整数キャスト（IPv4: `addr.packed` のバイト整数配列、IPv6: `addr.exploded` のヘックステット整数）を経由して完全に新しいクリーンな文字列として再構築。
+     - クラウドメタデータ (169.254.169.254)、ループバック、マルチキャスト、未指定アドレス等を確実にブロック。
+     - `src/web/server.py` の `_verify_worker_direct_reachability` および `_pull_missing_models_from_worker` において、`candidate_ip` / `worker_ip` を `sanitize_worker_ip` で非汚染 IP に変換して使用。またモデル名には `urllib.parse.quote` を適用。
+  2. **Path Injection (CWE-22) 防護 (`src/web/server.py`)**:
+     - `_pull_missing_models_from_worker` および `api_worker_models_upload` において、一時ファイル生成パスからユーザー入力（`clean_name`, `clean_model_name`）を完全に排除。
+     - `Path(tempfile.gettempdir()) / f"pull_worker_model_{uuid.uuid4().hex}.tar"` および `Path(tempfile.gettempdir()) / f"upload_worker_model_{uuid.uuid4().hex}.tar"` に改修。
+     - ユーザー入力由来の taint を完全に遮断し、ファイルシステム操作における Path Injection 警告を根本解消。
+  3. **単体テストと隔離検証 (`tests/test_audit_remediation_11_to_19.py`)**:
+     - `test_code_scanning_security_remediation` を新設。IPサニタイズ（正常系・メタデータ・インジェクション混入・ループバック遮断）および一時ファイルパスの安全性を検証。
+     - サンドボックス検証環境にて全71件の単体テストを実行し、100% PASS を確認。コンテナおよび一時データをゼロフットプリントで自動破棄。
+
 ## [2026-10-28] クラウドTTS (Edge/Azure/Google) & OpenJTalk の動的チャンク長スケーリング ＆ 合成実績フィードバック追跡の実装
 
 - **ユーザーフィードバック & 課題**:

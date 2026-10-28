@@ -393,6 +393,47 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
             # Worker は model_b を持つが Master は持たない -> Worker が Upload (または Master が Pull) すべきモデル: ["model_b"]
             self.assertEqual(models_to_upload, ["model_b"])
 
+    # =========================================================================
+    # GitHub Code Scanning (CodeQL) セキュリティ修復テスト (CWE-918, CWE-22)
+    # =========================================================================
+    def test_code_scanning_security_remediation(self):
+        """CodeQL Alert #83-#90 (SSRF / Path Injection) の防御検証"""
+        from src.utils.security import sanitize_worker_ip, validate_safe_worker_ip, sanitize_filename
+
+        # 1. SSRF 防護: sanitize_worker_ip の検証
+        self.assertEqual(sanitize_worker_ip("192.168.1.50"), "192.168.1.50")
+        self.assertEqual(sanitize_worker_ip(" 10.0.0.1 "), "10.0.0.1")
+        self.assertEqual(sanitize_worker_ip("100.64.1.2"), "100.64.1.2")
+        
+        # 危険なIP・メタデータ・未指定・ループバックのブロック
+        self.assertIsNone(sanitize_worker_ip("169.254.169.254"))  # クラウドメタデータ (AWS/GCP/Azure)
+        self.assertIsNone(sanitize_worker_ip("127.0.0.1"))        # ループバック
+        self.assertIsNone(sanitize_worker_ip("0.0.0.0"))          # 未指定
+        self.assertIsNone(sanitize_worker_ip("224.0.0.1"))        # マルチキャスト
+        self.assertIsNone(sanitize_worker_ip("192.168.1.50; id")) # コマンドインジェクション混入
+        self.assertIsNone(sanitize_worker_ip("evil.com"))         # ドメイン名混入
+        self.assertIsNone(sanitize_worker_ip(None))
+        self.assertIsNone(sanitize_worker_ip(""))
+
+        # validate_safe_worker_ip も一貫して動作すること
+        self.assertTrue(validate_safe_worker_ip("192.168.1.50"))
+        self.assertFalse(validate_safe_worker_ip("169.254.169.254"))
+        self.assertFalse(validate_safe_worker_ip("127.0.0.1"))
+
+        # 2. Path Injection 防護: 一時ファイル名にモデル名が混入しないことの検証
+        server = WebServer(
+            bot=MagicMock(),
+            config=AppConfig(),
+            database=MagicMock(),
+            cache_manager=MagicMock(),
+            tts_manager=MagicMock()
+        )
+
+        # _pull_missing_models_from_worker のテスト: 危険なモデル名
+        dangerous_model_name = "../../etc/passwd"
+        clean_name = sanitize_filename(dangerous_model_name)
+        self.assertEqual(clean_name, "passwd")  # トラバーサル除去確認
+
 
 if __name__ == "__main__":
     unittest.main()

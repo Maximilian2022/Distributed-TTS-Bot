@@ -42,6 +42,34 @@ def is_private_or_local_ip(ip_str: str) -> bool:
         return False
 
 
+def sanitize_worker_ip(ip_str: str) -> Optional[str]:
+    """
+    通信先IPアドレスを検証し、整数変換経由で再構築した安全なIP文字列を返却する (SSRF / CWE-918 防護)。
+    - CodeQL の taint barrier として、整数キャスト (int) を経由して完全に新しい文字列を生成。
+    - ループバック (127.0.0.1, ::1)、リンクローカル/クラウドメタデータ (169.254.169.254)、
+      マルチキャスト、未指定 (0.0.0.0)、予約済みアドレスを拒否。
+    """
+    if not ip_str or not isinstance(ip_str, str):
+        return None
+    ip_clean = ip_str.strip()
+    if not re.match(r'^[0-9a-fA-F:\.]+$', ip_clean):
+        return None
+    try:
+        addr = ipaddress.ip_address(ip_clean)
+        if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
+            logger.warning(f"SSRF guard: Disallowed IP address blocked: {ip_clean}")
+            return None
+        # 整数変換経由で再構築 (CodeQL Taint-Free / CWE-918)
+        if isinstance(addr, ipaddress.IPv4Address):
+            octets = [int(b) for b in addr.packed]
+            return f"{octets[0]}.{octets[1]}.{octets[2]}.{octets[3]}"
+        else:
+            hextets = [int(h, 16) for h in addr.exploded.split(":")]
+            return ":".join(f"{h:x}" for h in hextets)
+    except ValueError:
+        return None
+
+
 def validate_safe_worker_ip(ip_str: str) -> bool:
     """
     通信先IPアドレスが安全かを検証する (SSRF / CWE-918 防護)。
@@ -49,19 +77,7 @@ def validate_safe_worker_ip(ip_str: str) -> bool:
     - ループバック (127.0.0.1, ::1)、リンクローカル/クラウドメタデータ (169.254.169.254)、
       マルチキャスト、未指定 (0.0.0.0)、予約済みアドレスを拒否
     """
-    if not ip_str or not isinstance(ip_str, str):
-        return False
-    ip_clean = ip_str.strip()
-    if not re.match(r'^[0-9a-fA-F:\.]+$', ip_clean):
-        return False
-    try:
-        addr = ipaddress.ip_address(ip_clean)
-        if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
-            logger.warning(f"SSRF guard: Disallowed IP address blocked: {ip_clean}")
-            return False
-        return True
-    except ValueError:
-        return False
+    return sanitize_worker_ip(ip_str) is not None
 
 
 def sanitize_filename(filename: str) -> str:

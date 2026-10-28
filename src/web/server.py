@@ -19,6 +19,7 @@ import tarfile
 import hashlib
 import ipaddress
 import uuid
+import tempfile
 import py_compile
 import aiohttp
 from aiohttp import web
@@ -34,7 +35,7 @@ from src.version import BUILD_VERSION, BUILD_DATE, AGENT_VERSION
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
 from src.utils.avatar_manager import get_avatar_path, has_avatar
-from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script, sanitize_filename, is_private_or_local_ip
+from src.utils.security import validate_safe_worker_ip, sanitize_worker_ip, validate_safe_path, is_safe_identifier, safe_json_for_html_script, sanitize_filename, is_private_or_local_ip
 from src.utils.system_info import get_host_system_info
 from .auth import DiscordAuth
 
@@ -4209,14 +4210,15 @@ class WebServer:
         if ip_clean in ("127.0.0.1", "::1", "localhost"):
             return not is_wan
 
-        if not validate_safe_worker_ip(ip_clean):
+        safe_ip = sanitize_worker_ip(ip_clean)
+        if not safe_ip:
             return False
 
         safe_port = int(agent_port or 50030)
         if not (1 <= safe_port <= 65535):
             return False
 
-        cache_key = (ip_clean, safe_port, str(expected_node_id).strip())
+        cache_key = (safe_ip, safe_port, str(expected_node_id).strip())
         now = time.time()
         if not force_refresh and cache_key in self._worker_reachability_cache:
             ts, cached_ok = self._worker_reachability_cache[cache_key]
@@ -4224,7 +4226,7 @@ class WebServer:
             if now - ts < ttl:
                 return cached_ok
 
-        health_url = f"http://{ip_clean}:{safe_port}/health"
+        health_url = f"http://{safe_ip}:{safe_port}/health"
         reachable = False
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout)) as session:
@@ -5705,7 +5707,8 @@ class WebServer:
         """
         Worker 側にのみ存在する未保有モデルを Master から直接 HTTP Pull して同期するバックグラウンドタスク (項目⑲)。
         """
-        if not validate_safe_worker_ip(worker_ip):
+        safe_worker_ip = sanitize_worker_ip(worker_ip)
+        if not safe_worker_ip:
             return
         safe_port = int(agent_port or 50030)
         if not (1 <= safe_port <= 65535):
@@ -5730,14 +5733,17 @@ class WebServer:
                 continue
 
             self._syncing_models.add(clean_name)
-            tmp_tar = Path(f"/tmp/pull_worker_model_{clean_name}_{uuid.uuid4().hex[:8]}.tar")
+            # Path Injection (CWE-22) 防護: テンポラリファイル名にはユーザー入力を一切含めず純粋な UUID のみを使用
+            tmp_tar = Path(tempfile.gettempdir()) / f"pull_worker_model_{uuid.uuid4().hex}.tar"
             try:
-                dl_url = f"http://{worker_ip}:{safe_port}/models/download/{clean_name}"
+                # SSRF (CWE-918) 防護: sanitize_worker_ip による非汚染 IP および URL エンコードされたモデル名を使用
+                quoted_name = urllib.parse.quote(clean_name)
+                dl_url = f"http://{safe_worker_ip}:{safe_port}/models/download/{quoted_name}"
                 headers = {}
                 secret = getattr(self.config, "worker_shared_secret", "").strip()
                 if secret:
                     headers["X-Worker-Token"] = secret
-                logger.info(f"📥 [ModelSync] Worker ({worker_ip}:{safe_port}) から未保有モデル '{clean_name}' を Pull 取得中...")
+                logger.info(f"📥 [ModelSync] Worker ({safe_worker_ip}:{safe_port}) から未保有モデル '{clean_name}' を Pull 取得中...")
                 timeout = aiohttp.ClientTimeout(total=300.0, connect=5.0, sock_read=60.0)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.get(dl_url, headers=headers) as resp:
@@ -5757,7 +5763,7 @@ class WebServer:
                 if not ok:
                     logger.warning(f"⚠️ [ModelSync] Worker からの Pull モデル '{clean_name}' 展開失敗: {msg}")
             except Exception as e:
-                logger.debug(f"[ModelSync] Pull model '{clean_name}' from {worker_ip} skipped/failed: {e}")
+                logger.debug(f"[ModelSync] Pull model '{clean_name}' from {safe_worker_ip} skipped/failed: {e}")
             finally:
                 self._syncing_models.discard(clean_name)
                 try:
@@ -5800,7 +5806,8 @@ class WebServer:
             pass
 
         self._syncing_models.add(clean_model_name)
-        tmp_tar = Path(f"/tmp/upload_worker_model_{clean_model_name}_{uuid.uuid4().hex[:8]}.tar")
+        # Path Injection (CWE-22) 防護: テンポラリファイル名にはユーザー入力を一切含めず純粋な UUID のみを使用
+        tmp_tar = Path(tempfile.gettempdir()) / f"upload_worker_model_{uuid.uuid4().hex}.tar"
         try:
             total_bytes = 0
             max_bytes = 1024 * 1024 * 1024  # 1GB上限
