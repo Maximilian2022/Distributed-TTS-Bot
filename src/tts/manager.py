@@ -991,7 +991,21 @@ class TTSManager:
             cloud_prov, cloud_param = chain[1]
 
             if speculative_timeout is None:
-                speculative_timeout = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", getattr(self.config, "speculative_timeout_seconds", 1.5)))
+                base_spec_timeout = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", getattr(self.config, "speculative_timeout_seconds", 1.5)))
+                try:
+                    from src.utils.latency_profiler import latency_profiler
+                    pool = self._get_pool_for_provider(prim_prov) if hasattr(self, "_get_pool_for_provider") else None
+                    cand_nodes = pool.nodes if pool and hasattr(pool, "nodes") else None
+                    speculative_timeout = latency_profiler.calculate_dynamic_speculative_timeout(
+                        base_timeout=base_spec_timeout,
+                        engine=prim_prov,
+                        text_len=len(text),
+                        chunk_index=0,
+                        buffer_headroom_sec=0.0,
+                        candidate_nodes=cand_nodes,
+                    )
+                except Exception:
+                    speculative_timeout = base_spec_timeout
             prim_task = asyncio.create_task(_call_provider(prim_prov, prim_param))
             try:
                 # 1500ms 待機 (ローカルGPU推論の完了を十分に粘り、キャラ声維持率を最大化)

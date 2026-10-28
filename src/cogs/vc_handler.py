@@ -1174,17 +1174,45 @@ class VCHandlerCog(commands.Cog):
 
         if getattr(item, "speculative_timeout", None) is not None:
             spec_timeout = float(item.speculative_timeout)
+            explicit_spec_timeout = True
         else:
             guild_settings = await self.db.get_guild_settings(guild.id, self.config)
             spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 1.5) or 1.5)
+            explicit_spec_timeout = False
 
-        async def _synth_chunk(ch, is_longest: bool):
+        def _estimate_chunk_play_sec(c_obj) -> float:
+            if getattr(c_obj, "is_beep", False):
+                dur = float(getattr(c_obj, "beep_duration_sec", 0.4) or 0.4)
+            else:
+                c_len = max(1, len(getattr(c_obj, "text", "") or ""))
+                dur = max(0.25, c_len * 0.14)
+            pause_s = float(getattr(c_obj, "pause_after_ms", 0) or 0) / 1000.0
+            return dur + pause_s
+
+        async def _synth_chunk(ch, is_longest: bool, chunk_idx: int = 0, est_headroom_sec: float = 0.0):
             t_s = time.time()
             if getattr(ch, "is_beep", False):
                 from src.utils.streaming_audio import get_beep_pcm
                 beep_pcm = get_beep_pcm(getattr(ch, "beep_duration_sec", 0.4))
                 t_e = time.time()
                 return ch, beep_pcm, "beep", "local", True, t_s, t_e, False, []
+
+            live_buf_sec = getattr(stream_source, "buffer_remaining_seconds", 0.0)
+            total_headroom = max(est_headroom_sec, live_buf_sec)
+            if explicit_spec_timeout and chunk_idx == 0 and total_headroom <= 0.2:
+                chunk_spec_timeout = spec_timeout
+            else:
+                try:
+                    from src.utils.latency_profiler import latency_profiler
+                    chunk_spec_timeout = latency_profiler.calculate_dynamic_speculative_timeout(
+                        base_timeout=spec_timeout,
+                        engine=engine_name,
+                        text_len=len(ch.text),
+                        chunk_index=chunk_idx,
+                        buffer_headroom_sec=total_headroom,
+                    )
+                except Exception:
+                    chunk_spec_timeout = spec_timeout
 
             b, p, w, c = await self.tts_manager.get_chunk_audio(
                 text=ch.text,
@@ -1193,7 +1221,7 @@ class VCHandlerCog(commands.Cog):
                 speed=item.speed,
                 user_id=item.user_id,
                 is_longest_chunk=is_longest,
-                speculative_timeout=spec_timeout
+                speculative_timeout=chunk_spec_timeout
             )
             t_e = time.time()
             c_meta = (
@@ -1218,15 +1246,17 @@ class VCHandlerCog(commands.Cog):
 
         try:
             if len(all_chunks) > 1:
+                cum_headroom_sec = _estimate_chunk_play_sec(first_chunk)
                 for idx, ch in enumerate(all_chunks[1:], start=1):
                     is_long = (idx == longest_idx)
-                    t = asyncio.create_task(_synth_chunk(ch, is_long))
+                    t = asyncio.create_task(_synth_chunk(ch, is_long, chunk_idx=idx, est_headroom_sec=cum_headroom_sec))
                     remaining_tasks.append(t)
                     all_created_tasks.append(t)
+                    cum_headroom_sec += _estimate_chunk_play_sec(ch)
 
             # 第1チャンクの取得
             c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await _synth_chunk(
-                first_chunk, first_is_longest
+                first_chunk, first_is_longest, chunk_idx=0, est_headroom_sec=0.0
             )
 
             # 第1チャンクをストリームに投入

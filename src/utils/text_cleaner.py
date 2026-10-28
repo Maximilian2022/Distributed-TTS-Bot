@@ -843,6 +843,12 @@ class TextCleaner:
                         min_chars=8,
                         max_chars=effective_max_chars
                     )
+                    # 第2チャンク以降の上限 (effective_max_chars) も未指定時はエンジンの実測性能に連動スケーリング
+                    if max_chunk_chars is None and effective_first_chars is not None:
+                        effective_max_chars = min(
+                            _MAX_CHUNK_CHARS,
+                            max(effective_first_chars + 4, int(round(effective_first_chars * 1.5)))
+                        )
                 except Exception as e:
                     logger.debug(f"Dynamic max chars resolution error: {e}")
 
@@ -978,7 +984,10 @@ class TextCleaner:
         comma_refined: List[Tuple[str, str]] = []
         for idx, (sentence, delim) in enumerate(head_conj_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
-            comma_thresh = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars and max_first_chunk_chars < 15) else 15)
+            cur_limit = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars) else max_chunk_chars)
+            comma_thresh = min(15, max(6, int(cur_limit * 0.55)))
+            if idx == 0 and is_first_plain_segment and max_first_chunk_chars and max_first_chunk_chars < 15:
+                comma_thresh = min(comma_thresh, max_first_chunk_chars)
             if '、' in sentence and raw_len > comma_thresh:
                 sub_parts = _RE_SPLIT_COMMA.split(sentence)
                 temp_pieces: List[Tuple[str, str]] = []
@@ -997,11 +1006,13 @@ class TextCleaner:
             else:
                 comma_refined.append((sentence, delim))
 
-        # 3. スペース（空白）境界分割 (新設: 14文字超、英単語間スペース保護、O(N)スキャン)
+        # 3. スペース（空白）境界分割 (動的閾値連動、英単語間スペース保護、O(N)スキャン)
         space_refined: List[Tuple[str, str]] = []
-        for sentence, delim in comma_refined:
+        for idx, (sentence, delim) in enumerate(comma_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
-            if raw_len > 14:
+            cur_limit = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars) else max_chunk_chars)
+            space_thresh = min(14, max(6, int(cur_limit * 0.5)))
+            if raw_len > space_thresh:
                 s_parts = TextCleaner._split_by_space_boundary(sentence)
                 if len(s_parts) > 1 and all(len(_RE_STRIP_PUNCT_SPACES.sub('', p)) >= _MIN_PART_CHARS for p in s_parts):
                     for p_idx, p in enumerate(s_parts):
@@ -1012,21 +1023,26 @@ class TextCleaner:
             else:
                 space_refined.append((sentence, delim))
 
-        # 4. スラング・笑い境界分割 (新設: 14文字超)
+        # 4. スラング・笑い境界分割 (動的閾値連動)
         slang_refined: List[Tuple[str, str]] = []
-        for sentence, delim in space_refined:
+        for idx, (sentence, delim) in enumerate(space_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
-            if raw_len > 14:
+            cur_limit = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars) else max_chunk_chars)
+            slang_thresh = min(14, max(6, int(cur_limit * 0.5)))
+            if raw_len > slang_thresh:
                 slang_pieces = TextCleaner._split_by_slang_boundary(sentence, delim)
                 slang_refined.extend(slang_pieces)
             else:
                 slang_refined.append((sentence, delim))
 
-        # 5. 語尾・終助詞・丁寧語終止形境界 (新設: 16文字超、句読点なし文)
+        # 5. 語尾・終助詞・丁寧語終止形境界 (動的閾値連動、句読点なし文)
         ending_refined: List[Tuple[str, str]] = []
-        for sentence, delim in slang_refined:
+        for idx, (sentence, delim) in enumerate(slang_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
-            if raw_len > 16:
+            cur_limit = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars) else max_chunk_chars)
+            ending_thresh = min(16, max(7, int(cur_limit * 0.55)))
+            end_min_part = min(6, max(3, ending_thresh // 3))
+            if raw_len > ending_thresh:
                 end_parts = _RE_SPLIT_ENDING.split(sentence)
                 if len(end_parts) > 1:
                     e_buf = ""
@@ -1034,7 +1050,7 @@ class TextCleaner:
                     for e_idx, e_p in enumerate(end_parts):
                         e_buf += e_p
                         if e_idx % 2 == 1: # キャプチャされた語尾
-                            if len(e_buf) >= 6 and (len(sentence) - len("".join(end_parts[:e_idx+1]))) >= 6:
+                            if len(e_buf) >= end_min_part and (len(sentence) - len("".join(end_parts[:e_idx+1]))) >= end_min_part:
                                 e_pieces.append((e_buf.strip(), "ending"))
                                 e_buf = ""
                     if e_buf.strip():
@@ -1048,15 +1064,17 @@ class TextCleaner:
             else:
                 ending_refined.append((sentence, delim))
 
-        # 6. 長文に対する形態素（SudachiPy / Janome / 接続助詞・接続詞）での分割 (動的閾値連動)
+        # 6. 長文に対する形態素（SudachiPy / Janome / 接続助詞・接続詞）での分割 (全チャンク動的閾値連動)
         morph_refined: List[Tuple[str, str]] = []
         for idx, (sentence, delim) in enumerate(ending_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
-            # 第1文かつ動的第1文上限が指定されている場合
-            if idx == 0 and is_first_plain_segment and max_first_chunk_chars and max_first_chunk_chars < 18:
-                m_thresh = max(8, max_first_chunk_chars)
-                m_head = min(5, max(3, max_first_chunk_chars // 2))
-                m_tail = min(4, max(3, max_first_chunk_chars // 3))
+            cur_limit = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars) else max_chunk_chars)
+            if cur_limit < 22:
+                m_thresh = max(8, min(18, int(cur_limit * 0.75)))
+                if idx == 0 and is_first_plain_segment and max_first_chunk_chars and max_first_chunk_chars < 18:
+                    m_thresh = max(8, min(m_thresh, max_first_chunk_chars))
+                m_head = min(7, max(3, m_thresh // 2))
+                m_tail = min(5, max(3, m_thresh // 3))
             else:
                 m_thresh = 18
                 m_head = 7

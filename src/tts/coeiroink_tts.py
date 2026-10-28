@@ -150,6 +150,21 @@ class CoeiroinkTTSClient(BaseTTSClient):
             logger.debug(f"COEIROINK engine unreachable from {url} (container may be idle): {e}")
             return []
 
+    @staticmethod
+    def calculate_synthesis_timeout(
+        text_len: int,
+        has_gpu: bool = True,
+        base_timeout: float = 12.0
+    ) -> float:
+        """
+        文字数とGPU/CPU構成に応じた動的な COEIROINK 波形合成タイムアウト秒数を算出。
+        """
+        safe_len = max(1, int(text_len))
+        dyn = 6.0 + safe_len * 0.20
+        if not has_gpu:
+            dyn *= 1.5
+        return round(min(25.0, max(6.0, dyn, float(base_timeout or 6.0) * 0.6)), 2)
+
     async def synthesize(
         self,
         text: str,
@@ -175,9 +190,10 @@ class CoeiroinkTTSClient(BaseTTSClient):
                 raise TTSConnectionError("No available COEIROINK node in pool (all busy or offline)")
             async with lease as node:
                 try:
-                    # 外部ワーカーへのリクエストは最大12.0秒（Speculative TTSと調和させ、誤隔離を完全防止）
-                    default_ext_timeout = min(self.timeout_seconds, 12.0)
-                    worker_timeout = float(os.getenv("EXTERNAL_WORKER_TIMEOUT_SECONDS", str(default_ext_timeout))) if node.is_external else self.timeout_seconds
+                    node_has_gpu = bool(getattr(node, "has_gpu", False))
+                    dyn_timeout = self.calculate_synthesis_timeout(len(text), has_gpu=node_has_gpu, base_timeout=self.timeout_seconds)
+                    env_ext = os.getenv("EXTERNAL_WORKER_TIMEOUT_SECONDS")
+                    worker_timeout = float(env_ext) if (node.is_external and env_ext) else dyn_timeout
                     if getattr(node, "is_ws", False):
                         res = await node.synthesize(
                             engine="coeiroink",
@@ -189,7 +205,7 @@ class CoeiroinkTTSClient(BaseTTSClient):
                         )
                     else:
                         res = await self._synthesize_on_node(
-                            node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout
+                            node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout, has_gpu=node_has_gpu
                         )
                     latency_ms = (time.time() - t0) * 1000.0
                     self.last_worker_label = node.summary_label
@@ -207,7 +223,10 @@ class CoeiroinkTTSClient(BaseTTSClient):
                     raise
         else:
             # 単一ノード時
-            res = await self._synthesize_on_node(self.base_url, text, voice_name, pitch, speed)
+            dyn_timeout = self.calculate_synthesis_timeout(len(text), has_gpu=False, base_timeout=self.timeout_seconds)
+            res = await self._synthesize_on_node(
+                self.base_url, text, voice_name, pitch, speed, timeout_seconds=dyn_timeout, has_gpu=False
+            )
             latency_ms = (time.time() - t0) * 1000.0
             self.last_worker_label = "local_master (CPU)"
             logger.info(
@@ -222,7 +241,8 @@ class CoeiroinkTTSClient(BaseTTSClient):
         voice_name: str,
         pitch: str = "0%",
         speed: float = 1.0,
-        timeout_seconds: Optional[float] = None
+        timeout_seconds: Optional[float] = None,
+        has_gpu: bool = True
     ) -> bytes:
         session = await self._get_session()
         speaker_uuid, style_id = self._parse_voice_identifier(voice_name)
@@ -249,7 +269,9 @@ class CoeiroinkTTSClient(BaseTTSClient):
             "accept": "audio/wav"
         }
 
-        eff_timeout = timeout_seconds or self.timeout_seconds
+        eff_timeout = timeout_seconds if timeout_seconds is not None else self.calculate_synthesis_timeout(
+            len(text), has_gpu=has_gpu, base_timeout=self.timeout_seconds
+        )
         req_timeout = aiohttp.ClientTimeout(total=eff_timeout)
 
         try:

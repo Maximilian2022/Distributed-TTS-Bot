@@ -104,6 +104,21 @@ class VoicevoxTTSClient(BaseTTSClient):
             logger.warning(f"Failed to fetch VOICEVOX speakers from {url}: {e}")
             return []
 
+    @staticmethod
+    def calculate_synthesis_timeout(
+        text_len: int,
+        has_gpu: bool = True,
+        base_timeout: float = 10.0
+    ) -> float:
+        """
+        文字数とGPU/CPU構成に応じた動的な波形合成タイムアウト秒数を算出。
+        """
+        safe_len = max(1, int(text_len))
+        dyn = 5.0 + safe_len * 0.18
+        if not has_gpu:
+            dyn *= 1.5
+        return round(min(25.0, max(6.0, dyn, float(base_timeout or 6.0) * 0.6)), 2)
+
     async def synthesize(
         self,
         text: str,
@@ -127,7 +142,10 @@ class VoicevoxTTSClient(BaseTTSClient):
             if not lease:
                 raise TTSConnectionError("No available VOICEVOX node in pool (all busy or offline)")
             async with lease as node:
-                worker_timeout = float(os.getenv("EXTERNAL_WORKER_TIMEOUT_SECONDS", str(self.timeout_seconds))) if node.is_external else self.timeout_seconds
+                node_has_gpu = bool(getattr(node, "has_gpu", False))
+                dyn_timeout = self.calculate_synthesis_timeout(len(text), has_gpu=node_has_gpu, base_timeout=self.timeout_seconds)
+                env_ext = os.getenv("EXTERNAL_WORKER_TIMEOUT_SECONDS")
+                worker_timeout = float(env_ext) if (node.is_external and env_ext) else dyn_timeout
                 if getattr(node, "is_ws", False):
                     res = await node.synthesize(
                         engine="voicevox",
@@ -139,7 +157,7 @@ class VoicevoxTTSClient(BaseTTSClient):
                     )
                 else:
                     res = await self._synthesize_on_node(
-                        node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout
+                        node.url, text, voice_name, pitch, speed, timeout_seconds=worker_timeout, has_gpu=node_has_gpu
                     )
                 latency_ms = (time.time() - t0) * 1000.0
                 self.last_worker_label = node.summary_label
@@ -148,7 +166,10 @@ class VoicevoxTTSClient(BaseTTSClient):
                 )
                 return res
         else:
-            res = await self._synthesize_on_node(self.base_url, text, voice_name, pitch, speed)
+            dyn_timeout = self.calculate_synthesis_timeout(len(text), has_gpu=False, base_timeout=self.timeout_seconds)
+            res = await self._synthesize_on_node(
+                self.base_url, text, voice_name, pitch, speed, timeout_seconds=dyn_timeout, has_gpu=False
+            )
             latency_ms = (time.time() - t0) * 1000.0
             self.last_worker_label = "local_master (CPU)"
             logger.info(
@@ -163,25 +184,31 @@ class VoicevoxTTSClient(BaseTTSClient):
         voice_name: str,
         pitch: str = "0%",
         speed: float = 1.0,
-        timeout_seconds: Optional[float] = None
+        timeout_seconds: Optional[float] = None,
+        has_gpu: bool = True
     ) -> bytes:
         session = await self._get_session()
         style_id = self._extract_style_id(voice_name)
         encoded_text = urllib.parse.quote(text)
-        eff_timeout = timeout_seconds or self.timeout_seconds
-        req_timeout = aiohttp.ClientTimeout(total=eff_timeout)
+        eff_timeout = timeout_seconds if timeout_seconds is not None else self.calculate_synthesis_timeout(
+            len(text), has_gpu=has_gpu, base_timeout=self.timeout_seconds
+        )
+        # audio_query は軽量なため 3.0s で迅速にハング検知、synthesis は文字数・GPU有無に応じた動的タイムアウト
+        query_timeout_sec = min(3.0, eff_timeout) if eff_timeout > 0 else 3.0
+        query_timeout = aiohttp.ClientTimeout(total=query_timeout_sec)
+        synth_timeout = aiohttp.ClientTimeout(total=eff_timeout)
 
         # 1. 音声合成用クエリの作成
         query_url = f"{target_url}/audio_query?text={encoded_text}&speaker={style_id}"
         try:
-            async with session.post(query_url, timeout=req_timeout) as q_resp:
+            async with session.post(query_url, timeout=query_timeout) as q_resp:
                 if q_resp.status != 200:
                     err_msg = await q_resp.text()
                     logger.error(f"VOICEVOX audio_query failed on {target_url} ({q_resp.status}): {err_msg}")
                     raise TTSError(f"VOICEVOX audio_query HTTP {q_resp.status}: {err_msg}")
                 query_data = await q_resp.json()
         except asyncio.TimeoutError:
-            raise TTSConnectionError(f"VOICEVOX audio_query timed out on {target_url} after {eff_timeout}s")
+            raise TTSConnectionError(f"VOICEVOX audio_query timed out on {target_url} after {query_timeout_sec}s")
         except aiohttp.ClientError as e:
             raise TTSConnectionError(f"VOICEVOX network error during audio_query on {target_url}: {e}")
 
@@ -197,7 +224,7 @@ class VoicevoxTTSClient(BaseTTSClient):
         synthesis_url = f"{target_url}/synthesis?speaker={style_id}"
         headers = {"Content-Type": "application/json"}
         try:
-            async with session.post(synthesis_url, json=query_data, headers=headers, timeout=req_timeout) as s_resp:
+            async with session.post(synthesis_url, json=query_data, headers=headers, timeout=synth_timeout) as s_resp:
                 if s_resp.status == 200:
                     return await s_resp.read()
                 else:

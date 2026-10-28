@@ -376,6 +376,14 @@ class StreamingAudioSource(discord.AudioSource):
         """アンダーラン（無音送出）の総ミリ秒数"""
         return float(self._underrun_frames * 20)
 
+    @property
+    def buffer_remaining_seconds(self) -> float:
+        """現在バッファに蓄積されている未再生音声の残り再生秒数 (48kHz 16-bit Stereo = 192000 bytes/sec)"""
+        if self._is_closed:
+            return 0.0
+        avail = max(0, len(self._buffer) - self._read_pos)
+        return avail / 192000.0
+
     def cleanup(self):
         """再生終了時のクリーンアップ"""
         self._is_closed = True

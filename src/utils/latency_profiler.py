@@ -224,6 +224,77 @@ class EngineLatencyProfiler:
         profile = self.get_or_create(node)
         return profile.estimate(text_len)
 
+    def estimate_synthesis_ms(
+        self,
+        engine: Optional[str] = None,
+        text_len: int = 10,
+        candidate_nodes: Optional[List[Any]] = None
+    ) -> float:
+        """
+        指定エンジンと文字数から、現在のクラスタ推論プロファイルに基づく予測合成時間(ms)を算出。
+        """
+        safe_len = max(1, int(text_len))
+        if not engine:
+            return 100.0 + safe_len * 20.0
+
+        eng_upper = engine.strip().upper()
+        matched_profiles: List[NodeLatencyProfile] = []
+        if candidate_nodes:
+            for n in candidate_nodes:
+                if getattr(n, "is_available", True):
+                    p = self.get_or_create(n)
+                    if p.engine_name == eng_upper:
+                        matched_profiles.append(p)
+        else:
+            for (_nid, e_name), p in self._profiles.items():
+                if e_name == eng_upper:
+                    matched_profiles.append(p)
+
+        if matched_profiles:
+            gpu_profiles = [p for p in matched_profiles if p.has_gpu]
+            if gpu_profiles:
+                best_gpu = max(gpu_profiles, key=lambda p: p.gpu_power_score)
+                return best_gpu.estimate(safe_len)
+            best_cpu = max(matched_profiles, key=lambda p: (p.sample_count, -p.ms_per_char))
+            return best_cpu.estimate(safe_len)
+
+        eng_prior = ENGINE_INITIAL_PRIORS.get(eng_upper, ENGINE_INITIAL_PRIORS["VOICEVOX"])
+        has_any_gpu = any(p.has_gpu for p in self._profiles.values())
+        prior = eng_prior["gpu_gen"] if has_any_gpu else eng_prior["cpu"]
+        return max(30.0, prior["base_ms"] + safe_len * prior["ms_per_char"])
+
+    def calculate_dynamic_speculative_timeout(
+        self,
+        base_timeout: float = 1.5,
+        engine: Optional[str] = None,
+        text_len: int = 10,
+        chunk_index: int = 0,
+        buffer_headroom_sec: float = 0.0,
+        candidate_nodes: Optional[List[Any]] = None
+    ) -> float:
+        """
+        チャンク位置・先行再生バッファ残量・文字数・エンジン実測推論時間に応じた
+        動的な Speculative TTS タイムアウト秒数を算出する。
+        - chunk_index == 0 (初動チャンク):
+          会話のテンポ維持が最優先。推定推論時間×1.35 と base_timeout を比較し [0.8s, 2.5s] にクランプ。
+        - chunk_index >= 1 (後続チャンク):
+          先行チャンク群の再生猶予 (buffer_headroom_sec) からクラウドTTS合成マージン (0.45s) を引いた秒数まで
+          ローカルエンジンの完了を粘り強く待ち、不必要な声変わり（クラウド投機混入）を防止する。
+        """
+        safe_base = max(0.5, float(base_timeout or 1.5))
+        est_ms = self.estimate_synthesis_ms(engine, max(1, text_len), candidate_nodes=candidate_nodes)
+        est_sec = est_ms / 1000.0
+
+        if chunk_index <= 0 and buffer_headroom_sec <= 0.2:
+            target = max(safe_base, est_sec * 1.35)
+            return round(min(2.5, max(0.8, target)), 2)
+
+        # 後続チャンクまたは十分な再生バッファ残量がある場合
+        headroom_budget = max(0.0, float(buffer_headroom_sec) - 0.45)
+        target = max(safe_base, headroom_budget, est_sec * 1.5)
+        min_bound = min(safe_base, 6.0)
+        return round(min(6.0, max(min_bound, target)), 2)
+
     def rank_nodes_by_power(self, nodes: List[Any]) -> List[Any]:
         """
         ノード一覧をGPU性能スコアの降順でソート (最強GPUが先頭)

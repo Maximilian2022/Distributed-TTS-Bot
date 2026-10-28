@@ -33,6 +33,46 @@ def get_host_memory_usage() -> Tuple[float, float, float]:
         return 0.0, 0.0, 0.0
 
 
+def get_dynamic_pin_limit(total_ram_gb: Optional[float] = None) -> int:
+    """
+    ホスト総RAM容量 (GB) に応じて安全にRAMDiskへピン留め常駐できる最大モデル数を動的算出。
+    - <= 8.5GB : 1モデル
+    - <= 16.5GB: 2モデル
+    - <= 32.5GB: 4モデル
+    - >  32.5GB: 6モデル
+    """
+    if total_ram_gb is None or total_ram_gb <= 0:
+        _, _, total_ram_gb = get_host_memory_usage()
+    if total_ram_gb <= 0:
+        return 2
+    if total_ram_gb <= 8.5:
+        return 1
+    if total_ram_gb <= 16.5:
+        return 2
+    if total_ram_gb <= 32.5:
+        return 4
+    return 6
+
+
+def get_dir_size_bytes(path: str) -> int:
+    """指定ディレクトリの合計サイズ (bytes) を再帰的に計測"""
+    total = 0
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    if not os.path.islink(fpath):
+                        total += os.path.getsize(fpath)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total
+
+
 class CoeiroinkRamManager:
     """
     COEIROINK 動的RAM Disk (tmpfs) マネージャー
