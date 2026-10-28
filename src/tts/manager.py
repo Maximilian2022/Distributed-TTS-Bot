@@ -13,6 +13,7 @@ from src.cache_manager import CacheManager
 from src.config import AppConfig, VoiceConfig
 from src.utils.text_cleaner import TextCleaner, TextChunk
 from src.utils.async_task import safe_create_task
+from src.utils.latency_profiler import latency_profiler
 from .base import BaseTTSClient, RateLimitError, TTSConnectionError, TTSError
 from .azure_tts import AzureTTSClient
 from .google_tts import GoogleTTSClient
@@ -787,7 +788,9 @@ class TTSManager:
                     speed=speed
                 )
                 if res:
-                    logger.info(f"☁️ [EDGE-TTS] 音声合成完了 ({(time.time()-t0)*1000:.0f}ms): クラウドAPI | text='{preview_text}'")
+                    dur_ms = (time.time() - t0) * 1000.0
+                    latency_profiler.record_synth_direct("edge", len(text), dur_ms)
+                    logger.info(f"☁️ [EDGE-TTS] 音声合成完了 ({dur_ms:.0f}ms): クラウドAPI | text='{preview_text}'")
                 return res
             except Exception as e:
                 logger.warning(f"Edge-TTS chunk synthesis failed: {e}")
@@ -805,7 +808,9 @@ class TTSManager:
                     speed=speed
                 )
                 if res:
-                    logger.info(f"☁️ [AZURE] 音声合成完了 ({(time.time()-t0)*1000:.0f}ms): クラウドAPI | text='{preview_text}'")
+                    dur_ms = (time.time() - t0) * 1000.0
+                    latency_profiler.record_synth_direct("azure", len(text), dur_ms)
+                    logger.info(f"☁️ [AZURE] 音声合成完了 ({dur_ms:.0f}ms): クラウドAPI | text='{preview_text}'")
                 return res
             except (RateLimitError, TTSConnectionError) as e:
                 logger.warning(f"Azure Speech chunk synthesis failed: {e}")
@@ -847,7 +852,9 @@ class TTSManager:
                     speed=speed
                 )
                 if res:
-                    logger.info(f"☁️ [GOOGLE] 音声合成完了 ({(time.time()-t0)*1000:.0f}ms): クラウドAPI | text='{preview_text}'")
+                    dur_ms = (time.time() - t0) * 1000.0
+                    latency_profiler.record_synth_direct("google", len(text), dur_ms)
+                    logger.info(f"☁️ [GOOGLE] 音声合成完了 ({dur_ms:.0f}ms): クラウドAPI | text='{preview_text}'")
                     # キャッシュ文字数をインクリメント
                     t_c, u_c = self._google_monthly_chars_cache
                     self._google_monthly_chars_cache = (t_c, u_c + len(text))
@@ -868,7 +875,9 @@ class TTSManager:
                     speed=speed
                 )
                 if res:
-                    logger.info(f"📢 [OPENJTALK] 音声合成完了 ({(time.time()-t0)*1000:.0f}ms): ローカルエンジン | text='{preview_text}'")
+                    dur_ms = (time.time() - t0) * 1000.0
+                    latency_profiler.record_synth_direct("openjtalk", len(text), dur_ms)
+                    logger.info(f"📢 [OPENJTALK] 音声合成完了 ({dur_ms:.0f}ms): ローカルエンジン | text='{preview_text}'")
                 return res
             except Exception as e:
                 logger.warning(f"OpenJTalk chunk synthesis failed: {e}")

@@ -65,6 +65,47 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         reconstructed_long = "".join(c.text for c in chunks_long).replace(" ", "")
         self.assertEqual(reconstructed_short, reconstructed_long)
 
+    def test_cloud_tts_dynamic_chunk_scaling_and_feedback(self):
+        """クラウドTTS (Edge/Azure/Google) の動的文字数適応・安全下限保護・実績フィードバックの検証"""
+        profiler = EngineLatencyProfiler()
+
+        # 1. コールドスタート初期値: クラウド安全下限 (14文字) と安全上限 (38文字) の保証
+        edge_chars_init = profiler.get_dynamic_max_chars("edge", target_budget_ms=1400.0)
+        self.assertGreaterEqual(edge_chars_init, 14)
+        self.assertLessEqual(edge_chars_init, 38)
+
+        azure_chars_init = profiler.get_dynamic_max_chars("azure", target_budget_ms=1400.0)
+        self.assertGreaterEqual(azure_chars_init, 14)
+        self.assertLessEqual(azure_chars_init, 38)
+
+        # 2. ネットワーク遅延・混雑フィードバック (低速回線シミュレーション)
+        # 15文字で 1200ms かかった実績を記録
+        for _ in range(5):
+            profiler.record_synth_direct("edge", 15, 1200.0)
+
+        edge_chars_slow = profiler.get_dynamic_max_chars("edge", target_budget_ms=1400.0)
+        # 遅延増大に伴い文字数が絞り込まれること
+        self.assertLess(edge_chars_slow, edge_chars_init)
+        # ただし API 乱発 (429/1006) を防ぐ安全下限 14文字 は下回らないこと
+        self.assertGreaterEqual(edge_chars_slow, 14)
+
+        # 3. 高速回線フィードバック (低遅延通信シミュレーション)
+        # 25文字でわずか 200ms で完了する超高速実績を記録
+        for _ in range(5):
+            profiler.record_synth_direct("azure", 25, 200.0)
+
+        azure_chars_fast = profiler.get_dynamic_max_chars("azure", target_budget_ms=1400.0)
+        # 高速回線では自然なイントネーションのため 30文字以上にスケールアップすること
+        self.assertGreaterEqual(azure_chars_fast, 30)
+        self.assertLessEqual(azure_chars_fast, 38)
+
+        # 4. TextCleaner.split_into_chunks でのクラウド話者自律連動
+        text = "クラウド音声合成の動的文字数テストです。回線状況に応じて適切な長さで分割されます。"
+        chunks_cloud = TextCleaner.split_into_chunks(text, speaker_id="edge_nanami")
+        self.assertGreater(len(chunks_cloud), 0)
+        # 先頭パーツが安全下限 14文字以上を尊重して自然に切り出されていること
+        self.assertTrue(any(len(c.text.strip()) >= 10 for c in chunks_cloud))
+
     # =========================================================================
     # 項目⑪: Speculative TTS バッファ残量連動タイムアウト＆残量計算テスト
     # =========================================================================

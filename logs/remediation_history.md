@@ -1,6 +1,31 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-28] クラウドTTS (Edge/Azure/Google) & OpenJTalk の動的チャンク長スケーリング ＆ 合成実績フィードバック追跡の実装
+
+- **ユーザーフィードバック & 課題**:
+  - 「今って、ローカルエンジンに対しては動的にマシンパワー、実績に応じたパーツ分け文字数上限が動的に決められてると思っている。クラウド側は固定のままになってる？かを確認してほしい。クラウド側も実績に応じた動的な値にしたほうが良いのかもと思い」
+- **調査結果 & 原因分析**:
+  - `src/utils/latency_profiler.py` の `get_dynamic_max_chars` において `LOCAL_ENGINES = {"coeiroink", "voicevox", "sharevox"}` の外側が無条件で `max_chars = 30` 固定になっていた。
+  - クラウド合成の実績レイテンシが `latency_profiler` に記録されておらず、回線混雑や低速通信環境に応じた適応が行われていなかった。
+- **対応内容**:
+  1. **クラウド各社＆OpenJTalk の事前特性分布の追加 (`src/utils/latency_profiler.py`)**:
+     - `ENGINE_INITIAL_PRIORS` に `EDGE` (base 320ms, 12ms/字), `AZURE` (base 240ms, 8ms/字), `GOOGLE` (base 280ms, 10ms/字), `OPENJTALK` (base 50ms, 4ms/字) を定義。
+     - `NodeLatencyProfile.__init__` で `"cloud"` プロファイルのコールドスタート初期化をサポート。
+  2. **クラウド直接実行実績のリアルタイム記録メソッド新設 (`src/utils/latency_profiler.py`, `src/tts/manager.py`)**:
+     - `EngineLatencyProfiler.record_synth_direct(engine_name, text_len, synth_ms)` を実装。
+     - `TTSManager` の `_try_edge`, `_try_azure`, `_try_google`, `_try_openjtalk` 成功時に、実測所要時間（ミリ秒）と文字数をフィードバック記録（EWMAによる回線速度自動追従）。
+  3. **クラウド特有の安全ガード付き動的文字数逆算 (`src/utils/latency_profiler.py`, `src/utils/text_cleaner.py`)**:
+     - **安全下限（14文字）保護**: 短時間の連続WebSocket接続やAPI乱発による 429 Too Many Requests や WebSocket 1006 異常切断を完全に防止。
+     - **安全上限（38文字）拡張**: 高速回線環境では自然なイントネーションを維持するため第2チャンク以降を最大38文字まで許容。
+     - **初動目標（1400ms）連動**: 回線遅延や混雑時は自動的に14〜18文字にスケーリングし、1秒未満で初動の音声が出始めるよう最適化。
+     - `TextCleaner.split_into_chunks` で `speaker_id` に `"edge"` が含まれる場合の話者解決漏れを修正し、クラウドエンジン時に `system_hardcap = 38` を適用。
+- **検証結果**:
+  - `tests/test_audit_remediation_11_to_19.py` に `test_cloud_tts_dynamic_chunk_scaling_and_feedback` を新設。
+  - 隔離サンドボックス環境にて全70件の単体テストを実行し、**Ran 70 tests in 2.331s - OK (100% PASS)** を確認。本番コンテナの健全稼働継続を確認。
+
+
+
 ## [2026-10-28] 全体監査第2フェーズ（項目⑪〜⑲および HA Slave Standby 対策）の実装 ＆ 完全自動モデル差分同期・Active Handshake到逹性検証
 
 - **ユーザーフィードバック & 合意事項**:

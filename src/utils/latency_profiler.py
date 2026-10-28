@@ -26,6 +26,22 @@ ENGINE_INITIAL_PRIORS = {
         "gpu_gen": {"base_ms": 110.0, "ms_per_char": 25.0},
         "cpu":     {"base_ms": 250.0, "ms_per_char": 75.0},
     },
+    "EDGE": {
+        # Edge-TTS (WebSocket / ネットワークRTT往復 + クラウド生成)
+        "cloud":   {"base_ms": 320.0, "ms_per_char": 12.0},
+    },
+    "AZURE": {
+        # Azure Cognitive Services TTS (高速・低遅延)
+        "cloud":   {"base_ms": 240.0, "ms_per_char": 8.0},
+    },
+    "GOOGLE": {
+        # Google Cloud TTS
+        "cloud":   {"base_ms": 280.0, "ms_per_char": 10.0},
+    },
+    "OPENJTALK": {
+        # ローカルCバイナリ超軽量推論
+        "cpu":     {"base_ms": 50.0,  "ms_per_char": 4.0},
+    },
 }
 
 class NodeLatencyProfile:
@@ -49,20 +65,24 @@ class NodeLatencyProfile:
         self.machine_name = machine_name
         self.ip = ip
 
-        # エンジン別・ハードウェア別のコールドスタート初期値 (VRAM容量ベース + 汎用識別子フォールバック)
+        # エンジン別・ハードウェア別のコールドスタート初期値 (クラウド/ローカル/GPU/CPU自動適応)
         eng_priors = ENGINE_INITIAL_PRIORS.get(self.engine_name, ENGINE_INITIAL_PRIORS["VOICEVOX"])
-        if has_gpu:
+        if "cloud" in eng_priors:
+            p = eng_priors["cloud"]
+            self.base_latency_ms = p["base_ms"]
+            self.ms_per_char = p["ms_per_char"]
+        elif has_gpu:
             g_upper = (gpu_name or "").upper()
             if vram_mb >= 16000 or any(k in g_upper for k in ("4090", "4080", "3090", "3080", "7900", "A100", "H100")):
-                p = eng_priors["gpu_top"]
+                p = eng_priors.get("gpu_top", eng_priors.get("cpu", {"base_ms": 100.0, "ms_per_char": 20.0}))
             elif vram_mb >= 8000 or any(k in g_upper for k in ("4070", "3070", "3060", "2080", "1080", "1070", "6800", "6700", "7800", "7700")):
-                p = eng_priors["gpu_mid"]
+                p = eng_priors.get("gpu_mid", eng_priors.get("cpu", {"base_ms": 150.0, "ms_per_char": 35.0}))
             else:
-                p = eng_priors["gpu_gen"]
+                p = eng_priors.get("gpu_gen", eng_priors.get("cpu", {"base_ms": 120.0, "ms_per_char": 25.0}))
             self.base_latency_ms = p["base_ms"]
             self.ms_per_char = p["ms_per_char"]
         else:
-            p = eng_priors["cpu"]
+            p = eng_priors.get("cpu", eng_priors.get("cloud", {"base_ms": 220.0, "ms_per_char": 65.0}))
             self.base_latency_ms = p["base_ms"]
             self.ms_per_char = p["ms_per_char"]
 
@@ -219,6 +239,25 @@ class EngineLatencyProfiler:
             f"{text_len} chars in {synth_ms:.0f}ms -> rate: {profile.ms_per_char:.1f}ms/char (base: {profile.base_latency_ms:.0f}ms)"
         )
 
+    def record_synth_direct(self, engine_name: str, text_len: int, synth_ms: float, node_id: str = "cloud_direct") -> None:
+        """クラウドTTSや直接実行エンジン等の実績を記録"""
+        if not engine_name or text_len <= 0 or synth_ms <= 0:
+            return
+        eng_upper = engine_name.strip().upper()
+        key = (node_id, eng_upper)
+        if key not in self._profiles:
+            self._profiles[key] = NodeLatencyProfile(
+                node_id=node_id,
+                engine_name=eng_upper,
+                has_gpu=False,
+                machine_name="Cloud/Direct"
+            )
+        self._profiles[key].record(text_len, synth_ms)
+        logger.debug(
+            f"📊 [Profiler] Updated direct {key[0]}/{key[1]}: "
+            f"{text_len} chars in {synth_ms:.0f}ms -> rate: {self._profiles[key].ms_per_char:.1f}ms/char (base: {self._profiles[key].base_latency_ms:.0f}ms)"
+        )
+
     def estimate_ms(self, node: Any, text_len: int) -> float:
         """指定ノードでの完了予測時間を取得"""
         profile = self.get_or_create(node)
@@ -258,9 +297,17 @@ class EngineLatencyProfiler:
             best_cpu = max(matched_profiles, key=lambda p: (p.sample_count, -p.ms_per_char))
             return best_cpu.estimate(safe_len)
 
-        eng_prior = ENGINE_INITIAL_PRIORS.get(eng_upper, ENGINE_INITIAL_PRIORS["VOICEVOX"])
-        has_any_gpu = any(p.has_gpu for p in self._profiles.values())
-        prior = eng_prior["gpu_gen"] if has_any_gpu else eng_prior["cpu"]
+        eng_prior = ENGINE_INITIAL_PRIORS.get(eng_upper)
+        if eng_prior:
+            if "cloud" in eng_prior:
+                prior = eng_prior["cloud"]
+            elif "cpu" in eng_prior and not any(p.has_gpu for p in self._profiles.values()):
+                prior = eng_prior["cpu"]
+            else:
+                has_any_gpu = any(p.has_gpu for p in self._profiles.values())
+                prior = eng_prior.get("gpu_gen") or eng_prior.get("cpu", {"base_ms": 150.0, "ms_per_char": 30.0})
+        else:
+            prior = {"base_ms": 120.0, "ms_per_char": 20.0}
         return max(30.0, prior["base_ms"] + safe_len * prior["ms_per_char"])
 
     def calculate_dynamic_speculative_timeout(
@@ -329,24 +376,27 @@ class EngineLatencyProfiler:
         """
         指定エンジンの現在の実測推論性能に基づき、目標許容時間 (target_budget_ms) 以内に
         安全に合成完了できる動的な最大文字数を算出する。
-        - クラウドTTS (azure, google, edge 等) や軽量ルール (openjtalk): 固定の max_chars (30) を返却。
-        - ローカルTTS (coeiroink, voicevox, sharevox 等):
-          1. candidate_nodes (候補ノード) が指定されている場合: 最有力ノードのプロファイルを採用。
-          2. 指定がない場合: self._profiles から該当エンジンの有効プロファイルを検索。
-             - GPUノードが存在する場合は最強GPUノードのプロファイルを採用。
-             - CPUノードのみの場合は、最も代表的なCPUノードのプロファイルを採用。
-          3. プロファイルが未登録の場合:
-             - クラスタ全体のGPU有無に応じた安全な初期値（GPU: max_chars, CPU: 13文字）を返却。
+        - クラウドTTS (edge, azure, google):
+          - レートリミット保護や接続オーバーヘッドを抑えるため安全下限 (min_chars: 14文字) を保証。
+          - 高速回線環境では自然なイントネーションを維持するため上限 (max_chars: 38文字) まで許容。
+          - 初動目標 1400ms 以内に収まるよう実績 (EWMA) または事前値から逆算スケーリング。
+        - ローカルTTS (coeiroink, voicevox, sharevox):
+          - GPUノード / CPUノードの実績プロファイル (EWMA) に応じて 8〜30文字に動的スケーリング。
+        - 軽量ルール (openjtalk):
+          - 超高速・低負荷なため、14〜35文字の範囲で安定動作。
         """
         if not engine:
             return max_chars
 
         eng_lower = engine.strip().lower()
-        LOCAL_ENGINES = {"coeiroink", "voicevox", "sharevox"}
-        if eng_lower not in LOCAL_ENGINES:
-            return max_chars
-
         eng_upper = eng_lower.upper()
+
+        CLOUD_ENGINES = {"edge", "azure", "google"}
+        is_cloud = eng_lower in CLOUD_ENGINES
+
+        eff_min_chars = max(min_chars, 14) if is_cloud else min_chars
+        eff_max_chars = max(max_chars, 38) if is_cloud else max_chars
+        eff_target_budget_ms = 1400.0 if (is_cloud and target_budget_ms > 1400.0) else target_budget_ms
 
         # 該当エンジンのプロファイルを収集
         matched_profiles: List[NodeLatencyProfile] = []
@@ -361,25 +411,37 @@ class EngineLatencyProfiler:
                     matched_profiles.append(p)
 
         if not matched_profiles:
-            # 該当エンジンの登録がまだない場合の初期推論基準値からエンジン別に逆算
-            eng_prior = ENGINE_INITIAL_PRIORS.get(eng_upper, ENGINE_INITIAL_PRIORS["VOICEVOX"])
-            has_any_gpu = any(p.has_gpu for p in self._profiles.values())
-            prior = eng_prior["gpu_gen"] if has_any_gpu else eng_prior["cpu"]
-            avail_ms = max(0.0, target_budget_ms - prior["base_ms"])
+            eng_prior = ENGINE_INITIAL_PRIORS.get(eng_upper)
+            if not eng_prior:
+                return max_chars
+            if "cloud" in eng_prior:
+                prior = eng_prior["cloud"]
+            elif "cpu" in eng_prior and not any(p.has_gpu for p in self._profiles.values()):
+                prior = eng_prior["cpu"]
+            else:
+                has_any_gpu = any(p.has_gpu for p in self._profiles.values())
+                prior = eng_prior.get("gpu_gen") or eng_prior.get("cpu", {"base_ms": 150.0, "ms_per_char": 30.0})
+
+            avail_ms = max(0.0, eff_target_budget_ms - prior["base_ms"])
             chars = int(avail_ms / max(1.0, prior["ms_per_char"]))
-            return max(min_chars, min(chars, max_chars))
+            return max(eff_min_chars, min(chars, eff_max_chars))
+
+        # クラウドプロファイルが存在する場合 (実績フィードバックに基づく動的逆算)
+        if is_cloud:
+            cloud_profile = matched_profiles[0]
+            return cloud_profile.calc_max_chars(eff_target_budget_ms, eff_min_chars, eff_max_chars)
 
         # GPUノードがあれば最強GPUノードのプロファイルを採用
         gpu_profiles = [p for p in matched_profiles if p.has_gpu]
         if gpu_profiles:
             best_gpu = max(gpu_profiles, key=lambda p: p.gpu_power_score)
-            return best_gpu.calc_max_chars(target_budget_ms, min_chars, max_chars)
+            return best_gpu.calc_max_chars(target_budget_ms, eff_min_chars, eff_max_chars)
 
         # CPUノードのみの場合: サンプル数が多く安定したプロファイルを採用
         cpu_profiles = matched_profiles
         if cpu_profiles:
             best_cpu = max(cpu_profiles, key=lambda p: (p.sample_count, -p.ms_per_char))
-            return best_cpu.calc_max_chars(target_budget_ms, min_chars, max_chars)
+            return best_cpu.calc_max_chars(target_budget_ms, eff_min_chars, eff_max_chars)
 
         return max_chars
 

@@ -813,44 +813,48 @@ class TextCleaner:
         t_start = time.time()
         chunks: List[TextChunk] = []
 
-        # 0. 動的第1チャンク文字数上限 (max_first_chunk_chars) の自律解決 (各マシン×各エンジン特性を反映)
+        # 0. 動的第1チャンク文字数上限 (max_first_chunk_chars) の自律解決 (各マシン×各エンジン特性・クラウド回線速度を反映)
         effective_first_chars = max_first_chunk_chars
-        effective_max_chars = max_chunk_chars or _MAX_CHUNK_CHARS
 
-        if effective_first_chars is None:
-            resolved_engine = engine
-            if not resolved_engine and speaker_id:
-                spk = str(speaker_id).strip().lower()
-                if "ci_" in spk or "coeiroink" in spk:
-                    resolved_engine = "coeiroink"
-                elif "vv_" in spk or "voicevox" in spk:
-                    resolved_engine = "voicevox"
-                elif "sv_" in spk or "sharevox" in spk:
-                    resolved_engine = "sharevox"
-                elif "ojt_" in spk or "openjtalk" in spk:
-                    resolved_engine = "openjtalk"
-                elif "az_" in spk or "azure" in spk:
-                    resolved_engine = "azure"
-                elif "g_" in spk or "google" in spk:
-                    resolved_engine = "google"
+        resolved_engine = engine
+        if not resolved_engine and speaker_id:
+            spk = str(speaker_id).strip().lower()
+            if "ci_" in spk or "coeiroink" in spk:
+                resolved_engine = "coeiroink"
+            elif "vv_" in spk or "voicevox" in spk:
+                resolved_engine = "voicevox"
+            elif "sv_" in spk or "sharevox" in spk:
+                resolved_engine = "sharevox"
+            elif "ojt_" in spk or "openjtalk" in spk:
+                resolved_engine = "openjtalk"
+            elif "az_" in spk or "azure" in spk:
+                resolved_engine = "azure"
+            elif "g_" in spk or "google" in spk:
+                resolved_engine = "google"
+            elif "edge" in spk:
+                resolved_engine = "edge"
 
-            if resolved_engine:
-                try:
-                    from src.utils.latency_profiler import latency_profiler
-                    effective_first_chars = latency_profiler.get_dynamic_max_chars(
-                        engine=resolved_engine,
-                        target_budget_ms=1750.0,
-                        min_chars=8,
-                        max_chars=effective_max_chars
+        is_cloud_engine = bool(resolved_engine and resolved_engine.lower() in {"edge", "azure", "google"})
+        system_hardcap = 38 if is_cloud_engine else _MAX_CHUNK_CHARS
+        effective_max_chars = max_chunk_chars or system_hardcap
+
+        if effective_first_chars is None and resolved_engine:
+            try:
+                from src.utils.latency_profiler import latency_profiler
+                effective_first_chars = latency_profiler.get_dynamic_max_chars(
+                    engine=resolved_engine,
+                    target_budget_ms=1750.0,
+                    min_chars=8,
+                    max_chars=effective_max_chars
+                )
+                # 第2チャンク以降の上限 (effective_max_chars) も未指定時はエンジンの実測性能に連動スケーリング
+                if max_chunk_chars is None and effective_first_chars is not None:
+                    effective_max_chars = min(
+                        system_hardcap,
+                        max(effective_first_chars + 4, int(round(effective_first_chars * 1.5)))
                     )
-                    # 第2チャンク以降の上限 (effective_max_chars) も未指定時はエンジンの実測性能に連動スケーリング
-                    if max_chunk_chars is None and effective_first_chars is not None:
-                        effective_max_chars = min(
-                            _MAX_CHUNK_CHARS,
-                            max(effective_first_chars + 4, int(round(effective_first_chars * 1.5)))
-                        )
-                except Exception as e:
-                    logger.debug(f"Dynamic max chars resolution error: {e}")
+            except Exception as e:
+                logger.debug(f"Dynamic max chars resolution error: {e}")
 
         # 1. 発言者名プレフィックスがあれば先頭パーツとして追加 (間: 80ms)
         # NGワードピー音プレースホルダー (<<__BEEP...>> / <<ピー音...>>) を含む場合は前後でチャンク分割
