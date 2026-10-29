@@ -117,7 +117,8 @@ class WebServer:
             client_secret=config.discord_client_secret,
             redirect_uri=config.discord_redirect_uri,
             session_secret=config.web_session_secret,
-            bot=bot
+            bot=bot,
+            bot_provider=lambda: self.bot
         )
         # Discord API レートリミット対策キャッシュ ((guild_id, user_id) -> (timestamp, Optional[discord.Member]))
         self._member_cache: Dict[Tuple[int, int], Tuple[float, Optional[discord.Member]]] = {}
@@ -1643,8 +1644,8 @@ class WebServer:
         if not tmp_path or file_count == 0:
             return web.json_response({"message": "No frequent cache files found to sync", "file_count": 0}, status=200)
 
-        response = web.FileResponse(
-            tmp_path,
+        # FileResponse には on_finish が無いため、StreamResponse で逐次送信し finally で一時ファイルを確実に削除する
+        response = web.StreamResponse(
             headers={
                 "Content-Type": "application/gzip",
                 "Content-Disposition": 'attachment; filename="frequent_cache.tar.gz"',
@@ -1652,17 +1653,26 @@ class WebServer:
                 "X-Archive-Size": str(archive_size)
             }
         )
+        response.content_length = archive_size
         logger.info(f"✨ [HA] Streaming frequent cache archive: {file_count} files ({archive_size} bytes) for Slave '{node_id or 'unknown'}'")
 
-        # レスポンス送信完了後に一時ファイルを削除するクリーンアップコールバック
-        async def _cleanup_tmp(_resp):
+        try:
+            await response.prepare(request)
+            with open(tmp_path, "rb") as f:
+                while True:
+                    chunk = await loop.run_in_executor(None, f.read, 1024 * 1024)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+            await response.write_eof()
+        except (ConnectionResetError, asyncio.CancelledError) as e:
+            logger.info(f"[HA] Cache snapshot stream interrupted by client: {type(e).__name__}")
+        finally:
             try:
                 if os.path.exists(tmp_path):
                     await asyncio.to_thread(os.unlink, tmp_path)
             except Exception:
                 pass
-
-        response.on_finish.append(_cleanup_tmp)
         return response
 
     async def api_system_trigger_cache_sync(self, request: web.Request) -> web.Response:

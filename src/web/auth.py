@@ -6,7 +6,7 @@ import hashlib
 import base64
 import logging
 from urllib.parse import urlencode
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 import aiohttp
 from aiohttp import web
 import discord
@@ -23,13 +23,16 @@ class DiscordAuth:
         redirect_uri: str,
         session_secret: str,
         bot: discord.Client,
-        old_session_secrets: Optional[List[str]] = None
+        old_session_secrets: Optional[List[str]] = None,
+        bot_provider: Optional[Callable[[], Any]] = None
     ):
         self.client_id = client_id.strip()
         self.client_secret = client_secret.strip()
         self.redirect_uri = redirect_uri.strip()
         self.session_secret = session_secret.strip().encode("utf-8")
         self.bot = bot
+        # Bot は WebServer 起動後 (BotPool 経由) に生成されるため、判定時に遅延解決するプロバイダー
+        self.bot_provider = bot_provider
 
         # シークレットローテーション用: 旧シークレットリスト
         self.old_session_secrets: List[bytes] = []
@@ -99,11 +102,18 @@ class DiscordAuth:
         """
         ユーザーがBotの参加しているいずれかのサーバーに所属しているか検証
         """
-        if not self.bot or not getattr(self.bot, "guilds", None):
+        bot = self.bot
+        if self.bot_provider is not None:
+            try:
+                bot = self.bot_provider() or bot
+            except Exception as e:
+                logger.debug(f"bot_provider resolution failed: {e}")
+
+        if not bot or not getattr(bot, "guilds", None):
             logger.warning("Bot is currently not connected to any guild.")
             return False
 
-        for guild in self.bot.guilds:
+        for guild in bot.guilds:
             member = guild.get_member(user_id)
             if member is not None:
                 return True

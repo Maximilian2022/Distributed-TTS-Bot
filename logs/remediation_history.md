@@ -8451,3 +8451,19 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 - **検証結果**:
   - サンドボックス隔離テスト（全80テスト）を実行し、**100% 合格（Ran 80 tests in 0.408s, OK）** を確認。一時コンテナは即座に完全破棄。
 
+
+## 2026-10-29 12:03 WebUIログイン不可(「サーバーに参加していません」)の是正 & HAキャッシュスナップショット例外の是正
+- **事象**:
+  1. 参加済みアカウント (maximilian_chainedbell) が WebUI ログイン時に「Bot導入中サーバーに参加していません」で拒否される。web.log に `Bot is currently not connected to any guild.` が毎回出力。
+  2. bot.log に `AttributeError: 'FileResponse' object has no attribute 'on_finish'` (`api_ha_frequent_cache_snapshot`) が HA スレーブ (192.168.11.244/.248) から約12秒間隔で発生 (05:29〜05:31)。
+- **原因**:
+  1. `main.py` は `WebServer(bot=None, ...)` で Bot より先行起動し、`DiscordAuth(bot=bot)` にも `None` が固定で渡る。`WebServer.bot` プロパティは BotPool から動的解決するが `DiscordAuth.bot` は解決されず、`is_user_in_bot_guilds` が常に False を返していた (エラー画面のサーバー名一覧は `WebServer.bot` 経由のため表示されていた)。
+  2. aiohttp の `web.FileResponse` に `on_finish` 属性は存在しない。
+- **改修内容**:
+  - `src/web/auth.py`: `DiscordAuth` に `bot_provider` を追加し、`is_user_in_bot_guilds` で判定時に遅延解決 (provider 例外時は固定 bot にフォールバック)。
+  - `src/web/server.py`: `DiscordAuth(..., bot_provider=lambda: self.bot)` を渡す。`api_ha_frequent_cache_snapshot` を `StreamResponse` による 1MB 逐次送信に変更し、`finally` で一時ファイルを確実に削除 (切断系例外も捕捉)。
+  - `tests/test_auth.py`: 遅延解決・bot=None 拒否・provider 例外フォールバックの回帰テスト3件を追加。
+- **検証**: サンドボックス (`./scripts/run_sandbox_test.sh`, 一時コンテナ即破棄) で test_auth.py 全9テスト OK。
+- **本番反映**: VC アクティブセッション 0 件を確認のうえ `docker compose up -d --no-deps --force-recreate app` を1回のみ実施。約65秒で healthy、Bot #1〜#5 全機が 2 guilds に再接続、再起動後の ERROR は 0 件。
+- **補足**: 再作成時の `Volume ttsbot_coeiroink_models Created` 表示は compose の表示のみで、実体は 2026-10-02 作成の 31GB の既存ボリュームがそのまま再利用されている (データ消失なし)。
+- **未確認/残件**: 実ブラウザでの OAuth ログイン成功はユーザー確認待ち。`OAuth2 CSRF state mismatch (Expected=False)` はコールバック URL の再読込・戻る操作で oauth_state クッキーが削除済みの場合に出る正常挙動 (バグではない)。

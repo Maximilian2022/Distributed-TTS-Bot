@@ -130,3 +130,41 @@ class TestPasswordBruteforceProtection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDiscordAuthLazyBot(unittest.IsolatedAsyncioTestCase):
+    """WebServer は bot=None で先行起動されるため、判定時に bot_provider で遅延解決できること (WebUIログイン不可の回帰防止)"""
+
+    class _Member: pass
+
+    class _Guild:
+        def __init__(self, members):
+            self._members = members
+        def get_member(self, uid):
+            return self._members.get(uid)
+        async def fetch_member(self, uid):
+            raise RuntimeError("not found")
+
+    class _Bot:
+        def __init__(self, guilds):
+            self.guilds = guilds
+
+    def _auth(self, bot, provider=None):
+        return DiscordAuth("i", "s", "http://x/cb", "secret", bot=bot, bot_provider=provider)
+
+    async def test_bot_none_without_provider_is_rejected(self):
+        self.assertFalse(await self._auth(None).is_user_in_bot_guilds(1))
+
+    async def test_provider_resolves_bot_lazily(self):
+        holder = {"bot": None}
+        auth = self._auth(None, lambda: holder["bot"])
+        self.assertFalse(await auth.is_user_in_bot_guilds(42))
+        holder["bot"] = self._Bot([self._Guild({42: self._Member()})])
+        self.assertTrue(await auth.is_user_in_bot_guilds(42))
+        self.assertFalse(await auth.is_user_in_bot_guilds(99))
+
+    async def test_provider_exception_falls_back(self):
+        def boom():
+            raise RuntimeError("x")
+        auth = self._auth(self._Bot([self._Guild({7: self._Member()})]), boom)
+        self.assertTrue(await auth.is_user_in_bot_guilds(7))
