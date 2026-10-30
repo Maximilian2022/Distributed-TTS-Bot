@@ -2276,10 +2276,10 @@ async function loadBotConfig(guildId) {
       announceVCCheckbox.checked = !!cfg.announce_vc_events;
     }
 
-    // 投機的フォールバック動的設定 (最大許容沈黙時間)
+    // 最大許容沈黙 (遅い・止まったと感じるまでの秒数)
     const specTimeoutInput = document.getElementById("cfg-speculative-timeout");
     if (specTimeoutInput) {
-      const currentVal = (cfg.speculative_timeout_seconds !== undefined && cfg.speculative_timeout_seconds !== null) ? cfg.speculative_timeout_seconds : 2.5;
+      const currentVal = (cfg.max_silence_seconds !== undefined && cfg.max_silence_seconds !== null) ? cfg.max_silence_seconds : 1.5;
       specTimeoutInput.value = currentVal;
       updateSpecPresetButtons(currentVal);
     }
@@ -2418,7 +2418,7 @@ async function saveBotConfig(e) {
   const adminRole = document.getElementById("cfg-admin-role")?.value || "0";
   const readUsername = document.getElementById("cfg-read-username")?.checked || false;
   const announceVCEvents = document.getElementById("cfg-announce-vc")?.checked || false;
-  const specTimeout = parseFloat(document.getElementById("cfg-speculative-timeout")?.value || 2.5);
+  const maxSilence = Math.max(1.0, Math.min(2.5, parseFloat(document.getElementById("cfg-speculative-timeout")?.value || 1.5)));
 
   const disasterEnabled = document.getElementById("cfg-disaster-enabled")?.checked ?? true;
   const disasterMinScale = parseInt(document.getElementById("cfg-disaster-min-scale")?.value || "30");
@@ -2452,7 +2452,7 @@ async function saveBotConfig(e) {
     auto_join_text_channel_id: pairs.length > 0 ? pairs[0].text_id : "0",
     read_username: readUsername,
     announce_vc_events: announceVCEvents,
-    speculative_timeout_seconds: specTimeout,
+    max_silence_seconds: maxSilence,
     disaster_alert_enabled: disasterEnabled,
     disaster_min_scale: disasterMinScale,
     disaster_pref_filter: disasterPref,

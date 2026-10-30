@@ -33,6 +33,15 @@ storage:
 tts:
   primary: "azure"
   fallback: "google"
+  # ストリーミング合成の段階導入 (off / shadow / on)。shadow は予測・締切を記録するだけで挙動は従来どおり
+  streaming:
+    stream_tl_speculative: "shadow"   # 投機締切を再生タイムライン基準に (最大許容沈黙)
+    head_route_earliest: "shadow"     # 先頭本文パーツを完了予測最短ノードへ
+    head_dynamic_length: "shadow"     # 先頭本文パーツ長の動的決定 (on は stream_tl_speculative=on 時のみ有効)
+    chunk_singleflight: "shadow"      # 同一パーツのローカル合成の二重発注防止
+    max_silence_default_seconds: 1.5
+    az_margin_seconds: 0.45           # Azure 実測 p95=424ms
+    head_plan_pessimism: 1.5
   google_monthly_limit_chars: 950000 # 無料枠(100万文字)の95%で自動フォールバック
   azure:
     region: "japaneast"

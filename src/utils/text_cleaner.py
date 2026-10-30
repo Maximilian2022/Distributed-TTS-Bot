@@ -806,6 +806,7 @@ class TextCleaner:
         speaker_id: Optional[str] = None,
         max_first_chunk_chars: Optional[int] = None,
         max_chunk_chars: Optional[int] = None,
+        head_chunk_chars: Optional[int] = None,
     ) -> List['TextChunk']:
         """
         テキストを発言者名プレフィックスおよび多段文境界（句点・読点・スペース・スラング・終助詞・形態素・動的ハードキャップ）で超低遅延パーツ分割する。
@@ -939,11 +940,47 @@ class TextCleaner:
             else:
                 chunks.append(TextChunk(text=text.strip(), pause_after_ms=0))
 
+        if head_chunk_chars:
+            chunks = TextCleaner.apply_head_chunk_limit(chunks, head_chunk_chars)
+
         split_ms = round((time.time() - t_start) * 1000, 2)
         for c in chunks:
             c.split_ms = split_ms
 
         return chunks
+
+    @staticmethod
+    def apply_head_chunk_limit(chunks: List['TextChunk'], head_chars: int) -> List['TextChunk']:
+        """
+        先頭本文チャンクだけを head_chars 以内に切り出す (2番目以降の上限は変えない)。
+        既存の max_first_chunk_chars は先頭の文全体に効くため、句読点の無い長文で全体が細切れになる。
+        こちらは頭の1パーツのみを短くし、残りは独立チャンクとして元の間 (pause) を引き継ぐ。
+        """
+        head_idx = next(
+            (i for i, c in enumerate(chunks)
+             if not c.is_name_prefix and not c.is_beep and c.text.strip()),
+            None,
+        )
+        if head_idx is None or len(chunks[head_idx].text) <= head_chars:
+            return chunks
+        orig = chunks[head_idx]
+        pieces = TextCleaner._hardcap_slice(orig.text, max_chars=head_chars)
+        head = pieces[0][0] if pieces else ""
+        if not head or len(head) >= len(orig.text):
+            return chunks
+        if orig.text.startswith(head):
+            rest = orig.text[len(head):].strip()
+        else:
+            rest = "".join(p for p, _ in pieces[1:])
+        if not rest:
+            return chunks
+        head_chunk = TextChunk(text=head, pause_after_ms=0)
+        rest_chunk = TextChunk(
+            text=rest,
+            pause_after_ms=orig.pause_after_ms,
+            is_followed_by_beep=orig.is_followed_by_beep,
+        )
+        return chunks[:head_idx] + [head_chunk, rest_chunk] + chunks[head_idx + 1:]
 
     @staticmethod
     def _split_plain_text(

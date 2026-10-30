@@ -171,7 +171,8 @@ class CoeiroinkTTSClient(BaseTTSClient):
         voice_name: str,
         pitch: str = "0%",
         speed: float = 1.0,
-        is_longest_chunk: bool = False
+        is_longest_chunk: bool = False,
+        prefer_earliest_finish: bool = False
     ) -> bytes:
         """
         指定されたテキストと話者・スタイルIDでCOEIROINK音声合成を実行
@@ -184,6 +185,7 @@ class CoeiroinkTTSClient(BaseTTSClient):
                 timeout=self.timeout_seconds,
                 text_len=len(text),
                 is_longest_chunk=is_longest_chunk,
+                prefer_earliest_finish=prefer_earliest_finish,
                 model_name=voice_name
             )
             if not lease:

@@ -85,6 +85,14 @@ class AppConfig:
     tts_primary: str = "azure"
     tts_fallback: str = "google"
     speculative_timeout_seconds: float = 2.5
+    # ストリーミング合成の段階導入フラグ ("off" / "shadow" / "on")
+    stream_tl_speculative: str = "off"     # 投機締切を再生タイムライン基準に (最大許容沈黙)
+    head_route_earliest: str = "off"       # 先頭本文パーツを完了予測最短ノードへ割当
+    head_dynamic_length: str = "off"       # 先頭本文パーツ長の動的決定
+    chunk_singleflight: str = "off"        # 同一パーツのローカル合成の二重発注防止
+    max_silence_default_seconds: float = 1.5  # 最大許容沈黙 (遅い・止まったと感じるまで)
+    az_margin_seconds: float = 0.45        # 投機先クラウドの応答マージン (Azure 実測 p95=424ms)
+    head_plan_pessimism: float = 1.5       # 先頭長計画時の合成時間悲観係数
     google_monthly_limit_chars: int = 950000  # 無料枠(100万文字)の95%
     azure_region: str = "japaneast"
     azure_timeout_seconds: float = 5.0
@@ -203,6 +211,17 @@ class AppConfig:
         for attr, value in new_cfg.__dict__.items():
             setattr(self, attr, value)
 
+ROLLOUT_MODES = ("off", "shadow", "on")
+
+
+def normalize_rollout_mode(value: Any) -> str:
+    """段階導入フラグ値を off / shadow / on に正規化 (不明値は安全側の off)"""
+    v = str(value or "off").strip().lower()
+    if v in ("true", "1", "yes"):
+        return "on"
+    return v if v in ROLLOUT_MODES else "off"
+
+
 def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg = AppConfig()
 
@@ -257,6 +276,12 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cfg.tts_primary = tts_raw.get("primary", cfg.tts_primary)
         cfg.tts_fallback = tts_raw.get("fallback", cfg.tts_fallback)
         cfg.speculative_timeout_seconds = float(tts_raw.get("speculative_timeout_seconds", cfg.speculative_timeout_seconds))
+        stream_raw = tts_raw.get("streaming", {}) or {}
+        for _flag in ("stream_tl_speculative", "head_route_earliest", "head_dynamic_length", "chunk_singleflight"):
+            setattr(cfg, _flag, normalize_rollout_mode(stream_raw.get(_flag, getattr(cfg, _flag))))
+        cfg.max_silence_default_seconds = float(stream_raw.get("max_silence_default_seconds", cfg.max_silence_default_seconds))
+        cfg.az_margin_seconds = float(stream_raw.get("az_margin_seconds", cfg.az_margin_seconds))
+        cfg.head_plan_pessimism = float(stream_raw.get("head_plan_pessimism", cfg.head_plan_pessimism))
         cfg.google_monthly_limit_chars = int(tts_raw.get("google_monthly_limit_chars", cfg.google_monthly_limit_chars))
         azure_raw = tts_raw.get("azure", {})
         cfg.azure_region = azure_raw.get("region", cfg.azure_region)
@@ -343,6 +368,8 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     cfg.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
     cfg.speculative_timeout_seconds = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", cfg.speculative_timeout_seconds))
+    for _flag in ("stream_tl_speculative", "head_route_earliest", "head_dynamic_length", "chunk_singleflight"):
+        setattr(cfg, _flag, normalize_rollout_mode(os.getenv(_flag.upper(), getattr(cfg, _flag))))
     cfg.cloudflare_tunnel_token = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", cfg.cloudflare_tunnel_token).strip()
 
     # Web UI & OAuth2 環境変数 (汎用WEB_BASE_URL対応)

@@ -33,7 +33,7 @@ from aiohttp import web
 import discord
 
 from src.config import AppConfig, save_yaml_config, reload_config, TTSNodeConfig
-from src.database import Database
+from src.database import Database, clamp_max_silence
 from src.cache_manager import CacheManager
 from src.tts.manager import TTSManager
 from src.tts.coeiroink_models import CoeiroinkModelManager
@@ -2718,6 +2718,7 @@ class WebServer:
             "read_username": bool(settings.get("read_username", 0)),
             "announce_vc_events": bool(settings.get("announce_vc_events", 0)),
             "speculative_timeout_seconds": float(settings.get("speculative_timeout_seconds", 2.5) or 2.5),
+            "max_silence_seconds": clamp_max_silence(settings.get("max_silence_seconds")),
             "ignore_prefixes": settings.get("ignore_prefixes", [";", "；"]),
             "disaster_alert_enabled": bool(settings.get("disaster_alert_enabled", 1)),
             "disaster_min_scale": int(settings.get("disaster_min_scale", 30)),
@@ -2783,6 +2784,8 @@ class WebServer:
                 self.config.speculative_timeout_seconds = update_fields["speculative_timeout_seconds"]
             except (ValueError, TypeError):
                 pass
+        if "max_silence_seconds" in data:
+            update_fields["max_silence_seconds"] = clamp_max_silence(data["max_silence_seconds"])
         if "ignore_prefixes" in data:
             update_fields["ignore_prefixes"] = data["ignore_prefixes"]
         if "disaster_alert_enabled" in data:

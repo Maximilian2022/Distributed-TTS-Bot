@@ -13,7 +13,7 @@ import time
 import logging
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import aiohttp
 from src.config import TTSNodeConfig
 from src.tts.base import TTSConnectionError, TTSError
@@ -269,6 +269,7 @@ class TTSNode:
 
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
         self.active_count = 0
+        self.pending_est_ms = 0.0  # 処理中リクエストの推定合成時間の合計 (完了予測用)
         self.is_healthy = True
         self.unhealthy_until = 0.0
         self.last_heartbeat = time.time()
@@ -676,13 +677,29 @@ class NodeLease:
         self.node = node
         self.text_len = text_len
         self.start_time = 0.0
+        # 取得時点で処理中見込みに加算 (完了予測最短ノード選択の backlog として使用)
+        self.est_ms = pool.estimate_node_ms(node, text_len) if text_len > 0 else 0.0
+        node.pending_est_ms += self.est_ms
 
     async def __aenter__(self) -> TTSNode:
         self.start_time = time.time()
         return self.node
 
+    def _release_pending(self) -> None:
+        self.node.pending_est_ms = max(0.0, self.node.pending_est_ms - self.est_ms)
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         latency_ms = (time.time() - self.start_time) * 1000.0
+        # 投機負け等でキャンセルされても、エンジン側は計算を続ける前提 (未実証のため保守側) で、
+        # 推定完了時刻までは処理中見込みを残す
+        remain_s = (self.start_time + self.est_ms / 1000.0) - time.time()
+        if exc_type is asyncio.CancelledError and remain_s > 0:
+            try:
+                asyncio.get_running_loop().call_later(remain_s, self._release_pending)
+            except RuntimeError:
+                self._release_pending()
+        else:
+            self._release_pending()
         try:
             if exc_type is None:
                 self.node.mark_success(latency_ms)
@@ -904,6 +921,55 @@ class TTSNodePool:
             ordered_nodes.extend(buckets.get(tier_key, []))
         return ordered_nodes
 
+    def estimate_node_ms(self, node: TTSNode, text_len: int) -> float:
+        """ノード×エンジンの実測プロファイルから単発合成時間 (ms) を推定"""
+        try:
+            return float(latency_profiler.get_or_create(node).estimate(max(1, int(text_len))))
+        except Exception:
+            return 0.0
+
+    def predict_eta_ms(self, node: TTSNode, text_len: int) -> float:
+        """今このノードに投入した場合の完了予測 (ms)。エンジンは実質直列 (CPU 実測) とみなし、処理中見込みを前に積む"""
+        return node.pending_est_ms + self.estimate_node_ms(node, text_len)
+
+    def _earliest_finish_candidates(self, available: List[TTSNode], model_name: Optional[str]) -> List[TTSNode]:
+        """モデルをRAMに保持するノードがあればそれに限定 (SSDロードの見積り外れを避ける)"""
+        if model_name:
+            in_ram = [n for n in available if n.has_model_in_ram(model_name)]
+            if in_ram:
+                return in_ram
+        return available
+
+    def peek_earliest_finish(
+        self,
+        text_len: int,
+        model_name: Optional[str] = None,
+        guild_id: Optional[Any] = None
+    ) -> Tuple[Optional[TTSNode], float]:
+        """完了予測が最短のノードと予測時間 (ms) をロック取得なしで参照 (先頭パーツ計画・Preroll 推定用)"""
+        available = self._filter_available_nodes(model_name, guild_id)
+        cands = self._earliest_finish_candidates(available, model_name)
+        if not cands:
+            return None, 0.0
+        best = min(cands, key=lambda n: (self.predict_eta_ms(n, text_len), n.priority))
+        return best, self.predict_eta_ms(best, text_len)
+
+    def _filter_available_nodes(self, model_name: Optional[str], guild_id: Optional[Any]) -> List[TTSNode]:
+        target_gid_str = str(guild_id).strip() if guild_id is not None else None
+        available: List[TTSNode] = []
+        for n in self.nodes:
+            if not n.is_available:
+                continue
+            if not n.supports_model(self.engine_name, model_name):
+                continue
+            ex_gid = getattr(n, "exclusive_guild_id", None)
+            if ex_gid:
+                if target_gid_str and target_gid_str == str(ex_gid):
+                    available.append(n)
+            else:
+                available.append(n)
+        return available
+
     def peek_best_node(
         self,
         is_longest_chunk: bool = True,
@@ -935,7 +1001,8 @@ class TTSNodePool:
         text_len: int = 0,
         is_longest_chunk: bool = False,
         model_name: Optional[str] = None,
-        guild_id: Optional[Any] = None
+        guild_id: Optional[Any] = None,
+        prefer_earliest_finish: bool = False
     ) -> Optional[NodeLease]:
         """
         エンジン毎の動的 4段階 Tier ルーティング (WebUIでエンジン毎に優先順位を設定可能)
@@ -992,6 +1059,18 @@ class TTSNodePool:
             if not available:
                 await asyncio.sleep(0.1)
                 continue
+
+            # 先頭パーツ: 空き枠優先ではなく完了予測最短ノードへ (枠が埋まっていてもそのノードの空きを待つ)
+            if prefer_earliest_finish:
+                cands = self._earliest_finish_candidates(available, model_name)
+                best = min(cands, key=lambda n: (self.predict_eta_ms(n, text_len), n.priority))
+                try:
+                    await asyncio.wait_for(best.semaphore.acquire(), timeout=0.05)
+                    best.active_count += 1
+                    best.total_requests += 1
+                    return NodeLease(self, best, text_len=text_len)
+                except asyncio.TimeoutError:
+                    continue  # 50ms ごとに再評価 (他ノードの予測が下回れば乗り換え)
 
             ordered_nodes = self._order_available_nodes(
                 available,

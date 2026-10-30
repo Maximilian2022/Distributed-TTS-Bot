@@ -141,6 +141,22 @@ class SQLitePool:
         self._size = 0
 
 
+
+MAX_SILENCE_MIN_SECONDS = 1.0
+MAX_SILENCE_MAX_SECONDS = 2.5
+MAX_SILENCE_DEFAULT_SECONDS = 1.5
+
+
+def clamp_max_silence(value: Any) -> float:
+    """最大許容沈黙を 1.0〜2.5 秒に正規化 (不正値は既定 1.5 秒)"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return MAX_SILENCE_DEFAULT_SECONDS
+    if v != v:  # NaN
+        return MAX_SILENCE_DEFAULT_SECONDS
+    return round(max(MAX_SILENCE_MIN_SECONDS, min(MAX_SILENCE_MAX_SECONDS, v)), 2)
+
 class Database:
     def __init__(self, db_path: str, max_connections: int = 5):
         self.db_path = db_path
@@ -404,6 +420,11 @@ class Database:
                 if "error_contact_user_id" not in cols:
                     await db.execute("ALTER TABLE guild_settings ADD COLUMN error_contact_user_id INTEGER DEFAULT 0")
                     logger.info("Migrated guild_settings table: added error_contact_user_id column")
+                if "max_silence_seconds" not in cols:
+                    # 最大許容沈黙 (遅い・止まったと感じるまで)。旧 speculative_timeout_seconds とは意味が異なるため
+                    # 値は引き継がず全ギルド既定 1.5s から開始 (旧列は段階導入フラグ off 時の従来経路で引き続き使用)
+                    await db.execute("ALTER TABLE guild_settings ADD COLUMN max_silence_seconds REAL DEFAULT 1.5")
+                    logger.info("Migrated guild_settings table: added max_silence_seconds column")
 
             # 4. 月別TTS利用量トラッキング (失敗数・フォールバック生成数も記録)
             await db.execute("""
@@ -1759,6 +1780,7 @@ class Database:
                     res["ignore_prefixes"] = prefixes
                     res["announce_vc_events"] = int(res.get("announce_vc_events", 0) or 0)
                     res["speculative_timeout_seconds"] = float(res.get("speculative_timeout_seconds", 2.5) or 2.5)
+                    res["max_silence_seconds"] = clamp_max_silence(res.get("max_silence_seconds"))
                     res["disaster_volume"] = float(res.get("disaster_volume", 1.0) if res.get("disaster_volume") is not None else 1.0)
                     res["error_contact_user_id"] = int(res.get("error_contact_user_id", 0) or 0)
 
@@ -1792,6 +1814,7 @@ class Database:
             "read_username": 0,
             "announce_vc_events": 0,
             "speculative_timeout_seconds": def_spec_timeout,
+            "max_silence_seconds": clamp_max_silence(getattr(default_cfg, "max_silence_default_seconds", None) if default_cfg else None),
             "ignore_prefixes": list(def_prefixes),
             "disaster_alert_enabled": 1,
             "disaster_min_scale": 30,
@@ -1857,6 +1880,9 @@ class Database:
             current["ignore_prefixes"] = valid_prefixes[:30]
             del kwargs["ignore_prefixes"]
 
+        if "max_silence_seconds" in kwargs:
+            current["max_silence_seconds"] = clamp_max_silence(kwargs.pop("max_silence_seconds"))
+
         if "disaster_volume" in kwargs:
             try:
                 current["disaster_volume"] = max(0.0, min(float(kwargs["disaster_volume"]), 2.0))
@@ -1875,9 +1901,9 @@ class Database:
                     auto_join_pairs, admin_role_id, default_speaker, read_username,
                     announce_vc_events, speculative_timeout_seconds, ignore_prefixes,
                     disaster_alert_enabled, disaster_min_scale, disaster_pref_filter,
-                    disaster_alert_weather, disaster_volume, error_contact_user_id, updated_at
+                    disaster_alert_weather, disaster_volume, error_contact_user_id, max_silence_seconds, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     command_prefix=excluded.command_prefix,
                     max_text_length=excluded.max_text_length,
@@ -1898,6 +1924,7 @@ class Database:
                     disaster_alert_weather=excluded.disaster_alert_weather,
                     disaster_volume=excluded.disaster_volume,
                     error_contact_user_id=excluded.error_contact_user_id,
+                    max_silence_seconds=excluded.max_silence_seconds,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -1920,7 +1947,8 @@ class Database:
                     str(current.get("disaster_pref_filter", "")),
                     1 if current.get("disaster_alert_weather", 1) else 0,
                     float(current.get("disaster_volume", 1.0) if current.get("disaster_volume") is not None else 1.0),
-                    int(current.get("error_contact_user_id", 0) or 0)
+                    int(current.get("error_contact_user_id", 0) or 0),
+                    clamp_max_silence(current.get("max_silence_seconds"))
                 )
             )
             await db.commit()

@@ -1,6 +1,35 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-30] 最大許容沈黙 (1.5s) を軸にしたストリーミング合成の改修 — 投機締切の再生タイムライン化・先頭パーツ最優先割当/動的短縮・二重発注防止 (v2026.10.30-2048)
+
+- **ユーザーフィードバック & 課題**:
+  - 10/29 00:36 かつさんの発話 (136字・COEIROINK) で、後続パーツが Azure に声変わりし、最初の音まで 1361ms かかった。
+  - 「待てる時間もっとあるのに投機実行が不当に早くなってないか」「遅い・止まったと感じるまでは 1.5 秒と定義」。
+
+- **原因分析** (詳細: scratch/memo.md, scratch/impl_plan.md):
+  1. 投機締切が「合成開始から一律 4.0s 上限」だった。実際に待てた時間 (#2 約5.5s / #4 約12.8s / #6 約20.4s) より早く打ち切っていた。設定画面は「最大許容沈黙」と説明していたが、実装はそれと無関係だった。
+  2. 先行合成 (_prefetch_chunks) が合成中のパーツを、再生側が待たずに再発注していた (シングルフライトなし)。声変わりした #1/#2 は、Azure 採用より前に COEIROINK 音声がキャッシュに存在していた (latency_incidents.log L294)。
+  3. 空き枠優先のルーティングにより、GPU が一時的に満杯だと先頭パーツが CPU に流れる。句読点なしの長文では、先頭 30字を CPU で合成して最初の音が遅れる。
+
+- **対応内容** (すべて段階導入フラグ off/shadow/on で制御。初期値は shadow = 記録のみで挙動は従来どおり):
+  1. `stream_tl_speculative` (src/cogs/vc_handler.py `PlaybackTimeline`, src/tts/manager.py `speculative_deadline_fn`): 各パーツの投機締切を「再生予定時刻 − 0.45s」(Azure 実測 p95=424ms) とし、100ms ごとに再評価する。名前ありの Preroll 上限と先頭パーツの締切は、最大許容沈黙から逆算する。
+  2. `head_route_earliest` (src/tts/node_pool.py): ノード別の処理中見込み `pending_est_ms` を導入し、先頭本文パーツを完了予測が最短のノードへ割り当てる (枠が埋まっていても待ち、50ms ごとに再評価)。投機負けでキャンセルされた場合は、推定完了時刻まで見込みを保持する (エンジンが計算を続けると保守側で仮定)。
+  3. `head_dynamic_length` (src/utils/stream_planner.py, TextCleaner.apply_head_chunk_limit): 先頭パーツの長さを予測タイムラインから動的に決める (最初の音 ≤ 最大許容沈黙・途切れ0・声変わり0 を満たす最長。悲観係数 1.5)。短縮は先頭パーツのみで、後続は 30字上限のまま。
+  4. `chunk_singleflight` (src/tts/manager.py `_acquire_local_task`): 同一パーツのローカル合成を共有する。先行合成はローカルのみで投機しない。分割結果は QueueItem.chunks で先行合成と再生側が共有する。
+  5. 設定: guild_settings に `max_silence_seconds` 列 (既定 1.5、範囲 1.0〜2.5) を追加。旧 `speculative_timeout_seconds` は値を保持したまま、従来経路 (フラグ off) で使い続ける。WebUI の設定欄を「最大許容沈黙」に変更。
+  6. 観測ログ: chunks_meta に tl_deadline_rel_ms / legacy_spec_ms / pred_node / pred_eta_ms / head_chars_planned / head_chars_applied / joined_inflight を追加。
+
+- **検証**:
+  - サンドボックスで全 105 テスト PASS (新規: tests/test_streaming_max_silence.py 18件、tests/test_stream_play_item_flags.py 4件。後者は _stream_play_item を偽エンジン・偽VCで off/shadow/on それぞれ完走させる)。
+  - 本番 DB のコピーで列追加のマイグレーションを確認 (旧値 4.0 は保持、新列は 1.5、4.0 を指定すると 2.5 にクランプ)。コピーは削除済み。
+  - 実測回帰シミュレーション (scratch/exp_sim9.py): 事故条件 (GPU 不在) で、最初の音は名前あり 847ms / 名前なし 853ms、声変わり 0 (合成が予測の 1.3 倍遅くても 0)。GPU 空き時は従来と同じ。
+
+- **未実施 / 次の手順**: V1 (切断後もエンジンが計算を続けるか) と V2 (GPU の並列特性) は、VC 未使用時に実施する。shadow ログで 1〜2日観測した後、Phase 順 (TL → singleflight → route → head) に on へ切り替える。
+- **バージョン**: `BUILD_VERSION = "v2026.10.30-2048"`
+
+---
+
 ## [2026-10-28] 多段フォールバック順序最適化 (Azure ➔ Google ➔ Edge ➔ OpenJTalk)、Edge-TTS 非表示化、および Bot 出入りループの恒久是正 (v2026.10.28-2250)
 
 - **ユーザーフィードバック & 課題**:

@@ -19,6 +19,7 @@ from src.utils.deduplicator import Deduplicator
 from src.utils.async_task import safe_create_task
 from src.utils.latency_tracker import latency_tracker
 from src.utils.latency_profiler import latency_profiler
+from src.utils.stream_planner import plan_head_chars
 from src.utils.streaming_audio import StreamingAudioSource, get_beep_pcm
 from src.utils.gemini_tutor import GeminiTutorClient
 from src.utils.avatar_manager import cache_member_info_and_avatar
@@ -44,17 +45,60 @@ class QueueItem:
     queued_at: float = 0.0
     synth_task: Optional[asyncio.Task] = None
     speculative_timeout: Optional[float] = None
+    # 先行合成と再生側で共有する分割結果 (キャッシュキー一致のため。永続化対象外)
+    chunks: Optional[List[Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d.pop("synth_task", None)
+        d.pop("chunks", None)
         return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "QueueItem":
-        valid_keys = set(cls.__annotations__.keys()) - {"synth_task"}
+        valid_keys = set(cls.__annotations__.keys()) - {"synth_task", "chunks"}
         filtered = {k: v for k, v in data.items() if k in valid_keys}
         return cls(**filtered)
+
+CONSERVATIVE_PLAY_SEC_PER_CHAR = 0.12  # 未投入パーツの再生長見積り (Azure 実測下限。COEIROINK は 0.14〜0.21)
+MIN_LOCAL_TRY_SEC = 0.3                # 投機締切の下限 (合成開始からの最低試行時間)
+
+
+def _conservative_play_sec(chunk: Any) -> float:
+    if getattr(chunk, "is_beep", False):
+        return float(getattr(chunk, "beep_duration_sec", 0.4) or 0.4)
+    return len(getattr(chunk, "text", "") or "") * CONSERVATIVE_PLAY_SEC_PER_CHAR + (getattr(chunk, "pause_after_ms", 0) or 0) / 1000.0
+
+
+class PlaybackTimeline:
+    """
+    再生タイムライン基準の投機締切 (最大許容沈黙)。
+    各パーツの締切 = そのパーツの再生予定時刻 - クラウド応答マージン。
+    - 再生開始前: 順番が来た時刻 + 最大許容沈黙 + 投入済み音声長 + 間の未投入パーツ見積り
+    - 再生開始後: 現在 + 未再生バッファ残量 + 間の未投入パーツ見積り
+    締切は再生の進行で変わるため、呼び出し側は毎回再評価する。
+    """
+
+    def __init__(self, t_turn: float, max_silence: float, az_margin: float, est_play: List[float], stream_source: Any):
+        self.t_turn = t_turn
+        self.max_silence = max_silence
+        self.az_margin = az_margin
+        self.est_play = est_play
+        self.stream_source = stream_source
+        self.fed: Dict[int, float] = {}
+        self.t_play: Optional[float] = None
+
+    def mark_fed(self, idx: int, duration_sec: float) -> None:
+        self.fed[idx] = duration_sec
+
+    def deadline_for(self, idx: int) -> float:
+        unfed_before = sum(self.est_play[j] for j in range(min(idx, len(self.est_play))) if j not in self.fed)
+        if self.t_play is None:
+            base = self.t_turn + self.max_silence + sum(self.fed.values())
+        else:
+            base = time.time() + float(getattr(self.stream_source, "buffer_remaining_seconds", 0.0) or 0.0)
+        return base + unfed_before - self.az_margin
+
 
 class SafeAsyncQueue:
     """
@@ -872,6 +916,21 @@ class VCHandlerCog(commands.Cog):
 
     # --- バックグラウンド先行合成 (非同期プリフェッチ) ---
 
+    def _share_chunks_for_prefetch(self, item: QueueItem) -> None:
+        """シングルフライト有効時、キュー投入時点の分割結果を先行合成と再生側で共有する (分割の揺れによるキャッシュミス防止)"""
+        if getattr(self.config, "chunk_singleflight", "off") != "on":
+            return
+        try:
+            voice_cfg = self.tts_manager._get_voice_config(item.speaker_id)
+            item.chunks = TextCleaner.split_into_chunks(
+                item.text,
+                author_prefix=item.author_prefix,
+                engine=voice_cfg.provider if voice_cfg else None,
+                speaker_id=item.speaker_id
+            ) or None
+        except Exception as e:
+            logger.debug(f"Failed to pre-split chunks for prefetch: {e}")
+
     async def _prefetch_chunks(self, item: QueueItem, speculative_timeout: Optional[float] = None):
         """
         キュー待機時間中に、後続のストリーミング再生（_stream_play_item）で
@@ -888,7 +947,7 @@ class VCHandlerCog(commands.Cog):
             except Exception:
                 pass
 
-            chunks = TextCleaner.split_into_chunks(
+            chunks = item.chunks or TextCleaner.split_into_chunks(
                 item.text,
                 author_prefix=item.author_prefix,
                 engine=engine_name,
@@ -896,6 +955,9 @@ class VCHandlerCog(commands.Cog):
             )
             if not chunks:
                 return
+            # シングルフライト有効時: 先行合成はローカルのキャッシュ温めに限定 (投機・クラウド退避しない)。
+            # 再生の番が来たら再生側が実行中の合成に合流し、再生タイムライン基準で投機を判断する
+            local_only = getattr(self.config, "chunk_singleflight", "off") == "on"
 
             body_indices = [
                 i for i, ch in enumerate(chunks)
@@ -917,7 +979,8 @@ class VCHandlerCog(commands.Cog):
                         speed=item.speed,
                         user_id=item.user_id,
                         is_longest_chunk=is_long,
-                        speculative_timeout=speculative_timeout
+                        speculative_timeout=speculative_timeout,
+                        local_only=local_only
                     )
                 except Exception as e:
                     logger.debug(f"Prefetch chunk failed for '{ch.text[:15]}...': {e}")
@@ -1154,7 +1217,7 @@ class VCHandlerCog(commands.Cog):
             pass
 
         # チャンク分割の作成 (発言者名プレフィックス + 本文チャンク: 各マシン×各エンジン推論性能に応じた動的文字数適応)
-        all_chunks = TextCleaner.split_into_chunks(
+        all_chunks = item.chunks or TextCleaner.split_into_chunks(
             item.text,
             author_prefix=item.author_prefix,
             engine=engine_name,
@@ -1162,6 +1225,69 @@ class VCHandlerCog(commands.Cog):
         )
         if not all_chunks:
             return False
+
+        # --- 最大許容沈黙・段階導入フラグ (off / shadow / on) ---
+        tl_mode = getattr(self.config, "stream_tl_speculative", "off")
+        route_mode = getattr(self.config, "head_route_earliest", "off")
+        head_mode = getattr(self.config, "head_dynamic_length", "off")
+        is_local_engine = engine_name in ("voicevox", "sharevox", "coeiroink")
+        stream_settings = await self.db.get_guild_settings(guild.id, self.config)
+        max_silence = float(stream_settings.get("max_silence_seconds") or getattr(self.config, "max_silence_default_seconds", 1.5))
+        az_margin = float(getattr(self.config, "az_margin_seconds", 0.45))
+        chunk_extra: Dict[int, Dict[str, Any]] = {}
+        head_pred: Dict[str, Any] = {}
+
+        def _head_index(chs: List[Any]) -> Optional[int]:
+            return next(
+                (i for i, c in enumerate(chs) if not c.is_name_prefix and not c.is_beep and c.text.strip()),
+                None,
+            )
+
+        head_idx = _head_index(all_chunks)
+        if is_local_engine and head_idx is not None and (route_mode != "off" or head_mode != "off"):
+            try:
+                voice_cfg_p = self.tts_manager._get_voice_config(item.speaker_id)
+                model_id_p = getattr(voice_cfg_p, "speaker_uuid", "") or getattr(voice_cfg_p, "voice_name", "") or str(item.speaker_id)
+                # 先頭本文パーツ長の動的決定 (先行合成済みの発話は分割を変えない: キャッシュキー一致のため)
+                if head_mode != "off" and item.chunks is None:
+                    head_text = all_chunks[head_idx].text
+                    head_key = CacheManager.generate_cache_key(item.speaker_id, item.pitch, item.speed, head_text, user_id=item.user_id)
+                    planned = None
+                    if await self.tts_manager.cache_manager.get(head_key, provider=engine_name) is None:
+                        body_lens = [len(c.text) for c in all_chunks[head_idx:] if not c.is_beep and not c.is_name_prefix and c.text.strip()]
+                        name_chunks = [c for c in all_chunks[:head_idx] if c.is_name_prefix]
+                        planned = plan_head_chars(
+                            body_lens,
+                            has_name=bool(name_chunks),
+                            name_play_s=sum(_conservative_play_sec(c) for c in name_chunks),
+                            nodes=self.tts_manager.get_planning_nodes(engine_name, model_id_p, guild.id),
+                            max_silence=max_silence,
+                            az_margin=az_margin,
+                            k_plan=float(getattr(self.config, "head_plan_pessimism", 1.5)),
+                        )
+                    applied = bool(planned) and head_mode == "on" and tl_mode == "on"
+                    if applied:
+                        all_chunks = TextCleaner.apply_head_chunk_limit(all_chunks, planned)
+                        head_idx = _head_index(all_chunks)
+                    if planned:
+                        logger.info(
+                            f"✂️ [HeadPlan:{'on' if applied else 'shadow'}] guild={guild.id} head {len(head_text)}→{planned} chars "
+                            f"(max_silence={max_silence:.2f}s) text='{head_text[:15]}...'"
+                        )
+                    chunk_extra.setdefault(head_idx, {}).update({
+                        "head_chars_planned": planned,
+                        "head_chars_applied": len(all_chunks[head_idx].text) if applied else None,
+                    })
+                head_pred = self.tts_manager.peek_earliest_finish(
+                    engine_name, len(all_chunks[head_idx].text), model_name=model_id_p, guild_id=guild.id
+                )
+                if head_pred:
+                    chunk_extra.setdefault(head_idx, {}).update({
+                        "pred_node": head_pred.get("worker_label"),
+                        "pred_eta_ms": round(float(head_pred.get("eta_ms", 0.0)), 1),
+                    })
+            except Exception as plan_err:
+                logger.debug(f"Head planning skipped: {plan_err}")
 
         # 分割パーツの中で推論対象となる本文チャンクの最長チャンクを特定（最強GPUへ優先ルーティングするため）
         # ※ 発言者名プレフィックス (is_name_prefix=True) やピー音 (is_beep=True) は除外し、
@@ -1191,6 +1317,14 @@ class VCHandlerCog(commands.Cog):
             pause_s = float(getattr(c_obj, "pause_after_ms", 0) or 0) / 1000.0
             return dur + pause_s
 
+        timeline = PlaybackTimeline(
+            t_turn=t_dequeued,
+            max_silence=max_silence,
+            az_margin=az_margin,
+            est_play=[_conservative_play_sec(c) for c in all_chunks],
+            stream_source=stream_source,
+        )
+
         async def _synth_chunk(ch, is_longest: bool, chunk_idx: int = 0, est_headroom_sec: float = 0.0):
             t_s = time.time()
             if getattr(ch, "is_beep", False):
@@ -1214,6 +1348,17 @@ class VCHandlerCog(commands.Cog):
                 except Exception:
                     chunk_spec_timeout = spec_timeout
 
+            # 再生タイムライン基準の投機締切 (shadow は記録のみ)
+            extra = chunk_extra.setdefault(chunk_idx, {})
+            deadline_fn = None
+            if tl_mode != "off" and is_local_engine:
+                def _deadline(idx: int = chunk_idx, t0: float = t_s) -> float:
+                    return max(timeline.deadline_for(idx), t0 + MIN_LOCAL_TRY_SEC)
+                extra["tl_deadline_rel_ms"] = round((_deadline() - t_s) * 1000.0, 1)
+                extra["legacy_spec_ms"] = round(chunk_spec_timeout * 1000.0, 1)
+                if tl_mode == "on":
+                    deadline_fn = _deadline
+
             b, p, w, c = await self.tts_manager.get_chunk_audio(
                 text=ch.text,
                 speaker_id=item.speaker_id,
@@ -1221,7 +1366,9 @@ class VCHandlerCog(commands.Cog):
                 speed=item.speed,
                 user_id=item.user_id,
                 is_longest_chunk=is_longest,
-                speculative_timeout=chunk_spec_timeout
+                speculative_timeout=chunk_spec_timeout,
+                speculative_deadline_fn=deadline_fn,
+                prefer_earliest_finish=(route_mode == "on" and chunk_idx == head_idx)
             )
             t_e = time.time()
             c_meta = (
@@ -1234,6 +1381,8 @@ class VCHandlerCog(commands.Cog):
                 or (bool(engine_name) and p not in ("beep", engine_name))
             )
             failed_provs = list(c_meta.get("failed_providers", [])) if not c else []
+            if not c and c_meta.get("joined_inflight"):
+                extra["joined_inflight"] = c_meta.get("joined_inflight")
             return ch, b, p, w, c, t_s, t_e, is_fb, failed_provs
 
         # 最初のチャンク（プレフィックスまたは第1文）
@@ -1245,6 +1394,12 @@ class VCHandlerCog(commands.Cog):
         all_created_tasks: List[asyncio.Task] = []
 
         try:
+            # 名前なしで先頭が本文の場合、先頭パーツを最初に起動して完了予測最短ノードを確実に確保する
+            head_first_task: Optional[asyncio.Task] = None
+            if route_mode == "on" and head_idx == 0:
+                head_first_task = asyncio.create_task(_synth_chunk(first_chunk, first_is_longest, chunk_idx=0, est_headroom_sec=0.0))
+                all_created_tasks.append(head_first_task)
+
             if len(all_chunks) > 1:
                 cum_headroom_sec = _estimate_chunk_play_sec(first_chunk)
                 for idx, ch in enumerate(all_chunks[1:], start=1):
@@ -1255,9 +1410,12 @@ class VCHandlerCog(commands.Cog):
                     cum_headroom_sec += _estimate_chunk_play_sec(ch)
 
             # 第1チャンクの取得
-            c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await _synth_chunk(
-                first_chunk, first_is_longest, chunk_idx=0, est_headroom_sec=0.0
-            )
+            if head_first_task is not None:
+                c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await head_first_task
+            else:
+                c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await _synth_chunk(
+                    first_chunk, first_is_longest, chunk_idx=0, est_headroom_sec=0.0
+                )
 
             # 第1チャンクをストリームに投入
             if getattr(first_chunk, "is_beep", False):
@@ -1269,6 +1427,7 @@ class VCHandlerCog(commands.Cog):
                     is_followed_by_beep=getattr(first_chunk, "is_followed_by_beep", False)
                 )
             total_audio_duration += dur0
+            timeline.mark_fed(0, dur0)
 
             c0_synth_duration = round((c0_synth_end - c0_synth_start) * 1000, 1)
             c0_audio_duration = round(dur0 * 1000, 1)
@@ -1324,6 +1483,10 @@ class VCHandlerCog(commands.Cog):
                         except Exception as e:
                             logger.debug(f"Failed to check coeiroink model RAM state: {e}")
 
+                # 先頭本文の推定は割当予測 (完了予測最短ノード) と同じ値を使う (Preroll と割当の推定統一)
+                if route_mode == "on" and head_idx == 1 and head_pred:
+                    est_node_ms = float(head_pred.get("eta_ms", 0.0)) or est_node_ms
+
                 # 第0パーツの生成所要時間 (並行タスクがすでに消化したリードタイム)
                 l0_elapsed = max(0.0, c0_synth_end - c0_synth_start)
                 item_speed = max(0.5, min(float(item.speed or 1.0), 2.0))
@@ -1338,6 +1501,8 @@ class VCHandlerCog(commands.Cog):
                         max_cap_s = 1.35   # 重量プロバイダ時は最大1.35秒まで待機してアンダーラン防止
                     else:
                         max_cap_s = 0.85   # 高速GPU/Azure等は0.85秒キャップ
+                    if tl_mode == "on":
+                        max_cap_s = max_silence  # 最大許容沈黙: 順番が来てから最初の音までの上限
                     min_wait_s = 0.15      # 第1文がまだ完了していない場合の最低待機枠 (150ms)
                 else:
                     safety_margin_s = 0.15  # 150ms 安全マージン
@@ -1402,6 +1567,7 @@ class VCHandlerCog(commands.Cog):
                                 is_followed_by_beep=getattr(ch1, "is_followed_by_beep", False)
                             )
                         total_audio_duration += dur1
+                        timeline.mark_fed(1, dur1)
                         ch1_synth_dur = round((te1 - ts1) * 1000, 1)
                         ch1_audio_dur = round(dur1 * 1000, 1)
                         init_buffer_ms = round(total_audio_duration * 1000, 1)
@@ -1445,6 +1611,7 @@ class VCHandlerCog(commands.Cog):
                                     is_followed_by_beep=getattr(ch1, "is_followed_by_beep", False)
                                 )
                             total_audio_duration += dur1
+                            timeline.mark_fed(1, dur1)
                             ch1_synth_dur = round((te1 - ts1) * 1000, 1)
                             ch1_audio_dur = round(dur1 * 1000, 1)
                             init_buffer_ms = round(total_audio_duration * 1000, 1)
@@ -1475,6 +1642,7 @@ class VCHandlerCog(commands.Cog):
             # vc.play を開始！ (プレフィックスまたは第1文までの最適バッファでアンダーランゼロ再生)
             vc.play(volume_transformer, after=after_playing)
             t_play_start = time.time()
+            timeline.t_play = t_play_start
 
             # 残りの後続チャンクを完了次第、パイプライン逐次投入 (全タスク完了待ちによるアンダーランを完全防止)
             for task in remaining_tasks:
@@ -1495,6 +1663,7 @@ class VCHandlerCog(commands.Cog):
                         is_followed_by_beep=getattr(ch, "is_followed_by_beep", False)
                     )
                 total_audio_duration += dur
+                timeline.mark_fed(len(chunks_meta), dur)
 
                 task_synth_dur = round((t_e - t_s) * 1000, 1)
                 task_audio_dur = round(dur * 1000, 1)
@@ -1566,6 +1735,9 @@ class VCHandlerCog(commands.Cog):
                 split_ms = getattr(all_chunks[0], "split_ms", 0.0) if all_chunks else 0.0
                 calc_headroom = round(min_buffer_remaining_ms if min_buffer_remaining_ms != float('inf') else 0.0, 1)
                 gap_lag = round(abs(min(0.0, min_buffer_remaining_ms)) if min_buffer_remaining_ms != float('inf') else 0.0, 1)
+
+                for cm in chunks_meta:
+                    cm.update({k: v for k, v in chunk_extra.get(cm.get("chunk_index"), {}).items() if v is not None})
 
                 latency_tracker.record(
                     user_name=item.user_name,
@@ -1802,6 +1974,7 @@ class VCHandlerCog(commands.Cog):
         #    文分割単位で並行先行合成してパーツキャッシュ（L1/L2）に温めておく。
         is_busy = state.is_playing or not state.queue.empty()
         if is_busy:
+            self._share_chunks_for_prefetch(item)
             item.synth_task = safe_create_task(
                 self._prefetch_chunks(item, speculative_timeout=spec_timeout),
                 name=f"prefetch_chunks_{item.user_id}_{int(time.time()*1000)}"
@@ -2000,6 +2173,7 @@ class VCHandlerCog(commands.Cog):
 
             # キュー待機が生じる場合のみバックグラウンド先行合成
             if state.is_playing or not state.queue.empty():
+                self._share_chunks_for_prefetch(item)
                 item.synth_task = safe_create_task(
                     self._prefetch_chunks(item, speculative_timeout=spec_timeout),
                     name=f"prefetch_vc_event_{item.user_id}_{int(t_now*1000)}"
