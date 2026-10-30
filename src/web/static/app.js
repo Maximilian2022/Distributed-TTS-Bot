@@ -7954,30 +7954,33 @@ function updateWorkerOneliner(webBaseUrl, secret) {
   pre.textContent = cmd;
 }
 
-function updateStandbyOneliner() {
+// 秘密情報は公開配信スクリプトに埋め込まれないため、管理者が取得したクレデンシャルをワンライナーに明示的に含める
+function updateStandbyOneliner(haSecret) {
   const shPre = document.getElementById("standby-oneliner-sh");
   const ps1Pre = document.getElementById("standby-oneliner-ps1");
   const setupBox = document.getElementById("standby-setup-command-box");
   if (!shPre && !ps1Pre && !setupBox) return;
 
   const origin = window.location.origin.replace(/\/$/, "");
+  const sec = haSecret || window.currentHaSecret || "<HA_SECRET>";
 
-  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo bash`;
-  const ps1Cmd = `irm "${origin}/setup-standby.ps1" | iex`;
+  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo bash -s -- "" "${sec}"`;
+  const ps1Cmd = `$env:TTSBOT_HA_SECRET="${sec}"; irm "${origin}/setup-standby.ps1" | iex`;
 
   if (shPre) shPre.textContent = shCmd;
   if (ps1Pre) ps1Pre.textContent = ps1Cmd;
   if (setupBox) setupBox.textContent = shCmd;
 }
 
-function updateClusterWorkerOneliner() {
+function updateClusterWorkerOneliner(workerSecret) {
   const shBox = document.getElementById("cluster-worker-setup-sh");
   const ps1Box = document.getElementById("cluster-worker-setup-ps1");
   if (!shBox && !ps1Box) return;
 
   const origin = window.location.origin.replace(/\/$/, "");
-  const shCmd = `curl -sSL "${origin}/setup-worker.sh" | sudo bash`;
-  const ps1Cmd = `irm "${origin}/setup-worker.ps1" | iex`;
+  const sec = workerSecret || window.currentWorkerSecret || window.VOLUNTEER_WORKER_TOKEN || "<WORKER_SECRET>";
+  const shCmd = `curl -sSL "${origin}/setup-worker.sh" | sudo bash -s -- --secret "${sec}"`;
+  const ps1Cmd = `$env:TTSBOT_WORKER_SECRET="${sec}"; irm "${origin}/setup-worker.ps1" | iex`;
 
   if (shBox) shBox.textContent = shCmd;
   if (ps1Box) ps1Box.textContent = ps1Cmd;
@@ -8118,8 +8121,11 @@ async function loadCredentials() {
       }
     }
 
+    if (data.worker_shared_secret) {
+      window.currentWorkerSecret = data.worker_shared_secret;
+    }
     updateWorkerOneliner(data.web_base_url, data.worker_shared_secret);
-    updateClusterWorkerOneliner();
+    updateClusterWorkerOneliner(data.worker_shared_secret);
 
     // システム全体エラー通知先
     const credErrorContact = document.getElementById("cred-error-contact-user-id");

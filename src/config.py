@@ -123,6 +123,8 @@ class AppConfig:
     web_dashboard_url: str = "http://localhost:8088"
     web_session_secret: str = ""
     worker_shared_secret: str = ""
+    # トークン入れ替え時の猶予用。旧トークンは LAN 内からの接続に限り一時的に受け付ける (空なら無効)
+    worker_shared_secret_previous: str = ""
 
     # Voice defaults
     default_speaker: str = "nanami"
@@ -170,6 +172,8 @@ class AppConfig:
             self.google_credentials_json = credentials["google_credentials_json"]
         if credentials.get("worker_shared_secret"):
             self.worker_shared_secret = credentials["worker_shared_secret"]
+        if credentials.get("worker_shared_secret_previous") is not None:
+            self.worker_shared_secret_previous = credentials["worker_shared_secret_previous"].strip()
         if credentials.get("ha_secret"):
             self.ha_secret = credentials["ha_secret"]
         if credentials.get("cloudflare_tunnel_token") is not None:
@@ -393,6 +397,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cfg.web_session_secret = secrets.token_hex(32)
 
     cfg.worker_shared_secret = os.getenv("WORKER_SHARED_SECRET", "").strip()
+    cfg.worker_shared_secret_previous = os.getenv("WORKER_SHARED_SECRET_PREVIOUS", "").strip()
     if not cfg.worker_shared_secret:
         cfg.worker_shared_secret = secrets.token_hex(16)
 

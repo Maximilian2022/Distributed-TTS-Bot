@@ -46,7 +46,9 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
         self.assertNotIn('MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8088}"', text)
         self.assertNotIn('MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"', text)
         self.assertIn('MASTER_URL="${TTSBOT_MASTER_URL:-https://ttsbot.example.com}"', text)
-        self.assertIn('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-test_secret_12345}"', text)
+        # 共有トークンは公開配信に埋め込まない (管理画面のワンライナーが --secret で渡す)
+        self.assertNotIn("test_secret_12345", text)
+        self.assertIn('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"', text)
 
     @unittest_run_loop
     async def test_setup_worker_sh_delivery_lan(self):
@@ -60,7 +62,9 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
 
         # LAN内の直接通信URLが注入されていること
         self.assertIn('MASTER_URL="${TTSBOT_MASTER_URL:-http://192.168.11.248:8088}"', text)
-        self.assertIn('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-test_secret_12345}"', text)
+        # 共有トークンは公開配信に埋め込まない (管理画面のワンライナーが --secret で渡す)
+        self.assertNotIn("test_secret_12345", text)
+        self.assertIn('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"', text)
 
     @unittest_run_loop
     async def test_setup_worker_sh_static_alias_route(self):
@@ -76,20 +80,31 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
 
     @unittest_run_loop
     async def test_setup_worker_ps1_delivery_wan_and_lan(self):
-        """Windows用 setup-worker.ps1 で WAN/LAN に応じたURLとシークレットが注入されるか"""
+        """Windows用 setup-worker.ps1 で WAN/LAN に応じたURLが注入され、シークレットは埋め込まれないか"""
         # WAN
         wan_resp = await self.client.get("/setup-worker.ps1", headers={"CF-Connecting-IP": "203.0.113.195"})
         self.assertEqual(wan_resp.status, 200)
         wan_text = await wan_resp.text()
         self.assertIn('"https://ttsbot.example.com"', wan_text)
-        self.assertIn('"test_secret_12345"', wan_text)
+        self.assertNotIn("test_secret_12345", wan_text)
 
         # LAN
         lan_resp = await self.client.get("/setup-worker.ps1", headers={"Host": "192.168.11.248:8088"})
         self.assertEqual(lan_resp.status, 200)
         lan_text = await lan_resp.text()
         self.assertIn('"http://192.168.11.248:8088"', lan_text)
-        self.assertIn('"test_secret_12345"', lan_text)
+        self.assertNotIn("test_secret_12345", lan_text)
+
+    @unittest_run_loop
+    async def test_public_endpoints_do_not_embed_secrets(self):
+        """未ログインで取得できるページ・スクリプトに共有トークン / HA シークレットが含まれないか"""
+        self.web_server.config.ha_secret = "test_ha_secret_67890"
+        for path in ("/", "/setup-standby.sh", "/setup-standby.ps1", "/volunteer/run_volunteer.sh",
+                     "/volunteer/run_volunteer_gui.ps1", "/volunteer/run_volunteer.bat"):
+            resp = await self.client.get(path, headers={"CF-Connecting-IP": "203.0.113.195"})
+            text = await resp.text()
+            self.assertNotIn("test_secret_12345", text, path)
+            self.assertNotIn("test_ha_secret_67890", text, path)
 
     @unittest_run_loop
     async def test_static_agent_py_delivery(self):
@@ -134,3 +149,37 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class TestWorkerSecretRotationGrace(AioHTTPTestCase):
+    """Rotation grace: old token is accepted only from LAN; new token works from both LAN and WAN"""
+
+    async def get_application(self):
+        config = AppConfig()
+        config.worker_shared_secret = "new_secret_aaaa"
+        config.worker_shared_secret_previous = "old_secret_bbbb"
+        self.web_server = WebServer(
+            bot=MagicMock(), config=config, database=MagicMock(),
+            cache_manager=MagicMock(), tts_manager=MagicMock()
+        )
+        return self.web_server.app
+
+    def _req(self, token, wan):
+        from aiohttp.test_utils import make_mocked_request
+        headers = {"X-Worker-Token": token}
+        if wan:
+            headers["CF-Connecting-IP"] = "203.0.113.9"
+        transport = MagicMock()
+        transport.get_extra_info.return_value = ("192.168.11.207", 50000)
+        return make_mocked_request("POST", "/api/worker/heartbeat", headers=headers, transport=transport)
+
+    @unittest_run_loop
+    async def test_grace_rules(self):
+        v = self.web_server._verify_worker_auth
+        self.assertTrue(v(self._req("new_secret_aaaa", wan=False)))
+        self.assertTrue(v(self._req("new_secret_aaaa", wan=True)))
+        self.assertTrue(v(self._req("old_secret_bbbb", wan=False)))
+        self.assertFalse(v(self._req("old_secret_bbbb", wan=True)))
+        self.assertFalse(v(self._req("wrong_cccc", wan=False)))
+        self.web_server.config.worker_shared_secret_previous = ""
+        self.assertFalse(v(self._req("old_secret_bbbb", wan=False)))

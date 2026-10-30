@@ -152,6 +152,7 @@ class WebServer:
         )
         self._start_time = time.time()
         self.master_instance_id = f"master_{uuid.uuid4().hex[:12]}"
+        self._previous_secret_warned: Dict[str, float] = {}
         self.ha_slaves: Dict[str, Dict[str, Any]] = {}
         self.ha_revoked_nodes: set = set()
         self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
@@ -904,7 +905,8 @@ class WebServer:
         css_mtime = int(style_css_path.stat().st_mtime) if style_css_path.exists() else 0
         asset_v = f"{BUILD_VERSION}-{max(js_mtime, css_mtime)}"
 
-        worker_token = getattr(self.config, "worker_shared_secret", "").strip()
+        # 共有ワーカートークンは管理者セッションにのみ埋め込む
+        worker_token = getattr(self.config, "worker_shared_secret", "").strip() if (user and user.get("is_admin")) else ""
 
         html = html.replace("{{IS_LOGGED_IN}}", is_logged_in)
         html = html.replace("{{CLIENT_CONFIGURED}}", client_configured)
@@ -929,14 +931,12 @@ class WebServer:
             return web.Response(text="#!/bin/bash\necho 'Error: setup-worker.sh not found'\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
         content = script_path.read_text(encoding="utf-8").lstrip("\ufeff")
         master_url = self._get_master_base_url(request)
-        token = getattr(self.config, "worker_shared_secret", "").strip()
+        # 共有トークンは公開配信に埋め込まない (管理画面のワンライナーが --secret で明示的に渡す)
         # MASTER_URL を動的置換 (http://localhost:8080 / http://localhost:8088 等あらゆるデフォルト値に対応)
         content = re.sub(r'MASTER_URL="\$\{TTSBOT_MASTER_URL:-[^}"]*\}"', f'MASTER_URL="${{TTSBOT_MASTER_URL:-{master_url}}}"', content)
-        content = re.sub(r'WORKER_SECRET="\$\{TTSBOT_WORKER_SECRET:-[^}"]*\}"', f'WORKER_SECRET="${{TTSBOT_WORKER_SECRET:-{token}}}"', content)
         # 固定文字列置換も安全網として保持
         content = content.replace('MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"', f'MASTER_URL="${{TTSBOT_MASTER_URL:-{master_url}}}"')
         content = content.replace('MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8088}"', f'MASTER_URL="${{TTSBOT_MASTER_URL:-{master_url}}}"')
-        content = content.replace('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"', f'WORKER_SECRET="${{TTSBOT_WORKER_SECRET:-{token}}}"')
         resp = web.Response(text=content, content_type="text/plain", charset="utf-8")
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return resp
@@ -948,19 +948,15 @@ class WebServer:
             return web.Response(text="Write-Host 'Error: setup-worker.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
         content = script_path.read_text(encoding="utf-8").lstrip("\ufeff")
         master_url = self._get_master_base_url(request)
-        token = getattr(self.config, "worker_shared_secret", "").strip()
+        # 共有トークンは公開配信に埋め込まない (管理画面のワンライナーが $env:TTSBOT_WORKER_SECRET で明示的に渡す)
         # $MasterUrl を動的置換 (8080 / 8088 等あらゆるデフォルト値に対応)
         content = re.sub(r'\$MasterUrl\s*=\s*if\s*\(\$env:TTSBOT_MASTER_URL\)\s*\{\s*\$env:TTSBOT_MASTER_URL\s*\}\s*else\s*\{\s*"[^"]*"\s*\}',
                          f'$MasterUrl  = if ($env:TTSBOT_MASTER_URL) {{ $env:TTSBOT_MASTER_URL }} else {{ "{master_url}" }}', content)
-        content = re.sub(r'\$WorkerSecret\s*=\s*if\s*\(\$env:TTSBOT_WORKER_SECRET\)\s*\{\s*\$env:TTSBOT_WORKER_SECRET\s*\}\s*else\s*\{\s*"[^"]*"\s*\}',
-                         f'$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) {{ $env:TTSBOT_WORKER_SECRET }} else {{ "{token}" }}', content)
         # 固定文字列置換も安全網として保持
         content = content.replace('$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8080" }',
                                   f'$MasterUrl  = if ($env:TTSBOT_MASTER_URL) {{ $env:TTSBOT_MASTER_URL }} else {{ "{master_url}" }}')
         content = content.replace('$MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8088" }',
                                   f'$MasterUrl  = if ($env:TTSBOT_MASTER_URL) {{ $env:TTSBOT_MASTER_URL }} else {{ "{master_url}" }}')
-        content = content.replace('$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) { $env:TTSBOT_WORKER_SECRET } else { "" }',
-                                  f'$WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) {{ $env:TTSBOT_WORKER_SECRET }} else {{ "{token}" }}')
         resp = web.Response(text=content, content_type="text/plain", charset="utf-8")
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         return resp
@@ -1028,11 +1024,11 @@ class WebServer:
             return web.Response(text="#!/bin/bash\necho 'Error: setup-standby.sh not found'\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
 
         master_url = self._get_master_base_url(request)
-        ha_secret = await self._ensure_ha_secret()
+        # HA シークレットは公開配信に埋め込まない (DB スナップショット取得権限を持つため。管理画面のワンライナーが明示的に渡す)
+        await self._ensure_ha_secret()
 
         content = script_path.read_text(encoding="utf-8")
         content = content.replace("__DEFAULT_MASTER_URL__", master_url)
-        content = content.replace("__DEFAULT_HA_SECRET__", ha_secret)
         return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
     async def handle_setup_standby_ps1(self, request: web.Request) -> web.Response:
@@ -1042,11 +1038,11 @@ class WebServer:
             return web.Response(text="Write-Host 'Error: setup-standby.ps1 not found' -ForegroundColor Red\nexit 1\n", status=404, content_type="text/plain", charset="utf-8")
 
         master_url = self._get_master_base_url(request)
-        ha_secret = await self._ensure_ha_secret()
+        # HA シークレットは公開配信に埋め込まない (DB スナップショット取得権限を持つため。管理画面のワンライナーが明示的に渡す)
+        await self._ensure_ha_secret()
 
         content = script_path.read_text(encoding="utf-8")
         content = content.replace("__DEFAULT_MASTER_URL__", master_url)
-        content = content.replace("__DEFAULT_HA_SECRET__", ha_secret)
         return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
     async def handle_update_sh(self, request: web.Request) -> web.Response:
@@ -1135,10 +1131,8 @@ class WebServer:
             content = file_path.read_text(encoding="utf-8")
             master_base_url = self._get_master_base_url(request)
             ws_url = master_base_url.replace("http://", "ws://").replace("https://", "wss://").rstrip("/") + "/api/worker/ws"
-            worker_token = getattr(self.config, "worker_shared_secret", "").strip()
-
+            # 共有トークンは公開配信に埋め込まない (管理画面のワンライナーが引数・環境変数で明示的に渡す)
             content = content.replace("__DEFAULT_SERVER_WS_URL__", ws_url)
-            content = content.replace("__DEFAULT_WORKER_TOKEN__", worker_token)
             content = content.lstrip("\ufeff")
             return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
@@ -4228,8 +4222,17 @@ class WebServer:
         if secret and token:
             if hmac.compare_digest(token, secret):
                 return True
-            else:
-                return False
+            # トークン入れ替えの猶予: 旧トークンは LAN 内からの接続に限り受け付ける (WAN 経由は新トークンのみ)
+            previous = getattr(self.config, "worker_shared_secret_previous", "").strip()
+            if previous and hmac.compare_digest(token, previous) and not self._is_wan_request(request):
+                peername = request.transport.get_extra_info('peername') if request.transport else None
+                client_ip = peername[0] if peername else (request.remote or "")
+                now = time.time()
+                if now - self._previous_secret_warned.get(client_ip, 0.0) > 3600.0:
+                    self._previous_secret_warned[client_ip] = now
+                    logger.warning(f"🔑 [Security] Worker at {client_ip} is still using the PREVIOUS shared secret (accepted on LAN during rotation grace). Please update it.")
+                return True
+            return False
 
         # トークンなし、または未一致の場合: WAN経由は拒否
         if self._is_wan_request(request):
