@@ -889,9 +889,7 @@ class TTSNodePool:
         current_order = get_tier_routing_order(eng_key)
 
         def is_node_in_ram(node: TTSNode) -> bool:
-            if model_name:
-                return node.has_model_in_ram(model_name)
-            return bool(node.specs.get("ram_models") or node.specs.get("is_ramdisk") or node.specs.get("in_ramdisk"))
+            return self._is_node_in_ram(node, model_name)
 
         buckets = {
             "gpu_ram": [n for n in available if n.has_gpu and is_node_in_ram(n)],
@@ -1124,9 +1122,28 @@ class TTSNodePool:
         logger.warning(f"⚠️ [NodePool] All nodes for '{self.engine_name}' are busy or unavailable (timeout={timeout}s).")
         return None
 
+    @staticmethod
+    def _is_node_in_ram(node: TTSNode, model_name: Optional[str] = None) -> bool:
+        """Tier 判定用の RAM 常駐判定 (モデル指定時はそのモデル、未指定時はノードに常駐モデルがあるか)"""
+        if model_name:
+            return node.has_model_in_ram(model_name)
+        return bool(node.specs.get("ram_models") or node.specs.get("is_ramdisk") or node.specs.get("in_ramdisk"))
+
+    def node_tier(self, node: TTSNode) -> Tuple[str, int]:
+        """このエンジンの現在の Tier 順における (tier_key, 順位 1〜4)。ルーティングと同じ判定を使う"""
+        tier_key = ("gpu" if node.has_gpu else "cpu") + "_" + ("ram" if self._is_node_in_ram(node) else "ssd")
+        order = get_tier_routing_order(self.engine_name.lower())
+        rank = order.index(tier_key) + 1 if tier_key in order else 0
+        return tier_key, rank
+
     def get_status(self) -> List[Dict[str, Any]]:
-        """全ノードの健全性と統計情報を取得"""
-        return [n.to_dict() for n in self.nodes]
+        """全ノードの健全性と統計情報を取得 (エンジン別の Tier を付与)"""
+        result = []
+        for n in self.nodes:
+            d = n.to_dict()
+            d["tier_key"], d["tier_rank"] = self.node_tier(n)
+            result.append(d)
+        return result
 
     async def close(self) -> None:
         """プール内の全ノードのHTTPセッション・接続リソースを安全に解放"""

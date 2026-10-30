@@ -2958,11 +2958,16 @@ function renderWorkerNodes(nodesData) {
       const activeBadge = activeCount > 0
         ? ` <span style="background:rgba(80,230,255,0.25);color:#50e6ff;padding:0 4px;border-radius:3px;font-weight:700;">${activeCount}/${maxC}</span>`
         : ` <span style="color:var(--text-dim);font-size:9px;">(${maxC}並列)</span>`;
+      // ルーティング上の Tier (エンジン別の Tier 順における順位)
+      const tierRank = Number(e.tier_rank) || 0;
+      const tierBadgeHtml = tierRank > 0
+        ? ` <span title="ルーティング Tier (${escapeHtml(String(e.tier_key || ''))})" style="background:rgba(255,255,255,0.08);color:var(--text-normal);padding:0 4px;border-radius:3px;font-size:9px;font-weight:700;">Tier${tierRank}</span>`
+        : '';
 
       return `<span style="background:${badgeBg};border:1px solid ${badgeBorder};color:${badgeColor};padding:2px 7px;border-radius:5px;font-size:10px;display:inline-flex;align-items:center;gap:3px;margin-right:5px;margin-bottom:4px;" title="${escapeHtml(e.name)}: ${statusText}">` +
         `<strong style="font-weight:700;">${dot} ${escapeHtml(e.name)}</strong>` +
         `<span style="opacity:0.85;font-size:9px;">[${statusText}]</span>` +
-        `${activeBadge}</span>`;
+        `${tierBadgeHtml}${activeBadge}</span>`;
     }).join("");
 
     // 統計
@@ -3137,17 +3142,15 @@ function renderWorkerNodes(nodesData) {
     `;
 
     card.innerHTML = `
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
-        <div style="font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;">
-          <span>${icon}</span>
-          <span>${escapeHtml(nodeName)}</span>${volunteerBadge}
-          ${agentVersion ? `<span style="font-size:9px;color:var(--text-dim);background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:4px;">v${escapeHtml(agentVersion)}</span>` : ''}
-        </div>
-        <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
-          ${agentBadge}
-          ${engineSummaryBadge}
-          ${actionButtons}
-        </div>
+      <div style="font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+        <span>${icon}</span>
+        <span>${escapeHtml(nodeName)}</span>${volunteerBadge}
+        ${agentVersion ? `<span style="font-size:9px;color:var(--text-dim);background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:4px;">v${escapeHtml(agentVersion)}</span>` : ''}
+      </div>
+      <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
+        ${agentBadge}
+        ${engineSummaryBadge}
+        ${actionButtons}
       </div>
       <div style="font-size:11px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;background:rgba(0,0,0,0.22);padding:7px 10px;border-radius:6px;margin:2px 0;">
         <div>ホスト: <strong style="color:var(--text-normal);">${escapeHtml(workerHostDisplay)}</strong></div>

@@ -105,3 +105,31 @@ class TestTTSNodeColdStartAlert(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNodeTierLabel(unittest.TestCase):
+    """ワーカーカードの Tier 表示: エンジン別の Tier 順に追従し、ルーティングと同じ RAM 判定を使う"""
+
+    def setUp(self):
+        self._saved = node_pool.get_tier_routing_order("coeiroink")
+        self.addCleanup(node_pool.set_tier_routing_order, "coeiroink", self._saved)
+        node_pool.set_tier_routing_order("coeiroink", ["gpu_ram", "cpu_ram", "gpu_ssd", "cpu_ssd"])
+        cfgs = [node_pool.TTSNodeConfig(id=f"worker_{h}_coeiroink", url=f"http://10.0.0.{i}:50031")
+                for i, h in enumerate(("gpuram", "cpuram", "gpussd", "cpussd"), start=1)]
+        self.pool = node_pool.TTSNodePool("coeiroink", cfgs)
+        specs = {"gpuram": {"gpu": True, "ram_models": ["m1"]}, "cpuram": {"gpu": False, "ram_models": ["m1"]},
+                 "gpussd": {"gpu": True, "ram_models": []}, "cpussd": {"gpu": False}}
+        for n in self.pool.nodes:
+            n.specs.update(specs[n.id.split("_")[1]])
+
+    def test_rank_follows_engine_order(self):
+        ranks = {d["id"]: (d["tier_key"], d["tier_rank"]) for d in self.pool.get_status()}
+        self.assertEqual(ranks["worker_gpuram_coeiroink"], ("gpu_ram", 1))
+        self.assertEqual(ranks["worker_cpuram_coeiroink"], ("cpu_ram", 2))
+        self.assertEqual(ranks["worker_gpussd_coeiroink"], ("gpu_ssd", 3))
+        self.assertEqual(ranks["worker_cpussd_coeiroink"], ("cpu_ssd", 4))
+
+        node_pool.set_tier_routing_order("coeiroink", ["cpu_ram", "gpu_ram", "cpu_ssd", "gpu_ssd"])
+        ranks = {d["id"]: d["tier_rank"] for d in self.pool.get_status()}
+        self.assertEqual(ranks["worker_cpuram_coeiroink"], 1)
+        self.assertEqual(ranks["worker_gpuram_coeiroink"], 2)
