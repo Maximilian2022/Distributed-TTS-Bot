@@ -61,6 +61,11 @@ class WSWorkerNode(TTSNode):
             for k, v in (supported_models or {}).items()
         }
         self.pending_requests: Dict[str, asyncio.Future] = {}
+        # 接続時のトークン種別で確定 (個人トークン = ボランティア / 共有トークン + Agent トンネル = クラスタ)
+        self.is_volunteer: bool = True
+        self.owner_user_id: Optional[int] = None
+        self.owner_name: str = ""
+        self.token_id: Optional[str] = None
         self.last_heartbeat = time.time()
         self.is_healthy = True
         self.engine_running = True
@@ -71,7 +76,8 @@ class WSWorkerNode(TTSNode):
         gpu = self.specs.get("gpu_name") or ("GPU" if self.specs.get("gpu") else "CPU")
         gpu_clean = str(gpu).replace("NVIDIA GeForce ", "").replace("NVIDIA ", "")
         scope = f" [専用: {self.exclusive_guild_id}]" if self.exclusive_guild_id else ""
-        return f"Volunteer-{self.hostname} ({gpu_clean}){scope}"
+        prefix = "Volunteer-" if self.is_volunteer else ""
+        return f"{prefix}{self.hostname} ({gpu_clean}){scope}"
 
     @property
     def short_label(self) -> str:
@@ -162,7 +168,8 @@ class WSWorkerNode(TTSNode):
     def to_dict(self) -> Dict[str, Any]:
         """WebUIステータス用辞書"""
         d = super().to_dict()
-        d["is_volunteer"] = True
+        d["is_volunteer"] = self.is_volunteer
+        d["owner_name"] = self.owner_name if self.is_volunteer else ""
         d["connection_type"] = "websocket"
         d["supported_engines"] = self.supported_engines
         d["supported_models"] = self.supported_models

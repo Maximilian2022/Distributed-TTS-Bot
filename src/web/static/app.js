@@ -134,6 +134,7 @@ function triggerTabDataLoad(activeSubOrTab) {
   }
   if (activeSubOrTab === "volunteer") {
     updateVolunteerOneliner();
+    loadVolunteerTokens();
   }
   if (activeSubOrTab === "help") {
     renderCharacterTermsTable();
@@ -2781,14 +2782,11 @@ function renderWorkerNodes(nodesData) {
       workerHostDisplay = isMaster ? (specs.hostname || "MasterNode") : (nodeIp ? `Worker (${nodeIp})` : "Worker Node");
     }
 
-    // クラスタWorker (HTTP直接ポートを持つノード) が存在する場合、ボランティア判定に優先
-    const hasClusterEngine = (node.engines || []).some(e => e.url && !e.url.startsWith('ws://') && !e.is_volunteer);
-    const isVolunteer = !hasClusterEngine && Boolean(
-      node.is_volunteer || 
-      (node.engines || []).every(e => e.is_volunteer) || 
-      cleanCandidate.startsWith('volunteer_') || 
-      (node.url && node.url.startsWith('ws://'))
-    );
+    // ボランティア判定は接続時にトークン種別で確定した is_volunteer のみで行う
+    // (URL が ws:// やノード名の接頭辞で判定すると、WS トンネル接続のクラスタ Worker を誤認するため)
+    const engineList = node.engines || [];
+    const isVolunteer = engineList.length > 0 && engineList.every(e => e.is_volunteer === true);
+    const ownerName = isVolunteer ? (engineList.find(e => e.owner_name)?.owner_name || "") : "";
 
     // 1. Agent のオンライン/オフライン判定 (ハートビート疎通)
     const hbAgo = node.last_heartbeat_ago;
@@ -2816,7 +2814,8 @@ function renderWorkerNodes(nodesData) {
     const icon = isMaster ? "🏢" : (isVolunteer ? "🤝" : (hasGpu ? "🎮" : "🖥️"));
     const nodeName = isMaster ? (workerHostDisplay.includes("Master") ? workerHostDisplay : `${workerHostDisplay} (Master)`) : workerHostDisplay;
     const volunteerBadge = isVolunteer
-      ? '<span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;margin-left:4px;">🤝 ボランティア</span>'
+      ? '<span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;margin-left:4px;">🤝 ボランティア</span>' +
+        (ownerName ? `<span title="このボランティアワーカーの所有者" style="background:rgba(255,255,255,0.06);color:var(--text-normal);padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;">👤 ${escapeHtml(ownerName)}</span>` : '')
       : '';
 
     const agentBadge = isVolunteer
@@ -8002,17 +8001,118 @@ function updateVolunteerOneliner() {
     wsUrl = `${wsUrl}/api/worker/ws`;
   }
 
-  const token = window.VOLUNTEER_WORKER_TOKEN || "";
-  const tokenEnvPs1 = token ? `$env:TTSBOT_WORKER_TOKEN="${token}"; ` : "";
-  const tokenArgSh = token ? ` "${token}"` : "";
-
+  // ボランティアは個人トークンでのみ参加させる (端末とアカウントを紐づけ、ワーカー一覧に所有者を表示するため)
+  const token = window.VOLUNTEER_PERSONAL_TOKEN || "";
+  if (!token) {
+    const hint = "（上の「参加用ワンライナーを発行」を押すと、ここにあなた専用のコマンドが表示されます）";
+    if (ps1Pre) ps1Pre.textContent = hint;
+    if (shPre) shPre.textContent = hint;
+    return;
+  }
   if (ps1Pre) {
-    ps1Pre.textContent = `$env:TTSBOT_SERVER_URL="${wsUrl}"; ${tokenEnvPs1}irm "${origin}/volunteer/run_volunteer_gui.ps1" | iex`;
+    ps1Pre.textContent = `$env:TTSBOT_SERVER_URL="${wsUrl}"; $env:TTSBOT_WORKER_TOKEN="${token}"; irm "${origin}/volunteer/run_volunteer_gui.ps1" | iex`;
   }
   if (shPre) {
-    shPre.textContent = `curl -sSL "${origin}/volunteer/run_volunteer.sh" | bash -s -- "${wsUrl}"${tokenArgSh}`;
+    shPre.textContent = `curl -sSL "${origin}/volunteer/run_volunteer.sh" | bash -s -- "${wsUrl}" "${token}"`;
   }
 }
+
+// --- ボランティアの個人トークン (発行・一覧・失効) ---
+async function issueVolunteerToken(btn) {
+  const labelInput = document.getElementById("volunteer-token-label");
+  const label = labelInput ? labelInput.value.trim() : "";
+  const orig = btn ? btn.innerHTML : "";
+  if (btn) { btn.disabled = true; btn.innerHTML = "⏳ 発行中..."; }
+  try {
+    const resp = await fetch("/api/volunteer/tokens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label })
+    });
+    if (resp.status === 401) {
+      showToast("ログインすると参加用トークンを発行できます", "error");
+      return;
+    }
+    const data = await resp.json();
+    if (!resp.ok || !data.token) throw new Error(data.message || `HTTP ${resp.status}`);
+    window.VOLUNTEER_PERSONAL_TOKEN = data.token;
+    updateVolunteerOneliner();
+    const notice = document.getElementById("volunteer-token-issued");
+    if (notice) notice.hidden = false;
+    showToast("あなた専用の参加用ワンライナーを発行しました 🔑", "success");
+    loadVolunteerTokens();
+  } catch (e) {
+    showToast(`トークンの発行に失敗しました: ${e.message}`, "error");
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+  }
+}
+window.issueVolunteerToken = issueVolunteerToken;
+
+async function loadVolunteerTokens() {
+  const box = document.getElementById("volunteer-my-tokens");
+  const hint = document.getElementById("volunteer-token-login-hint");
+  const form = document.getElementById("volunteer-token-form");
+  if (!box) return;
+  if (!window.APP_IS_LOGGED_IN) {
+    if (hint) hint.hidden = false;
+    if (form) form.hidden = true;
+    box.innerHTML = "";
+    return;
+  }
+  if (hint) hint.hidden = true;
+  if (form) form.hidden = false;
+  try {
+    const resp = await fetch("/api/volunteer/tokens");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    const tokens = data.tokens || [];
+    const devices = data.devices || [];
+    if (tokens.length === 0) {
+      box.innerHTML = '<div style="font-size:12px;color:var(--text-dim);">発行済みのトークンはまだありません。</div>';
+      return;
+    }
+    const rows = tokens.map(t => {
+      const devs = devices.filter(d => d.token_id === t.token_id);
+      const devHtml = devs.length
+        ? devs.map(d => `<span style="white-space:nowrap;">${d.online ? "🟢" : "⚪"} ${escapeHtml(d.device_name || d.node_id)}</span>`).join("<br>")
+        : '<span style="color:var(--text-dim);">未接続</span>';
+      const revoked = Boolean(t.revoked_at);
+      const action = revoked
+        ? '<span style="color:var(--text-dim);">失効済み</span>'
+        : `<button type="button" class="btn btn-secondary btn-sm" onclick="revokeVolunteerToken('${escapeHtml(t.token_id)}', this)" style="padding:2px 8px;font-size:11px;color:#ff6b6b;border-color:rgba(231,76,60,0.4);">失効</button>`;
+      return `<tr style="${revoked ? "opacity:0.55;" : ""}">
+        <td style="padding:6px 8px;">${escapeHtml(t.label || "(名称なし)")}</td>
+        <td style="padding:6px 8px;font-size:11px;color:var(--text-dim);">${escapeHtml(t.created_at || "")}</td>
+        <td style="padding:6px 8px;font-size:11px;color:var(--text-dim);">${escapeHtml(t.last_used_at || "-")}</td>
+        <td style="padding:6px 8px;font-size:12px;">${devHtml}</td>
+        <td style="padding:6px 8px;text-align:right;">${action}</td>
+      </tr>`;
+    }).join("");
+    box.innerHTML = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
+      <thead><tr style="color:var(--text-muted);text-align:left;border-bottom:1px solid var(--border-color);">
+        <th style="padding:6px 8px;">名前</th><th style="padding:6px 8px;">発行日時</th><th style="padding:6px 8px;">最終利用</th><th style="padding:6px 8px;">端末</th><th></th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
+  } catch (e) {
+    box.innerHTML = `<div style="font-size:12px;color:#ff7878;">一覧の取得に失敗しました: ${escapeHtml(e.message)}</div>`;
+  }
+}
+window.loadVolunteerTokens = loadVolunteerTokens;
+
+async function revokeVolunteerToken(tokenId, btn) {
+  if (!confirm("このトークンを失効させますか？\nこのトークンで接続中の端末は切断され、再接続できなくなります。")) return;
+  if (btn) btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/volunteer/tokens/${encodeURIComponent(tokenId)}`, { method: "DELETE" });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    showToast("トークンを失効させました", "success");
+    loadVolunteerTokens();
+  } catch (e) {
+    showToast(`失効に失敗しました: ${e.message}`, "error");
+    if (btn) btn.disabled = false;
+  }
+}
+window.revokeVolunteerToken = revokeVolunteerToken;
 window.updateVolunteerOneliner = updateVolunteerOneliner;
 
 async function loadCredentials() {

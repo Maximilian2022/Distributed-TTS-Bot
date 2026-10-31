@@ -7,6 +7,8 @@ import random
 import json
 import time
 import re
+import secrets
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
@@ -142,6 +144,7 @@ class SQLitePool:
 
 
 
+VOLUNTEER_TOKEN_PREFIX = "vt_"  # 個人トークンの接頭辞 (共有ワーカートークンと区別する)
 MAX_SILENCE_MIN_SECONDS = 1.0
 MAX_SILENCE_MAX_SECONDS = 2.5
 MAX_SILENCE_DEFAULT_SECONDS = 1.5
@@ -572,6 +575,31 @@ class Database:
                 )
             """)
             await db.execute("CREATE INDEX IF NOT EXISTS idx_latency_incidents_created ON latency_incidents(created_at);")
+
+            # ボランティアワーカーの個人トークン (本体は保存せず SHA-256 のみ) と端末 (所有者表示用)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS volunteer_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    token_hash TEXT UNIQUE NOT NULL,
+                    discord_user_id INTEGER NOT NULL,
+                    owner_name TEXT DEFAULT '',
+                    label TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP,
+                    revoked_at TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS volunteer_devices (
+                    node_id TEXT PRIMARY KEY,
+                    token_id TEXT NOT NULL,
+                    discord_user_id INTEGER NOT NULL,
+                    owner_name TEXT DEFAULT '',
+                    device_name TEXT DEFAULT '',
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
             # 10. スキーママイグレーション管理テーブル
             await db.execute("""
@@ -2878,6 +2906,89 @@ class Database:
             async with db.execute("SELECT value FROM system_credentials WHERE key = ?", (key,)) as cur:
                 row = await cur.fetchone()
                 return str(row[0]) if row else default
+
+    # --- ボランティアワーカーの個人トークン & 端末 ---
+
+    @staticmethod
+    def _hash_volunteer_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def create_volunteer_token(self, discord_user_id: int, owner_name: str, label: str = "") -> Tuple[str, str]:
+        """個人トークンを発行 (戻り値: token_id, token)。トークン本体は返却時のみで DB には保存しない"""
+        token = VOLUNTEER_TOKEN_PREFIX + secrets.token_hex(16)
+        token_id = uuid.uuid4().hex[:12]
+        async with self.get_connection() as db:
+            await db.execute(
+                "INSERT INTO volunteer_tokens (token_id, token_hash, discord_user_id, owner_name, label) VALUES (?, ?, ?, ?, ?)",
+                (token_id, self._hash_volunteer_token(token), int(discord_user_id), str(owner_name)[:100], str(label)[:60])
+            )
+            await db.commit()
+        return token_id, token
+
+    async def resolve_volunteer_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """有効な個人トークンなら所有者情報を返す (最終利用日時を更新)。無効・失効は None"""
+        if not token or not token.startswith(VOLUNTEER_TOKEN_PREFIX):
+            return None
+        token_hash = self._hash_volunteer_token(token)
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT token_id, discord_user_id, owner_name, label FROM volunteer_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+                (token_hash,)
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return None
+            await db.execute("UPDATE volunteer_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_id = ?", (row["token_id"],))
+            await db.commit()
+            return dict(row)
+
+    async def list_volunteer_tokens(self, discord_user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """個人トークン一覧 (discord_user_id 指定時は本人分のみ)。ハッシュは返さない"""
+        sql = "SELECT token_id, discord_user_id, owner_name, label, created_at, last_used_at, revoked_at FROM volunteer_tokens"
+        args: Tuple[Any, ...] = ()
+        if discord_user_id is not None:
+            sql += " WHERE discord_user_id = ?"
+            args = (int(discord_user_id),)
+        sql += " ORDER BY created_at DESC"
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, args) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def revoke_volunteer_token(self, token_id: str, discord_user_id: Optional[int] = None) -> bool:
+        """個人トークンを失効 (discord_user_id 指定時は本人のトークンのみ)"""
+        sql = "UPDATE volunteer_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE token_id = ? AND revoked_at IS NULL"
+        args: Tuple[Any, ...] = (token_id,)
+        if discord_user_id is not None:
+            sql += " AND discord_user_id = ?"
+            args = (token_id, int(discord_user_id))
+        async with self.get_connection() as db:
+            cur = await db.execute(sql, args)
+            await db.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def upsert_volunteer_device(self, node_id: str, token_id: str, discord_user_id: int, owner_name: str, device_name: str) -> None:
+        async with self.get_connection() as db:
+            await db.execute("""
+                INSERT INTO volunteer_devices (node_id, token_id, discord_user_id, owner_name, device_name)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET token_id=excluded.token_id, owner_name=excluded.owner_name,
+                    device_name=excluded.device_name, last_seen=CURRENT_TIMESTAMP
+            """, (node_id, token_id, int(discord_user_id), str(owner_name)[:100], str(device_name)[:100]))
+            await db.commit()
+
+    async def list_volunteer_devices(self, discord_user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = "SELECT node_id, token_id, discord_user_id, owner_name, device_name, first_seen, last_seen FROM volunteer_devices"
+        args: Tuple[Any, ...] = ()
+        if discord_user_id is not None:
+            sql += " WHERE discord_user_id = ?"
+            args = (int(discord_user_id),)
+        sql += " ORDER BY last_seen DESC"
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, args) as cur:
+                return [dict(r) for r in await cur.fetchall()]
 
     async def set_credential(self, key: str, value: str, is_secret: bool = False) -> None:
         """システム設定・認証情報値を保存・更新"""

@@ -359,6 +359,24 @@
               </div>
             </div>
 
+            <!-- あなた専用の参加トークン (端末とアカウントの紐づけ) -->
+            <div class="card" style="margin-bottom:20px;border-left:4px solid #a855f7;">
+              <h3 style="margin:0 0 6px;font-size:16px;font-weight:700;">🔑 あなた専用の参加トークン</h3>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.6;margin-bottom:10px;">
+                このトークンを使って参加した PC は、あなたの Discord アカウントに紐づきます。ワーカー一覧には、あなたの名前が所有者として表示されます。<br>
+                1 つのアカウントで複数の PC を参加させられます。PC ごとにトークンを発行すると、あとから個別に止められます。
+              </div>
+              <div id="volunteer-token-login-hint" hidden style="font-size:12px;color:#faa61a;">ログインすると、参加用トークンを発行できます。</div>
+              <div id="volunteer-token-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+                <input type="text" id="volunteer-token-label" class="form-input" maxlength="60" placeholder="名前 (例: 自宅のゲーミングPC)" style="flex:1;min-width:200px;">
+                <button type="button" class="btn btn-primary btn-sm" onclick="issueVolunteerToken(this)">参加用ワンライナーを発行</button>
+              </div>
+              <div id="volunteer-token-issued" hidden style="font-size:12px;color:#faa61a;background:rgba(250,166,26,0.08);border:1px solid rgba(250,166,26,0.3);padding:6px 10px;border-radius:6px;margin-bottom:10px;">
+                ⚠️ 下のワンライナーに含まれるトークンは、この画面を閉じると二度と表示されません。他の人に見せないでください。
+              </div>
+              <div id="volunteer-my-tokens"></div>
+            </div>
+
             <!-- Windows 向け参加カード -->
             <div class="card" style="margin-bottom:20px;border-left:4px solid #38bdf8;">
               <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:12px;">

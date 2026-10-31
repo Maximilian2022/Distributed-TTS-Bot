@@ -33,7 +33,7 @@ from aiohttp import web
 import discord
 
 from src.config import AppConfig, save_yaml_config, reload_config, TTSNodeConfig
-from src.database import Database, clamp_max_silence
+from src.database import Database, clamp_max_silence, VOLUNTEER_TOKEN_PREFIX
 from src.cache_manager import CacheManager
 from src.tts.manager import TTSManager
 from src.tts.coeiroink_models import CoeiroinkModelManager
@@ -153,6 +153,7 @@ class WebServer:
         self._start_time = time.time()
         self.master_instance_id = self._load_or_create_master_instance_id()
         self._previous_secret_warned: Dict[str, float] = {}
+        self.volunteer_ws_by_token: Dict[str, set] = {}
         self.ha_slaves: Dict[str, Dict[str, Any]] = {}
         self.ha_revoked_nodes: set = set()
         self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
@@ -498,6 +499,9 @@ class WebServer:
         self.app.router.add_get("/api/system/tier_routing", self.api_system_get_tier_routing)
         self.app.router.add_post("/api/system/tier_routing", self.api_system_save_tier_routing)
         self.app.router.add_get("/api/worker/ws", self.api_worker_ws)
+        self.app.router.add_get("/api/volunteer/tokens", self.api_volunteer_tokens_list)
+        self.app.router.add_post("/api/volunteer/tokens", self.api_volunteer_tokens_create)
+        self.app.router.add_delete("/api/volunteer/tokens/{token_id}", self.api_volunteer_tokens_revoke)
 
         # HA (High Availability) & Standby 同期 API
         self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
@@ -603,7 +607,9 @@ class WebServer:
             # 例外2: リモート Worker / クラスタ Worker 接続エンドポイント (/api/worker/ws, /api/worker/register, /api/worker/heartbeat, /api/worker/models/)
             # 外部 (Cloudflare Tunnel / インターネット) からの安全な接続のため、正当な共有トークン (WORKER_SHARED_SECRET) が【必須】
             elif path in ("/api/worker/ws", "/api/worker/register", "/api/worker/heartbeat") or path.startswith("/api/worker/models/"):
-                if not self._verify_worker_auth(request):
+                # ボランティアの個人トークンは WS のみ許可し、DB 照合はハンドラ内で行う
+                is_personal_ws = path == "/api/worker/ws" and self._extract_worker_token(request).startswith(VOLUNTEER_TOKEN_PREFIX)
+                if not is_personal_ws and not self._verify_worker_auth(request):
                     client_ip = request.headers.get("CF-Connecting-IP") or request.remote or "unknown"
                     logger.warning(f"🚫 [Security] Blocked WAN worker request (missing or invalid shared token) to '{path}' from {client_ip}")
                     return web.json_response(
@@ -4224,6 +4230,13 @@ class WebServer:
             "message": "User settings reset to default"
         })
 
+    @staticmethod
+    def _extract_worker_token(request: web.Request) -> str:
+        """Bearer / X-Worker-Token / クエリ token の順にワーカートークンを取り出す"""
+        auth_header = request.headers.get("Authorization", "")
+        bearer_token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+        return bearer_token or request.headers.get("X-Worker-Token") or request.query.get("token") or ""
+
     def _verify_worker_auth(self, request: web.Request) -> bool:
         """
         Worker 認証検証:
@@ -4232,12 +4245,7 @@ class WebServer:
         3. トークン未設定、またはリクエストに含まれない場合のみ、ローカルプライベートIPからの直接通信を許可
         """
         secret = getattr(self.config, "worker_shared_secret", "").strip()
-        auth_header = request.headers.get("Authorization", "")
-        bearer_token = ""
-        if auth_header.startswith("Bearer "):
-            bearer_token = auth_header[7:].strip()
-
-        token = bearer_token or request.headers.get("X-Worker-Token") or request.query.get("token") or ""
+        token = self._extract_worker_token(request)
         if secret and token:
             if hmac.compare_digest(token, secret):
                 return True
@@ -6698,12 +6706,66 @@ class WebServer:
         else:
             return web.json_response({"status": "error", "message": "Failed to persist tier routing configuration"}, status=500)
 
+    # --- ボランティアワーカーの個人トークン (WebUI ログインユーザー) ---
+
+    def _require_login_user(self, request: web.Request) -> Dict[str, Any]:
+        user = self.auth.get_current_user(request)
+        if not user or not user.get("user_id"):
+            raise web.HTTPUnauthorized(text="Login required")
+        return user
+
+    async def api_volunteer_tokens_create(self, request: web.Request) -> web.Response:
+        """個人トークンを発行 (本体はこの応答でのみ返す)"""
+        user = self._require_login_user(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        label = str((body or {}).get("label", "")).strip()[:60]
+        owner_name = str(user.get("global_name") or user.get("username") or user["user_id"])
+        token_id, token = await self.db.create_volunteer_token(int(user["user_id"]), owner_name, label)
+        logger.info(f"🔑 [Volunteer] Issued personal worker token {token_id} for user {user['user_id']} ({owner_name})")
+        return web.json_response({"status": "ok", "token_id": token_id, "token": token, "owner_name": owner_name})
+
+    async def api_volunteer_tokens_list(self, request: web.Request) -> web.Response:
+        """自分のトークンと端末の一覧 (管理者は ?all=1 で全員分)"""
+        user = self._require_login_user(request)
+        scope_user = None if (user.get("is_admin") and request.query.get("all") == "1") else int(user["user_id"])
+        tokens = await self.db.list_volunteer_tokens(scope_user)
+        devices = await self.db.list_volunteer_devices(scope_user)
+        online = set(getattr(self.tts_manager, "ws_worker_nodes", {}).keys()) if self.tts_manager else set()
+        for d in devices:
+            d["online"] = d["node_id"] in online
+        return web.json_response({"status": "ok", "tokens": tokens, "devices": devices})
+
+    async def api_volunteer_tokens_revoke(self, request: web.Request) -> web.Response:
+        """トークンを失効し、そのトークンで接続中の端末を切断 (本人、または管理者)"""
+        user = self._require_login_user(request)
+        token_id = request.match_info.get("token_id", "")
+        ok = await self.db.revoke_volunteer_token(token_id, None if user.get("is_admin") else int(user["user_id"]))
+        if not ok:
+            return web.json_response({"status": "error", "message": "Token not found"}, status=404)
+        for ws in list(self.volunteer_ws_by_token.pop(token_id, set())):
+            try:
+                await ws.close(code=4001, message=b"token revoked")
+            except Exception:
+                pass
+        logger.info(f"🔑 [Volunteer] Revoked personal worker token {token_id} (by user {user['user_id']})")
+        return web.json_response({"status": "ok"})
+
     async def api_worker_ws(self, request: web.Request) -> web.WebSocketResponse:
         """
         リモートボランティアWorkerノード用 WebSocket ゲートウェイ
         Worker (外部PC/GPUノード等) が外向きにMasterへ常時接続し、Masterからの音声合成要求を双方向中継する
         """
-        if not self._verify_worker_auth(request):
+        # 個人トークン = ボランティア (所有者あり)、共有トークン = クラスタ (または管理者自身のボランティア)
+        token = self._extract_worker_token(request)
+        volunteer_owner: Optional[Dict[str, Any]] = None
+        if token.startswith(VOLUNTEER_TOKEN_PREFIX):
+            volunteer_owner = await self.db.resolve_volunteer_token(token)
+            if not volunteer_owner:
+                raise web.HTTPUnauthorized(text="Invalid or revoked volunteer token")
+        elif not self._verify_worker_auth(request):
             raise web.HTTPUnauthorized(text="Unauthorized worker token")
 
         ws = web.WebSocketResponse(heartbeat=20.0, max_msg_size=32 * 1024 * 1024)
@@ -6739,7 +6801,15 @@ class WebServer:
                         specs = data.get("specs", {})
                         priority = int(data.get("priority", 50))
                         exclusive_guild_id = data.get("exclusive_guild_id")
-                        is_cluster_worker = bool(data.get("is_cluster_worker") or str(worker_node_id).startswith("worker_"))
+                        if volunteer_owner:
+                            # 端末 ID からノード ID を安定化 (同じ PC は再接続しても同じノード)
+                            device_id = re.sub(r"[^0-9a-fA-F]", "", str(data.get("device_id") or ""))[:8].lower()
+                            if not device_id:
+                                device_id = hashlib.sha256(str(node_name).encode("utf-8")).hexdigest()[:8]
+                            worker_node_id = f"volunteer_{str(volunteer_owner['discord_user_id'])[-6:]}_{device_id}"
+                            is_cluster_worker = False
+                        else:
+                            is_cluster_worker = bool(data.get("is_cluster_worker") or str(worker_node_id).startswith("worker_"))
 
                         # 既に常設 HTTP クラスタノードとして「直接HTTP到達可能な状態で」プール内に登録されているかチェック
                         has_active_http_node = False
@@ -6779,6 +6849,17 @@ class WebServer:
                             # クラスタノードとして接続された場合は is_volunteer を False に設定
                             if is_cluster_worker:
                                 ws_node.is_volunteer = False
+                            if volunteer_owner:
+                                ws_node.owner_user_id = int(volunteer_owner["discord_user_id"])
+                                ws_node.owner_name = volunteer_owner.get("owner_name") or ""
+                                ws_node.token_id = volunteer_owner["token_id"]
+                                self.volunteer_ws_by_token.setdefault(ws_node.token_id, set()).add(ws)
+                                try:
+                                    await self.db.upsert_volunteer_device(
+                                        worker_node_id, ws_node.token_id, ws_node.owner_user_id, ws_node.owner_name, str(node_name)
+                                    )
+                                except Exception as dev_err:
+                                    logger.warning(f"[WorkerWS] Failed to record volunteer device: {dev_err}")
                             self.tts_manager.register_ws_worker_node(ws_node)
 
                         await ws.send_json({
@@ -6826,6 +6907,8 @@ class WebServer:
                 elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
                     break
         finally:
+            if volunteer_owner:
+                self.volunteer_ws_by_token.get(volunteer_owner["token_id"], set()).discard(ws)
             if ws_node is not None:
                 await ws_node.close()
                 self.tts_manager.unregister_ws_worker_node(ws_node.id)

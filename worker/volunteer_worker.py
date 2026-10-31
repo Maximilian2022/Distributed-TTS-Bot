@@ -44,7 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger("VolunteerWorker")
 
 # プロトコル定数
-PROTOCOL_VERSION = "2.1.0"
+PROTOCOL_VERSION = "2.2.0"
 BINARY_HEADER_FORMAT = ">32sIB"
 FLAG_FINAL_CHUNK = 0x01
 
@@ -53,6 +53,25 @@ DOCKER_CONTAINER_MAP = {
     "sharevox": "ttsbot-worker-sharevox",
     "coeiroink": "ttsbot-worker-coeiroink",
 }
+
+def load_or_create_device_id() -> str:
+    """端末 ID (初回生成してホーム配下に保存)。Master はこれでノード ID を安定化し、端末と所有者を紐づける"""
+    path = os.path.join(os.path.expanduser("~"), ".ttsbot-volunteer", "device_id")
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                saved = f.read().strip()
+            if saved:
+                return saved
+        import uuid
+        new_id = uuid.uuid4().hex
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_id)
+        return new_id
+    except Exception:
+        return ""
+
 
 def pack_binary_chunk(req_id: str, chunk_index: int, payload: bytes, is_final: bool = True) -> bytes:
     req_id_bytes = req_id.encode('ascii')[:32].ljust(32, b' ')
@@ -66,6 +85,7 @@ class VolunteerWorker:
         self.token = args.token
         self.node_name = args.name or socket.gethostname()
         self.node_id = f"volunteer_{self.node_name.lower().replace(' ', '_')}_{int(time.time()) % 10000}"
+        self.device_id = load_or_create_device_id()
         self.capacity = args.capacity
         self.priority = args.priority
         self.exclusive_guild_id = getattr(args, "exclusive_guild_id", "") or None
@@ -456,6 +476,7 @@ class VolunteerWorker:
                     "priority": self.priority,
                     "exclusive_guild_id": self.exclusive_guild_id,
                     "specs": specs,
+                    "device_id": self.device_id,
                     "client_version": PROTOCOL_VERSION
                 }
                 await ws.send_json(reg_payload)
@@ -472,6 +493,9 @@ class VolunteerWorker:
 
                             m_type = data.get("type") or data.get("action")
                             if m_type == "register_ack":
+                                # Master が端末 ID から確定した安定ノード ID を以後のハートビートで使う
+                                if data.get("node_id"):
+                                    self.node_id = data["node_id"]
                                 logger.info(f"🎉 サーバーにワーカーとして登録されました (Priority: {data.get('assigned_priority', self.priority)})")
 
                             elif m_type == "synthesize_request":
