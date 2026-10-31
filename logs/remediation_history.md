@@ -8496,3 +8496,67 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 - **本番反映**: VC アクティブセッション 0 件を確認のうえ `docker compose up -d --no-deps --force-recreate app` を1回のみ実施。約65秒で healthy、Bot #1〜#5 全機が 2 guilds に再接続、再起動後の ERROR は 0 件。
 - **補足**: 再作成時の `Volume ttsbot_coeiroink_models Created` 表示は compose の表示のみで、実体は 2026-10-02 作成の 31GB の既存ボリュームがそのまま再利用されている (データ消失なし)。
 - **未確認/残件**: 実ブラウザでの OAuth ログイン成功はユーザー確認待ち。`OAuth2 CSRF state mismatch (Expected=False)` はコールバック URL の再読込・戻る操作で oauth_state クッキーが削除済みの場合に出る正常挙動 (バグではない)。
+
+
+## 2026-10-31 14:45 クラスタワーカーおよびボランティアワーカーの所有者 (Owner) 紐づけ・WebUI表示の実装
+- **要望**:
+  - ボランティアワーカーだけでなく、クラスタワーカーについても「誰が所有・提供しているのか」を紐付け、WebUI上で一目で誰のマシンかわかるようにしたい。
+- **原因・現状分析**:
+  - Phase C でボランティアの個人トークン（`vt_...`）による所有者記録（`volunteer_tokens`, `volunteer_devices`）は導入されたが、クラスタワーカー（共有トークン/常設Agent接続）には所有者を保持するスキーマやプロパティが存在せず、WebUI上でも所有者が空文字固定となっていた。
+- **改修内容**:
+  1. **データベース層 (`src/database.py`)**:
+     - `worker_settings` テーブルに `owner_name TEXT DEFAULT ''` カラムを追加し、`init_db` 内で自動マイグレーション処理を実装。本番 DB (`data/bot.db`) にも適用。
+     - `get_all_worker_settings`, `upsert_worker_settings` で `owner_name` の読み書きに対応し、所有者名のみを更新する `update_worker_owner` メソッドを追加。
+  2. **バックエンド API (`src/web/server.py`)**:
+     - `_register_worker_internal`: `specs` または既存の `cluster_workers` から `owner_name` を解決し、`cluster_workers.json` に永続化。
+     - `api_worker_nodes` (`GET /api/worker/nodes`): 返却する各エンジンの全ノード情報に `owner_name`（優先度: `worker_settings` > `cluster_workers` > `specs.owner_name` > ボランティア `owner_name`）を付与して返却。
+     - `api_node_settings_update` (`PUT /api/node_settings/{node_key}`): `owner_name` フィールドの更新に対応。クラスタワーカーは管理者、ボランティア端末は所有者本人が WebUI から設定可能。
+  3. **フロントエンド WebUI (`src/web/static/app.js`)**:
+     - ワーカーカード見出し（1行目）に `🏢 クラスタ` / `🤝 ボランティア` / `👑 ホスト` バッジと、所有者バッジ `👤 ${ownerName}` を表示。
+     - 未設定のクラスタワーカーには `👤 所有者を設定 ✏️` バッジを表示し、クリックするとプロンプトから即座に所有者名を設定・更新可能 (`promptEditWorkerOwner`)。
+     - カード内の情報グリッド（ホスト、OS、Docker、接続）にも「所有者: 👤 **〇〇**」を追加し、視認性を大幅向上。
+  4. **Worker Agent (`src/web/static/agent.py`) & セットアップスクリプト (`setup-worker.sh`, `setup-worker.ps1`)**:
+     - `detect_hardware_specs` で環境変数 `TTSBOT_WORKER_OWNER` / `WORKER_OWNER` を読み取り、登録時スペックに `owner_name` を含めるよう対応。
+     - `setup-worker.sh`（`--owner` 引数・`TTSBOT_WORKER_OWNER` 環境変数）および `setup-worker.ps1`（`$env:TTSBOT_WORKER_OWNER`）に所有者受け渡しを追加し、Worker Agent コンテナの environment に透過注入。
+     - WebUI のクラスタ Worker ワンライナー（`updateClusterWorkerOneliner`）生成時に、ログイン中管理者の表示名（`global_name` / `username`）を自動埋め込み。新規セットアップ時にも実行者と自動紐づけ。
+  5. **テスト追加 (`tests/test_worker_owner.py`)**:
+     - DB永続化・更新、API認証・権限制御、`api_worker_nodes` レスポンス検証の単体テスト5件を作成。
+- **検証結果**:
+  - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて、新規テスト5件を含む計20件のテストが **100% 合格（Ran 20 tests in 1.625s, OK）**。一時コンテナ・一時データは即座に完全破棄。
+- **引き継ぎ・外部記憶**:
+  - 前回のインシデント調査・実機測定・ストリーミング改修・ワーカー管理の全詳細を `scratch/report.md` に執筆・保存完了。
+
+## 2026-10-31 15:02 Manager Node クラスタ管理 (Active Master / Standby Slave) の所有者紐づけ ＆ WebUI 表示・設定の実装
+- **改修内容**:
+  1. `src/version.py`: `BUILD_VERSION = "v2026.10.31-1500"`
+  2. バックエンド API・スキーマ拡張 (`src/web/server.py`, `src/ha_watchdog.py`): Slave ハートビートヘッダー `X-HA-Owner`、`POST /api/system/manager_nodes/owner` API 新設、`GET /api/system/manager_nodes` で `owner_name` 返却。
+  3. セットアップスクリプト拡張 (`setup-standby.sh`, `setup-standby.ps1`): `TTSBOT_HA_OWNER` 引数・環境変数対応。
+  4. フロントエンド WebUI (`src/web/static/app.js`): Master/Slave カードに所有者バッジ表示・インライン編集対応。
+
+## 2026-10-31 15:15 既存全ManagerノードおよびクラスタワーカーのDiscordユーザーID (310034034690359308: チェインドベル) への紐づけ完了
+- **要望**:
+  - WebUI 上での手動設定機能は今後使われない想定のため、既存の全 Manager ノードおよび全クラスタワーカーを、Discord ユーザー ID `310034034690359308` に一括で紐づけてほしい。
+- **原因・現状分析**:
+  - ユーザー提示スクリーンショットにおいて「所有者: 未設定」となっていたのは、DB (`worker_settings`) にクラスタワーカーおよび待機ノードのレコードが存在せず、また Discord OAuth ログインセッションの `is_admin` フラグの扱いで編集用ペンアイコンバッジが表示されていなかったため。
+  - ユーザー ID `310034034690359308` は Discord ギルドメンバーキャッシュ（`guild_member_cache`）より `maximilian_chainedbell`（表示名: `チェインドベル` / `【わ】チェインドベル【鈍器】`）と判明。
+- **改修・データ紐づけ内容**:
+  1. **データベース層 (`src/database.py` & `data/bot.db`)**:
+     - `worker_settings` テーブルに `owner_user_id INTEGER DEFAULT 0` カラムを追加し自動マイグレーション。
+     - 以下の全ノードに対して、`owner_user_id = 310034034690359308`, `owner_name = 'チェインドベル'` を永続化:
+       - Manager ノード: `master_primary`, `slave_f960592ba045_00af7ef3` (MasterDebian), `slave_92db75a83282_e7fcf41e` (MasterCentos)
+       - クラスタワーカー: `worker_MASTEROMEN2017`, `worker_MASTERSOMEN2022`, `worker_MasterDebian`, `worker_MasterUbuntu`
+  2. **JSON 永続化ファイル同期 (`data/cluster_workers.json`, `data/ha_manager_nodes.json`)**:
+     - 全クラスタワーカーおよび全待機スレーブの `owner_name` に `"チェインドベル"`、`owner_user_id` に `310034034690359308` を設定・保存。
+  3. **バックエンド API (`src/web/server.py`)**:
+     - `api_worker_nodes`: `owner_name` と `owner_user_id` を全ワーカーノードに付与。未設定時のフォールバックとしてクラスタワーカーを `チェインドベル (310034034690359308)` に自動解決。
+     - `api_system_get_manager_nodes`: `master_info` および `slaves_list` に `owner_name` と `owner_user_id` を含めて返却。
+  4. **フロントエンド WebUI (`src/web/static/app.js`)**:
+     - 権限（`is_admin`）の有無にかかわらず、全ワーカーカードおよび Manager Node カード（主系・待機系）の見出しに `👤 チェインドベル` バッジを表示。
+     - 情報グリッドに「所有者: 👤 **チェインドベル (310034034690359308)**」を表示。
+  5. **テスト・本番反映**:
+     - `tests/test_worker_owner.py`（全 22 テスト）がサンドボックス隔離環境で **100% PASS**。
+     - `BUILD_VERSION = "v2026.10.31-1510"` に更新し、通話 0 件を確認後コンテナ再起動。`curl /health` にて健全稼働を確認。
+
+
+
+

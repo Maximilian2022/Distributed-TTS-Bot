@@ -239,6 +239,8 @@ class WebServer:
                 ip = wdata.get("ip")
                 engines = wdata.get("engines", {})
                 specs = wdata.get("specs", {})
+                if wdata.get("owner_name") and not specs.get("owner_name"):
+                    specs["owner_name"] = wdata["owner_name"]
                 if not ip or not engines:
                     continue
                 self._register_worker_internal(
@@ -283,11 +285,13 @@ class WebServer:
         docker_version: str = "",
         is_direct_verified: bool = False,
         direct_url: str = "",
-        container_hostname: str = ""
+        container_hostname: str = "",
+        owner_name: str = ""
     ):
         if not node_id:
             return
         now = time.time()
+        clean_owner = owner_name.strip()[:100]
         if node_id not in self.ha_slaves:
             # 参加順または指定値に基づいて空き Priority を自動採番
             priority = requested_priority if (requested_priority and requested_priority > 0) else self._get_next_available_priority(node_id)
@@ -308,7 +312,8 @@ class WebServer:
                 "cpu_cores": cpu_cores,
                 "memory_gb": memory_gb,
                 "os_name": os_name,
-                "docker_version": docker_version
+                "docker_version": docker_version,
+                "owner_name": clean_owner
             }
             self._save_ha_nodes(force=True)
         else:
@@ -323,6 +328,8 @@ class WebServer:
             if direct_url:
                 entry["direct_url"] = direct_url
             entry["last_seen"] = now
+            if clean_owner:
+                entry["owner_name"] = clean_owner
             if is_sync:
                 entry["last_sync"] = now
             if node_id in self.ha_revoked_nodes:
@@ -522,6 +529,7 @@ class WebServer:
         self.app.router.add_get("/api/ha/status", self.api_ha_status)
         self.app.router.add_post("/api/ha/broadcast_update", self.api_ha_broadcast_update)
         self.app.router.add_get("/api/system/manager_nodes", self.api_system_get_manager_nodes)
+        self.app.router.add_post("/api/system/manager_nodes/owner", self.api_system_set_manager_nodes_owner)
         self.app.router.add_post("/api/system/manager_nodes/priority", self.api_system_set_manager_nodes_priority)
         self.app.router.add_post("/api/system/manager_nodes/cache_sync", self.api_system_trigger_cache_sync)
         self.app.router.add_post("/api/system/manager_nodes/revoke", self.api_system_revoke_manager_node)
@@ -1240,6 +1248,7 @@ class WebServer:
         except ValueError:
             mem_gb = 0.0
         os_name = request.headers.get("X-HA-Os", "").strip()
+        owner_name = request.headers.get("X-HA-Owner", "").strip()
 
         if node_id and (node_id in self.ha_revoked_nodes or self.ha_slaves.get(node_id, {}).get("status") == "revoked"):
             logger.warning(f"🛑 [HA] Status check from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
@@ -1247,7 +1256,7 @@ class WebServer:
                 node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
                 cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p,
                 local_ip=local_ip, docker_version=docker_version, is_direct_verified=is_direct_verified,
-                direct_url=direct_url, container_hostname=container_hostname
+                direct_url=direct_url, container_hostname=container_hostname, owner_name=owner_name
             )
             return web.json_response({
                 "action": "terminate",
@@ -1261,7 +1270,7 @@ class WebServer:
                 node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
                 cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p,
                 local_ip=local_ip, docker_version=docker_version, is_direct_verified=is_direct_verified,
-                direct_url=direct_url, container_hostname=container_hostname
+                direct_url=direct_url, container_hostname=container_hostname, owner_name=owner_name
             )
 
         db_path = self.config.db_path
@@ -1403,12 +1412,13 @@ class WebServer:
         except ValueError:
             mem_gb = 0.0
         os_name = request.headers.get("X-HA-Os", "").strip()
+        owner_name = request.headers.get("X-HA-Owner", "").strip()
 
         if node_id and (node_id in self.ha_revoked_nodes or self.ha_slaves.get(node_id, {}).get("status") == "revoked"):
             logger.warning(f"🛑 [HA] Snapshot sync from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
             self._record_ha_slave_heartbeat(
                 node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
-                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, owner_name=owner_name
             )
             return web.json_response({
                 "action": "terminate",
@@ -1420,7 +1430,7 @@ class WebServer:
         if node_id:
             self._record_ha_slave_heartbeat(
                 node_id, hostname, client_ip, is_sync=True, user_agent=user_agent,
-                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name
+                cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, owner_name=owner_name
             )
 
         db_path = self.config.db_path
@@ -1856,6 +1866,10 @@ class WebServer:
         primary_local_ip = next((ip for ip in local_ips if not ip.startswith("172.")), local_ips[0] if local_ips else "")
         master_port = int(os.getenv("HOST_WEB_PORT", getattr(self.config, "web_port", 8088)) or 8088)
 
+        master_st = (await self._worker_settings()).get("master_primary", {})
+        master_owner = master_st.get("owner_name") or "チェインドベル"
+        master_owner_uid = master_st.get("owner_user_id") or 310034034690359308
+
         master_info = {
             "node_id": "master_primary",
             "instance_id": getattr(self, "master_instance_id", "master_primary"),
@@ -1874,10 +1888,13 @@ class WebServer:
             "active_bots": active_bots,
             "version": AGENT_VERSION,
             "is_current": True,
-            "uptime_seconds": int(now - getattr(self, "_start_time", now))
+            "uptime_seconds": int(now - getattr(self, "_start_time", now)),
+            "owner_name": master_owner,
+            "owner_user_id": master_owner_uid
         }
 
         slaves_list = []
+        w_settings_map = await self._worker_settings()
         for node_id, slave in list(self.ha_slaves.items()):
             last_seen = slave.get("last_seen", 0)
             is_revoked = node_id in self.ha_revoked_nodes or slave.get("status") == "revoked"
@@ -1894,6 +1911,10 @@ class WebServer:
             local_ip = slave.get("local_ip", "")
             is_direct = bool(slave.get("is_direct_verified", False))
             direct_url = slave.get("direct_url", "")
+
+            slave_st = w_settings_map.get(node_id, {})
+            slave_owner = slave.get("owner_name") or slave_st.get("owner_name") or "チェインドベル"
+            slave_owner_uid = slave.get("owner_user_id") or slave_st.get("owner_user_id") or 310034034690359308
 
             slaves_list.append({
                 "node_id": node_id,
@@ -1916,7 +1937,9 @@ class WebServer:
                 "last_sync_ago": int(now - slave.get("last_sync", 0)) if slave.get("last_sync", 0) > 0 else -1,
                 "status": status,
                 "status_display": status_display,
-                "user_agent": slave.get("user_agent", "")
+                "user_agent": slave.get("user_agent", ""),
+                "owner_name": slave_owner,
+                "owner_user_id": slave_owner_uid
             })
 
         # オンライン優先、その中で Priority 昇順 (1, 2, 3...)
@@ -1986,6 +2009,44 @@ class WebServer:
             })
 
         return web.json_response({"error": "node_id and valid priority (positive integer) or action is required"}, status=400)
+
+    async def api_system_set_manager_nodes_owner(self, request: web.Request) -> web.Response:
+        """指定した Manager Node (Slave または Master) の所有者を更新 (管理者のみ)"""
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        node_id = str(data.get("node_id", "")).strip()
+        owner_name = str(data.get("owner_name", "")).strip()[:100]
+        if not node_id:
+            return web.json_response({"error": "node_id is required"}, status=400)
+
+        user = self._require_login_user(request)
+        if node_id == "master_primary":
+            await self.db.update_worker_owner("master_primary", owner_name, int(user["user_id"]))
+            self._worker_settings_cache = None
+            return web.json_response({
+                "status": "ok",
+                "node_id": node_id,
+                "owner_name": owner_name,
+                "message": f"主系ノードの所有者を「{owner_name or '未設定'}」に更新しました。"
+            })
+
+        if node_id in self.ha_slaves:
+            self.ha_slaves[node_id]["owner_name"] = owner_name
+            self._save_ha_nodes(force=True)
+            await self.db.update_worker_owner(node_id, owner_name, int(user["user_id"]))
+            self._worker_settings_cache = None
+            return web.json_response({
+                "status": "ok",
+                "node_id": node_id,
+                "owner_name": owner_name,
+                "message": f"待機ノード '{node_id}' の所有者を「{owner_name or '未設定'}」に更新しました。"
+            })
+
+        return web.json_response({"error": f"Manager Node '{node_id}' not found"}, status=404)
 
     async def api_system_revoke_manager_node(self, request: web.Request) -> web.Response:
         """指定した Slave Node を除外・自律停止対象に登録 (管理者のみ)"""
@@ -4472,7 +4533,9 @@ class WebServer:
         except Exception:
             pass
 
-        # 永続化情報に保存
+        # 永続化情報に保存 (所有者情報の引き継ぎ)
+        existing_wdata = self.cluster_workers.get(node_id, {})
+        owner_name = str(specs.get("owner_name") or specs.get("owner") or existing_wdata.get("owner_name") or "").strip()
         self.cluster_workers[node_id] = {
             "node_id": node_id,
             "node_name": node_name,
@@ -4481,6 +4544,7 @@ class WebServer:
             "rsync_port": rsync_port,
             "specs": specs,
             "engines": engines_data,
+            "owner_name": owner_name,
             "last_seen": time.time(),
             "updated_at": time.time()
         }
@@ -4905,9 +4969,34 @@ class WebServer:
             "sharevox": self.tts_manager.sharevox_pool,
             "coeiroink": self.tts_manager.coeiroink_pool,
         }
+        w_settings = await self._worker_settings()
         result = {}
         for engine_name, pool in pool_map.items():
-            result[engine_name] = pool.get_status()
+            status_list = pool.get_status()
+            for node_dict in status_list:
+                node_id = str(node_dict.get("id", ""))
+                base_id = re.sub(r"_(voicevox|sharevox|coeiroink)$", "", node_id)
+                st = w_settings.get(base_id) or w_settings.get(node_id)
+                owner = (st.get("owner_name") if st else "") or ""
+                owner_uid = (st.get("owner_user_id") if st else 0) or 0
+                if not owner:
+                    cw = self.cluster_workers.get(base_id) or self.cluster_workers.get(node_id)
+                    owner = (cw.get("owner_name") if cw else "") or ""
+                    owner_uid = (cw.get("owner_user_id") if cw else 0) or owner_uid
+                if not owner:
+                    specs = node_dict.get("specs", {}) or {}
+                    owner = specs.get("owner_name") or specs.get("owner") or ""
+                if not owner:
+                    owner = node_dict.get("owner_name") or ""
+
+                # 既存クラスタワーカーのデフォルト紐づけ (310034034690359308: チェインドベル)
+                if not owner and (base_id.startswith("worker_") or node_id.startswith("worker_")):
+                    owner = "チェインドベル"
+                    owner_uid = 310034034690359308
+
+                node_dict["owner_name"] = owner
+                node_dict["owner_user_id"] = owner_uid
+            result[engine_name] = status_list
 
         return web.json_response({"pools": result})
 
@@ -6920,7 +7009,7 @@ class WebServer:
         return web.json_response({"status": "ok", "settings": settings})
 
     async def api_node_settings_update(self, request: web.Request) -> web.Response:
-        """エンジン自動停止の設定 (クラスタは管理者、ボランティア端末は所有者または管理者)"""
+        """エンジン自動停止および所有者の設定 (クラスタは管理者、ボランティア端末は所有者または管理者)"""
         user = self._require_login_user(request)
         node_key = request.match_info.get("node_key", "")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", node_key):
@@ -6931,20 +7020,37 @@ class WebServer:
             body = await request.json()
         except Exception:
             return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
-        policy = str(body.get("idle_policy", "default"))
+
+        existing_st = (await self._worker_settings()).get(node_key, {})
+        policy = str(body.get("idle_policy", existing_st.get("idle_policy", "default")))
         if policy not in self.IDLE_POLICIES:
             return web.json_response({"status": "error", "message": "idle_policy must be default / never / minutes"}, status=400)
         try:
-            minutes = int(body.get("idle_minutes", 15))
+            minutes = int(body.get("idle_minutes", existing_st.get("idle_minutes", 15)))
         except (TypeError, ValueError):
             return web.json_response({"status": "error", "message": "idle_minutes must be an integer"}, status=400)
         lo, hi = self.IDLE_MINUTES_RANGE
         if policy == "minutes" and not (lo <= minutes <= hi):
             return web.json_response({"status": "error", "message": f"idle_minutes must be {lo}-{hi}"}, status=400)
-        await self.db.upsert_worker_settings(node_key, policy, minutes, int(user["user_id"]))
+
+        owner_name = None
+        if "owner_name" in body:
+            owner_name = str(body.get("owner_name", "")).strip()[:100]
+
+        await self.db.upsert_worker_settings(node_key, policy, minutes, int(user["user_id"]), owner_name=owner_name)
+        if owner_name is not None and node_key in self.cluster_workers:
+            self.cluster_workers[node_key]["owner_name"] = owner_name
+            self._save_cluster_workers()
+
         self._worker_settings_cache = None
-        logger.info(f"⚙️ [WorkerSettings] {node_key}: idle_policy={policy} idle_minutes={minutes} (by user {user['user_id']})")
-        return web.json_response({"status": "ok", "node_key": node_key, "idle_policy": policy, "idle_minutes": minutes})
+        logger.info(f"⚙️ [WorkerSettings] {node_key}: idle_policy={policy} idle_minutes={minutes} owner_name={owner_name} (by user {user['user_id']})")
+        return web.json_response({
+            "status": "ok",
+            "node_key": node_key,
+            "idle_policy": policy,
+            "idle_minutes": minutes,
+            "owner_name": owner_name if owner_name is not None else existing_st.get("owner_name", "")
+        })
 
     # --- ボランティアワーカーの個人トークン (WebUI ログインユーザー) ---
 

@@ -1045,6 +1045,7 @@ def detect_hardware_specs() -> Dict[str, Any]:
         except Exception:
             pass
 
+    env_owner = (os.getenv("TTSBOT_WORKER_OWNER") or os.getenv("WORKER_OWNER") or "").strip()
     specs: Dict[str, Any] = {
         "hostname": host_h,
         "host_hostname": host_h,
@@ -1059,6 +1060,7 @@ def detect_hardware_specs() -> Dict[str, Any]:
         "gpu_vram_mb": 0,
         "recommended_max_concurrent": 1,
         "recommended_priority": 2,
+        "owner_name": env_owner,
     }
 
     # --- RAM ---

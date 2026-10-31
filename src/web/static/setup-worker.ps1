@@ -14,6 +14,7 @@
 
 $MasterUrl  = if ($env:TTSBOT_MASTER_URL) { $env:TTSBOT_MASTER_URL } else { "http://localhost:8080" }
 $WorkerSecret = if ($env:TTSBOT_WORKER_SECRET) { $env:TTSBOT_WORKER_SECRET } else { "" }
+$WorkerOwner  = if ($env:TTSBOT_WORKER_OWNER)  { $env:TTSBOT_WORKER_OWNER  } else { "" }
 $WorkDir    = if ($env:TTSBOT_WORK_DIR)   { $env:TTSBOT_WORK_DIR   } else { "$HOME\ttsbot-worker" }
 $WorkDirUnix = $WorkDir.Replace('\', '/')
 
@@ -430,6 +431,7 @@ services:
       - WORKER_COMPOSE_FILE=/work/docker-compose.worker.yml
       - NODE_ID=worker_${Hostname}
       - HOST_HOSTNAME=${Hostname}
+      - TTSBOT_WORKER_OWNER=$WorkerOwner
     command: >
       sh -c "pip install --quiet --no-cache-dir --root-user-action=ignore aiohttp && python3 agent.py"
 $AgentDeploy

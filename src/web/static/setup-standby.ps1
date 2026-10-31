@@ -51,6 +51,7 @@ if (-not $HaSecret -or $HaSecret -eq "__DEFAULT_HA_SECRET__") {
 if (-not $TunnelToken -and $env:CLOUDFLARE_TUNNEL_TOKEN) {
     $TunnelToken = $env:CLOUDFLARE_TUNNEL_TOKEN
 }
+$HaOwner = if ($env:TTSBOT_HA_OWNER) { $env:TTSBOT_HA_OWNER } else { "" }
 
 Write-Host "  ✓ 接続先 Master URL: $MasterUrl" -ForegroundColor Green
 Write-Host "  ✓ HA 認証シークレット: 設定完了 (自動認証・暗号化同期)" -ForegroundColor Green
@@ -165,6 +166,7 @@ $envContent = @"
 TTSBOT_HA_ROLE=slave
 TTSBOT_MASTER_URL=$MasterUrl
 TTSBOT_HA_SECRET=$HaSecret
+TTSBOT_HA_OWNER=$HaOwner
 TTSBOT_CHECK_INTERVAL=5
 TTSBOT_FAIL_THRESHOLD=18
 TTSBOT_SYNC_INTERVAL=60

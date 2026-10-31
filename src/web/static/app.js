@@ -2711,9 +2711,12 @@ function renderWorkerNodes(nodesData) {
       const baseId = n.id.replace(/_voicevox$|_sharevox$|_coeiroink$/, "");
       if (!seenHostIds.has(baseId)) {
         seenHostIds.set(baseId, allNodes.length);
-        allNodes.push({ ...n, id: baseId, engines: [{ name: engine, ...n }] });
+        allNodes.push({ ...n, id: baseId, owner_name: n.owner_name || "", engines: [{ name: engine, ...n }] });
       } else {
         const idx = seenHostIds.get(baseId);
+        if (!allNodes[idx].owner_name && n.owner_name) {
+          allNodes[idx].owner_name = n.owner_name;
+        }
         // 同一エンジンがすでに存在するかチェック (HTTP直接接続クラスタノードを優先し、WS仮想重複を統合)
         const existingEngineIdx = allNodes[idx].engines.findIndex(e => e.name === engine);
         if (existingEngineIdx >= 0) {
@@ -2786,7 +2789,14 @@ function renderWorkerNodes(nodesData) {
     // (URL が ws:// やノード名の接頭辞で判定すると、WS トンネル接続のクラスタ Worker を誤認するため)
     const engineList = node.engines || [];
     const isVolunteer = engineList.length > 0 && engineList.every(e => e.is_volunteer === true);
-    const ownerName = isVolunteer ? (engineList.find(e => e.owner_name)?.owner_name || "") : "";
+
+    // 所有者名の解決: worker_settings > node.owner_name > engineList > specs > デフォルト (チェインドベル)
+    const settingsOwner = (window._nodeSettings && window._nodeSettings[node.id]) ? (window._nodeSettings[node.id].owner_name || "") : "";
+    let ownerName = settingsOwner || node.owner_name || (engineList.find(e => e.owner_name)?.owner_name || "") || (specs.owner_name || specs.owner || "");
+    const ownerUserId = (window._nodeSettings && window._nodeSettings[node.id]) ? (window._nodeSettings[node.id].owner_user_id || 0) : (node.owner_user_id || 310034034690359308);
+    if (!ownerName && !isVolunteer) {
+      ownerName = "チェインドベル";
+    }
 
     // 1. Agent のオンライン/オフライン判定 (ハートビート疎通)
     const hbAgo = node.last_heartbeat_ago;
@@ -2810,13 +2820,20 @@ function renderWorkerNodes(nodesData) {
       workerDockerDisplay = "v29.4.2";
     }
 
-    // アイコン & ボランティアバッジ (エスケープ分離)
+    // 所有者バッジ
+    let ownerBadge = '';
+    if (ownerName) {
+      ownerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(ownerUserId || '310034034690359308')}" style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;">👤 ${escapeHtml(ownerName)}</span>`;
+    } else if (isMaster) {
+      ownerBadge = `<span title="Botホスト環境" style="background:rgba(250,166,26,0.15);border:1px solid rgba(250,166,26,0.35);color:#ffcc66;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;">👑 ホスト</span>`;
+    }
+
+    // アイコン & 種別バッジ (エスケープ分離)
     const icon = isMaster ? "🏢" : (isVolunteer ? "🤝" : (hasGpu ? "🎮" : "🖥️"));
     const nodeName = isMaster ? (workerHostDisplay.includes("Master") ? workerHostDisplay : `${workerHostDisplay} (Master)`) : workerHostDisplay;
-    const volunteerBadge = isVolunteer
-      ? '<span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;margin-left:4px;">🤝 ボランティア</span>' +
-        (ownerName ? `<span title="このボランティアワーカーの所有者" style="background:rgba(255,255,255,0.06);color:var(--text-normal);padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;">👤 ${escapeHtml(ownerName)}</span>` : '')
-      : '';
+    const typeBadge = isVolunteer
+      ? '<span style="background:rgba(88,101,242,0.25);border:1px solid rgba(88,101,242,0.5);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">🤝 ボランティア</span>'
+      : (!isMaster ? '<span style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.18);color:var(--text-normal);padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;">🏢 クラスタ</span>' : '');
 
     const agentBadge = isVolunteer
       ? '<span class="badge" style="background:rgba(88,101,242,0.2);color:#50e6ff;border:1px solid rgba(88,101,242,0.4);font-size:10px;font-weight:700;">⚡ WSS 常時接続</span>'
@@ -3143,7 +3160,9 @@ function renderWorkerNodes(nodesData) {
     card.innerHTML = `
       <div style="font-weight:700;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
         <span>${icon}</span>
-        <span>${escapeHtml(nodeName)}</span>${volunteerBadge}
+        <span>${escapeHtml(nodeName)}</span>
+        ${typeBadge}
+        ${ownerBadge}
         ${agentVersion ? `<span style="font-size:9px;color:var(--text-dim);background:rgba(255,255,255,0.06);padding:1px 5px;border-radius:4px;">v${escapeHtml(agentVersion)}</span>` : ''}
       </div>
       <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
@@ -3153,6 +3172,7 @@ function renderWorkerNodes(nodesData) {
       </div>
       <div style="font-size:11px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;background:rgba(0,0,0,0.22);padding:7px 10px;border-radius:6px;margin:2px 0;">
         <div>ホスト: <strong style="color:var(--text-normal);">${escapeHtml(workerHostDisplay)}</strong></div>
+        <div>所有者: <strong style="color:${ownerName ? '#50e6ff' : 'var(--text-dim)'};">${escapeHtml(ownerName || (isMaster ? "ホスト" : "未設定"))}${ownerUserId ? ` <span style="font-size:10px;color:var(--text-dim);font-weight:normal;">(${ownerUserId})</span>` : ''}</strong></div>
         <div>OS: <strong style="color:var(--text-normal);">${escapeHtml(workerOsDisplay)}</strong></div>
         <div>Docker: <strong style="color:var(--text-normal);">${escapeHtml(workerDockerDisplay)}</strong></div>
         <div>接続: <strong style="color:var(--text-normal);font-family:monospace;">${escapeHtml(nodeIp || '-')}</strong></div>
@@ -3264,6 +3284,40 @@ async function saveIdlePolicy(nodeKey, policy, minutes) {
 }
 window.onIdlePolicyChange = onIdlePolicyChange;
 window.saveIdlePolicy = saveIdlePolicy;
+
+async function promptEditWorkerOwner(nodeKey, currentOwner, event) {
+  if (event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+  const cleanCurrent = (currentOwner || "").trim();
+  const input = prompt(`ワーカー「${nodeKey}」の所有者名を入力してください:\n(空欄にしてOKを押すと未設定に戻せます)`, cleanCurrent);
+  if (input === null) return; // キャンセル
+
+  const newOwner = input.trim();
+  try {
+    const resp = await fetch(`/api/node_settings/${encodeURIComponent(nodeKey)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ owner_name: newOwner })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.message || `HTTP ${resp.status}`);
+
+    window._nodeSettings = window._nodeSettings || {};
+    window._nodeSettings[nodeKey] = Object.assign({}, window._nodeSettings[nodeKey] || {}, { owner_name: newOwner });
+
+    showToast(`ワーカー所有者を「${newOwner || '未設定'}」に設定しました 👤`, "success");
+
+    // 即座にワーカー一覧を再取得・再描画
+    if (typeof loadWorkerNodes === "function") {
+      loadWorkerNodes();
+    }
+  } catch (e) {
+    showToast(`所有者の更新に失敗しました: ${e.message}`, "error");
+  }
+}
+window.promptEditWorkerOwner = promptEditWorkerOwner;
 
 // システムリソース ノード切り替え
 window.currentMetricsNode = 'master';
@@ -7131,6 +7185,10 @@ async function loadManagerNodes() {
     const masterUptime = master.uptime_seconds != null ? formatUptime(master.uptime_seconds) : "-";
     const masterContainerId = (master.container_hostname && master.container_hostname !== master.hostname) ? `<span style="font-size:11px;color:var(--text-dim);font-family:monospace;font-weight:normal;" title="Container ID">(${escapeHtml(master.container_hostname)})</span>` : "";
     const masterLocalIpDisplay = master.local_ip ? `${escapeHtml(master.local_ip)} <span style="font-size:10px;color:var(--text-dim);">(Host: ${escapeHtml(master.ip || '-')})</span>` : escapeHtml(master.ip || "-");
+    const masterOwner = (master.owner_name || "チェインドベル").trim();
+    const masterOwnerUid = master.owner_user_id || 310034034690359308;
+    const canEditManager = Boolean(window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+    const masterOwnerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(masterOwnerUid)}" ${canEditManager ? `onclick="promptEditManagerNodeOwner('master_primary', '${escapeHtml(masterOwner)}', event)" style="cursor:pointer;background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"` : 'style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"'}>👤 ${escapeHtml(masterOwner)}${canEditManager ? ' ✏️' : ''}</span>`;
 
     cardsHtml += `
       <div class="card" style="background:rgba(88,101,242,0.08);border:1px solid rgba(88,101,242,0.35);padding:16px;border-radius:10px;position:relative;">
@@ -7139,6 +7197,7 @@ async function loadManagerNodes() {
             <div style="font-size:12px;color:#7289da;font-weight:700;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
               <span>👑 主系ノード (Primary Master)</span>
               <span class="badge" style="background:rgba(88,101,242,0.25);color:#7289da;border:1px solid rgba(88,101,242,0.5);font-weight:700;">★ Priority 0 (最優先本尊)</span>
+              ${masterOwnerBadge}
             </div>
             <h4 style="margin:4px 0 0;font-size:16px;color:var(--text-normal);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
               <span>${escapeHtml(master.hostname || "Master Node")}</span>
@@ -7149,6 +7208,7 @@ async function loadManagerNodes() {
         </div>
 
         <div style="font-size:12px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,0.2);padding:10px;border-radius:6px;margin-bottom:12px;">
+          <div>所有者: <strong style="color:#50e6ff;">${escapeHtml(masterOwner)} <span style="font-size:10px;color:var(--text-dim);font-weight:normal;">(${masterOwnerUid})</span></strong></div>
           <div>IP: <strong style="color:var(--text-normal);">${masterLocalIpDisplay}</strong></div>
           <div>OS: <strong style="color:var(--text-normal);">${escapeHtml(master.os_name || "Linux")}</strong></div>
           <div>Docker: <strong style="color:var(--text-normal);">${master.docker_version && master.docker_version !== 'N/A' ? 'v' + escapeHtml(master.docker_version) : 'N/A'}</strong></div>
@@ -7244,6 +7304,10 @@ async function loadManagerNodes() {
         const dockerText = slave.docker_version && slave.docker_version !== 'N/A' ? ` (v${escapeHtml(slave.docker_version)})` : '';
         const osText = escapeHtml(slave.os_name || "Linux") + dockerText;
 
+        const slaveOwner = (slave.owner_name || "チェインドベル").trim();
+        const slaveOwnerUid = slave.owner_user_id || 310034034690359308;
+        const slaveOwnerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(slaveOwnerUid)}" ${canEditManager ? `onclick="promptEditManagerNodeOwner('${escapeHtml(slave.node_id)}', '${escapeHtml(slaveOwner)}', event)" style="cursor:pointer;background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"` : 'style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"'}>👤 ${escapeHtml(slaveOwner)}${canEditManager ? ' ✏️' : ''}</span>`;
+
         cardsHtml += `
           <div class="card" style="background:rgba(0,0,0,0.2);border:1px solid ${borderCol};padding:16px;border-radius:10px;">
             <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
@@ -7252,6 +7316,7 @@ async function loadManagerNodes() {
                   <span>🛡️ 待機ノード (Standby Slave)</span>
                   ${priorityBadge}
                   ${directBadge}
+                  ${slaveOwnerBadge}
                 </div>
                 <h4 style="margin:4px 0 0;font-size:15px;color:var(--text-normal);display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                   <span>${escapeHtml(slave.hostname || "Slave Node")}</span>
@@ -7265,6 +7330,7 @@ async function loadManagerNodes() {
             </div>
 
             <div style="font-size:12px;color:var(--text-muted);display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(0,0,0,0.25);padding:10px;border-radius:6px;margin-bottom:12px;">
+              <div>所有者: <strong style="color:#50e6ff;">${escapeHtml(slaveOwner)} <span style="font-size:10px;color:var(--text-dim);font-weight:normal;">(${slaveOwnerUid})</span></strong></div>
               <div>IP: ${slaveIpDisplay}</div>
               <div>OS / Docker: <strong style="color:var(--text-normal);">${osText}</strong></div>
               <div>スペック: <strong style="color:var(--text-normal);">${escapeHtml(slave.spec_display || "-")}</strong></div>
@@ -7296,6 +7362,37 @@ async function loadManagerNodes() {
     grid.innerHTML = `<div style="grid-column:1/-1;padding:24px;text-align:center;color:#ff6b6b;">⚠️ Manager Node情報の取得中にエラーが発生しました: ${escapeHtml(err.message)}</div>`;
   }
 }
+
+async function promptEditManagerNodeOwner(nodeId, currentOwner, event) {
+  if (event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+  const cleanCurrent = (currentOwner || "").trim();
+  const nodeLabel = nodeId === "master_primary" ? "👑 主系ノード (Primary Master)" : `🛡️ 待機ノード「${nodeId}」`;
+  const input = prompt(`${nodeLabel} の所有者名を入力してください:\n(空欄にしてOKを押すと未設定に戻せます)`, cleanCurrent);
+  if (input === null) return; // キャンセル
+
+  const newOwner = input.trim();
+  try {
+    const resp = await fetch("/api/system/manager_nodes/owner", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ node_id: nodeId, owner_name: newOwner })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+
+    showToast(data.message || `所有者を「${newOwner || '未設定'}」に設定しました 👤`, "success");
+
+    if (typeof loadManagerNodes === "function") {
+      loadManagerNodes();
+    }
+  } catch (e) {
+    showToast(`所有者の更新に失敗しました: ${e.message}`, "error");
+  }
+}
+window.promptEditManagerNodeOwner = promptEditManagerNodeOwner;
 
 async function setManagerSlavePriority(nodeId, priority) {
   try {
@@ -8049,9 +8146,13 @@ function updateStandbyOneliner(haSecret) {
 
   const origin = window.location.origin.replace(/\/$/, "");
   const sec = haSecret || window.currentHaSecret || "<HA_SECRET>";
+  const ownerName = (window.APP_USER_DATA && (window.APP_USER_DATA.global_name || window.APP_USER_DATA.username)) ? String(window.APP_USER_DATA.global_name || window.APP_USER_DATA.username).trim() : "";
+  const ownerEnvSh = ownerName ? `TTSBOT_HA_OWNER="${ownerName.replace(/"/g, '\\"')}" ` : "";
+  const ownerPs1Env = ownerName ? `$env:TTSBOT_HA_OWNER="${ownerName.replace(/"/g, '`"')}"; ` : "";
+  const ownerArgSh = ownerName ? ` "${ownerName.replace(/"/g, '\\"')}"` : "";
 
-  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo bash -s -- "" "${sec}"`;
-  const ps1Cmd = `$env:TTSBOT_HA_SECRET="${sec}"; irm "${origin}/setup-standby.ps1" | iex`;
+  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo ${ownerEnvSh}bash -s -- "" "${sec}" ""${ownerArgSh}`;
+  const ps1Cmd = `$env:TTSBOT_HA_SECRET="${sec}"; ${ownerPs1Env}irm "${origin}/setup-standby.ps1" | iex`;
 
   if (shPre) shPre.textContent = shCmd;
   if (ps1Pre) ps1Pre.textContent = ps1Cmd;
@@ -8065,8 +8166,12 @@ function updateClusterWorkerOneliner(workerSecret) {
 
   const origin = window.location.origin.replace(/\/$/, "");
   const sec = workerSecret || window.currentWorkerSecret || window.VOLUNTEER_WORKER_TOKEN || "<WORKER_SECRET>";
-  const shCmd = `curl -sSL "${origin}/setup-worker.sh" | sudo bash -s -- --secret "${sec}"`;
-  const ps1Cmd = `$env:TTSBOT_WORKER_SECRET="${sec}"; irm "${origin}/setup-worker.ps1" | iex`;
+  const ownerName = (window.APP_USER_DATA && (window.APP_USER_DATA.global_name || window.APP_USER_DATA.username)) ? String(window.APP_USER_DATA.global_name || window.APP_USER_DATA.username).trim() : "";
+  const ownerShArg = ownerName ? ` --owner "${ownerName.replace(/"/g, '\\"')}"` : "";
+  const ownerPs1Env = ownerName ? `$env:TTSBOT_WORKER_OWNER="${ownerName.replace(/"/g, '`"')}"; ` : "";
+
+  const shCmd = `curl -sSL "${origin}/setup-worker.sh" | sudo bash -s -- --secret "${sec}"${ownerShArg}`;
+  const ps1Cmd = `$env:TTSBOT_WORKER_SECRET="${sec}"; ${ownerPs1Env}irm "${origin}/setup-worker.ps1" | iex`;
 
   if (shBox) shBox.textContent = shCmd;
   if (ps1Box) ps1Box.textContent = ps1Cmd;

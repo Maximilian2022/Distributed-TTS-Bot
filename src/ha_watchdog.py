@@ -159,6 +159,7 @@ class HAWatchdog:
                 self.master_url = self.master_url[:-7]
 
         self.ha_secret = os.getenv("TTSBOT_HA_SECRET", os.getenv("HA_SECRET", "")).strip()
+        self.owner_name = os.getenv("TTSBOT_HA_OWNER", os.getenv("HA_OWNER", "")).strip()
         # 起動時 LAN 判定で最優先に試す Master の LAN URL (任意、カンマ区切り)
         self.master_lan_urls = [u.strip().rstrip("/") for u in os.getenv("TTSBOT_MASTER_LAN_URL", "").split(",") if u.strip()]
         self.check_interval = float(os.getenv("TTSBOT_CHECK_INTERVAL", "5.0"))
@@ -409,6 +410,7 @@ class HAWatchdog:
             "X-HA-Local-IP": self.local_ip,
             "X-HA-Direct-Verified": "true" if self.is_direct_verified else "false",
             "X-HA-Direct-Url": self.direct_master_url if self.is_direct_verified else "",
+            "X-HA-Owner": self.owner_name,
         }
         if self.ha_secret:
             headers["Authorization"] = f"Bearer {self.ha_secret}"

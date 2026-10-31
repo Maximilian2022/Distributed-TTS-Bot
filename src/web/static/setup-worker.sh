@@ -26,6 +26,7 @@ C_CYAN="\033[36m"
 MASTER_URL="${TTSBOT_MASTER_URL:-http://localhost:8080}"
 MASTER_WS_URL="${TTSBOT_MASTER_WS_URL:-}"
 WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"
+WORKER_OWNER="${TTSBOT_WORKER_OWNER:-}"
 WORK_DIR="${TTSBOT_WORK_DIR:-${HOME}/ttsbot-worker}"
 AGENT_IMAGE="${TTSBOT_AGENT_IMAGE:-python:3.14-slim}"
 
@@ -42,6 +43,10 @@ while [ $# -gt 0 ]; do
             ;;
         --secret)
             WORKER_SECRET="$2"
+            shift 2
+            ;;
+        --owner)
+            WORKER_OWNER="$2"
             shift 2
             ;;
         --work-dir)
@@ -389,6 +394,7 @@ services:
       - WORK_DIR=/work
       - WORKER_COMPOSE_FILE=/work/docker-compose.worker.yml
       - NODE_ID=worker_$(hostname)
+      - TTSBOT_WORKER_OWNER=${WORKER_OWNER}
     command: >
       sh -c "pip install --quiet --no-cache-dir --root-user-action=ignore aiohttp && python3 agent.py"
 ${AGENT_GPU_SECTION}

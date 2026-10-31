@@ -589,16 +589,26 @@ class Database:
                     revoked_at TIMESTAMP
                 )
             """)
-            # ワーカー別設定 (エンジン自動停止など。Master からハートビート応答で配信)
+            # ワーカー別設定 (エンジン自動停止、所有者表示など。Master からハートビート応答で配信)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS worker_settings (
                     node_key TEXT PRIMARY KEY,
                     idle_policy TEXT DEFAULT 'default',
                     idle_minutes INTEGER DEFAULT 15,
                     updated_by INTEGER DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    owner_name TEXT DEFAULT '',
+                    owner_user_id INTEGER DEFAULT 0
                 )
             """)
+            async with db.execute("PRAGMA table_info(worker_settings)") as cur:
+                w_cols = [row[1] for row in await cur.fetchall()]
+                if "owner_name" not in w_cols:
+                    await db.execute("ALTER TABLE worker_settings ADD COLUMN owner_name TEXT DEFAULT ''")
+                    logger.info("Migrated worker_settings: added owner_name column")
+                if "owner_user_id" not in w_cols:
+                    await db.execute("ALTER TABLE worker_settings ADD COLUMN owner_user_id INTEGER DEFAULT 0")
+                    logger.info("Migrated worker_settings: added owner_user_id column")
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS volunteer_devices (
                     node_id TEXT PRIMARY KEY,
@@ -2922,17 +2932,55 @@ class Database:
     async def get_all_worker_settings(self) -> Dict[str, Dict[str, Any]]:
         async with self.get_connection() as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT node_key, idle_policy, idle_minutes, updated_by, updated_at FROM worker_settings") as cur:
+            async with db.execute("SELECT node_key, idle_policy, idle_minutes, updated_by, updated_at, owner_name, owner_user_id FROM worker_settings") as cur:
                 return {r["node_key"]: dict(r) for r in await cur.fetchall()}
 
-    async def upsert_worker_settings(self, node_key: str, idle_policy: str, idle_minutes: int, updated_by: int) -> None:
+    async def upsert_worker_settings(
+        self,
+        node_key: str,
+        idle_policy: str,
+        idle_minutes: int,
+        updated_by: int,
+        owner_name: Optional[str] = None,
+        owner_user_id: Optional[int] = None
+    ) -> None:
+        async with self.get_connection() as db:
+            updates = []
+            vals = [node_key, idle_policy, int(idle_minutes), int(updated_by)]
+            cols = ["node_key", "idle_policy", "idle_minutes", "updated_by"]
+            if owner_name is not None:
+                cols.append("owner_name")
+                vals.append(str(owner_name)[:100])
+            if owner_user_id is not None:
+                cols.append("owner_user_id")
+                vals.append(int(owner_user_id))
+
+            placeholders = ", ".join(["?"] * len(vals))
+            col_names = ", ".join(cols)
+            set_clauses = ["idle_policy=excluded.idle_policy", "idle_minutes=excluded.idle_minutes", "updated_by=excluded.updated_by", "updated_at=CURRENT_TIMESTAMP"]
+            if owner_name is not None:
+                set_clauses.append("owner_name=excluded.owner_name")
+            if owner_user_id is not None:
+                set_clauses.append("owner_user_id=excluded.owner_user_id")
+
+            sql = f"""
+                INSERT INTO worker_settings ({col_names})
+                VALUES ({placeholders})
+                ON CONFLICT(node_key) DO UPDATE SET {", ".join(set_clauses)}
+            """
+            await db.execute(sql, tuple(vals))
+            await db.commit()
+
+    async def update_worker_owner(self, node_key: str, owner_name: str, updated_by: int, owner_user_id: int = 0) -> None:
+        """ワーカーの所有者名およびDiscordユーザーID (WebUI表示用) を更新"""
         async with self.get_connection() as db:
             await db.execute("""
-                INSERT INTO worker_settings (node_key, idle_policy, idle_minutes, updated_by)
+                INSERT INTO worker_settings (node_key, updated_by, owner_name, owner_user_id)
                 VALUES (?, ?, ?, ?)
-                ON CONFLICT(node_key) DO UPDATE SET idle_policy=excluded.idle_policy, idle_minutes=excluded.idle_minutes,
+                ON CONFLICT(node_key) DO UPDATE SET owner_name=excluded.owner_name,
+                    owner_user_id=excluded.owner_user_id,
                     updated_by=excluded.updated_by, updated_at=CURRENT_TIMESTAMP
-            """, (node_key, idle_policy, int(idle_minutes), int(updated_by)))
+            """, (node_key, int(updated_by), str(owner_name)[:100], int(owner_user_id)))
             await db.commit()
 
     async def get_volunteer_device_owner(self, node_id: str) -> Optional[int]:
