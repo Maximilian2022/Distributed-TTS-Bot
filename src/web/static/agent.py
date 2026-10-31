@@ -238,17 +238,18 @@ def resolve_work_dir() -> str:
     return os.path.abspath(".")
 
 
-AGENT_COEIROINK_MODELS_MOUNT = "/coeiroink_models"
+AGENT_DATA_MOUNT_ROOT = "/"
 
 
-def resolve_coeiroink_models_dir(work_dir: str) -> str:
-    """Agent が COEIROINK モデルを読み書きする実体ディレクトリ。
-    Windows で coeiroink_models を別ドライブへのジャンクションにしていると、/work 越しには
-    コンテナ内で辿れないシンボリックリンクに見えるため、Agent 専用マウント (/coeiroink_models) を使う。
+def resolve_agent_data_dir(work_dir: str, name: str) -> str:
+    """Agent が読み書きする作業ディレクトリ配下のデータディレクトリ (coeiroink_models / coeiroink_ram) の実体。
+    Windows で別ドライブへのジャンクションにしていると、/work 越しにはコンテナ内で辿れない
+    シンボリックリンクに見えるため、Agent 専用マウント (/<name>) があればそちらを使う。
     """
-    path = os.path.join(work_dir, "coeiroink_models")
-    if os.path.islink(path) and not os.path.exists(path) and os.path.isdir(AGENT_COEIROINK_MODELS_MOUNT):
-        return AGENT_COEIROINK_MODELS_MOUNT
+    path = os.path.join(work_dir, name)
+    mount = os.path.join(AGENT_DATA_MOUNT_ROOT, name)
+    if os.path.islink(path) and not os.path.exists(path) and os.path.isdir(mount):
+        return mount
     return path
 
 WORK_DIR = resolve_work_dir()
@@ -262,7 +263,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.14.2"
+    AGENT_VERSION = "3.14.3"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -348,8 +349,8 @@ class CoeiroinkWorkerRamManager:
 
     def __init__(self, work_dir: str):
         self.work_dir = work_dir
-        self.ssd_dir = resolve_coeiroink_models_dir(work_dir)
-        self.ram_dir = os.path.join(work_dir, "coeiroink_ram")
+        self.ssd_dir = resolve_agent_data_dir(work_dir, "coeiroink_models")
+        self.ram_dir = resolve_agent_data_dir(work_dir, "coeiroink_ram")
         self.hybrid_dir = os.path.join(work_dir, "coeiroink_hybrid")
         self._uuid_to_model_dir: Dict[str, str] = {}
         self._pinned_models: set = set()
@@ -2831,7 +2832,7 @@ hosts allow = *
         3. 新規または大幅破損モデルは .staging_* に安全ストリーミング展開 ➔ SHA-256検証 ➔ アトミック昇格
         4. 破損残骸は本番ディレクトリに1バイトも残さない
         """
-        models_dir = resolve_coeiroink_models_dir(work_dir)
+        models_dir = resolve_agent_data_dir(work_dir, "coeiroink_models")
         os.makedirs(models_dir, exist_ok=True)
 
         # 過去の中断されたステージング一時ディレクトリ（.staging_*）を自動クリーンアップ
@@ -3434,6 +3435,7 @@ hosts allow = *
                                     "      - ./:/work\n"
                                     "      - ./docker/agent:/app\n"
                                     "      - ./coeiroink_models:/coeiroink_models\n"
+                                    "      - ./coeiroink_ram:/coeiroink_ram\n"
                                     "      - ./docker-compose.worker.yml:/app/docker-compose.worker.yml\n"
                                     "    working_dir: /app\n"
                                     "    environment:\n"
@@ -3818,7 +3820,7 @@ async def handle_diagnostics(request: web.Request) -> web.Response:
     """ノード内の詳細診断情報（コンテナマウント、モデルディレクトリ、コンテナ内ファイル）を返却"""
     agent: WorkerAgent = request.app["agent"]
     work_dir = resolve_work_dir()
-    models_dir = os.path.join(work_dir, "coeiroink_models")
+    models_dir = resolve_agent_data_dir(work_dir, "coeiroink_models")
 
     # 1. ホスト側 models ディレクトリの調査 (高速)
     models_on_disk = []
@@ -3876,7 +3878,7 @@ async def handle_sync_models(request: web.Request) -> web.Response:
         # パストラバーサル防止 (CWE-22): 英数字識別子チェックおよび実在ディレクトリホワイトリスト照合
         if not re.match(r'^[a-zA-Z0-9_\-]+$', clean_model):
             return web.Response(text="Invalid clean_model identifier", status=400)
-        models_base = (Path(work_dir) / "coeiroink_models").resolve()
+        models_base = Path(resolve_agent_data_dir(work_dir, "coeiroink_models")).resolve()
         if models_base.exists() and models_base.is_dir():
             valid_dirs = {p.name: p for p in models_base.iterdir() if p.is_dir()}
             if clean_model in valid_dirs:
@@ -3965,7 +3967,7 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
         return web.Response(text="Invalid model name", status=400)
 
     work_dir = Path(resolve_work_dir())
-    model_dir = (work_dir / "coeiroink_models").resolve()
+    model_dir = Path(resolve_agent_data_dir(str(work_dir), "coeiroink_models")).resolve()
     agent = request.app.get("agent")
     if agent and getattr(agent, "ram_manager", None):
         model_dir = Path(agent.ram_manager.persistent_dir).resolve()

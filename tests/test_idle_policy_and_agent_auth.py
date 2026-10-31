@@ -169,22 +169,27 @@ class TestAgentComposeSelfHealGuard(unittest.TestCase):
             self.assertIn("worker-voicevox", content)
 
 
-class TestCoeiroinkModelsDirResolution(unittest.TestCase):
-    """Windows のジャンクション (コンテナ内では辿れないリンク) でも Agent 専用マウントでモデルを扱えること"""
+
+class TestAgentDataDirResolution(unittest.TestCase):
+    """Windows のジャンクション (コンテナ内では辿れないリンク) でも Agent 専用マウントでモデル・RAM 領域を扱えること"""
 
     def test_dangling_link_falls_back_to_agent_mount(self):
         agent = _load_agent("x")
         with tempfile.TemporaryDirectory() as d:
-            work, mount = os.path.join(d, "work"), os.path.join(d, "mount")
+            work, root = os.path.join(d, "work"), os.path.join(d, "root")
             os.makedirs(work)
-            os.makedirs(mount)
-            os.symlink("/mnt/host/e/missing/coeiroink_models", os.path.join(work, "coeiroink_models"))
-            with patch.object(agent, "AGENT_COEIROINK_MODELS_MOUNT", mount):
-                self.assertEqual(agent.resolve_coeiroink_models_dir(work), mount)
+            for name in ("coeiroink_models", "coeiroink_ram"):
+                os.makedirs(os.path.join(root, name))
+                os.symlink(f"/mnt/host/e/missing/{name}", os.path.join(work, name))
+            with patch.object(agent, "AGENT_DATA_MOUNT_ROOT", root):
+                for name in ("coeiroink_models", "coeiroink_ram"):
+                    self.assertEqual(agent.resolve_agent_data_dir(work, name), os.path.join(root, name))
+                # Agent 専用マウントが無ければ従来どおり (呼び出し側で通常のエラーになる)
+                self.assertEqual(agent.resolve_agent_data_dir(work, "coeiroink_hybrid"), os.path.join(work, "coeiroink_hybrid"))
 
     def test_regular_dir_is_used_as_is(self):
         agent = _load_agent("x")
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "coeiroink_models"))
-            with patch.object(agent, "AGENT_COEIROINK_MODELS_MOUNT", d):
-                self.assertEqual(agent.resolve_coeiroink_models_dir(d), os.path.join(d, "coeiroink_models"))
+            with patch.object(agent, "AGENT_DATA_MOUNT_ROOT", d):
+                self.assertEqual(agent.resolve_agent_data_dir(d, "coeiroink_models"), os.path.join(d, "coeiroink_models"))

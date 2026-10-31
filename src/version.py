@@ -7,10 +7,10 @@ from pathlib import Path
 デプロイ・更新時に更新することで、ブラウザキャッシュの無効化と画面上でのバージョン確認を可能にします。
 """
 
-BUILD_VERSION = "v2026.10.31-1345"
-BUILD_DATE = "2026-10-31 13:45:00 JST"
+BUILD_VERSION = "v2026.10.31-1400"
+BUILD_DATE = "2026-10-31 14:00:00 JST"
 APP_NAME = "Distributed TTS Discord Bot"
-AGENT_VERSION = "3.14.2"  # 最新 Worker Agent バージョン (単一管理元: SSOT)
+AGENT_VERSION = "3.14.3"  # 最新 Worker Agent バージョン (単一管理元: SSOT)
 
 
 def sync_agent_py_version() -> bool:

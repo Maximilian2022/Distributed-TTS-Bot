@@ -27,6 +27,7 @@ New-Item -ItemType Directory -Force -Path "$WorkDir\docker\sharevox" | Out-Null
 New-Item -ItemType Directory -Force -Path "$WorkDir\docker\coeiroink" | Out-Null
 New-Item -ItemType Directory -Force -Path "$WorkDir\docker\agent"     | Out-Null
 New-Item -ItemType Directory -Force -Path "$WorkDir\coeiroink_models" | Out-Null
+New-Item -ItemType Directory -Force -Path "$WorkDir\coeiroink_ram" | Out-Null
 Set-Location $WorkDir
 
 # 1. Docker チェック
@@ -411,6 +412,7 @@ services:
       - ./:/work
       - ./docker/agent:/app
       - ./coeiroink_models:/coeiroink_models
+      - ./coeiroink_ram:/coeiroink_ram
       - ./docker-compose.worker.yml:/app/docker-compose.worker.yml
     working_dir: /app
     environment:
