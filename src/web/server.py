@@ -3601,11 +3601,15 @@ class WebServer:
             limit = int(request.query.get("limit", "50"))
         except ValueError:
             limit = 50
+        exclude_queue_wait = request.query.get("include_queue_wait", "false").lower() != "true"
         incidents = []
         if self.db and hasattr(self.db, "get_latency_incidents"):
-            incidents = await self.db.get_latency_incidents(limit)
+            incidents = await self.db.get_latency_incidents(limit, exclude_queue_wait=exclude_queue_wait)
         if not incidents:
-            incidents = latency_tracker.get_recent_incidents()[:limit]
+            raw_incidents = latency_tracker.get_recent_incidents()
+            if exclude_queue_wait:
+                raw_incidents = [inc for inc in raw_incidents if inc.get("incident_types") != ["F_QUEUE_WAIT"]]
+            incidents = raw_incidents[:limit]
         return web.json_response({"incidents": incidents, "count": len(incidents)})
 
     async def api_purge_cache(self, request: web.Request) -> web.Response:

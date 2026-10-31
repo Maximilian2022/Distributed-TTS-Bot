@@ -8723,4 +8723,21 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   4. **テスト・検証**:
      - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて全 147 件の単体テストが **100% 合格（Ran 147 tests in 8.626s, OK）**。
 
+## 2026-11-01 00:30 遅延インシデント履歴における「キュー滞留（連投順番待ち）」非表示フィルタ実装 (v2026.11.01-0030)
+- **課題・要望**:
+  - ユーザーより「遅延・アンダーラン インシデント履歴で、キュー滞留で連投順番待ちは表示しないようにしてほしい」との要望。
+  - 実態として、先行発話の再生終了を待つ「正常なシーケンス順序制御（F_QUEUE_WAIT / QUEUE_CONGESTION）」がインシデント履歴（全体の20〜30%）を埋め尽くし、真の不具合（音途切れやクラウド切替）の視認性を阻害していた。
+- **改修内容**:
+  1. **データベース層 (`src/database.py`)**:
+     - `get_latency_incidents`: 引数 `exclude_queue_wait: bool = True` を追加。SQLクエリ（`WHERE incident_types != 'F_QUEUE_WAIT'`）およびレコードパーサーにて純粋な連投順番待ちインシデントをデフォルトで完全除外。
+  2. **バックエンド API (`src/web/server.py`)**:
+     - `api_get_latency_incidents`: クエリパラメータ `include_queue_wait`（デフォルト false）を受け取り、DBおよびインメモリインシデントリストから `F_QUEUE_WAIT` を自動除外。
+  3. **フロントエンド WebUI (`src/web/static/app.js`)**:
+     - `loadLatencyIncidents`: API 呼び出しに `include_queue_wait=false` を付与しつつ、クライアント側でも `types.length === 1 && types[0] === 'F_QUEUE_WAIT'` かつ `causes.includes('QUEUE_CONGESTION')` を確実にフィルタリング除外。
+     - 件数バッジもフィルタ後の実件数で正しく更新。
+  4. **バージョン更新 & テスト**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.11.01-0030"`
+     - サンドボックス隔離テストにて単体テスト合格確認。
+
+
 

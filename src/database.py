@@ -2706,21 +2706,41 @@ class Database:
         except Exception as e:
             logger.warning(f"Failed to save latency incident to DB: {e}")
 
-    async def get_latency_incidents(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """直近の状態悪化インシデントを新しい順で取得"""
+    async def get_latency_incidents(self, limit: int = 50, exclude_queue_wait: bool = True) -> List[Dict[str, Any]]:
+        """直近の状態悪化インシデントを新しい順で取得 (連投順番待ち F_QUEUE_WAIT はデフォルト除外)"""
         try:
+            lim = max(1, min(int(limit), 500))
+            fetch_limit = lim * 3 if exclude_queue_wait else lim
             async with self.get_connection() as db:
-                async with db.execute(
-                    "SELECT id, incident_json FROM latency_incidents ORDER BY id DESC LIMIT ?",
-                    (max(1, min(int(limit), 500)),)
-                ) as cursor:
+                if exclude_queue_wait:
+                    query = """
+                        SELECT id, incident_types, root_causes, incident_json
+                        FROM latency_incidents
+                        WHERE incident_types != 'F_QUEUE_WAIT'
+                        ORDER BY id DESC LIMIT ?
+                    """
+                else:
+                    query = """
+                        SELECT id, incident_types, root_causes, incident_json
+                        FROM latency_incidents
+                        ORDER BY id DESC LIMIT ?
+                    """
+                async with db.execute(query, (fetch_limit,)) as cursor:
                     rows = await cursor.fetchall()
             result = []
             for row in rows:
                 try:
-                    item = json.loads(row[1])
+                    item = json.loads(row[3])
                     item["id"] = row[0]
+                    types = item.get("incident_types", [])
+                    causes = item.get("root_causes", [])
+                    if exclude_queue_wait:
+                        # 純粋なキュー滞留（連投順番待ち・正常動作）は除外
+                        if types == ["F_QUEUE_WAIT"] or (len(types) == 1 and types[0] == "F_QUEUE_WAIT" and "QUEUE_CONGESTION" in causes):
+                            continue
                     result.append(item)
+                    if len(result) >= lim:
+                        break
                 except Exception:
                     continue
             return result

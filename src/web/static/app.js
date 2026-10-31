@@ -7084,10 +7084,19 @@ async function loadLatencyIncidents() {
   tbody.innerHTML = '<tr><td colspan="6" style="padding:16px;text-align:center;color:var(--text-muted);"><div class="loading-spinner"></div> インシデント履歴を読み込み中...</td></tr>';
 
   try {
-    const res = await fetch("/api/system/latency/incidents?limit=50");
+    const res = await fetch("/api/system/latency/incidents?limit=50&include_queue_wait=false");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    const incidents = Array.isArray(data.incidents) ? data.incidents : [];
+    const rawIncidents = Array.isArray(data.incidents) ? data.incidents : [];
+
+    // 純粋なキュー滞留 (連投順番待ち・正常動作) を完全非表示
+    const incidents = rawIncidents.filter(inc => {
+      const types = inc.incident_types || [];
+      const causes = inc.root_causes || [];
+      if (types.length === 1 && types[0] === "F_QUEUE_WAIT") return false;
+      if (causes.length === 1 && causes[0] === "QUEUE_CONGESTION" && !types.includes("A_UNDERRUN") && !types.includes("E_FALLBACK")) return false;
+      return true;
+    });
 
     if (countBadge) {
       countBadge.textContent = `${incidents.length}件`;
