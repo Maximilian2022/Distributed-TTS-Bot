@@ -87,3 +87,6 @@ coeiroink_models/
 .agents/
 
 data_backup/
+
+# Claude Code local settings
+.claude/settings.local.json

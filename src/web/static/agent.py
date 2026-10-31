@@ -237,6 +237,20 @@ def resolve_work_dir() -> str:
         return default_dir
     return os.path.abspath(".")
 
+
+AGENT_COEIROINK_MODELS_MOUNT = "/coeiroink_models"
+
+
+def resolve_coeiroink_models_dir(work_dir: str) -> str:
+    """Agent が COEIROINK モデルを読み書きする実体ディレクトリ。
+    Windows で coeiroink_models を別ドライブへのジャンクションにしていると、/work 越しには
+    コンテナ内で辿れないシンボリックリンクに見えるため、Agent 専用マウント (/coeiroink_models) を使う。
+    """
+    path = os.path.join(work_dir, "coeiroink_models")
+    if os.path.islink(path) and not os.path.exists(path) and os.path.isdir(AGENT_COEIROINK_MODELS_MOUNT):
+        return AGENT_COEIROINK_MODELS_MOUNT
+    return path
+
 WORK_DIR = resolve_work_dir()
 WORKER_COMPOSE_FILE = os.getenv("WORKER_COMPOSE_FILE", os.path.join(WORK_DIR, "docker-compose.worker.yml"))
 AGENT_COMPOSE_FILE = os.getenv("AGENT_COMPOSE_FILE", os.path.join(WORK_DIR, "docker-compose.agent.yml"))
@@ -248,7 +262,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.14.1"
+    AGENT_VERSION = "3.14.2"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -334,7 +348,7 @@ class CoeiroinkWorkerRamManager:
 
     def __init__(self, work_dir: str):
         self.work_dir = work_dir
-        self.ssd_dir = os.path.join(work_dir, "coeiroink_models")
+        self.ssd_dir = resolve_coeiroink_models_dir(work_dir)
         self.ram_dir = os.path.join(work_dir, "coeiroink_ram")
         self.hybrid_dir = os.path.join(work_dir, "coeiroink_hybrid")
         self._uuid_to_model_dir: Dict[str, str] = {}
@@ -2817,7 +2831,7 @@ hosts allow = *
         3. 新規または大幅破損モデルは .staging_* に安全ストリーミング展開 ➔ SHA-256検証 ➔ アトミック昇格
         4. 破損残骸は本番ディレクトリに1バイトも残さない
         """
-        models_dir = os.path.join(work_dir, "coeiroink_models")
+        models_dir = resolve_coeiroink_models_dir(work_dir)
         os.makedirs(models_dir, exist_ok=True)
 
         # 過去の中断されたステージング一時ディレクトリ（.staging_*）を自動クリーンアップ
