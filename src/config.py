@@ -125,6 +125,8 @@ class AppConfig:
     worker_shared_secret: str = ""
     # トークン入れ替え時の猶予用。旧トークンは LAN 内からの接続に限り一時的に受け付ける (空なら無効)
     worker_shared_secret_previous: str = ""
+    # ホスト / 主系ノードの所有者 Discord ユーザーID (.env 指定で最優先バインド)
+    discord_owner_user_id: int = 0
 
     # Voice defaults
     default_speaker: str = "nanami"
@@ -382,6 +384,16 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.web_host = os.getenv("WEB_HOST", cfg.web_host)
     cfg.discord_client_id = os.getenv("DISCORD_CLIENT_ID", cfg.discord_client_id).strip()
     cfg.discord_client_secret = os.getenv("DISCORD_CLIENT_SECRET", cfg.discord_client_secret).strip()
+
+    raw_owner_id = (
+        os.getenv("DISCORD_OWNER_USER_ID")
+        or os.getenv("DISCORD_OWNER_ID")
+        or os.getenv("HOST_OWNER_USER_ID", "0")
+    ).strip()
+    try:
+        cfg.discord_owner_user_id = int(raw_owner_id) if raw_owner_id else 0
+    except ValueError:
+        cfg.discord_owner_user_id = 0
 
     base_url = os.getenv("WEB_BASE_URL", "").strip().rstrip("/")
     if not base_url:

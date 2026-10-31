@@ -145,6 +145,8 @@ class SQLitePool:
 
 
 VOLUNTEER_TOKEN_PREFIX = "vt_"  # 個人トークンの接頭辞 (共有ワーカートークンと区別する)
+CLUSTER_WORKER_TOKEN_PREFIX = "cwtok_"  # クラスタWorker登録用トークン (所有者紐づけ)
+STANDBY_HA_TOKEN_PREFIX = "hatok_"      # Manager Standby (Slave) 登録用トークン (所有者紐づけ)
 MAX_SILENCE_MIN_SECONDS = 1.0
 MAX_SILENCE_MAX_SECONDS = 2.5
 MAX_SILENCE_DEFAULT_SECONDS = 1.5
@@ -620,6 +622,23 @@ class Database:
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # ノードセットアップ用トークン (クラスタWorker / Standby Slave の所有者安全紐づけ)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS node_setup_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    token_secret TEXT NOT NULL,
+                    token_hash TEXT UNIQUE NOT NULL,
+                    discord_user_id INTEGER NOT NULL,
+                    owner_name TEXT DEFAULT '',
+                    token_type TEXT NOT NULL DEFAULT 'worker',
+                    label TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP,
+                    revoked_at TIMESTAMP
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_node_setup_tokens_lookup ON node_setup_tokens(token_type, discord_user_id, revoked_at);")
 
             # 10. スキーママイグレーション管理テーブル
             await db.execute("""
@@ -3059,6 +3078,104 @@ class Database:
                     device_name=excluded.device_name, last_seen=CURRENT_TIMESTAMP
             """, (node_id, token_id, int(discord_user_id), str(owner_name)[:100], str(device_name)[:100]))
             await db.commit()
+
+    # --- ノードセットアップ用トークン (クラスタWorker / Standby Slave 所有者安全紐づけ) ---
+
+    @staticmethod
+    def _hash_setup_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def create_node_setup_token(
+        self,
+        discord_user_id: int,
+        owner_name: str,
+        token_type: str = "worker",
+        label: str = ""
+    ) -> Tuple[str, str]:
+        """ノードセットアップ用トークンを新規発行 (token_id, token)"""
+        prefix = STANDBY_HA_TOKEN_PREFIX if token_type == "standby" else CLUSTER_WORKER_TOKEN_PREFIX
+        token = prefix + secrets.token_urlsafe(24)
+        token_id = uuid.uuid4().hex[:12]
+        token_hash = self._hash_setup_token(token)
+
+        async with self.get_connection() as db:
+            await db.execute(
+                """
+                INSERT INTO node_setup_tokens
+                (token_id, token_secret, token_hash, discord_user_id, owner_name, token_type, label)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (token_id, token, token_hash, int(discord_user_id), str(owner_name)[:100], str(token_type), str(label)[:60])
+            )
+            await db.commit()
+        return token_id, token
+
+    async def get_or_create_node_setup_token(
+        self,
+        discord_user_id: int,
+        owner_name: str,
+        token_type: str = "worker"
+    ) -> str:
+        """有効なノードセットアップ用トークンを取得、無ければ新規生成してトークン文字列を返す"""
+        token_type = "standby" if token_type == "standby" else "worker"
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT token_secret FROM node_setup_tokens
+                WHERE discord_user_id = ? AND token_type = ? AND revoked_at IS NULL
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (int(discord_user_id), token_type)
+            ) as cur:
+                row = await cur.fetchone()
+                if row and row["token_secret"]:
+                    return str(row["token_secret"])
+
+        _, new_token = await self.create_node_setup_token(discord_user_id, owner_name, token_type=token_type)
+        return new_token
+
+    async def resolve_node_setup_token(
+        self,
+        token: str,
+        token_type: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """トークンを検証し、有効であれば発行者のDiscordユーザー情報・所有者情報を返す (最終利用日時を更新)"""
+        if not token:
+            return None
+        token_hash = self._hash_setup_token(token)
+        sql = "SELECT token_id, discord_user_id, owner_name, token_type, label FROM node_setup_tokens WHERE token_hash = ? AND revoked_at IS NULL"
+        args: List[Any] = [token_hash]
+        if token_type:
+            sql += " AND token_type = ?"
+            args.append(token_type)
+
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, tuple(args)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return None
+            await db.execute("UPDATE node_setup_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_id = ?", (row["token_id"],))
+            await db.commit()
+            return dict(row)
+
+    async def revoke_node_setup_tokens(
+        self,
+        discord_user_id: int,
+        token_type: Optional[str] = None
+    ) -> int:
+        """指定ユーザーのセットアップトークンを失効"""
+        sql = "UPDATE node_setup_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE discord_user_id = ? AND revoked_at IS NULL"
+        args: List[Any] = [int(discord_user_id)]
+        if token_type:
+            sql += " AND token_type = ?"
+            args.append(token_type)
+
+        async with self.get_connection() as db:
+            cur = await db.execute(sql, tuple(args))
+            await db.commit()
+            return cur.rowcount or 0
 
     async def list_volunteer_devices(self, discord_user_id: Optional[int] = None) -> List[Dict[str, Any]]:
         sql = "SELECT node_id, token_id, discord_user_id, owner_name, device_name, first_seen, last_seen FROM volunteer_devices"

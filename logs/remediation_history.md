@@ -1,6 +1,75 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-10-31] トークンベース所有権安全紐づけアーキテクチャ (Setup Token) の実装 ＆ 他者ノード所有権保護 (v2026.10.31-1620)
+
+- **ユーザーフィードバック & 課題**:
+  - 「特定のTokenか何かの文字列をその人と紐付けて、最終的にDiscord IDと紐づける形ってどうかな」
+  - ワンライナーに生の Discord ID や表示名を埋め込むのはセキュリティ的・運用的に不適切（露出・改ざんの懸念）。
+  - 他人がセットアップした Manager Slave やクラスタワーカーが、ホストの `.env` や初回ログインで勝手に上書きされないように保護したい。
+
+- **原因分析 & 設計**:
+  1. ワンライナーに平文で生 ID や名前を渡す方式は、コマンド改ざんによるなりすましが可能であり、ログやプロセス一覧にも露出する。
+  2. ボランティア Worker で実績のある「個人トークン（`volunteer_tokens`）」と同様に、暗号的ランダムトークン（SHA-256照合）を管理者が払い出し、そのトークンに Discord ユーザー ID・名前を紐づける方式が最も安全でエレガント。
+  3. `_auto_bind_host_nodes_owner` が、ホストの `.env` に記載がある際に他人の外部クラスタワーカーまで上書きしてしまう判定になっていたため、未設定ノードのみを対象にするよう是正が必要。
+
+- **対応内容**:
+  1. **データベース (`src/database.py`)**:
+     - `node_setup_tokens` テーブルを作成（`token_id`, `token_secret`, `token_hash`, `discord_user_id`, `owner_name`, `token_type`, `created_at`, `revoked_at`）。
+     - トークンプレフィックス: クラスタワーカー用 `cwtok_`、待機Slave用 `hatok_`。
+     - 操作メソッド `create_node_setup_token`, `get_or_create_node_setup_token`, `resolve_node_setup_token`, `revoke_node_setup_tokens` を実装。
+     - 本番 DB（`data/bot.db`）に無停止でテーブル・インデックスのマイグレーションを事前適用完了。
+  2. **サーバー API & 認証連携 (`src/web/server.py`)**:
+     - `GET /api/admin/setup_tokens`: ログイン中管理者の `worker` / `standby` 用 Setup Token を取得。
+     - `POST /api/admin/setup_tokens/rotate`: セットアップトークンの失効・再生成。
+     - `_resolve_setup_token_from_request`: リクエストヘッダー（`Authorization: Bearer <TOKEN>`, `X-Worker-Token`, `X-HA-Secret` 等）から Setup Token を自動抽出し照合。
+     - `api_worker_register` / `api_worker_ws`: Setup Token（`cwtok_`）で接続されたワーカーを自動認証し、トークン発行者の Discord ユーザー ID・名前をノード所有者情報として DB / メモリに永続化。
+     - `_is_ha_authorized` / `api_ha_status`: Setup Token（`hatok_`）で接続された Slave を自動認証し、発行者の Discord ユーザー ID・名前をノード所有者情報として永続化。
+     - `_auto_bind_host_nodes_owner`: 所有者が未設定の初期ノードのみをバインド対象とし、他者がセットアップした外部ノード（`owner_user_id > 0` または `owner_name` 設定済み）は絶対に上書きせず保護するよう改修。
+  3. **フロントエンド (`src/web/static/app.js`)**:
+     - `updateStandbyOneliner` / `updateClusterWorkerOneliner` を改修し、管理者が取得した Setup Token をワンライナーに埋め込むよう変更。生 Discord ID や `--owner` 引数をコマンドから完全撤廃。
+     - バージョンを `BUILD_VERSION = "v2026.10.31-1620"` に更新。
+  4. **単体テスト (`tests/test_node_setup_tokens.py`)**:
+     - トークン生成・再利用・照合・失効のテスト。
+     - WebUI API（取得・ローテーション・権限チェック）のテスト。
+     - Setup Token による Worker 登録＆所有者自動バインドテスト。
+     - Setup Token による Slave ステータス通知＆所有者自動バインドテスト。
+     - ホスト `.env` 自動バインドによる他者ワーカーの上書き保護テスト。
+     - 隔離サンドボックスで全 5 テスト 100% PASS（プロジェクト全体で 147 テスト 100% PASS）。
+
+- **本番反映状態**:
+  - `data/bot.db` に `node_setup_tokens` テーブルを作成済み。
+  - 静的アセット（`app.js`）はバインドマウント経由でブラウザ側に即座に提供中。
+  - 現在アクティブな VC 通話セッション（1件: guild_id `1225256556577423491`）が進行中のため、運用統制ルールに従いコンテナ再起動は行わず、通話終了後に安全に再起動可能。
+
+---
+
+## [2026-10-31] WebUI の数値エスケープ不具合修正 (str.replace is not a function 解消) および トークンベース所有権アーキテクチャの設計 (v2026.10.31-1605)
+
+- **ユーザーフィードバック & 課題**:
+  - `⚠️ Manager Node情報の取得中にエラーが発生しました: str.replace is not a function` と表示される。
+  - 分散コンピュートワーカーのカードが一覧に表示されなくなっている。
+  - 「WebUI上でログインしてるユーザーのユーザーIDを生でワンライナーに使うと、セキュリティ的によろしくなさそう。特定のTokenか何かの文字列をその人と紐付けて、最終的にDiscord IDと紐づける形ってどうかな」
+
+- **原因分析**:
+  - `src/web/static/app.js` の `escapeHtml(str)` において、`str.replace` を呼び出す前に引数の型チェック・文字列変換が行われていなかった。
+  - DB から取得した `owner_user_id`（例: `310034034690359308`）が数値（Number）として渡された際、`typeof str === "number"` のため `str.replace is not a function` の TypeError が発生。
+  - これにより `loadManagerNodes` でキャッチされて警告表示になり、`renderWorkerNodes` では全ノードループ内で例外が発生して描画が中断され、ワーカーカードが表示されなくなっていた。
+
+- **対応内容**:
+  1. **UI復旧・防御的エスケープ**:
+     - `src/web/static/app.js` の `escapeHtml` を改修し、`if (str === null || str === undefined) return ""; const s = String(str); return s.replace(...)` とすることで、数値・オブジェクト・文字列を問わず例外なく確実に HTML エスケープするよう安全化。
+     - バージョンを `BUILD_VERSION = "v2026.10.31-1605"` に更新。
+  2. **セキュリティ設計の整理 (Token紐付け方式の検討)**:
+     - ユーザーの指摘通り、ワンライナーへの生 Discord ID 埋め込みは改ざんや偽装、ログ露出のリスクがある。
+     - 既存のボランティアワーカーで成功している `volunteer_tokens`（暗号的ランダムトークン ↔ Discord User ID のDB紐付け）と同様に、Manager Slave / クラスタ Worker 用の登録トークン発行アーキテクチャを設計。
+
+- **検証**:
+  - 隔離サンドボックスコンテナ（`madpiero/ttsbot:latest`）にて単体テスト全 142 件を実行し、100% 合格（Ran 142 tests, OK）。
+  - 通話セッション数 0 件を確認。
+
+---
+
 ## [2026-10-30] 最大許容沈黙 (1.5s) を軸にしたストリーミング合成の改修 — 投機締切の再生タイムライン化・先頭パーツ最優先割当/動的短縮・二重発注防止 (v2026.10.30-2048)
 
 - **ユーザーフィードバック & 課題**:
@@ -8560,3 +8629,26 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 
 
+
+## 2026-10-31 15:30 OSS初回起動時の所有者自動バインド仕様 (アイデア A & B ハイブリッド) の設計・実装 (v2026.10.31-1530)
+- **要望・設計方針**:
+  - OSS として第三者がまっさらな環境でコンテナを起動した際、Master (主系) およびホスト同居 Worker の Discord 所有者紐づけをどう行うべきか。
+  - アイデア A（WebUI 初回管理者ログイン時の自動バインド）と アイデア B（`.env` の `DISCORD_OWNER_USER_ID` 指定）を組み合わせ、オーナーとホストが異なる可能性を考慮して **`.env` 指定を最優先とするハイブリッド仕様** を採用。
+- **改修内容**:
+  1. **設定層 (`src/config.py`, `.env.example`, `.env`)**:
+     - `AppConfig` に `discord_owner_user_id: int = 0` を追加。
+     - 環境変数 `DISCORD_OWNER_USER_ID`, `DISCORD_OWNER_ID`, `HOST_OWNER_USER_ID` の自動読み取りに対応。
+     - `.env.example` に説明コメントと項目を追加。本番 `.env` にも設定。
+  2. **バックエンド所有者自動バインド (`src/web/server.py`)**:
+     - `_resolve_discord_username(user_id)`: `guild_member_cache` ➔ Bot ギルドメンバー ➔ `fetch_user` の順で Discord 表示名（装飾括弧除去済み）を高信頼解決。
+     - `_auto_bind_host_nodes_owner(user_info, is_admin)`:
+       - **優先度 1**: `.env` に `DISCORD_OWNER_USER_ID` が指定されている場合はそちらを最優先で Master / 同居 Worker にバインド。
+       - **優先度 2**: `.env` 未指定時、WebUI に最初にログインした Discord サーバー管理者（またはオーナー）のアカウント情報で未設定ノードを自動バインド。
+     - `handle_callback`: Discord OAuth2 ログイン成功時に管理者権限を判定し、`_auto_bind_host_nodes_owner` をキック＆セッションに `is_admin` を明示。
+     - サーバー起動時 (`start`): `.env` にオーナー ID 指定がある場合、起動完了直後に非同期で初期バインドを実行。
+  3. **単体テスト (`tests/test_worker_owner.py`)**:
+     - `TestAutoOwnerBind`: 初回管理者ログインによる Master 自動バインド、および `.env` 指定優先バインドのテスト 2 件を追加。
+     - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて全 24 件の単体テストが **100% 合格（Ran 24 tests in 2.013s, OK）**。
+  4. **本番環境への安全な反映**:
+     - 通話セッション 0 件を確認後、`docker compose restart app` を実施。
+     - `curl /health` にて `version: "v2026.10.31-1530"`, `bot.is_ready: true` の健全稼働を確認。

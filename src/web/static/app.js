@@ -6291,8 +6291,9 @@ function toggleWorkerLogAutoRefresh(checkbox) {
 }
 
 function escapeHtml(str) {
-  if (!str) return "";
-  return str.replace(/[&<>'"]/g, 
+  if (str === null || str === undefined) return "";
+  const s = String(str);
+  return s.replace(/[&<>'"]/g, 
     tag => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[tag] || tag)
   );
 }
@@ -8137,41 +8138,62 @@ function updateWorkerOneliner(webBaseUrl, secret) {
   pre.textContent = cmd;
 }
 
-// 秘密情報は公開配信スクリプトに埋め込まれないため、管理者が取得したクレデンシャルをワンライナーに明示的に含める
-function updateStandbyOneliner(haSecret) {
+// --- ノードセットアップ用トークン (管理者用所有者安全紐づけ) ---
+window.CURRENT_SETUP_TOKENS = null;
+async function ensureSetupTokens() {
+  if (window.CURRENT_SETUP_TOKENS) return window.CURRENT_SETUP_TOKENS;
+  if (!window.APP_USER_DATA || !window.APP_USER_DATA.is_admin) return null;
+  try {
+    const res = await fetch("/api/admin/setup_tokens");
+    if (res.ok) {
+      const data = await res.json();
+      if (data.status === "ok") {
+        window.CURRENT_SETUP_TOKENS = data;
+        return data;
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to fetch setup tokens:", e);
+  }
+  return null;
+}
+
+// 秘密情報は公開配信スクリプトに埋め込まれないため、管理者が取得したクレデンシャルまたは個人SetupTokenをワンライナーに明示的に含める
+async function updateStandbyOneliner(haSecret) {
   const shPre = document.getElementById("standby-oneliner-sh");
   const ps1Pre = document.getElementById("standby-oneliner-ps1");
   const setupBox = document.getElementById("standby-setup-command-box");
   if (!shPre && !ps1Pre && !setupBox) return;
 
   const origin = window.location.origin.replace(/\/$/, "");
-  const sec = haSecret || window.currentHaSecret || "<HA_SECRET>";
-  const ownerName = (window.APP_USER_DATA && (window.APP_USER_DATA.global_name || window.APP_USER_DATA.username)) ? String(window.APP_USER_DATA.global_name || window.APP_USER_DATA.username).trim() : "";
-  const ownerEnvSh = ownerName ? `TTSBOT_HA_OWNER="${ownerName.replace(/"/g, '\\"')}" ` : "";
-  const ownerPs1Env = ownerName ? `$env:TTSBOT_HA_OWNER="${ownerName.replace(/"/g, '`"')}"; ` : "";
-  const ownerArgSh = ownerName ? ` "${ownerName.replace(/"/g, '\\"')}"` : "";
+  let sec = haSecret || window.currentHaSecret || "<HA_SECRET>";
+  const tokens = await ensureSetupTokens();
+  if (tokens && tokens.standby_token) {
+    sec = tokens.standby_token;
+  }
 
-  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo ${ownerEnvSh}bash -s -- "" "${sec}" ""${ownerArgSh}`;
-  const ps1Cmd = `$env:TTSBOT_HA_SECRET="${sec}"; ${ownerPs1Env}irm "${origin}/setup-standby.ps1" | iex`;
+  const shCmd = `curl -sSL "${origin}/setup-standby.sh" | sudo bash -s -- "" "${sec}"`;
+  const ps1Cmd = `$env:TTSBOT_HA_SECRET="${sec}"; irm "${origin}/setup-standby.ps1" | iex`;
 
   if (shPre) shPre.textContent = shCmd;
   if (ps1Pre) ps1Pre.textContent = ps1Cmd;
   if (setupBox) setupBox.textContent = shCmd;
 }
 
-function updateClusterWorkerOneliner(workerSecret) {
+async function updateClusterWorkerOneliner(workerSecret) {
   const shBox = document.getElementById("cluster-worker-setup-sh");
   const ps1Box = document.getElementById("cluster-worker-setup-ps1");
   if (!shBox && !ps1Box) return;
 
   const origin = window.location.origin.replace(/\/$/, "");
-  const sec = workerSecret || window.currentWorkerSecret || window.VOLUNTEER_WORKER_TOKEN || "<WORKER_SECRET>";
-  const ownerName = (window.APP_USER_DATA && (window.APP_USER_DATA.global_name || window.APP_USER_DATA.username)) ? String(window.APP_USER_DATA.global_name || window.APP_USER_DATA.username).trim() : "";
-  const ownerShArg = ownerName ? ` --owner "${ownerName.replace(/"/g, '\\"')}"` : "";
-  const ownerPs1Env = ownerName ? `$env:TTSBOT_WORKER_OWNER="${ownerName.replace(/"/g, '`"')}"; ` : "";
+  let sec = workerSecret || window.currentWorkerSecret || window.VOLUNTEER_WORKER_TOKEN || "<WORKER_SECRET>";
+  const tokens = await ensureSetupTokens();
+  if (tokens && tokens.worker_token) {
+    sec = tokens.worker_token;
+  }
 
-  const shCmd = `curl -sSL "${origin}/setup-worker.sh" | sudo bash -s -- --secret "${sec}"${ownerShArg}`;
-  const ps1Cmd = `$env:TTSBOT_WORKER_SECRET="${sec}"; ${ownerPs1Env}irm "${origin}/setup-worker.ps1" | iex`;
+  const shCmd = `curl -sSL "${origin}/setup-worker.sh" | sudo bash -s -- --secret "${sec}"`;
+  const ps1Cmd = `$env:TTSBOT_WORKER_SECRET="${sec}"; irm "${origin}/setup-worker.ps1" | iex`;
 
   if (shBox) shBox.textContent = shCmd;
   if (ps1Box) ps1Box.textContent = ps1Cmd;

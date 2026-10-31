@@ -207,6 +207,47 @@ class TestManagerNodeOwnerApi(_Base):
         self.assertEqual(resp.status, 403)
 
 
+class TestAutoOwnerBind(_Base):
+    @unittest_run_loop
+    async def test_first_admin_login_auto_binds_master_owner(self):
+        # 1. 初期状態: master_primary は未設定
+        settings = await self.db.get_all_worker_settings()
+        self.assertNotIn("master_primary", settings)
+
+        # 2. 管理者がログイン
+        admin_info = {"id": 123456789, "username": "boss", "global_name": "【鯖主】ボス"}
+        await self.web_server._auto_bind_host_nodes_owner(admin_info, is_admin=True)
+
+        # 3. master_primary に自動バインドされたことを確認 (装飾括弧は除去)
+        settings = await self.db.get_all_worker_settings()
+        self.assertIn("master_primary", settings)
+        self.assertEqual(settings["master_primary"]["owner_user_id"], 123456789)
+        self.assertEqual(settings["master_primary"]["owner_name"], "ボス")
+
+    @unittest_run_loop
+    async def test_env_owner_id_takes_precedence_over_login(self):
+        # 1. .env にオーナーIDが指定されている場合
+        self.web_server.config.discord_owner_user_id = 999888777
+
+        # guild_member_cache に名前を登録しておく
+        async with self.db.get_connection() as db:
+            await db.execute("""
+                INSERT INTO guild_member_cache (guild_id, user_id, username, display_name)
+                VALUES (1, 999888777, 'env_owner', '【王】環境変数オーナー')
+            """)
+            await db.commit()
+
+        # 2. 別の管理者 (ID: 111222) がログイン
+        other_admin = {"id": 111222, "username": "sub_admin", "global_name": "副管理者"}
+        await self.web_server._auto_bind_host_nodes_owner(other_admin, is_admin=True)
+
+        # 3. ログイン者ではなく .env のオーナーが優先されること
+        settings = await self.db.get_all_worker_settings()
+        self.assertIn("master_primary", settings)
+        self.assertEqual(settings["master_primary"]["owner_user_id"], 999888777)
+        self.assertEqual(settings["master_primary"]["owner_name"], "環境変数オーナー")
+
+
 if __name__ == "__main__":
     unittest.main()
 

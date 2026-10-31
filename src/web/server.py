@@ -34,7 +34,10 @@ from aiohttp import web
 import discord
 
 from src.config import AppConfig, save_yaml_config, reload_config, TTSNodeConfig
-from src.database import Database, clamp_max_silence, VOLUNTEER_TOKEN_PREFIX
+from src.database import (
+    Database, clamp_max_silence, VOLUNTEER_TOKEN_PREFIX,
+    CLUSTER_WORKER_TOKEN_PREFIX, STANDBY_HA_TOKEN_PREFIX
+)
 from src.cache_manager import CacheManager
 from src.tts.manager import TTSManager
 from src.tts.coeiroink_models import CoeiroinkModelManager
@@ -286,7 +289,8 @@ class WebServer:
         is_direct_verified: bool = False,
         direct_url: str = "",
         container_hostname: str = "",
-        owner_name: str = ""
+        owner_name: str = "",
+        owner_user_id: int = 0
     ):
         if not node_id:
             return
@@ -313,8 +317,11 @@ class WebServer:
                 "memory_gb": memory_gb,
                 "os_name": os_name,
                 "docker_version": docker_version,
-                "owner_name": clean_owner
+                "owner_name": clean_owner,
+                "owner_user_id": int(owner_user_id or 0)
             }
+            if owner_user_id > 0:
+                asyncio.create_task(self.db.update_worker_owner(node_id, clean_owner, owner_user_id, owner_user_id=owner_user_id))
             self._save_ha_nodes(force=True)
         else:
             entry = self.ha_slaves[node_id]
@@ -330,6 +337,9 @@ class WebServer:
             entry["last_seen"] = now
             if clean_owner:
                 entry["owner_name"] = clean_owner
+            if owner_user_id > 0:
+                entry["owner_user_id"] = owner_user_id
+                asyncio.create_task(self.db.update_worker_owner(node_id, clean_owner or entry.get("owner_name", ""), owner_user_id, owner_user_id=owner_user_id))
             if is_sync:
                 entry["last_sync"] = now
             if node_id in self.ha_revoked_nodes:
@@ -397,6 +407,128 @@ class WebServer:
             return user
         except Exception:
             self._user_cache[user_id] = (now, None)
+            return None
+
+    async def _resolve_discord_username(self, user_id: int) -> str:
+        """Discord ユーザー ID から表示名を取得 (member_cache ➔ get_or_fetch_member ➔ get_or_fetch_user)"""
+        if not user_id:
+            return ""
+        try:
+            # 1. guild_member_cache DB から探索
+            async with self.db.get_connection() as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute("SELECT display_name, username FROM guild_member_cache WHERE user_id = ? LIMIT 1", (user_id,)) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        name = row["display_name"] or row["username"] or ""
+                        clean = re.sub(r"^[【\[].*?[】\]]\s*", "", name).strip()
+                        return clean or name
+
+            # 2. bot ギルドから探索
+            if self.bot and getattr(self.bot, "guilds", None):
+                for guild in self.bot.guilds:
+                    m = await self._get_or_fetch_member(guild, user_id)
+                    if m:
+                        clean = re.sub(r"^[【\[].*?[】\]]\s*", "", m.display_name).strip()
+                        return clean or m.display_name
+
+            # 3. fetch_user から探索
+            u = await self._get_or_fetch_user(user_id)
+            if u:
+                return getattr(u, "global_name", None) or u.name or f"User-{user_id}"
+        except Exception:
+            pass
+        return f"DiscordUser-{user_id}"
+
+    async def _auto_bind_host_nodes_owner(self, user_info: Dict[str, Any], is_admin: bool = False):
+        """
+        Master (主系) およびホスト同居 Worker の所有者を自動バインドする (アイデア A & B ハイブリッド)
+        優先順位:
+          1. .env の DISCORD_OWNER_USER_ID が指定されている場合はそちらを最優先
+          2. 未指定かつ Master の所有者が未設定 (owner_user_id=0) の場合、
+             WebUI に初回ログインした管理者 Discord ユーザーで自動バインド
+        """
+        try:
+            target_user_id = 0
+            target_owner_name = ""
+
+            env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+            login_uid = int(user_info.get("id", 0) or user_info.get("user_id", 0) or 0)
+
+            if env_owner_id > 0:
+                target_user_id = env_owner_id
+                if login_uid == env_owner_id:
+                    name = user_info.get("global_name") or user_info.get("username") or ""
+                    target_owner_name = re.sub(r"^[【\[].*?[】\]]\s*", "", name).strip() or name
+                else:
+                    target_owner_name = await self._resolve_discord_username(env_owner_id)
+            elif is_admin and login_uid > 0:
+                target_user_id = login_uid
+                name = user_info.get("global_name") or user_info.get("username") or ""
+                target_owner_name = re.sub(r"^[【\[].*?[】\]]\s*", "", name).strip() or name
+
+            if not target_user_id or not target_owner_name:
+                return
+
+            w_settings = await self._worker_settings()
+            master_st = w_settings.get("master_primary", {})
+            current_master_uid = master_st.get("owner_user_id", 0)
+
+            # Master 所有者の自動バインド判定
+            # 未設定(0) または .env 指定と異なる場合に同期
+            needs_master_update = (current_master_uid == 0) or (env_owner_id > 0 and current_master_uid != env_owner_id)
+            if needs_master_update:
+                await self.db.update_worker_owner("master_primary", target_owner_name, target_user_id, owner_user_id=target_user_id)
+                logger.info(f"👑 [OwnerBind] Master ノードの所有者を Discord ユーザー「{target_owner_name}」({target_user_id}) にバインドしました。")
+
+            # ホスト同居 Worker / 未設定クラスタワーカーへのバインド
+            # 所有者が完全に未設定 (0 かつ名前も空) の初期ノードのみをバインド対象とする。
+            # すでに誰か(別アカウント)の所有者情報が入っている外部ノードは絶対に上書きせず保護する
+            for node_key in list(self.cluster_workers.keys()):
+                cw_st = w_settings.get(node_key, {})
+                cw_uid = cw_st.get("owner_user_id", 0)
+                cw_name = (cw_st.get("owner_name") or "").strip()
+                if cw_uid == 0 and not cw_name:
+                    await self.db.update_worker_owner(node_key, target_owner_name, target_user_id, owner_user_id=target_user_id)
+                    if node_key in self.cluster_workers:
+                        self.cluster_workers[node_key]["owner_name"] = target_owner_name
+                        self.cluster_workers[node_key]["owner_user_id"] = target_user_id
+                    logger.info(f"🏢 [OwnerBind] 未設定クラスタワーカー '{node_key}' の所有者を「{target_owner_name}」({target_user_id}) にバインドしました。")
+
+            self._save_cluster_workers()
+            self._worker_settings_cache = None
+        except Exception as e:
+            logger.warning(f"⚠️ [OwnerBind] 自動バインド処理中に軽微な例外 (スキップ): {e}")
+
+    async def _resolve_setup_token_from_request(self, request: web.Request, token_type: str) -> Optional[Dict[str, Any]]:
+        """
+        リクエストヘッダーまたはクエリからノードセットアップ用トークン (cwtok_... または hatok_...) を抽出し、
+        DB照合して発行者 (所有者) 情報を返す。無効・失効時は None を返す。
+        """
+        token = ""
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip()
+        if not token:
+            token = (
+                request.headers.get("X-Worker-Token", "") or
+                request.headers.get("X-HA-Secret", "") or
+                request.headers.get("X-HA-Token", "") or
+                request.query.get("token", "") or
+                request.headers.get("X-Setup-Token", "")
+            ).strip()
+
+        if not token:
+            return None
+
+        prefix = STANDBY_HA_TOKEN_PREFIX if token_type == "standby" else CLUSTER_WORKER_TOKEN_PREFIX
+        if not token.startswith(prefix):
+            return None
+
+        try:
+            return await self.db.resolve_node_setup_token(token, token_type)
+        except Exception as e:
+            logger.warning(f"⚠️ [SetupToken] トークン照合中に例外: {e}")
             return None
 
     def _setup_routes(self):
@@ -522,6 +654,10 @@ class WebServer:
         self.app.router.add_post("/api/volunteer/tokens", self.api_volunteer_tokens_create)
         self.app.router.add_delete("/api/volunteer/tokens/{token_id}", self.api_volunteer_tokens_revoke)
 
+        # ノードセットアップ用トークン (管理者用所有者安全紐づけ)
+        self.app.router.add_get("/api/admin/setup_tokens", self.api_admin_setup_tokens)
+        self.app.router.add_post("/api/admin/setup_tokens/rotate", self.api_admin_setup_tokens_rotate)
+
         # HA (High Availability) & Standby 同期 API
         self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
         self.app.router.add_get("/api/ha/code_snapshot", self.api_ha_code_snapshot)
@@ -625,11 +761,13 @@ class WebServer:
                 if not user:
                     return web.json_response({"error": "Forbidden: WAN access requires authentication"}, status=403)
             # 例外2: リモート Worker / クラスタ Worker 接続エンドポイント (/api/worker/ws, /api/worker/register, /api/worker/heartbeat, /api/worker/models/)
-            # 外部 (Cloudflare Tunnel / インターネット) からの安全な接続のため、正当な共有トークン (WORKER_SHARED_SECRET) が【必須】
+            # 外部 (Cloudflare Tunnel / インターネット) からの安全な接続のため、正当な共有トークン (WORKER_SHARED_SECRET) または セットアップトークン が【必須】
             elif path in ("/api/worker/ws", "/api/worker/register", "/api/worker/heartbeat") or path.startswith("/api/worker/models/"):
-                # ボランティアの個人トークンは WS のみ許可し、DB 照合はハンドラ内で行う
-                is_personal_ws = path == "/api/worker/ws" and self._extract_worker_token(request).startswith(VOLUNTEER_TOKEN_PREFIX)
-                if not is_personal_ws and not self._verify_worker_auth(request):
+                # ボランティア個人トークンおよびクラスタセットアップトークンはハンドラ内でDB照合を行うためミドルウェアを通過
+                raw_token = self._extract_worker_token(request)
+                is_personal_ws = path == "/api/worker/ws" and raw_token.startswith(VOLUNTEER_TOKEN_PREFIX)
+                is_setup_token = raw_token.startswith(CLUSTER_WORKER_TOKEN_PREFIX)
+                if not is_personal_ws and not is_setup_token and not self._verify_worker_auth(request):
                     client_ip = request.headers.get("CF-Connecting-IP") or request.remote or "unknown"
                     logger.warning(f"🚫 [Security] Blocked WAN worker request (missing or invalid shared token) to '{path}' from {client_ip}")
                     return web.json_response(
@@ -1221,9 +1359,19 @@ class WebServer:
             return False
         return secrets.compare_digest(token, expected)
 
+    async def _is_ha_authorized(self, request: web.Request) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """HA API 認証: 共有シークレット (TTSBOT_HA_SECRET) または Setup Token (hatok_...) を検証"""
+        token_owner = await self._resolve_setup_token_from_request(request, "standby")
+        if token_owner:
+            return True, token_owner
+        if self._verify_ha_auth(request):
+            return True, None
+        return False, None
+
     async def api_ha_status(self, request: web.Request) -> web.Response:
         """HA 状態確認 API (Slave からの死活 & メタデータ照会 & ハートビート記録)"""
-        if not self._verify_ha_auth(request):
+        authed, token_owner = await self._is_ha_authorized(request)
+        if not authed:
             return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
 
         node_id = request.headers.get("X-HA-Node-ID", "").strip()
@@ -1248,7 +1396,16 @@ class WebServer:
         except ValueError:
             mem_gb = 0.0
         os_name = request.headers.get("X-HA-Os", "").strip()
-        owner_name = request.headers.get("X-HA-Owner", "").strip()
+
+        if token_owner:
+            owner_name = token_owner["owner_name"]
+            owner_user_id = token_owner["discord_user_id"]
+            if node_id:
+                await self.db.update_worker_owner(node_id, owner_name, owner_user_id, owner_user_id=owner_user_id)
+            logger.info(f"🔑 [HAStatus] Setup Token により Slave '{node_id}' を所有者「{owner_name}」({owner_user_id}) に紐づけました。")
+        else:
+            owner_name = request.headers.get("X-HA-Owner", "").strip()
+            owner_user_id = 0
 
         if node_id and (node_id in self.ha_revoked_nodes or self.ha_slaves.get(node_id, {}).get("status") == "revoked"):
             logger.warning(f"🛑 [HA] Status check from REVOKED Slave '{node_id}' ({hostname} @ {client_ip}). Sending 410 Gone.")
@@ -1256,7 +1413,8 @@ class WebServer:
                 node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
                 cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p,
                 local_ip=local_ip, docker_version=docker_version, is_direct_verified=is_direct_verified,
-                direct_url=direct_url, container_hostname=container_hostname, owner_name=owner_name
+                direct_url=direct_url, container_hostname=container_hostname, owner_name=owner_name,
+                owner_user_id=owner_user_id
             )
             return web.json_response({
                 "action": "terminate",
@@ -1270,7 +1428,8 @@ class WebServer:
                 node_id, hostname, client_ip, is_sync=False, user_agent=user_agent,
                 cpu_cores=cpu_cores, memory_gb=mem_gb, os_name=os_name, requested_priority=req_p,
                 local_ip=local_ip, docker_version=docker_version, is_direct_verified=is_direct_verified,
-                direct_url=direct_url, container_hostname=container_hostname, owner_name=owner_name
+                direct_url=direct_url, container_hostname=container_hostname, owner_name=owner_name,
+                owner_user_id=owner_user_id
             )
 
         db_path = self.config.db_path
@@ -1396,7 +1555,8 @@ class WebServer:
 
     async def api_ha_db_snapshot(self, request: web.Request) -> web.Response:
         """Slave 同期用 SQLite 完全整合性バックアップ (gzip 圧縮) 配信"""
-        if not self._verify_ha_auth(request):
+        authed, _ = await self._is_ha_authorized(request)
+        if not authed:
             return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
 
         node_id = request.headers.get("X-HA-Node-ID", "").strip()
@@ -1487,7 +1647,8 @@ class WebServer:
 
     async def api_ha_code_snapshot(self, request: web.Request) -> web.Response:
         """Slave 自動同期用 ソースコード完全アーカイブ (gzip tarball) 配信"""
-        if not self._verify_ha_auth(request):
+        authed, _ = await self._is_ha_authorized(request)
+        if not authed:
             return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
 
         now_ts = time.time()
@@ -1589,7 +1750,8 @@ class WebServer:
         Slaveノードの早朝自動同期および手動即時同期用。
         メモリ枯渇 (OOM) を防止するため、一時ファイル経由のストリーミング配信と件数・サイズ上限を適用。
         """
-        if not self._verify_ha_auth(request):
+        authed, _ = await self._is_ha_authorized(request)
+        if not authed:
             return web.json_response({"error": "Unauthorized: Invalid or missing HA shared secret"}, status=403)
 
         node_id = request.headers.get("X-HA-Node-ID")
@@ -2189,8 +2351,24 @@ class WebServer:
             resp.del_cookie("oauth_state")
             return resp
 
+        # 管理者判定 (サーバーオーナー / サーバー管理者 / .env 指定管理者)
+        is_admin = False
+        if self.bot and getattr(self.bot, "guilds", None):
+            for guild in self.bot.guilds:
+                m = await self._get_or_fetch_member(guild, user_id)
+                if m and (m.guild_permissions.administrator or guild.owner_id == user_id):
+                    is_admin = True
+                    break
+        admin_ids = getattr(self.config, "admin_user_ids", []) or []
+        env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+        if user_id in admin_ids or (env_owner_id > 0 and user_id == env_owner_id):
+            is_admin = True
+
+        # Master (主系) / 同居 Worker の所有者自動バインド (アイデア A & B ハイブリッド)
+        await self._auto_bind_host_nodes_owner(user_info, is_admin=is_admin)
+
         # 認証成功: セッションCookieを設定
-        token = self.auth.create_session_token(user_info)
+        token = self.auth.create_session_token(user_info, is_admin=is_admin)
         response = web.HTTPFound("/")
         response.del_cookie("oauth_state")
         response.set_cookie(
@@ -4536,6 +4714,7 @@ class WebServer:
         # 永続化情報に保存 (所有者情報の引き継ぎ)
         existing_wdata = self.cluster_workers.get(node_id, {})
         owner_name = str(specs.get("owner_name") or specs.get("owner") or existing_wdata.get("owner_name") or "").strip()
+        owner_user_id = int(specs.get("owner_user_id") or specs.get("owner_id") or existing_wdata.get("owner_user_id") or 0)
         self.cluster_workers[node_id] = {
             "node_id": node_id,
             "node_name": node_name,
@@ -4545,9 +4724,12 @@ class WebServer:
             "specs": specs,
             "engines": engines_data,
             "owner_name": owner_name,
+            "owner_user_id": owner_user_id,
             "last_seen": time.time(),
             "updated_at": time.time()
         }
+        if owner_user_id > 0:
+            asyncio.create_task(self.db.update_worker_owner(node_id, owner_name, owner_user_id, owner_user_id=owner_user_id))
         self._save_cluster_workers()
         return registered_engines
 
@@ -4556,7 +4738,8 @@ class WebServer:
         Worker からの自動登録リクエストを受け付け、TTSNodePool に動的追加する。
         スペック（GPU/CPU/RAM）に基づいて max_concurrent / priority を自動設定。
         """
-        if not self._verify_worker_auth(request):
+        token_owner = await self._resolve_setup_token_from_request(request, "worker")
+        if not token_owner and not self._verify_worker_auth(request):
             return web.json_response({"error": "Unauthorized worker request"}, status=401)
 
         try:
@@ -4571,6 +4754,14 @@ class WebServer:
         rsync_port = data.get("rsync_port", 8730)
         specs = data.get("specs", {})
         engines_data = data.get("engines", {})
+
+        if token_owner:
+            specs["owner_user_id"] = token_owner["discord_user_id"]
+            specs["owner_name"] = token_owner["owner_name"]
+            await self.db.update_worker_owner(
+                node_id, token_owner["owner_name"], token_owner["discord_user_id"], owner_user_id=token_owner["discord_user_id"]
+            )
+            logger.info(f"🔑 [WorkerRegister] Setup Token により Worker '{node_id}' を所有者「{token_owner['owner_name']}」({token_owner['discord_user_id']}) に紐づけました。")
 
         if not node_id or not ip:
             return web.json_response({"error": "node_id and ip are required"}, status=400)
@@ -7099,18 +7290,65 @@ class WebServer:
         logger.info(f"🔑 [Volunteer] Revoked personal worker token {token_id} (by user {user['user_id']})")
         return web.json_response({"status": "ok"})
 
+    async def api_admin_setup_tokens(self, request: web.Request) -> web.Response:
+        """ログイン中の管理者向けにノードセットアップ用トークン (Worker / Standby) を取得"""
+        user = self._require_login_user(request)
+        if not user.get("is_admin"):
+            raise web.HTTPForbidden(text="Admin permission required")
+
+        user_id = int(user.get("user_id") or user.get("id") or 0)
+        owner_name = str(user.get("global_name") or user.get("username") or f"Admin-{user_id}")
+        clean_owner = re.sub(r"^[【\[].*?[】\]]\s*", "", owner_name).strip() or owner_name
+
+        worker_token = await self.db.get_or_create_node_setup_token(user_id, clean_owner, "worker")
+        standby_token = await self.db.get_or_create_node_setup_token(user_id, clean_owner, "standby")
+        return web.json_response({
+            "status": "ok",
+            "worker_token": worker_token,
+            "standby_token": standby_token,
+            "owner_name": clean_owner,
+            "owner_user_id": user_id
+        })
+
+    async def api_admin_setup_tokens_rotate(self, request: web.Request) -> web.Response:
+        """ログイン中管理者のセットアップ用トークンを失効・再生成"""
+        user = self._require_login_user(request)
+        if not user.get("is_admin"):
+            raise web.HTTPForbidden(text="Admin permission required")
+
+        user_id = int(user.get("user_id") or user.get("id") or 0)
+        owner_name = str(user.get("global_name") or user.get("username") or f"Admin-{user_id}")
+        clean_owner = re.sub(r"^[【\[].*?[】\]]\s*", "", owner_name).strip() or owner_name
+
+        await self.db.revoke_node_setup_tokens(user_id)
+        _, new_worker = await self.db.create_node_setup_token(user_id, clean_owner, "worker")
+        _, new_standby = await self.db.create_node_setup_token(user_id, clean_owner, "standby")
+        logger.info(f"🔑 [SetupToken] Rotated setup tokens for user {user_id} ({clean_owner})")
+        return web.json_response({
+            "status": "ok",
+            "worker_token": new_worker,
+            "standby_token": new_standby,
+            "owner_name": clean_owner,
+            "owner_user_id": user_id
+        })
+
     async def api_worker_ws(self, request: web.Request) -> web.WebSocketResponse:
         """
         リモートボランティアWorkerノード用 WebSocket ゲートウェイ
         Worker (外部PC/GPUノード等) が外向きにMasterへ常時接続し、Masterからの音声合成要求を双方向中継する
         """
-        # 個人トークン = ボランティア (所有者あり)、共有トークン = クラスタ (または管理者自身のボランティア)
+        # 個人トークン = ボランティア (所有者あり)、Setup Token = クラスタ (所有者あり)、共有トークン = クラスタ (または管理者自身のボランティア)
         token = self._extract_worker_token(request)
         volunteer_owner: Optional[Dict[str, Any]] = None
+        cluster_token_owner: Optional[Dict[str, Any]] = None
         if token.startswith(VOLUNTEER_TOKEN_PREFIX):
             volunteer_owner = await self.db.resolve_volunteer_token(token)
             if not volunteer_owner:
                 raise web.HTTPUnauthorized(text="Invalid or revoked volunteer token")
+        elif token.startswith(CLUSTER_WORKER_TOKEN_PREFIX):
+            cluster_token_owner = await self.db.resolve_node_setup_token(token, "worker")
+            if not cluster_token_owner:
+                raise web.HTTPUnauthorized(text="Invalid or revoked cluster worker token")
         elif not self._verify_worker_auth(request):
             raise web.HTTPUnauthorized(text="Unauthorized worker token")
 
@@ -7195,6 +7433,20 @@ class WebServer:
                             # クラスタノードとして接続された場合は is_volunteer を False に設定
                             if is_cluster_worker:
                                 ws_node.is_volunteer = False
+                            if cluster_token_owner:
+                                ws_node.owner_user_id = int(cluster_token_owner["discord_user_id"])
+                                ws_node.owner_name = cluster_token_owner.get("owner_name") or ""
+                                try:
+                                    await self.db.update_worker_owner(
+                                        worker_node_id, ws_node.owner_name, ws_node.owner_user_id, owner_user_id=ws_node.owner_user_id
+                                    )
+                                    if worker_node_id in self.cluster_workers:
+                                        self.cluster_workers[worker_node_id]["owner_name"] = ws_node.owner_name
+                                        self.cluster_workers[worker_node_id]["owner_user_id"] = ws_node.owner_user_id
+                                        self._save_cluster_workers()
+                                    logger.info(f"🔑 [WorkerWS] Setup Token により Cluster Worker '{worker_node_id}' を「{ws_node.owner_name}」({ws_node.owner_user_id}) にバインドしました。")
+                                except Exception as c_err:
+                                    logger.warning(f"[WorkerWS] Failed to update cluster worker owner: {c_err}")
                             if volunteer_owner:
                                 ws_node.owner_user_id = int(volunteer_owner["discord_user_id"])
                                 ws_node.owner_name = volunteer_owner.get("owner_name") or ""
@@ -7281,6 +7533,13 @@ class WebServer:
         self.site = web.TCPSite(self.runner, self.config.web_host, self.config.web_port)
         await self.site.start()
         logger.info(f"WebUI server started on http://{self.config.web_host}:{self.config.web_port}")
+
+        # .env の DISCORD_OWNER_USER_ID による起動時初期バインド (非同期実行)
+        if getattr(self.config, "discord_owner_user_id", 0):
+            asyncio.create_task(self._auto_bind_host_nodes_owner(
+                {"id": self.config.discord_owner_user_id},
+                is_admin=True
+            ))
 
     async def stop(self):
         """Webサーバーを安全に停止"""
