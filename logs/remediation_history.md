@@ -8766,3 +8766,8 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - `src/version.py`: `BUILD_VERSION = "v2026.11.01-0100"`
      - `tests/test_turn_anti_affinity.py` 新規作成（Anti-Affinity ソート検証、セマフォ獲得＆セット自動記録検証、単一ノードフォールバック保護検証）。
      - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて全 151 件の単体テストが **100% 合格（Ran 151 tests in 8.330s, OK）**。
+
+- **本番適用完了 (2026-11-01 03:00)**:
+  - ユーザー指示に基づき、アイドル状態を確認の上で `docker compose restart app` を実施。
+  - 本番コンテナ `ttsbot-app-1` が最新バージョン `v2026.11.01-0100` にて正常に起動し、**healthy** 状態へ復旧。
+  - 12ノード（MASTEROMEN2017, MASTERSOMEN2022, MasterDebian, MasterUbuntu）の音声合成エンジン、Discord Bot Pool (5台)、WebUI、データベースがすべて正常稼働中であることを確認。
