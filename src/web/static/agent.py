@@ -263,7 +263,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.14.3"
+    AGENT_VERSION = "3.15.0"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -2091,16 +2091,13 @@ hosts allow = *
                             tar.add(str(model_path), arcname=clean_name)
 
                         file_size = tmp_tar_path.stat().st_size
-                        # Cloudflare Tunnel / WAN 経由の 100MB 制限保護:
-                        # 95MB を超えるモデルを Cloudflare Tunnel 経由で POST すると 413 Payload Too Large で即死するためスキップ
-                        if is_wan and file_size > 95 * 1024 * 1024:
-                            logger.warning(
-                                f"⚠️ [ModelSync] Cloudflare Tunnel / WAN経由のため大容量モデル Push を安全にスキップ "
-                                f"({file_size / 1024 / 1024:.1f} MB > 95MB, 413防止): {clean_name} "
-                                f"(Master からの直接 Pull または LAN 接続経由を待機します)"
-                            )
-                            # 10分間再試行を抑止
-                            self._model_upload_cooldowns[clean_name] = time.time() + 600.0
+                        # Cloudflare Tunnel / WAN 経由は 1 リクエスト 100MB 上限があるため、50MB 単位の分割アップロードを使う
+                        if is_wan:
+                            ok = await self._chunked_upload_model(master_url, clean_name, tmp_tar_path, headers)
+                            if ok:
+                                self._model_upload_cooldowns.pop(clean_name, None)
+                            else:
+                                self._model_upload_cooldowns[clean_name] = time.time() + 600.0
                             continue
 
                         logger.info(f"📦 [ModelSync] Master へのモデルPushアップロードを開始: {clean_name} ({file_size / 1024 / 1024:.1f} MB ➔ {master_url})")
@@ -2130,6 +2127,96 @@ hosts allow = *
                     self._model_upload_cooldowns[clean_name] = time.time() + 600.0
                 finally:
                     self._uploading_models.discard(clean_name)
+
+    MODEL_CHUNK_BYTES = 50 * 1024 * 1024  # Cloudflare Tunnel の 100MB 上限に対する安全な分割単位
+
+    async def _chunked_upload_model(self, master_url: str, model_name: str, tar_path: Path, headers: Dict[str, str]) -> bool:
+        """モデル tar を 50MB 単位で分割アップロード (受信済みチャンクはスキップして再開、チャンク・全体を SHA-256 で検証)"""
+        session = await self.get_session()
+        total = tar_path.stat().st_size
+        digest = await asyncio.to_thread(WorkerAgent._calculate_file_sha256, str(tar_path))
+        base = f"{master_url}/api/worker/models/chunked"
+        try:
+            async with session.post(f"{base}/{urllib.parse.quote(model_name)}/init", headers=headers,
+                                    json={"total_size": total, "sha256": digest, "chunk_size": self.MODEL_CHUNK_BYTES},
+                                    timeout=aiohttp.ClientTimeout(total=30.0)) as resp:
+                data = await resp.json(content_type=None)
+                if data.get("status") == "already_exists":
+                    logger.info(f"ℹ️ [ModelSync] Master は既に {model_name} を保有しています")
+                    return True
+                if resp.status != 200 or not data.get("upload_id"):
+                    logger.warning(f"⚠️ [ModelSync] 分割アップロード開始失敗 ({resp.status}): {model_name} {str(data)[:200]}")
+                    return False
+            upload_id = data["upload_id"]
+            chunk_size = int(data.get("chunk_size") or self.MODEL_CHUNK_BYTES)
+            received = set(data.get("received") or [])
+            chunks = (total + chunk_size - 1) // chunk_size
+            logger.info(f"📦 [ModelSync] 分割アップロード: {model_name} ({total / 1024 / 1024:.1f} MB, {chunks} チャンク, 受信済み {len(received)})")
+            with open(tar_path, "rb") as f:
+                for idx in range(chunks):
+                    if idx in received:
+                        continue
+                    f.seek(idx * chunk_size)
+                    buf = f.read(chunk_size)
+                    chunk_headers = dict(headers)
+                    chunk_headers["X-Chunk-SHA256"] = hashlib.sha256(buf).hexdigest()
+                    for attempt in range(3):
+                        try:
+                            async with session.put(f"{base}/{upload_id}/chunk/{idx}", data=buf, headers=chunk_headers,
+                                                   timeout=aiohttp.ClientTimeout(total=300.0)) as r:
+                                if r.status == 200:
+                                    break
+                                logger.warning(f"⚠️ [ModelSync] チャンク {idx} 送信失敗 HTTP {r.status} (試行 {attempt + 1}/3)")
+                        except Exception as e:
+                            logger.warning(f"⚠️ [ModelSync] チャンク {idx} 送信エラー: {e} (試行 {attempt + 1}/3)")
+                        await asyncio.sleep(2 * (attempt + 1))
+                    else:
+                        return False
+            async with session.post(f"{base}/{upload_id}/complete", headers=headers,
+                                    timeout=aiohttp.ClientTimeout(total=900.0)) as resp:
+                if resp.status == 200:
+                    logger.info(f"✅ [ModelSync] 分割アップロード完了: {model_name} ({total / 1024 / 1024:.1f} MB)")
+                    return True
+                logger.warning(f"⚠️ [ModelSync] 分割アップロード完了処理失敗 ({resp.status}): {(await resp.text())[:200]}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ [ModelSync] 分割アップロード例外 ({model_name}): {e}")
+            return False
+
+    async def _sync_one_model_via_manifest(self, folder_name: str, models_dir: str) -> bool:
+        """
+        Master のマニフェスト (ファイル別 SHA-256) に従い、ファイル単位・Range 分割 (50MB) でモデルを取得して
+        ステージング展開 → 全ファイル検証 → アトミック昇格。WAN 越しでも途中失敗はファイル単位でやり直せる。
+        """
+        headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
+        session = await self.get_session()
+        try:
+            async with session.get(f"{get_master_url()}/api/worker/models/manifest/{urllib.parse.quote(folder_name)}",
+                                   headers=headers, timeout=aiohttp.ClientTimeout(total=30.0)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"⚠️ [ModelSync] マニフェスト取得失敗 ({resp.status}): {folder_name}")
+                    return False
+                manifest = await resp.json()
+        except Exception as e:
+            logger.warning(f"⚠️ [ModelSync] マニフェスト取得エラー ({folder_name}): {e}")
+            return False
+        files = manifest.get("files") or []
+        if not files:
+            return False
+        staging_dir = os.path.join(models_dir, f".staging_{folder_name}_{int(time.time() * 1000)}")
+        os.makedirs(staging_dir, exist_ok=True)
+        try:
+            for f_info in files:
+                if not await self._download_single_model_file(folder_name, f_info, staging_dir):
+                    return False
+            is_valid, bad = await asyncio.to_thread(WorkerAgent._verify_model_manifest, staging_dir, manifest)
+            if not is_valid:
+                logger.error(f"❌ [ModelSync] {folder_name} の検証に失敗しました ({len(bad)} 件不一致)")
+                return False
+            return WorkerAgent._atomic_promote_dir(staging_dir, os.path.join(models_dir, folder_name))
+        finally:
+            if os.path.exists(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
     async def pull_missing_models_from_master(self, model_names: List[str]) -> None:
         """Master から不足している COEIROINK モデルをダウンロードして自律同期する (項目⑲)"""
@@ -2163,61 +2250,15 @@ hosts allow = *
                     pass
 
                 try:
-                    logger.info(f"📥 [ModelSync] Master からモデルPullダウンロードを開始: {clean_name}")
-                    master_url = get_master_url()
-                    url = f"{master_url}/api/worker/models/download/{urllib.parse.quote(clean_name)}"
-                    session = await self.get_session()
-                    headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
-
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tf:
-                        tmp_tar_path = Path(tf.name)
-
-                    try:
-                        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=300.0)) as resp:
-                            if resp.status != 200:
-                                logger.warning(f"⚠️ [ModelSync] Master からのモデルダウンロード失敗 ({resp.status}): {clean_name}")
-                                self._model_pull_cooldowns[clean_name] = time.time() + 600.0
-                                continue
-                            with open(tmp_tar_path, "wb") as f:
-                                async for chunk in resp.content.iter_chunked(64 * 1024):
-                                    f.write(chunk)
-
-                        staging_dir = models_dir / f".staging_{clean_name}_{int(time.time())}"
-                        if staging_dir.exists():
-                            shutil.rmtree(staging_dir, ignore_errors=True)
-                        staging_dir.mkdir(parents=True, exist_ok=True)
-
-                        with tarfile.open(tmp_tar_path, "r") as tar:
-                            for member in tar.getmembers():
-                                member_path = (staging_dir / member.name).resolve()
-                                if not str(member_path).startswith(str(staging_dir.resolve())):
-                                    raise ValueError(f"Path traversal detected in tar: {member.name}")
-                            tar.extractall(path=staging_dir)
-
-                        extracted_model = staging_dir / clean_name
-                        if not extracted_model.exists():
-                            extracted_model = staging_dir
-
-                        if (extracted_model / "metas.json").exists():
-                            if target_dir.exists():
-                                shutil.rmtree(target_dir, ignore_errors=True)
-                            shutil.move(str(extracted_model), str(target_dir))
-                            shutil.rmtree(staging_dir, ignore_errors=True)
-                            self._model_pull_cooldowns.pop(clean_name, None)
-                            logger.info(f"🎉 [ModelSync] モデル {clean_name} を正常にMasterから同期・配置しました")
-                            pulled_count += 1
-                            if self.ram_manager:
-                                self.ram_manager.setup_hybrid_structure()
-                        else:
-                            shutil.rmtree(staging_dir, ignore_errors=True)
-                            logger.warning(f"⚠️ [ModelSync] 展開モデルに metas.json が見つかりませんでした: {clean_name}")
-                    finally:
-                        if tmp_tar_path.exists():
-                            try:
-                                tmp_tar_path.unlink()
-                            except Exception:
-                                pass
+                    logger.info(f"📥 [ModelSync] Master からモデルPullダウンロードを開始 (マニフェスト・ファイル単位): {clean_name}")
+                    if await self._sync_one_model_via_manifest(clean_name, str(models_dir)):
+                        self._model_pull_cooldowns.pop(clean_name, None)
+                        logger.info(f"🎉 [ModelSync] モデル {clean_name} を正常にMasterから同期・配置しました")
+                        pulled_count += 1
+                        if self.ram_manager:
+                            self.ram_manager.setup_hybrid_structure()
+                    else:
+                        self._model_pull_cooldowns[clean_name] = time.time() + 600.0
                 except Exception as e:
                     logger.error(f"❌ [ModelSync] モデル {clean_name} のPull同期中に例外発生: {e}")
                     self._model_pull_cooldowns[clean_name] = time.time() + 600.0
@@ -2695,7 +2736,11 @@ hosts allow = *
         """aiohttp を用いて Range リクエストを並列実行し、大容量ファイルを高速分割ダウンロード"""
         try:
             session = await self.get_session()
-            chunk_len = total_size // connections
+            # 1 リクエスト 50MB 以下に分割 (Cloudflare Tunnel 越しの長時間接続断に備える)。VC 使用中は同時 1 本に抑える
+            if getattr(self, "any_human_in_vc", False):
+                connections = 1
+            sem = asyncio.Semaphore(max(1, connections))
+            part_len = min(self.MODEL_CHUNK_BYTES, max(1, (total_size + connections - 1) // connections))
             tasks = []
 
             # 事前に空ファイルを期待サイズで確保
@@ -2703,6 +2748,10 @@ hosts allow = *
                 f.truncate(total_size)
 
             async def _download_part(part_idx: int, start_byte: int, end_byte: int):
+                async with sem:
+                    await _download_part_inner(part_idx, start_byte, end_byte)
+
+            async def _download_part_inner(part_idx: int, start_byte: int, end_byte: int):
                 part_headers = dict(headers)
                 part_headers["Range"] = f"bytes={start_byte}-{end_byte}"
                 async with session.get(
@@ -2717,10 +2766,8 @@ hosts allow = *
                         async for chunk in resp.content.iter_chunked(256 * 1024):
                             f.write(chunk)
 
-            for i in range(connections):
-                s = i * chunk_len
-                e = total_size - 1 if i == connections - 1 else (i + 1) * chunk_len - 1
-                tasks.append(_download_part(i, s, e))
+            for i, s in enumerate(range(0, total_size, part_len)):
+                tasks.append(_download_part(i, s, min(total_size, s + part_len) - 1))
 
             await asyncio.gather(*tasks)
             return True
@@ -2746,7 +2793,8 @@ hosts allow = *
             download_success = False
 
             # 1. 大容量ファイル (5MB以上) かつ aria2c が利用可能な場合、多重ダウンロードを実行
-            if expected_size >= 5 * 1024 * 1024 and shutil.which("aria2c"):
+            #    WAN (Cloudflare Tunnel) 越しは 1 リクエスト 50MB 以下に分割する下の Range 取得を使う
+            if expected_size >= 5 * 1024 * 1024 and shutil.which("aria2c") and is_private_or_local_url(get_master_url()):
                 try:
                     aria2_cmd = [
                         "aria2c",
@@ -2847,8 +2895,9 @@ hosts allow = *
 
         session = await self.get_session()
         list_url = f"{get_master_url()}/api/worker/models/list"
+        auth_headers = {"X-Worker-Token": WORKER_TOKEN} if WORKER_TOKEN else {}
         try:
-            async with session.get(list_url, timeout=aiohttp.ClientTimeout(total=20.0)) as resp:
+            async with session.get(list_url, headers=auth_headers, timeout=aiohttp.ClientTimeout(total=20.0)) as resp:
                 if resp.status != 200:
                     logger.warning(f"⚠️ モデル一覧取得失敗: HTTP {resp.status}")
                     return
@@ -2877,7 +2926,7 @@ hosts allow = *
             manifest = None
             try:
                 mf_url = f"{get_master_url()}/api/worker/models/manifest/{folder_name}"
-                async with session.get(mf_url, timeout=aiohttp.ClientTimeout(total=20.0)) as mf_resp:
+                async with session.get(mf_url, headers=auth_headers, timeout=aiohttp.ClientTimeout(total=20.0)) as mf_resp:
                     if mf_resp.status == 200:
                         manifest = await mf_resp.json()
             except Exception as e:
@@ -2923,7 +2972,7 @@ hosts allow = *
             stream_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30.0, sock_read=120.0)
 
             try:
-                async with session.get(dl_url, timeout=stream_timeout) as dl_resp:
+                async with session.get(dl_url, headers=auth_headers, timeout=stream_timeout) as dl_resp:
                     if dl_resp.status != 200:
                         logger.warning(f"⚠️ モデル {folder_name} ダウンロード失敗: HTTP {dl_resp.status}")
                         shutil.rmtree(staging_dir, ignore_errors=True)

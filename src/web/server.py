@@ -175,6 +175,8 @@ class WebServer:
         self._code_hash_cache_time = 0.0
         self._syncing_models: set = set()
         self._model_sync_cooldowns: Dict[str, float] = {}
+        # WAN (Cloudflare Tunnel 100MB 上限) 越しのモデル分割アップロード: upload_id -> 状態
+        self._chunked_uploads: Dict[str, Dict[str, Any]] = {}
         self._worker_reachability_cache: Dict[Tuple[str, int, str], Tuple[float, bool]] = {}
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
@@ -487,6 +489,10 @@ class WebServer:
         self.app.router.add_get("/api/worker/models/file/{model_name}/{file_path:.+}", self.api_worker_models_file)
         self.app.router.add_get("/api/worker/models/download/{model_name}", self.api_worker_models_download)
         self.app.router.add_post("/api/worker/models/upload/{model_name}", self.api_worker_models_upload)
+        self.app.router.add_post("/api/worker/models/chunked/{model_name}/init", self.api_worker_models_chunked_init)
+        self.app.router.add_put("/api/worker/models/chunked/{upload_id}/chunk/{index}", self.api_worker_models_chunked_put)
+        self.app.router.add_get("/api/worker/models/chunked/{upload_id}/status", self.api_worker_models_chunked_status)
+        self.app.router.add_post("/api/worker/models/chunked/{upload_id}/complete", self.api_worker_models_chunked_complete)
 
         # パスワード認証 & Bot管理 & クレデンシャル管理 API (OSS動的管理)
         self.app.router.add_post("/api/auth/login_password", self.api_auth_login_password)
@@ -5885,6 +5891,166 @@ class WebServer:
                         tmp_tar.unlink()
                 except Exception:
                     pass
+
+    # --- モデルの分割アップロード (Worker → Master、WAN 越しの 100MB 上限対策) ---
+
+    CHUNKED_MAX_CHUNK_BYTES = 50 * 1024 * 1024
+    CHUNKED_MAX_TOTAL_BYTES = 5 * 1024 * 1024 * 1024
+    CHUNKED_MAX_ACTIVE = 3
+    CHUNKED_TTL_SECONDS = 24 * 3600
+
+    def _chunked_upload_root(self) -> Path:
+        root = Path(tempfile.gettempdir()) / "ttsbot_model_uploads"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _purge_stale_chunked_uploads(self) -> None:
+        now = time.time()
+        for uid, st in list(self._chunked_uploads.items()):
+            if now - st.get("updated_at", st["created_at"]) > self.CHUNKED_TTL_SECONDS:
+                shutil.rmtree(st["dir"], ignore_errors=True)
+                self._chunked_uploads.pop(uid, None)
+                self._syncing_models.discard(st["model"])
+
+    async def api_worker_models_chunked_init(self, request: web.Request) -> web.Response:
+        """分割アップロード開始: 全体サイズ・全体 SHA-256・チャンクサイズを受け取り upload_id を払い出す"""
+        if not self._verify_worker_auth(request):
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
+        clean = sanitize_filename(request.match_info.get("model_name", ""))
+        if not clean or not is_safe_identifier(clean):
+            return web.json_response({"error": "Invalid model name"}, status=400)
+        try:
+            body = await request.json()
+            total = int(body["total_size"])
+            chunk_size = int(body.get("chunk_size", self.CHUNKED_MAX_CHUNK_BYTES))
+            sha256 = str(body["sha256"]).lower()
+        except Exception:
+            return web.json_response({"error": "total_size, sha256 (and optional chunk_size) are required"}, status=400)
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return web.json_response({"error": "Invalid sha256"}, status=400)
+        if not (0 < total <= self.CHUNKED_MAX_TOTAL_BYTES) or not (0 < chunk_size <= self.CHUNKED_MAX_CHUNK_BYTES):
+            return web.json_response({"error": "Size out of range"}, status=413)
+        model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models")).resolve()
+        final_dir = validate_safe_path(model_dir, clean)
+        if final_dir and (final_dir / "metas.json").exists():
+            return web.json_response({"status": "already_exists", "model_name": clean})
+        self._purge_stale_chunked_uploads()
+        # 同じモデル・同じ内容の進行中アップロードがあれば再開させる
+        for uid, st in self._chunked_uploads.items():
+            if st["model"] == clean and st["sha256"] == sha256 and st["total"] == total and st["chunk_size"] == chunk_size:
+                return web.json_response({"status": "ok", "upload_id": uid, "chunk_size": chunk_size, "received": sorted(st["received"])})
+        if clean in self._syncing_models:
+            return web.json_response({"status": "syncing", "model_name": clean}, status=202)
+        if len(self._chunked_uploads) >= self.CHUNKED_MAX_ACTIVE:
+            return web.json_response({"error": "Too many concurrent uploads"}, status=429)
+        try:
+            free = shutil.disk_usage(str(self._chunked_upload_root())).free
+            if free < total * 2 + 500 * 1024 * 1024:  # 分割ファイル + 結合後 tar + 余裕
+                return web.json_response({"error": "Insufficient disk space on Master"}, status=507)
+        except Exception:
+            pass
+        uid = uuid.uuid4().hex
+        udir = self._chunked_upload_root() / uid
+        udir.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        self._chunked_uploads[uid] = {
+            "model": clean, "sha256": sha256, "total": total, "chunk_size": chunk_size,
+            "chunks": (total + chunk_size - 1) // chunk_size, "received": set(), "dir": udir,
+            "created_at": now, "updated_at": now,
+        }
+        self._syncing_models.add(clean)
+        logger.info(f"📦 [ModelSync] Chunked upload started: {clean} ({total / 1024 / 1024:.1f} MB, {self._chunked_uploads[uid]['chunks']} chunks)")
+        return web.json_response({"status": "ok", "upload_id": uid, "chunk_size": chunk_size, "received": []})
+
+    def _get_chunked_upload(self, request: web.Request) -> Optional[Dict[str, Any]]:
+        uid = request.match_info.get("upload_id", "")
+        return self._chunked_uploads.get(uid) if re.fullmatch(r"[0-9a-f]{32}", uid) else None
+
+    async def api_worker_models_chunked_put(self, request: web.Request) -> web.Response:
+        """チャンク受信 (X-Chunk-SHA256 で検証。同じチャンクの再送は上書き)"""
+        if not self._verify_worker_auth(request):
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
+        st = self._get_chunked_upload(request)
+        if not st:
+            return web.json_response({"error": "Unknown upload_id"}, status=404)
+        try:
+            index = int(request.match_info.get("index", "-1"))
+        except ValueError:
+            index = -1
+        if not (0 <= index < st["chunks"]):
+            return web.json_response({"error": "Invalid chunk index"}, status=400)
+        expected_len = min(st["chunk_size"], st["total"] - index * st["chunk_size"])
+        hasher = hashlib.sha256()
+        part_tmp = st["dir"] / f"part_{index:06d}.tmp"
+        received = 0
+        with open(part_tmp, "wb") as f:
+            async for data in request.content.iter_chunked(256 * 1024):
+                received += len(data)
+                if received > expected_len:
+                    part_tmp.unlink(missing_ok=True)
+                    return web.json_response({"error": "Chunk too large"}, status=413)
+                hasher.update(data)
+                await asyncio.to_thread(f.write, data)
+        if received != expected_len:
+            part_tmp.unlink(missing_ok=True)
+            return web.json_response({"error": f"Chunk size mismatch (got {received}, expected {expected_len})"}, status=400)
+        claimed = request.headers.get("X-Chunk-SHA256", "").lower()
+        if claimed and claimed != hasher.hexdigest():
+            part_tmp.unlink(missing_ok=True)
+            return web.json_response({"error": "Chunk checksum mismatch"}, status=422)
+        os.replace(part_tmp, st["dir"] / f"part_{index:06d}")
+        st["received"].add(index)
+        st["updated_at"] = time.time()
+        return web.json_response({"status": "ok", "index": index, "received_count": len(st["received"]), "chunks": st["chunks"]})
+
+    async def api_worker_models_chunked_status(self, request: web.Request) -> web.Response:
+        if not self._verify_worker_auth(request):
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
+        st = self._get_chunked_upload(request)
+        if not st:
+            return web.json_response({"error": "Unknown upload_id"}, status=404)
+        return web.json_response({"status": "ok", "received": sorted(st["received"]), "chunks": st["chunks"]})
+
+    async def api_worker_models_chunked_complete(self, request: web.Request) -> web.Response:
+        """全チャンク結合 → 全体 SHA-256 検証 → 既存のステージング展開・アトミック配置"""
+        if not self._verify_worker_auth(request):
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
+        uid = request.match_info.get("upload_id", "")
+        st = self._get_chunked_upload(request)
+        if not st:
+            return web.json_response({"error": "Unknown upload_id"}, status=404)
+        missing = [i for i in range(st["chunks"]) if i not in st["received"]]
+        if missing:
+            return web.json_response({"error": "Missing chunks", "missing": missing[:50]}, status=409)
+        tar_path = st["dir"] / "model.tar"
+
+        def _assemble() -> str:
+            h = hashlib.sha256()
+            with open(tar_path, "wb") as out:
+                for i in range(st["chunks"]):
+                    with open(st["dir"] / f"part_{i:06d}", "rb") as part:
+                        while True:
+                            buf = part.read(1024 * 1024)
+                            if not buf:
+                                break
+                            h.update(buf)
+                            out.write(buf)
+            return h.hexdigest()
+
+        try:
+            digest = await asyncio.to_thread(_assemble)
+            if digest != st["sha256"]:
+                return web.json_response({"error": "Archive checksum mismatch"}, status=422)
+            ok, msg = await self._install_coeiroink_model_from_tar_file(st["model"], tar_path)
+            if not ok:
+                return web.json_response({"error": msg, "model_name": st["model"]}, status=400)
+            self._model_sync_cooldowns.pop(st["model"], None)
+            logger.info(f"✅ [ModelSync] Chunked upload completed: {st['model']} ({st['total'] / 1024 / 1024:.1f} MB)")
+            return web.json_response({"status": "ok", "success": True, "model_name": st["model"], "received_bytes": st["total"]})
+        finally:
+            shutil.rmtree(st["dir"], ignore_errors=True)
+            self._chunked_uploads.pop(uid, None)
+            self._syncing_models.discard(st["model"])
 
     async def api_worker_models_upload(self, request: web.Request) -> web.Response:
         """
