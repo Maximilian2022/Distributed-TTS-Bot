@@ -18,12 +18,11 @@ logger = logging.getLogger(__name__)
 # JSTタイムゾーン定義 (UTC+9)
 JST = timezone(timedelta(hours=9))
 
-# 初期・フォールバック用管理者ユーザーID (現行の通知先をデフォルトとして維持)
-INITIAL_DEFAULT_CONTACT_ID = 310034034690359308
+# 初期・フォールバック用管理者ユーザーID (環境変数または未設定0)
 try:
-    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", str(INITIAL_DEFAULT_CONTACT_ID)))
+    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", os.getenv("DISCORD_OWNER_USER_ID", "0")) or 0)
 except ValueError:
-    ADMIN_USER_ID = INITIAL_DEFAULT_CONTACT_ID
+    ADMIN_USER_ID = 0
 
 # エラー分類定義
 CATEGORY_BOT = "Bot本体"

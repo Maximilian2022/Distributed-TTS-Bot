@@ -2790,13 +2790,10 @@ function renderWorkerNodes(nodesData) {
     const engineList = node.engines || [];
     const isVolunteer = engineList.length > 0 && engineList.every(e => e.is_volunteer === true);
 
-    // 所有者名の解決: worker_settings > node.owner_name > engineList > specs > デフォルト (チェインドベル)
+    // 所有者名の解決: worker_settings > node.owner_name > engineList > specs
     const settingsOwner = (window._nodeSettings && window._nodeSettings[node.id]) ? (window._nodeSettings[node.id].owner_name || "") : "";
     let ownerName = settingsOwner || node.owner_name || (engineList.find(e => e.owner_name)?.owner_name || "") || (specs.owner_name || specs.owner || "");
-    const ownerUserId = (window._nodeSettings && window._nodeSettings[node.id]) ? (window._nodeSettings[node.id].owner_user_id || 0) : (node.owner_user_id || 310034034690359308);
-    if (!ownerName && !isVolunteer) {
-      ownerName = "チェインドベル";
-    }
+    const ownerUserId = (window._nodeSettings && window._nodeSettings[node.id]) ? (window._nodeSettings[node.id].owner_user_id || 0) : (node.owner_user_id || 0);
 
     // 1. Agent のオンライン/オフライン判定 (ハートビート疎通)
     const hbAgo = node.last_heartbeat_ago;
@@ -2823,7 +2820,7 @@ function renderWorkerNodes(nodesData) {
     // 所有者バッジ
     let ownerBadge = '';
     if (ownerName) {
-      ownerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(ownerUserId || '310034034690359308')}" style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;">👤 ${escapeHtml(ownerName)}</span>`;
+      ownerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(ownerUserId || '-')}" style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;">👤 ${escapeHtml(ownerName)}</span>`;
     } else if (isMaster) {
       ownerBadge = `<span title="Botホスト環境" style="background:rgba(250,166,26,0.15);border:1px solid rgba(250,166,26,0.35);color:#ffcc66;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;">👑 ホスト</span>`;
     }
@@ -3190,7 +3187,14 @@ function renderWorkerNodes(nodesData) {
         <span>HB: ${node.last_heartbeat_ago != null ? Math.round(node.last_heartbeat_ago)+'s前' : '--'}</span>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:2px;margin-top:2px;">${engineBadges}</div>
-      ${(!isMaster && !isVolunteer && window.APP_USER_DATA && window.APP_USER_DATA.is_admin) ? `<div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim);">💤 エンジン自動停止: ${idlePolicyControlHtml(node.id)}</div>` : ''}
+      ${!isMaster ? `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;background:rgba(0,0,0,0.22);padding:5px 8px;border-radius:6px;border:1px solid rgba(80,230,255,0.2);margin:4px 0;">
+          <span style="color:#50e6ff;font-weight:600;display:flex;align-items:center;gap:4px;">💤 エンジン自動停止 (スリープ):</span>
+          <div style="display:flex;align-items:center;gap:4px;">
+            ${idlePolicyControlHtml(node.id)}
+          </div>
+        </div>
+      ` : ''}
       ${engineNotice}
       ${coeiroinkRamSection}
     `;
@@ -3209,22 +3213,30 @@ window._nodeSettingsLoadedAt = 0;
 
 function idlePolicyControlHtml(nodeKey) {
   const k = escapeHtml(nodeKey);
-  return `<select class="form-input idle-policy-select" data-node-key="${k}" onchange="onIdlePolicyChange(this)" style="padding:2px 6px;font-size:11px;width:auto;">
-      <option value="default">既定 (Worker の設定値)</option>
-      <option value="never">停止しない</option>
-      <option value="15">15分</option>
-      <option value="30">30分</option>
-      <option value="60">1時間</option>
-      <option value="120">2時間</option>
-      <option value="custom">カスタム…</option>
-    </select>
-    <input type="number" class="form-input idle-policy-custom" data-node-key="${k}" min="5" max="240" step="1" hidden
-      onchange="saveIdlePolicy(this.dataset.nodeKey, 'minutes', this.value)" style="padding:2px 6px;font-size:11px;width:70px;" placeholder="分">`;
+  return `
+    <div style="display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap;" class="idle-policy-wrap" data-node-key="${k}">
+      <select class="form-input idle-policy-select" data-node-key="${k}" onchange="onIdlePolicyChange(this)" style="padding:2px 6px;font-size:11px;width:auto;cursor:pointer;">
+        <option value="default">既定 (Worker の設定値)</option>
+        <option value="never">停止しない (常時待機)</option>
+        <option value="15">15分</option>
+        <option value="30">30分</option>
+        <option value="60">1時間</option>
+        <option value="120">2時間</option>
+        <option value="custom">カスタム…</option>
+      </select>
+      <input type="number" class="form-input idle-policy-custom" data-node-key="${k}" min="5" max="240" step="1" hidden
+        onchange="triggerSaveIdlePolicy('${k}', this)" style="padding:2px 6px;font-size:11px;width:60px;" placeholder="分">
+      <button type="button" class="btn btn-sm idle-save-btn" data-node-key="${k}" onclick="triggerSaveIdlePolicy('${k}', this)" style="padding:2px 8px;font-size:11px;background:rgba(80,230,255,0.15);border:1px solid rgba(80,230,255,0.4);color:#50e6ff;cursor:pointer;border-radius:4px;font-weight:600;display:inline-flex;align-items:center;gap:3px;" title="この設定を保存します">
+        💾 保存
+      </button>
+      <span class="idle-save-status" data-node-key="${k}" style="font-size:10px;margin-left:2px;display:none;"></span>
+    </div>
+  `;
 }
 
 async function applyNodeSettingsToControls(force = false) {
   const selects = document.querySelectorAll(".idle-policy-select");
-  if (selects.length === 0 || !window.APP_IS_LOGGED_IN) return;
+  if (selects.length === 0) return;
   if (force || !window._nodeSettings || Date.now() - window._nodeSettingsLoadedAt > 30000) {
     try {
       const resp = await fetch("/api/node_settings");
@@ -3236,8 +3248,11 @@ async function applyNodeSettingsToControls(force = false) {
     }
   }
   document.querySelectorAll(".idle-policy-select").forEach(sel => {
-    const st = window._nodeSettings[sel.dataset.nodeKey];
-    const custom = sel.parentElement.querySelector(`.idle-policy-custom[data-node-key="${CSS.escape(sel.dataset.nodeKey)}"]`);
+    const key = sel.dataset.nodeKey;
+    const st = window._nodeSettings[key];
+    const custom = sel.parentElement ? sel.parentElement.querySelector(`.idle-policy-custom[data-node-key="${CSS.escape(key)}"]`) : null;
+    // ユーザーが入力を操作中の場合は上書きしない
+    if (document.activeElement === sel || (custom && document.activeElement === custom)) return;
     let value = "default";
     if (st && st.idle_policy === "never") value = "never";
     else if (st && st.idle_policy === "minutes") {
@@ -3251,35 +3266,119 @@ async function applyNodeSettingsToControls(force = false) {
 
 function onIdlePolicyChange(sel) {
   const key = sel.dataset.nodeKey;
-  const custom = sel.parentElement.querySelector(`.idle-policy-custom[data-node-key="${CSS.escape(key)}"]`);
+  const parent = sel.closest(".idle-policy-wrap") || sel.parentElement;
+  const custom = parent.querySelector(`.idle-policy-custom[data-node-key="${CSS.escape(key)}"]`);
   if (sel.value === "custom") {
-    if (custom) { custom.hidden = false; custom.focus(); }
+    if (custom) {
+      custom.hidden = false;
+      custom.focus();
+    }
     return;
   }
   if (custom) custom.hidden = true;
-  if (sel.value === "default" || sel.value === "never") saveIdlePolicy(key, sel.value, 15);
-  else saveIdlePolicy(key, "minutes", sel.value);
+  triggerSaveIdlePolicy(key, sel);
 }
 
-async function saveIdlePolicy(nodeKey, policy, minutes) {
+async function triggerSaveIdlePolicy(nodeKey, triggerEl) {
+  const parent = triggerEl ? (triggerEl.closest(".idle-policy-wrap") || triggerEl.parentElement) : document.querySelector(`.idle-policy-wrap[data-node-key="${CSS.escape(nodeKey)}"]`);
+  if (!parent) return;
+  const sel = parent.querySelector(`.idle-policy-select[data-node-key="${CSS.escape(nodeKey)}"]`);
+  const custom = parent.querySelector(`.idle-policy-custom[data-node-key="${CSS.escape(nodeKey)}"]`);
+  if (!sel) return;
+
+  let policy = sel.value;
+  let mins = 15;
+  if (policy === "custom") {
+    policy = "minutes";
+    mins = custom ? parseInt(custom.value, 10) : 15;
+  } else if (policy === "never" || policy === "default") {
+    mins = 15;
+  } else {
+    mins = parseInt(policy, 10) || 15;
+    policy = "minutes";
+  }
+
+  await saveIdlePolicy(nodeKey, policy, mins, triggerEl);
+}
+window.triggerSaveIdlePolicy = triggerSaveIdlePolicy;
+
+async function saveIdlePolicy(nodeKey, policy, minutes, originEl) {
   const mins = parseInt(minutes, 10);
   if (policy === "minutes" && (!(mins >= 5) || mins > 240)) {
     showToast("待機時間は 5〜240 分で指定してください", "error");
     return;
   }
+
+  const parent = originEl ? (originEl.closest(".idle-policy-wrap") || originEl.parentElement) : document.querySelector(`.idle-policy-wrap[data-node-key="${CSS.escape(nodeKey)}"]`);
+  const btn = parent ? parent.querySelector(".idle-save-btn") : null;
+  const statusEl = parent ? parent.querySelector(".idle-save-status") : null;
+
+  if (!window.APP_IS_LOGGED_IN) {
+    showToast("設定を保存するには Discord でログイン（管理者またはノード所有者）してください", "error");
+    if (statusEl) {
+      statusEl.style.display = "inline";
+      statusEl.style.color = "#ff6b6b";
+      statusEl.textContent = "⚠️ ログインが必要";
+      setTimeout(() => { if (statusEl) statusEl.style.display = "none"; }, 4000);
+    }
+    return;
+  }
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `⏳ 保存中...`;
+  }
+  if (statusEl) {
+    statusEl.style.display = "inline";
+    statusEl.style.color = "#50e6ff";
+    statusEl.textContent = "保存中...";
+  }
+
   try {
     const resp = await fetch(`/api/node_settings/${encodeURIComponent(nodeKey)}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ idle_policy: policy, idle_minutes: mins || 15 })
     });
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.message || `HTTP ${resp.status}`);
     window._nodeSettings = window._nodeSettings || {};
     window._nodeSettings[nodeKey] = { idle_policy: policy, idle_minutes: mins || 15 };
-    showToast("エンジン自動停止の設定を保存しました (次のハートビートで反映)", "success");
+    showToast("エンジン自動停止の設定を保存しました", "success");
+    if (btn) {
+      btn.innerHTML = `✅ 保存済`;
+      btn.style.borderColor = "rgba(46,204,113,0.6)";
+      btn.style.color = "#2ecc71";
+    }
+    if (statusEl) {
+      statusEl.style.color = "#2ecc71";
+      statusEl.textContent = "✅ 保存完了";
+    }
   } catch (e) {
     showToast(`設定の保存に失敗しました: ${e.message}`, "error");
+    if (btn) {
+      btn.innerHTML = `💾 保存`;
+      btn.style.borderColor = "rgba(231,76,60,0.6)";
+      btn.style.color = "#ff6b6b";
+    }
+    if (statusEl) {
+      statusEl.style.color = "#ff6b6b";
+      statusEl.textContent = `❌ ${e.message}`;
+    }
+  } finally {
+    if (btn) {
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.innerHTML = `💾 保存`;
+        btn.style.borderColor = "rgba(80,230,255,0.4)";
+        btn.style.color = "#50e6ff";
+      }, 3000);
+    }
+    if (statusEl) {
+      setTimeout(() => {
+        statusEl.style.display = "none";
+      }, 4000);
+    }
   }
 }
 window.onIdlePolicyChange = onIdlePolicyChange;
@@ -7186,10 +7285,10 @@ async function loadManagerNodes() {
     const masterUptime = master.uptime_seconds != null ? formatUptime(master.uptime_seconds) : "-";
     const masterContainerId = (master.container_hostname && master.container_hostname !== master.hostname) ? `<span style="font-size:11px;color:var(--text-dim);font-family:monospace;font-weight:normal;" title="Container ID">(${escapeHtml(master.container_hostname)})</span>` : "";
     const masterLocalIpDisplay = master.local_ip ? `${escapeHtml(master.local_ip)} <span style="font-size:10px;color:var(--text-dim);">(Host: ${escapeHtml(master.ip || '-')})</span>` : escapeHtml(master.ip || "-");
-    const masterOwner = (master.owner_name || "チェインドベル").trim();
-    const masterOwnerUid = master.owner_user_id || 310034034690359308;
+    const masterOwner = (master.owner_name || "ホスト管理者").trim();
+    const masterOwnerUid = master.owner_user_id || 0;
     const canEditManager = Boolean(window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
-    const masterOwnerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(masterOwnerUid)}" ${canEditManager ? `onclick="promptEditManagerNodeOwner('master_primary', '${escapeHtml(masterOwner)}', event)" style="cursor:pointer;background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"` : 'style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"'}>👤 ${escapeHtml(masterOwner)}${canEditManager ? ' ✏️' : ''}</span>`;
+    const masterOwnerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(masterOwnerUid || '-')}" ${canEditManager ? `onclick="promptEditManagerNodeOwner('master_primary', '${escapeHtml(masterOwner)}', event)" style="cursor:pointer;background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"` : 'style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"'}>👤 ${escapeHtml(masterOwner)}${canEditManager ? ' ✏️' : ''}</span>`;
 
     cardsHtml += `
       <div class="card" style="background:rgba(88,101,242,0.08);border:1px solid rgba(88,101,242,0.35);padding:16px;border-radius:10px;position:relative;">
@@ -7305,9 +7404,9 @@ async function loadManagerNodes() {
         const dockerText = slave.docker_version && slave.docker_version !== 'N/A' ? ` (v${escapeHtml(slave.docker_version)})` : '';
         const osText = escapeHtml(slave.os_name || "Linux") + dockerText;
 
-        const slaveOwner = (slave.owner_name || "チェインドベル").trim();
-        const slaveOwnerUid = slave.owner_user_id || 310034034690359308;
-        const slaveOwnerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(slaveOwnerUid)}" ${canEditManager ? `onclick="promptEditManagerNodeOwner('${escapeHtml(slave.node_id)}', '${escapeHtml(slaveOwner)}', event)" style="cursor:pointer;background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"` : 'style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"'}>👤 ${escapeHtml(slaveOwner)}${canEditManager ? ' ✏️' : ''}</span>`;
+        const slaveOwner = (slave.owner_name || "未設定").trim();
+        const slaveOwnerUid = slave.owner_user_id || 0;
+        const slaveOwnerBadge = `<span class="worker-owner-badge" title="所有者 Discord ID: ${escapeHtml(slaveOwnerUid || '-')}" ${canEditManager ? `onclick="promptEditManagerNodeOwner('${escapeHtml(slave.node_id)}', '${escapeHtml(slaveOwner)}', event)" style="cursor:pointer;background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"` : 'style="background:rgba(80,230,255,0.12);border:1px solid rgba(80,230,255,0.35);color:#50e6ff;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;"'}>👤 ${escapeHtml(slaveOwner)}${canEditManager ? ' ✏️' : ''}</span>`;
 
         cardsHtml += `
           <div class="card" style="background:rgba(0,0,0,0.2);border:1px solid ${borderCol};padding:16px;border-radius:10px;">

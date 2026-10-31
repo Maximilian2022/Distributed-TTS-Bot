@@ -2029,8 +2029,8 @@ class WebServer:
         master_port = int(os.getenv("HOST_WEB_PORT", getattr(self.config, "web_port", 8088)) or 8088)
 
         master_st = (await self._worker_settings()).get("master_primary", {})
-        master_owner = master_st.get("owner_name") or "チェインドベル"
-        master_owner_uid = master_st.get("owner_user_id") or 310034034690359308
+        master_owner = master_st.get("owner_name") or ""
+        master_owner_uid = master_st.get("owner_user_id") or 0
 
         master_info = {
             "node_id": "master_primary",
@@ -2075,8 +2075,8 @@ class WebServer:
             direct_url = slave.get("direct_url", "")
 
             slave_st = w_settings_map.get(node_id, {})
-            slave_owner = slave.get("owner_name") or slave_st.get("owner_name") or "チェインドベル"
-            slave_owner_uid = slave.get("owner_user_id") or slave_st.get("owner_user_id") or 310034034690359308
+            slave_owner = slave.get("owner_name") or slave_st.get("owner_name") or ""
+            slave_owner_uid = slave.get("owner_user_id") or slave_st.get("owner_user_id") or 0
 
             slaves_list.append({
                 "node_id": node_id,
@@ -5180,11 +5180,6 @@ class WebServer:
                 if not owner:
                     owner = node_dict.get("owner_name") or ""
 
-                # 既存クラスタワーカーのデフォルト紐づけ (310034034690359308: チェインドベル)
-                if not owner and (base_id.startswith("worker_") or node_id.startswith("worker_")):
-                    owner = "チェインドベル"
-                    owner_uid = 310034034690359308
-
                 node_dict["owner_name"] = owner
                 node_dict["owner_user_id"] = owner_uid
             result[engine_name] = status_list
@@ -7187,20 +7182,30 @@ class WebServer:
     async def _can_edit_node_settings(self, user: Dict[str, Any], node_key: str) -> bool:
         if user.get("is_admin"):
             return True
+        uid = int(user.get("user_id") or user.get("id") or 0)
+        # クラスタワーカー / Managerノードの所有者チェック
+        w_settings = await self._worker_settings()
+        node_st = w_settings.get(node_key, {})
+        if uid > 0 and node_st.get("owner_user_id") and node_st["owner_user_id"] == uid:
+            return True
         owner = await self.db.get_volunteer_device_owner(node_key)
-        return owner is not None and owner == int(user["user_id"])
+        return owner is not None and owner == uid
 
     async def api_node_settings_list(self, request: web.Request) -> web.Response:
-        """設定一覧 (管理者は全ノード、一般ユーザーは自分のボランティア端末のみ)"""
-        user = self._require_login_user(request)
+        """設定一覧 (管理者は全ノード、一般ユーザーは自分のノード・端末のみ、未ログインは全ノード)"""
+        user = self.auth.get_current_user(request)
         settings = await self._worker_settings()
-        if not user.get("is_admin"):
-            own = {d["node_id"] for d in await self.db.list_volunteer_devices(int(user["user_id"]))}
+        if user and not user.get("is_admin"):
+            uid = int(user.get("user_id") or user.get("id") or 0)
+            own = {d["node_id"] for d in await self.db.list_volunteer_devices(uid)}
+            for k, v in settings.items():
+                if v.get("owner_user_id") and v["owner_user_id"] == uid:
+                    own.add(k)
             settings = {k: v for k, v in settings.items() if k in own}
         return web.json_response({"status": "ok", "settings": settings})
 
     async def api_node_settings_update(self, request: web.Request) -> web.Response:
-        """エンジン自動停止および所有者の設定 (クラスタは管理者、ボランティア端末は所有者または管理者)"""
+        """エンジン自動停止および所有者の設定 (クラスタは管理者・所有者、ボランティア端末は所有者または管理者)"""
         user = self._require_login_user(request)
         node_key = request.match_info.get("node_key", "")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", node_key):

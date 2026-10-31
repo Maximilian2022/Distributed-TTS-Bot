@@ -8652,3 +8652,75 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   4. **本番環境への安全な反映**:
      - 通話セッション 0 件を確認後、`docker compose restart app` を実施。
      - `curl /health` にて `version: "v2026.10.31-1530"`, `bot.is_ready: true` の健全稼働を確認。
+
+## 2026-10-31 16:20 トークンベース所有権安全紐づけアーキテクチャ (Setup Token) 実装完了 (v2026.10.31-1620)
+- **要望・設計方針**:
+  - ワンライナーに生の Discord ID を含めるのはセキュリティ上望ましくないため、特定のセキュア Token を人と紐付け、ノード参加時に自動で該当 Discord ID と紐づけるアーキテクチャを採用。
+- **改修内容**:
+  1. **データベース層 (`src/database.py`, `data/bot.db`)**:
+     - `node_setup_tokens` テーブルを作成（`token`, `token_type`, `owner_user_id`, `owner_name`, `created_at`, `revoked_at` 等）。
+     - 本番 DB に無停止マイグレーションを実施。
+  2. **バックエンド API (`src/web/server.py`)**:
+     - `GET /api/admin/setup_tokens`: ログイン中管理者のトークン取得。
+     - `POST /api/admin/setup_tokens/rotate`: トークン再生成。
+     - `api_worker_register`, `api_worker_ws`, `api_ha_status`: `cwtok_` / `hatok_` トークンを照合し、初回接続時にノード所有者を自動バインド。
+  3. **フロントエンド WebUI (`src/web/static/app.js`)**:
+     - ワンライナー生成コードに Setup Token を自動埋め込み。
+     - `escapeHtml(str)` に数値が渡された際の例外（`str.replace is not a function`）を修正。
+  4. **テスト・検証**:
+     - `tests/test_node_setup_tokens.py` を作成し、全 147 件のテストが 100% 合格。
+
+## 2026-10-31 23:50 クラスタワーカー・ボランティア端末のエンジン自動停止 (スリープ待機時間) 設定UIの常時表示化・権限是正 (v2026.10.31-2350)
+- **課題・事象**:
+  - ユーザーより「クラスタワーカーとボランティアワーカーで、オプションでコンテナを起動したままにするか、15分何もなければ落とすか、選択できるようにする機能がどこから設定できるかわからない」「ないんですねぇこれがぁ（スクリーンショット提示）」との報告。
+- **原因の特定**:
+  - `src/web/static/app.js` のワーカーカード生成（3193行目付近）において、
+    `${(!isMaster && !isVolunteer && window.APP_USER_DATA && window.APP_USER_DATA.is_admin) ? ... : ''}`
+    という過剰に厳しいガードが存在していた。
+  - 未ログイン閲覧時や一般ユーザーセッション（`is_admin: false`）の際、HTML タグ自体が一切生成されず画面から消滅していた。
+  - `applyNodeSettingsToControls` 内でも `!window.APP_IS_LOGGED_IN` ガードにより設定値の自動ロードが中断されていた。
+  - サーバー側 `src/web/server.py` の `_can_edit_node_settings` でも、クラスタワーカーの所有者（`owner_user_id`）一致チェックが抜けており管理者のみに制限されていた。
+- **改修内容**:
+  1. **フロントエンド UI 是正 (`src/web/static/app.js`)**:
+     - `!isMaster`（主系Master本体以外）のすべてのカード（MASTERSOMEN2022, MASTEROMEN2017, MasterDebian 等）において、
+       「💤 エンジン自動停止 (スリープ): [プルダウン ▼]」を枠付きの目立つデザイン（シアン枠）で常時表示。
+     - 選択肢: 既定 (Worker の設定値) / 停止しない / 15分 / 30分 / 1時間 / 2時間 / カスタム...
+     - `applyNodeSettingsToControls`: 未ログイン状態でも DB の設定値（`never` / `15` / `30` 等）を確実にプルダウンに反映。
+  2. **バックエンド API 是正 (`src/web/server.py`)**:
+     - `_can_edit_node_settings`: 管理者（`is_admin`）に加え、ノードの所有者（`owner_user_id` がログインユーザーと一致）も設定変更（PUT）を許可。
+     - `api_node_settings_list`: 管理者だけでなく一般ユーザー・未ログイン時でも現在のスリープ設定一覧を取得可能に緩和。
+  3. **バージョン更新**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.10.31-2350"`
+  4. **テスト・検証**:
+     - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて全 147 件のテストが 100% 合格。
+     - 本番静的ファイルは `./src:/app/src` のバインドマウント＆ `asset_v = f"{BUILD_VERSION}-{max(js_mtime, css_mtime)}"` キャッシュバスターにより、**通話中の Discord Bot を停止・再起動することなく、ブラウザのリロード（F5）だけで最新 UI が即座に反映される** ことを確認。
+
+## 2026-11-01 00:10 OSS向け環境固有値（固定ユーザーID・ユーザー名）の完全撤廃＆スリープ設定「💾保存」ボタン設置・即時フィードバック化 (v2026.11.01-0010)
+- **課題・背景**:
+  1. ユーザーより「OSSで公開しているプロジェクトだから環境固有の書き方はしてない、でいいよね？」との懸念・確認。
+  2. 調査の結果、直前の改修や過去の実装において、特定の Discord ユーザーID（`310034034690359308`）やユーザー名（`チェインドベル`）がフォールバック値や権限ガードとしてコード内に直接ハードコード（ベタ書き）されている箇所が複数判明。
+  3. 併せて「セーブボタンとかない認識だけど、保存されないかも」との指摘があり、UI上の保存確定ボタンや視覚的ステータスフィードバックの不足、未ログイン時の保存拒否リスクが判明。
+- **改修内容**:
+  1. **コードベース内の環境固有値の完全一掃 (OSS化標準準拠)**:
+     - `src/cogs/commands.py`: `/alert_test` の固定管理者ID判定（`ADMIN_ID = 310034034690359308`）を撤廃し、Bot アプリケーションオーナー、サーバー管理者権限（`administrator`）、および `.env`（`DISCORD_OWNER_USER_ID`/`ADMIN_USER_ID`）による汎用認可へ刷新。
+     - `src/utils/alert_service.py`: `INITIAL_DEFAULT_CONTACT_ID = 310034034690359308` を撤廃し、環境変数または未設定（0）とする動的解決へ是正。
+     - `src/database.py`: `system_credentials` の初期化クエリにハードコードされていた ID を撤廃し、環境変数が明示された場合のみ登録する仕様に改修。`import os` を追加。
+     - `src/web/server.py`: Master / Slave / クラスタワーカーの未設定時フォールバック値（`310034034690359308`, `チェインドベル`）を完全に削除。未設定時は空文字および 0 に統一。
+     - `src/web/static/app.js`: ワーカーカード、Masterカード、Slaveカードに残留していた固定 ID / 名前のフォールバックを完全撤廃。
+     - `src/cogs/vc_handler.py`: コメント例の個人名を中立的なダミー表記に変更。
+     - `.env.example`: コメント例の固定 ID をダミー値（`123456789012345678`）に置換。
+     - `tests/test_worker_owner.py`: テスト用 ID をダミー値に置換。
+     - ※ 本番 DB（`bot.db`）および本番 `.env` にはすでに正しく設定が保存されているため、チェインドベル様の本番環境での表示・動作には一切悪影響を与えず、第三者が OSS としてクローンした場合に汎用的に動作する完全な状態を実現。
+  2. **スリープ待機時間設定の UI / UX 改善 (セーブボタン＆即時ステータス)**:
+     - `src/web/static/app.js` (`idlePolicyControlHtml` / `saveIdlePolicy` / `triggerSaveIdlePolicy`):
+       - プルダウンの横に **明示的な「💾 保存」ボタン** を常時設置。
+       - プルダウン変更時にも自動保存をキックしつつ、ボタン押下による明示的な手動保存にも完全対応。
+       - 保存実行時はボタンが「⏳ 保存中...」となり、成功時は「✅ 保存済」および緑色の「✅ 保存完了」メッセージをインライン表示。
+       - 未ログイン（`!window.APP_IS_LOGGED_IN`）時は「⚠️ 設定を保存するには Discord でログイン（管理者またはノード所有者）してください」とトーストおよびインラインで明確にガイダンス表示。
+       - `applyNodeSettingsToControls`: ユーザーがプルダウンや分数入力欄を操作中の場合は定期ポーリングによる値の上書きをスキップする保護を導入。
+  3. **バージョン更新**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.11.01-0010"`
+  4. **テスト・検証**:
+     - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて全 147 件の単体テストが **100% 合格（Ran 147 tests in 8.626s, OK）**。
+
+

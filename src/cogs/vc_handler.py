@@ -1918,7 +1918,7 @@ class VCHandlerCog(commands.Cog):
         author_prefix = None
         if read_username:
             raw_display_name = message.author.display_name
-            # 個人設定で「括弧除去 (【】（）等)」がONの場合 (デフォルトON: 例「【わ】チェインドベル【鈍器】」→「チェインドベル」)
+            # 個人設定で「括弧除去 (【】（）等)」がONの場合 (デフォルトON: 例「【称号】ユーザー名【属性】」→「ユーザー名」)
             if user_settings.get("strip_name_brackets", True):
                 stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
                 if stripped:

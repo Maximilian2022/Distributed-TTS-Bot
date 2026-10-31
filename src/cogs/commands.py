@@ -1049,9 +1049,11 @@ class CommandsCog(commands.Cog):
         app_commands.Choice(name="⚡ Workerエンジンのエラー", value="worker_engine"),
     ])
     async def alert_test(self, interaction: discord.Interaction, target: str):
-        ADMIN_ID = 310034034690359308
-        if interaction.user.id != ADMIN_ID:
-            await interaction.response.send_message("❌ このコマンドはBot管理者（ユーザーID: 310034034690359308）のみ実行できます。", ephemeral=True)
+        is_owner = await self.bot.is_owner(interaction.user)
+        is_admin_perm = interaction.user.guild_permissions.administrator if interaction.guild else False
+        owner_id = getattr(self.config, "discord_owner_user_id", 0) or int(os.getenv("ADMIN_USER_ID", "0") or 0)
+        if not (is_owner or is_admin_perm or (owner_id > 0 and interaction.user.id == owner_id)):
+            await interaction.response.send_message("❌ このコマンドはBot管理者またはサーバー管理者のみ実行できます。", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)

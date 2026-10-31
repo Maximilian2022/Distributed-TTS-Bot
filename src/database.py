@@ -9,6 +9,7 @@ import time
 import re
 import secrets
 import uuid
+import os
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
@@ -657,11 +658,13 @@ class Database:
                 )
             """)
 
-            # デフォルトエラー連絡先ユーザーID (未登録の場合に現行IDで初期化)
-            await db.execute("""
-                INSERT OR IGNORE INTO system_credentials (key, value, updated_at)
-                VALUES ('error_contact_user_id', '310034034690359308', CURRENT_TIMESTAMP)
-            """)
+            # デフォルトエラー連絡先ユーザーID (環境変数で指定されている場合に初期化)
+            admin_contact = os.getenv("ADMIN_USER_ID", os.getenv("DISCORD_OWNER_USER_ID", "")).strip()
+            if admin_contact:
+                await db.execute("""
+                    INSERT OR IGNORE INTO system_credentials (key, value, updated_at)
+                    VALUES ('error_contact_user_id', ?, CURRENT_TIMESTAMP)
+                """, (admin_contact,))
 
             # 12. Discord Botトークンプール (最大10台動的スケーリング)
             await db.execute("""

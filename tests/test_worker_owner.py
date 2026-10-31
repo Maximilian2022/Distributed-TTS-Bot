@@ -55,18 +55,18 @@ class TestWorkerOwnerStorage(_Base):
     @unittest_run_loop
     async def test_owner_name_in_worker_settings(self):
         # 1. 初期upsertでowner_nameとowner_user_idを保存
-        await self.db.upsert_worker_settings("worker_OMEN", "never", 15, 111, owner_name="Maximilian", owner_user_id=310034034690359308)
+        await self.db.upsert_worker_settings("worker_OMEN", "never", 15, 111, owner_name="Maximilian", owner_user_id=999888777666555444)
         settings = await self.db.get_all_worker_settings()
         self.assertIn("worker_OMEN", settings)
         self.assertEqual(settings["worker_OMEN"]["owner_name"], "Maximilian")
-        self.assertEqual(settings["worker_OMEN"]["owner_user_id"], 310034034690359308)
+        self.assertEqual(settings["worker_OMEN"]["owner_user_id"], 999888777666555444)
         self.assertEqual(settings["worker_OMEN"]["idle_policy"], "never")
 
         # 2. update_worker_owner で所有者名・ID更新
-        await self.db.update_worker_owner("worker_OMEN", "チェインドベル", 222, owner_user_id=310034034690359308)
+        await self.db.update_worker_owner("worker_OMEN", "OwnerBob", 222, owner_user_id=999888777666555444)
         settings = await self.db.get_all_worker_settings()
-        self.assertEqual(settings["worker_OMEN"]["owner_name"], "チェインドベル")
-        self.assertEqual(settings["worker_OMEN"]["owner_user_id"], 310034034690359308)
+        self.assertEqual(settings["worker_OMEN"]["owner_name"], "OwnerBob")
+        self.assertEqual(settings["worker_OMEN"]["owner_user_id"], 999888777666555444)
         # idle_policy が保持されていること
         self.assertEqual(settings["worker_OMEN"]["idle_policy"], "never")
 
