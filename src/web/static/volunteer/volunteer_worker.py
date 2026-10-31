@@ -44,7 +44,7 @@ logging.basicConfig(
 logger = logging.getLogger("VolunteerWorker")
 
 # プロトコル定数
-PROTOCOL_VERSION = "2.2.0"
+PROTOCOL_VERSION = "2.3.0"
 BINARY_HEADER_FORMAT = ">32sIB"
 FLAG_FINAL_CHUNK = 0x01
 
@@ -92,6 +92,7 @@ class VolunteerWorker:
         self.game_priority = getattr(args, "game_priority", False)
         self.runtime = getattr(args, "runtime", "native").lower()
         self.idle_timeout = getattr(args, "idle_timeout", 600)  # 10分 (600秒)
+        self.idle_policy: Optional[Dict[str, Any]] = None  # 所有者が WebUI で設定した自動停止 (未配信なら --idle-timeout)
         self.auto_exit = not getattr(args, "no_auto_exit", False)
         
         self.engine_urls = {
@@ -352,8 +353,12 @@ class VolunteerWorker:
             await asyncio.sleep(30.0)
             if self.active_tasks > 0:
                 continue
+            policy = self.idle_policy or {}
+            if policy and not policy.get("enabled", True):
+                continue
+            idle_timeout = int(policy.get("timeout_sec") or self.idle_timeout)
             idle_sec = time.time() - self.last_activity_time
-            if idle_sec >= self.idle_timeout:
+            if idle_sec >= idle_timeout:
                 for eng in self.supported_engines:
                     cname = DOCKER_CONTAINER_MAP.get(eng)
                     if cname and self._is_container_running(cname):
@@ -496,6 +501,7 @@ class VolunteerWorker:
                                 # Master が端末 ID から確定した安定ノード ID を以後のハートビートで使う
                                 if data.get("node_id"):
                                     self.node_id = data["node_id"]
+                                self.idle_policy = data.get("idle_policy")
                                 logger.info(f"🎉 サーバーにワーカーとして登録されました (Priority: {data.get('assigned_priority', self.priority)})")
 
                             elif m_type == "synthesize_request":
@@ -506,7 +512,7 @@ class VolunteerWorker:
                                 asyncio.create_task(self._handle_self_update())
 
                             elif m_type == "heartbeat_ack":
-                                pass
+                                self.idle_policy = data.get("idle_policy")
 
                         elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             logger.info("🔌 サーバーから切断通知を受信しました。")

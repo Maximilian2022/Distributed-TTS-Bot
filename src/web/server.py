@@ -29,6 +29,7 @@ import uuid
 import tempfile
 import py_compile
 import aiohttp
+from src.utils.worker_auth import agent_auth_headers, configure_agent_auth
 from aiohttp import web
 import discord
 
@@ -154,6 +155,9 @@ class WebServer:
         self.master_instance_id = self._load_or_create_master_instance_id()
         self._previous_secret_warned: Dict[str, float] = {}
         self.volunteer_ws_by_token: Dict[str, set] = {}
+        self._worker_settings_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        # Master → Agent 呼び出しに付与する共有トークン (入れ替えに追従するため設定から都度取得)
+        configure_agent_auth(lambda: getattr(self.config, "worker_shared_secret", ""))
         self.ha_slaves: Dict[str, Dict[str, Any]] = {}
         self.ha_revoked_nodes: set = set()
         self.ha_nodes_file = Path(self.config.db_path).parent / "ha_manager_nodes.json"
@@ -500,6 +504,8 @@ class WebServer:
         self.app.router.add_post("/api/system/tier_routing", self.api_system_save_tier_routing)
         self.app.router.add_get("/api/worker/ws", self.api_worker_ws)
         self.app.router.add_get("/api/volunteer/tokens", self.api_volunteer_tokens_list)
+        self.app.router.add_get("/api/node_settings", self.api_node_settings_list)
+        self.app.router.add_put("/api/node_settings/{node_key}", self.api_node_settings_update)
         self.app.router.add_post("/api/volunteer/tokens", self.api_volunteer_tokens_create)
         self.app.router.add_delete("/api/volunteer/tokens/{token_id}", self.api_volunteer_tokens_revoke)
 
@@ -4571,7 +4577,9 @@ class WebServer:
                     name=f"sync_worker_active_{node_id}"
                 )
 
+        idle_policy = await self._idle_policy_payload(str(node_id))
         return web.json_response({
+            **({"idle_policy": idle_policy} if idle_policy is not None else {}),
             "success": True,
             "node_id": node_id,
             "registered_engines": registered_engines,
@@ -4861,7 +4869,7 @@ class WebServer:
                     name=f"pull_worker_models_hb_{node_id}"
                 )
 
-        return web.json_response({
+        hb_response = {
             "registered": True,
             "node_id": node_id,
             "any_human_in_vc": any_human,
@@ -4874,7 +4882,11 @@ class WebServer:
             "models_to_pull": models_to_pull,
             "models_to_upload": models_to_upload,
             "master_lan_url": self._get_master_lan_url(request),
-        })
+        }
+        idle_policy = await self._idle_policy_payload(str(node_id))
+        if idle_policy is not None:
+            hb_response["idle_policy"] = idle_policy
+        return web.json_response(hb_response)
 
     async def api_worker_nodes(self, request: web.Request) -> web.Response:
         """全 Worker ノードの状態一覧を返す（WebUI / 管理用）"""
@@ -5058,7 +5070,7 @@ class WebServer:
             update_url = f"http://{ip}:{port}/update"
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(update_url, json=payload, timeout=aiohttp.ClientTimeout(total=8.0)) as resp:
+                    async with session.post(update_url, json=payload, headers=agent_auth_headers(), timeout=aiohttp.ClientTimeout(total=8.0)) as resp:
                         body = await resp.json()
                         return {"ip": ip, "success": True, "worker_response": body}
             except Exception as e:
@@ -5181,7 +5193,7 @@ class WebServer:
                 if before is None:
                     return False, "Agent に接続できません"
                 if action == "restart":
-                    async with session.post(f"{base}/restart", timeout=aiohttp.ClientTimeout(total=8.0)) as r:
+                    async with session.post(f"{base}/restart", headers=agent_auth_headers(), timeout=aiohttp.ClientTimeout(total=8.0)) as r:
                         if r.status == 404:
                             return False, "Agent が旧バージョンのため再起動APIに未対応です (v3.12.0 以降で利用可能)"
                         if r.status not in (200, 409):
@@ -5189,7 +5201,7 @@ class WebServer:
                     timeout = self.ROLLING_RESTART_NODE_TIMEOUT
                 else:
                     payload = {"full": full, "update_agent": True, "update_engines": True}
-                    async with session.post(f"{base}/update", json=payload, timeout=aiohttp.ClientTimeout(total=8.0)) as r:
+                    async with session.post(f"{base}/update", json=payload, headers=agent_auth_headers(), timeout=aiohttp.ClientTimeout(total=8.0)) as r:
                         if r.status not in (200, 409):  # 409 = 既に更新中 → 完了待ちへ
                             return False, f"更新指示に失敗しました (HTTP {r.status})"
                     timeout = self.ROLLING_UPDATE_NODE_TIMEOUT
@@ -5353,7 +5365,7 @@ class WebServer:
                 safe_lines = max(1, min(int(lines), 1000))
                 url = f"http://{safe_target_ip}:50030/logs?target={safe_target}&lines={safe_lines}"
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3.5)) as session:
-                    async with session.get(url) as resp:
+                    async with session.get(url, headers=agent_auth_headers()) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             await worker_log_collector.collect_single_worker(node_id, safe_target_ip, tail=lines)
@@ -5839,10 +5851,7 @@ class WebServer:
                 # SSRF (CWE-918) 防護: sanitize_worker_ip による非汚染 IP および URL エンコードされたモデル名を使用
                 quoted_name = urllib.parse.quote(clean_name)
                 dl_url = f"http://{safe_worker_ip}:{safe_port}/models/download/{quoted_name}"
-                headers = {}
-                secret = getattr(self.config, "worker_shared_secret", "").strip()
-                if secret:
-                    headers["X-Worker-Token"] = secret
+                headers = agent_auth_headers()
                 logger.info(f"📥 [ModelSync] Worker ({safe_worker_ip}:{safe_port}) から未保有モデル '{clean_name}' を Pull 取得中...")
                 timeout = aiohttp.ClientTimeout(total=1800.0, connect=10.0, sock_read=300.0)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -6706,6 +6715,71 @@ class WebServer:
         else:
             return web.json_response({"status": "error", "message": "Failed to persist tier routing configuration"}, status=500)
 
+    # --- ワーカー別設定 (エンジン自動停止) ---
+
+    IDLE_POLICIES = ("default", "never", "minutes")
+    IDLE_MINUTES_RANGE = (5, 240)
+
+    async def _worker_settings(self) -> Dict[str, Dict[str, Any]]:
+        if self._worker_settings_cache is None:
+            try:
+                self._worker_settings_cache = await self.db.get_all_worker_settings()
+            except Exception as e:
+                logger.warning(f"[WorkerSettings] Failed to load worker settings: {e}")
+                return {}
+        return self._worker_settings_cache
+
+    async def _idle_policy_payload(self, node_key: str) -> Optional[Dict[str, Any]]:
+        """配信用のエンジン自動停止ポリシー。未設定 (既定) は None を返し、ワーカー側の従来値で動かす"""
+        st = (await self._worker_settings()).get(node_key)
+        if not st or st.get("idle_policy") == "default":
+            return None
+        if st.get("idle_policy") == "never":
+            return {"enabled": False}
+        return {"enabled": True, "timeout_sec": int(st.get("idle_minutes") or 15) * 60}
+
+    async def _can_edit_node_settings(self, user: Dict[str, Any], node_key: str) -> bool:
+        if user.get("is_admin"):
+            return True
+        owner = await self.db.get_volunteer_device_owner(node_key)
+        return owner is not None and owner == int(user["user_id"])
+
+    async def api_node_settings_list(self, request: web.Request) -> web.Response:
+        """設定一覧 (管理者は全ノード、一般ユーザーは自分のボランティア端末のみ)"""
+        user = self._require_login_user(request)
+        settings = await self._worker_settings()
+        if not user.get("is_admin"):
+            own = {d["node_id"] for d in await self.db.list_volunteer_devices(int(user["user_id"]))}
+            settings = {k: v for k, v in settings.items() if k in own}
+        return web.json_response({"status": "ok", "settings": settings})
+
+    async def api_node_settings_update(self, request: web.Request) -> web.Response:
+        """エンジン自動停止の設定 (クラスタは管理者、ボランティア端末は所有者または管理者)"""
+        user = self._require_login_user(request)
+        node_key = request.match_info.get("node_key", "")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", node_key):
+            return web.json_response({"status": "error", "message": "Invalid node key"}, status=400)
+        if not await self._can_edit_node_settings(user, node_key):
+            return web.json_response({"status": "error", "message": "Forbidden"}, status=403)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "message": "Invalid JSON"}, status=400)
+        policy = str(body.get("idle_policy", "default"))
+        if policy not in self.IDLE_POLICIES:
+            return web.json_response({"status": "error", "message": "idle_policy must be default / never / minutes"}, status=400)
+        try:
+            minutes = int(body.get("idle_minutes", 15))
+        except (TypeError, ValueError):
+            return web.json_response({"status": "error", "message": "idle_minutes must be an integer"}, status=400)
+        lo, hi = self.IDLE_MINUTES_RANGE
+        if policy == "minutes" and not (lo <= minutes <= hi):
+            return web.json_response({"status": "error", "message": f"idle_minutes must be {lo}-{hi}"}, status=400)
+        await self.db.upsert_worker_settings(node_key, policy, minutes, int(user["user_id"]))
+        self._worker_settings_cache = None
+        logger.info(f"⚙️ [WorkerSettings] {node_key}: idle_policy={policy} idle_minutes={minutes} (by user {user['user_id']})")
+        return web.json_response({"status": "ok", "node_key": node_key, "idle_policy": policy, "idle_minutes": minutes})
+
     # --- ボランティアワーカーの個人トークン (WebUI ログインユーザー) ---
 
     def _require_login_user(self, request: web.Request) -> Dict[str, Any]:
@@ -6862,13 +6936,17 @@ class WebServer:
                                     logger.warning(f"[WorkerWS] Failed to record volunteer device: {dev_err}")
                             self.tts_manager.register_ws_worker_node(ws_node)
 
-                        await ws.send_json({
+                        ack = {
                             "type": "register_ack",
                             "status": "ok",
                             "node_id": worker_node_id,
                             "exclusive_guild_id": exclusive_guild_id,
                             "heartbeat_interval_sec": 10.0
-                        })
+                        }
+                        idle_policy = await self._idle_policy_payload(str(worker_node_id))
+                        if idle_policy is not None:
+                            ack["idle_policy"] = idle_policy
+                        await ws.send_json(ack)
                         scope_desc = f" (Dedicated to Guild {exclusive_guild_id})" if exclusive_guild_id else " (Global Shared)"
                         models_desc = f" - Models: {list(supported_models.keys())}" if supported_models else ""
                         node_type_desc = "Cluster Worker Tunnel" if is_cluster_worker else "Volunteer Worker"
@@ -6886,7 +6964,11 @@ class WebServer:
                                 supported_models=data.get("supported_models", {})
                             )
                             ws_node.update_from_heartbeat(hb)
-                        await ws.send_json({"type": "heartbeat_ack", "server_time": time.time()})
+                        hb_ack = {"type": "heartbeat_ack", "server_time": time.time()}
+                        idle_policy = await self._idle_policy_payload(str(worker_node_id or ""))
+                        if idle_policy is not None:
+                            hb_ack["idle_policy"] = idle_policy
+                        await ws.send_json(hb_ack)
 
                     elif msg_type == "synthesize_error":
                         if ws_node is not None:

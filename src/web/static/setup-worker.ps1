@@ -690,7 +690,9 @@ if ($AgentReady) {
     Write-Host "`n⏳ Master ($MasterUrl) への自動登録を確認中..." -ForegroundColor Blue
     for ($i = 0; $i -lt 15; $i++) {
         try {
-            $statusResp = Invoke-RestMethod -Uri "http://127.0.0.1:50030/status" -UseBasicParsing -TimeoutSec 2
+            $statusHeaders = @{}
+            if ($WorkerSecret) { $statusHeaders["X-Worker-Token"] = $WorkerSecret }
+            $statusResp = Invoke-RestMethod -Uri "http://127.0.0.1:50030/status" -Headers $statusHeaders -UseBasicParsing -TimeoutSec 2
             if ($statusResp.master_registered -eq $true) {
                 $RegisteredOk = $true
                 break

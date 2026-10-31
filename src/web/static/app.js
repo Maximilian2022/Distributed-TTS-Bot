@@ -3170,6 +3170,7 @@ function renderWorkerNodes(nodesData) {
         <span>HB: ${node.last_heartbeat_ago != null ? Math.round(node.last_heartbeat_ago)+'s前' : '--'}</span>
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:2px;margin-top:2px;">${engineBadges}</div>
+      ${(!isMaster && !isVolunteer && window.APP_USER_DATA && window.APP_USER_DATA.is_admin) ? `<div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim);">💤 エンジン自動停止: ${idlePolicyControlHtml(node.id)}</div>` : ''}
       ${engineNotice}
       ${coeiroinkRamSection}
     `;
@@ -3179,7 +3180,90 @@ function renderWorkerNodes(nodesData) {
     }
   });
   setTimeout(renderAllWorkerSparklines, 50);
+  applyNodeSettingsToControls();
 }
+
+// --- エンジン自動停止の設定 (クラスタ: 管理者 / ボランティア端末: 所有者) ---
+window._nodeSettings = window._nodeSettings || null;
+window._nodeSettingsLoadedAt = 0;
+
+function idlePolicyControlHtml(nodeKey) {
+  const k = escapeHtml(nodeKey);
+  return `<select class="form-input idle-policy-select" data-node-key="${k}" onchange="onIdlePolicyChange(this)" style="padding:2px 6px;font-size:11px;width:auto;">
+      <option value="default">既定 (Worker の設定値)</option>
+      <option value="never">停止しない</option>
+      <option value="15">15分</option>
+      <option value="30">30分</option>
+      <option value="60">1時間</option>
+      <option value="120">2時間</option>
+      <option value="custom">カスタム…</option>
+    </select>
+    <input type="number" class="form-input idle-policy-custom" data-node-key="${k}" min="5" max="240" step="1" hidden
+      onchange="saveIdlePolicy(this.dataset.nodeKey, 'minutes', this.value)" style="padding:2px 6px;font-size:11px;width:70px;" placeholder="分">`;
+}
+
+async function applyNodeSettingsToControls(force = false) {
+  const selects = document.querySelectorAll(".idle-policy-select");
+  if (selects.length === 0 || !window.APP_IS_LOGGED_IN) return;
+  if (force || !window._nodeSettings || Date.now() - window._nodeSettingsLoadedAt > 30000) {
+    try {
+      const resp = await fetch("/api/node_settings");
+      if (!resp.ok) return;
+      window._nodeSettings = (await resp.json()).settings || {};
+      window._nodeSettingsLoadedAt = Date.now();
+    } catch (e) {
+      return;
+    }
+  }
+  document.querySelectorAll(".idle-policy-select").forEach(sel => {
+    const st = window._nodeSettings[sel.dataset.nodeKey];
+    const custom = sel.parentElement.querySelector(`.idle-policy-custom[data-node-key="${CSS.escape(sel.dataset.nodeKey)}"]`);
+    let value = "default";
+    if (st && st.idle_policy === "never") value = "never";
+    else if (st && st.idle_policy === "minutes") {
+      value = ["15", "30", "60", "120"].includes(String(st.idle_minutes)) ? String(st.idle_minutes) : "custom";
+      if (custom && value === "custom") custom.value = st.idle_minutes;
+    }
+    sel.value = value;
+    if (custom) custom.hidden = value !== "custom";
+  });
+}
+
+function onIdlePolicyChange(sel) {
+  const key = sel.dataset.nodeKey;
+  const custom = sel.parentElement.querySelector(`.idle-policy-custom[data-node-key="${CSS.escape(key)}"]`);
+  if (sel.value === "custom") {
+    if (custom) { custom.hidden = false; custom.focus(); }
+    return;
+  }
+  if (custom) custom.hidden = true;
+  if (sel.value === "default" || sel.value === "never") saveIdlePolicy(key, sel.value, 15);
+  else saveIdlePolicy(key, "minutes", sel.value);
+}
+
+async function saveIdlePolicy(nodeKey, policy, minutes) {
+  const mins = parseInt(minutes, 10);
+  if (policy === "minutes" && (!(mins >= 5) || mins > 240)) {
+    showToast("待機時間は 5〜240 分で指定してください", "error");
+    return;
+  }
+  try {
+    const resp = await fetch(`/api/node_settings/${encodeURIComponent(nodeKey)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ idle_policy: policy, idle_minutes: mins || 15 })
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.message || `HTTP ${resp.status}`);
+    window._nodeSettings = window._nodeSettings || {};
+    window._nodeSettings[nodeKey] = { idle_policy: policy, idle_minutes: mins || 15 };
+    showToast("エンジン自動停止の設定を保存しました (次のハートビートで反映)", "success");
+  } catch (e) {
+    showToast(`設定の保存に失敗しました: ${e.message}`, "error");
+  }
+}
+window.onIdlePolicyChange = onIdlePolicyChange;
+window.saveIdlePolicy = saveIdlePolicy;
 
 // システムリソース ノード切り替え
 window.currentMetricsNode = 'master';
@@ -8075,7 +8159,10 @@ async function loadVolunteerTokens() {
     const rows = tokens.map(t => {
       const devs = devices.filter(d => d.token_id === t.token_id);
       const devHtml = devs.length
-        ? devs.map(d => `<span style="white-space:nowrap;">${d.online ? "🟢" : "⚪"} ${escapeHtml(d.device_name || d.node_id)}</span>`).join("<br>")
+        ? devs.map(d => `<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:3px;">
+            <span style="white-space:nowrap;">${d.online ? "🟢" : "⚪"} ${escapeHtml(d.device_name || d.node_id)}</span>
+            <span style="font-size:11px;color:var(--text-dim);">💤 ${idlePolicyControlHtml(d.node_id)}</span>
+          </div>`).join("")
         : '<span style="color:var(--text-dim);">未接続</span>';
       const revoked = Boolean(t.revoked_at);
       const action = revoked
@@ -8091,8 +8178,9 @@ async function loadVolunteerTokens() {
     }).join("");
     box.innerHTML = `<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:12px;">
       <thead><tr style="color:var(--text-muted);text-align:left;border-bottom:1px solid var(--border-color);">
-        <th style="padding:6px 8px;">名前</th><th style="padding:6px 8px;">発行日時</th><th style="padding:6px 8px;">最終利用</th><th style="padding:6px 8px;">端末</th><th></th>
+        <th style="padding:6px 8px;">名前</th><th style="padding:6px 8px;">発行日時</th><th style="padding:6px 8px;">最終利用</th><th style="padding:6px 8px;">端末 / エンジン自動停止 (Docker モード)</th><th></th>
       </tr></thead><tbody>${rows}</tbody></table></div>`;
+    applyNodeSettingsToControls(true);
   } catch (e) {
     box.innerHTML = `<div style="font-size:12px;color:#ff7878;">一覧の取得に失敗しました: ${escapeHtml(e.message)}</div>`;
   }

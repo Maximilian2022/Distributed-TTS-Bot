@@ -13,6 +13,7 @@ import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Set, Tuple
 import aiohttp
+from src.utils.worker_auth import agent_auth_headers
 from urllib.parse import urlparse
 try:
     import psutil
@@ -504,7 +505,7 @@ class LocalEngineResourceManager:
                 url = f"http://{ip}:50030/engine/stop"
                 timeout = aiohttp.ClientTimeout(total=4.0)
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(url, json={"engine": "all"}) as resp:
+                    async with session.post(url, json={"engine": "all"}, headers=agent_auth_headers()) as resp:
                         if resp.status == 200:
                             logger.info(f"✨ [Worker Stop] Successfully stopped engines on worker ({ip})")
             except Exception as e:
@@ -750,7 +751,7 @@ class LocalEngineResourceManager:
                     url = f"http://{ip}:50030/engine/start"
                     timeout = aiohttp.ClientTimeout(total=10.0)
                     async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.post(url, json={"engine": prov}) as resp:
+                        async with session.post(url, json={"engine": prov}, headers=agent_auth_headers()) as resp:
                             if resp.status == 200:
                                 logger.info(f"✨ [Worker Pre-warm] Remote engine '{prov}' ready on worker ({ip})")
                                 # ノード状態を即時アクティブに更新し、UIおよびルーティングへ即時反映
@@ -786,7 +787,7 @@ class LocalEngineResourceManager:
             url = f"http://{ip}:50030/models/ram_promote"
             timeout = aiohttp.ClientTimeout(total=90.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json={"model": model_id, "pinned": pinned}) as resp:
+                async with session.post(url, json={"model": model_id, "pinned": pinned}, headers=agent_auth_headers()) as resp:
                     if resp.status == 200:
                         logger.info(f"✨ [WorkerRAM] Worker ({ip}) でのモデル昇格成功: {model_id} (pinned={pinned})")
                         return True

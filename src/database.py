@@ -589,6 +589,16 @@ class Database:
                     revoked_at TIMESTAMP
                 )
             """)
+            # ワーカー別設定 (エンジン自動停止など。Master からハートビート応答で配信)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS worker_settings (
+                    node_key TEXT PRIMARY KEY,
+                    idle_policy TEXT DEFAULT 'default',
+                    idle_minutes INTEGER DEFAULT 15,
+                    updated_by INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS volunteer_devices (
                     node_id TEXT PRIMARY KEY,
@@ -2906,6 +2916,30 @@ class Database:
             async with db.execute("SELECT value FROM system_credentials WHERE key = ?", (key,)) as cur:
                 row = await cur.fetchone()
                 return str(row[0]) if row else default
+
+    # --- ワーカー別設定 ---
+
+    async def get_all_worker_settings(self) -> Dict[str, Dict[str, Any]]:
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT node_key, idle_policy, idle_minutes, updated_by, updated_at FROM worker_settings") as cur:
+                return {r["node_key"]: dict(r) for r in await cur.fetchall()}
+
+    async def upsert_worker_settings(self, node_key: str, idle_policy: str, idle_minutes: int, updated_by: int) -> None:
+        async with self.get_connection() as db:
+            await db.execute("""
+                INSERT INTO worker_settings (node_key, idle_policy, idle_minutes, updated_by)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(node_key) DO UPDATE SET idle_policy=excluded.idle_policy, idle_minutes=excluded.idle_minutes,
+                    updated_by=excluded.updated_by, updated_at=CURRENT_TIMESTAMP
+            """, (node_key, idle_policy, int(idle_minutes), int(updated_by)))
+            await db.commit()
+
+    async def get_volunteer_device_owner(self, node_id: str) -> Optional[int]:
+        async with self.get_connection() as db:
+            async with db.execute("SELECT discord_user_id FROM volunteer_devices WHERE node_id = ?", (node_id,)) as cur:
+                row = await cur.fetchone()
+                return int(row[0]) if row else None
 
     # --- ボランティアワーカーの個人トークン & 端末 ---
 

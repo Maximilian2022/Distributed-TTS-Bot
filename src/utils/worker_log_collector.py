@@ -17,6 +17,7 @@ from typing import Dict, Any, List, Optional, Union
 import re
 from pathlib import Path
 import aiohttp
+from src.utils.worker_auth import agent_auth_headers
 
 from src.utils.security import validate_safe_worker_ip, validate_safe_path, is_safe_identifier, sanitize_filename
 from src.utils.log_handler import compress_archive_worker
@@ -117,7 +118,7 @@ class WorkerLogCollector:
         own_session = self._session is None
 
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, headers=agent_auth_headers()) as resp:
                 if resp.status != 200:
                     return False
                 data = await resp.json()

@@ -27,6 +27,7 @@ from src.utils.alert_service import (
     SEVERITY_WARNING
 )
 from src.utils.system_info import get_host_system_info
+from src.utils.worker_auth import agent_auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -324,7 +325,7 @@ class TTSNode:
             # コンテナ起動＋ヘルスチェック完了（最大60秒、実測10〜15秒）を待機できる専用タイムアウトで送出
             client_to = aiohttp.ClientTimeout(total=timeout, connect=5.0)
             async with aiohttp.ClientSession(timeout=client_to) as temp_session:
-                async with temp_session.post(agent_url, json={"engine": engine}) as resp:
+                async with temp_session.post(agent_url, json={"engine": engine}, headers=agent_auth_headers()) as resp:
                     if resp.status == 200:
                         logger.info(f"✨ [On-Demand Start] Successfully woke engine '{engine}' on worker ({target_ip})")
                         self.is_healthy = True

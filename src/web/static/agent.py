@@ -23,6 +23,7 @@ import base64
 import tarfile
 import zipfile
 import hashlib
+import hmac
 import re
 import http.client
 import json
@@ -247,7 +248,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.13.8"
+    AGENT_VERSION = "3.14.0"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -1574,6 +1575,7 @@ class WorkerAgent:
         self._uploading_models: set = set()                                  # アップロード中モデル名セット
         self._model_upload_cooldowns: Dict[str, float] = {}                  # Push失敗時クーリングタイム (再試行抑止・子プロセス増殖防止)
         self._model_pull_cooldowns: Dict[str, float] = {}                    # Pull失敗時クーリングタイム (再試行抑止)
+        self.idle_policy: Optional[Dict[str, Any]] = None                    # Master から配信されるエンジン自動停止設定 (未配信なら環境変数の値)
 
         # Compose プロジェクト完全物理分離の自己点検・補完
         try:
@@ -1839,12 +1841,18 @@ hosts allow = *
                     self.last_used_time[eng] = now
                 continue
 
+            # Master から配信された設定を優先 (「停止しない」/ 待機時間)。未配信なら環境変数 IDLE_TIMEOUT_SECONDS
+            policy = self.idle_policy or {}
+            if policy and not policy.get("enabled", True):
+                continue
+            idle_timeout = int(policy.get("timeout_sec") or IDLE_TIMEOUT_SECONDS)
+
             for eng, meta in ENGINES.items():
                 cname = meta["container_name"]
                 if is_container_running(cname):
                     last = self.last_used_time.get(eng, 0.0)
-                    if last > 0 and (now - last) >= IDLE_TIMEOUT_SECONDS:
-                        logger.info(f"⏰ [Auto Sleep] '{eng}' はVC完全無人かつ15分間未使用のため自動停止します。")
+                    if last > 0 and (now - last) >= idle_timeout:
+                        logger.info(f"⏰ [Auto Sleep] '{eng}' はVC完全無人かつ{idle_timeout // 60}分間未使用のため自動停止します。")
                         self.stop_engine(eng)
 
 
@@ -2242,6 +2250,7 @@ hosts allow = *
                 if resp.status == 200:
                     data = await resp.json()
                     self.registered_to_master = True
+                    self.idle_policy = data.get("idle_policy")
                     logger.info(f"🎉 Master への自動登録成功！ (url={master_url}, concurrent={mac}, priority={pri})")
                     if data.get("ws_tunnel_required"):
                         self._ensure_ws_tunnel_started()
@@ -2404,6 +2413,7 @@ hosts allow = *
                         try:
                             hb_res = await resp.json()
                             self.any_human_in_vc = hb_res.get("any_human_in_vc", False)
+                            self.idle_policy = hb_res.get("idle_policy")
                             if hb_res.get("ws_tunnel_required"):
                                 self._ensure_ws_tunnel_started()
                             master_lan_url = hb_res.get("master_lan_url")
@@ -4017,11 +4027,26 @@ async def handle_model_download(request: web.Request) -> web.StreamResponse:
     return response
 
 
+AGENT_AUTH_EXEMPT_PATHS = ("/health",)
+
+
+@web.middleware
+async def agent_auth_middleware(request: web.Request, handler):
+    """共有ワーカートークン設定時は /health 以外を X-Worker-Token (または Bearer) で認証する"""
+    if WORKER_TOKEN and request.path not in AGENT_AUTH_EXEMPT_PATHS:
+        auth = request.headers.get("Authorization", "")
+        token = request.headers.get("X-Worker-Token") or (auth[7:].strip() if auth.startswith("Bearer ") else "")
+        if not token or not hmac.compare_digest(token.strip(), WORKER_TOKEN):
+            logger.warning(f"🚫 [AgentAuth] Rejected unauthenticated request to {request.path} from {request.remote}")
+            return web.json_response({"error": "Unauthorized"}, status=401)
+    return await handler(request)
+
+
 async def main():
     agent = WorkerAgent()
     agent.start_rsync_daemon()
 
-    app = web.Application()
+    app = web.Application(middlewares=[agent_auth_middleware])
     app["agent"] = agent
     app.router.add_post("/engine/start", handle_engine_start)
     app.router.add_post("/engine/stop", handle_engine_stop)
