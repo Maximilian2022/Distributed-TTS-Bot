@@ -172,7 +172,8 @@ class CoeiroinkTTSClient(BaseTTSClient):
         pitch: str = "0%",
         speed: float = 1.0,
         is_longest_chunk: bool = False,
-        prefer_earliest_finish: bool = False
+        prefer_earliest_finish: bool = False,
+        avoid_nodes: Optional[Set[str]] = None
     ) -> bytes:
         """
         指定されたテキストと話者・スタイルIDでCOEIROINK音声合成を実行
@@ -186,7 +187,8 @@ class CoeiroinkTTSClient(BaseTTSClient):
                 text_len=len(text),
                 is_longest_chunk=is_longest_chunk,
                 prefer_earliest_finish=prefer_earliest_finish,
-                model_name=voice_name
+                model_name=voice_name,
+                avoid_nodes=avoid_nodes
             )
             if not lease:
                 raise TTSConnectionError("No available COEIROINK node in pool (all busy or offline)")

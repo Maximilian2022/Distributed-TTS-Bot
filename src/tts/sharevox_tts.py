@@ -125,7 +125,8 @@ class SharevoxTTSClient(BaseTTSClient):
         pitch: str = "0%",
         speed: float = 1.0,
         is_longest_chunk: bool = False,
-        prefer_earliest_finish: bool = False
+        prefer_earliest_finish: bool = False,
+        avoid_nodes: Optional[Set[str]] = None
     ) -> bytes:
         """
         指定されたテキストとスタイルIDでSHAREVOX音声合成を実行
@@ -138,7 +139,8 @@ class SharevoxTTSClient(BaseTTSClient):
                 timeout=self.timeout_seconds,
                 text_len=len(text),
                 is_longest_chunk=is_longest_chunk,
-                prefer_earliest_finish=prefer_earliest_finish
+                prefer_earliest_finish=prefer_earliest_finish,
+                avoid_nodes=avoid_nodes
             )
             if not lease:
                 raise TTSConnectionError("No available SHAREVOX node in pool (all busy or offline)")

@@ -8741,3 +8741,28 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 
 
+
+## 2026-11-01 01:00 同一発話内チャンクの別ノード分散 (Anti-Affinity / ロードバランシング) 実装 (v2026.11.01-0100)
+- **課題・背景**:
+  - 10/31 22:36:25 の発話（ピー音等で分割されたチャンク #1「テストで」と #3「入れてたのよ」）において、クラスタ内に MASTERSOMEN2022 (RTX 3090, 3並列) と MASTEROMEN2017 (GTX 1080 Ti, 2並列) の両方が稼働していたにもかかわらず、両チャンクが RTX 3090 に同時に投入された。
+  - その結果、RTX 3090 内部での推論競合により後続の #3 (609ms) が先に終わり、先頭の #1 (844ms待機) が遅延して Azure 投機フォールバックが発動した。
+- **根本原因**:
+  - 先頭パーツは完了最短予測（`predict_eta_ms`）で RTX 3090 を獲得。
+  - 後続パーツは 153 マイクロ秒差で起動され、最長チャンク判定で「最強GPU優先」かつ RTX 3090 のセマフォ枠が空いていた（残り2枠）ため、別GPU（GTX 1080 Ti）が完全アイドルであるにもかかわらず 3090 に吸い込まれた。
+- **改修内容**:
+  1. **同一発話分散アーキテクチャ (`turn_avoid_nodes`)**:
+     - `src/cogs/vc_handler.py`: 発話ごとに共有の `turn_avoid_nodes: Set[str]` を生成。先頭本文パーツ（`head_idx`）が最短予測されたノード（例: `MASTERSOMEN2022`）を事前登録し、後続チャンクのタスクへ受け渡し。
+     - 先頭パーツは最速完了ノードを最優先で獲得するため制約をかけず、後続チャンクのみに `avoid_nodes` を適用。
+  2. **ノード選定・セマフォ獲得層 (`src/tts/node_pool.py`)**:
+     - `_order_available_nodes`: `avoid_nodes` 引数および `is_avoided` 判定を追加。同一 Tier（GPU同格）内で、まだ同一発話で使われていない別ノード（`is_avoided == 0`）を最優先整列。
+     - `acquire_node`: `avoid_nodes` 引数を追加し、ノード獲得成功時に自動で `avoid_nodes.add(node.machine_name)` を記録。
+     - ノード識別子照合: ホスト名、コンテナID、specs表示名など多様な表現に耐える柔軟な照合ロジックを実装。
+     - フォールバック保護: 利用可能な別ノードが存在しない場合（単一ノード構成）や全ノードがビジーな場合は、既存ノードの空き枠を通常通り利用してスタックを完全防止。
+  3. **TTS マネージャー・エンジン連携層 (`src/tts/manager.py`, `src/tts/*_tts.py`)**:
+     - `peek_earliest_finish`: 戻り値辞書に `"machine_name"` を追加。
+     - `get_chunk_audio`, `_synthesize_single_chunk`, `_try_local_engine`: `avoid_nodes` の受け渡しパイプラインを確立。
+     - `voicevox_tts.py`, `coeiroink_tts.py`, `sharevox_tts.py`: `synthesize` に `avoid_nodes` を追加し `node_pool.acquire_node` へ透過。
+  4. **バージョン更新 & テスト検証**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.11.01-0100"`
+     - `tests/test_turn_anti_affinity.py` 新規作成（Anti-Affinity ソート検証、セマフォ獲得＆セット自動記録検証、単一ノードフォールバック保護検証）。
+     - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて全 151 件の単体テストが **100% 合格（Ran 151 tests in 8.330s, OK）**。

@@ -883,14 +883,36 @@ class TTSNodePool:
         available: List[TTSNode],
         text_len: int = 0,
         is_longest_chunk: bool = False,
-        model_name: Optional[str] = None
+        model_name: Optional[str] = None,
+        avoid_nodes: Optional[Set[str]] = None
     ) -> List[TTSNode]:
-        """利用可能ノード一覧を Tier 設定およびエンジン別動的チャンク長・GPUパワースコアに従って整列"""
+        """利用可能ノード一覧を Tier 設定およびエンジン別動的チャンク長・GPUパワースコアに従って整列 (avoid_nodes による同一発話分散をサポート)"""
         eng_key = self.engine_name.lower()
         current_order = get_tier_routing_order(eng_key)
 
         def is_node_in_ram(node: TTSNode) -> bool:
             return self._is_node_in_ram(node, model_name)
+
+        def is_avoided(node: TTSNode) -> int:
+            """同一発話内の別チャンクが割り当て済みのノードを検知 (0: 未割当優先, 1: 割当済み後回し)"""
+            if not avoid_nodes:
+                return 0
+            node_identifiers = {
+                getattr(node, "machine_name", None),
+                getattr(node, "hostname", None),
+                getattr(node, "id", None),
+                getattr(node, "url", None),
+                getattr(node, "short_label", None),
+                getattr(node, "summary_label", None),
+            }
+            explicit_host = node.specs.get("host_hostname") or node.specs.get("hostname") or node.specs.get("machine_name")
+            if explicit_host:
+                node_identifiers.add(str(explicit_host).strip())
+
+            for target in node_identifiers:
+                if target and (target in avoid_nodes or any(a and (target in a or a in target) for a in avoid_nodes)):
+                    return 1
+            return 0
 
         buckets = {
             "gpu_ram": [n for n in available if n.has_gpu and is_node_in_ram(n)],
@@ -904,11 +926,11 @@ class TTSNodePool:
         long_threshold = max(8, int(dyn_max * 0.6))
 
         if is_longest_chunk or text_len >= long_threshold:
-            gpu_sort_key = lambda n: (n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
+            gpu_sort_key = lambda n: (is_avoided(n), n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
         else:
-            gpu_sort_key = lambda n: (n.active_count, latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
+            gpu_sort_key = lambda n: (is_avoided(n), n.active_count, latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
 
-        cpu_sort_key = lambda n: (n.active_count, n.priority, n.last_latency_ms)
+        cpu_sort_key = lambda n: (is_avoided(n), n.active_count, n.priority, n.last_latency_ms)
 
         buckets["gpu_ram"].sort(key=gpu_sort_key)
         buckets["gpu_ssd"].sort(key=gpu_sort_key)
@@ -1001,11 +1023,13 @@ class TTSNodePool:
         is_longest_chunk: bool = False,
         model_name: Optional[str] = None,
         guild_id: Optional[Any] = None,
-        prefer_earliest_finish: bool = False
+        prefer_earliest_finish: bool = False,
+        avoid_nodes: Optional[Set[str]] = None
     ) -> Optional[NodeLease]:
         """
         エンジン毎の動的 4段階 Tier ルーティング (WebUIでエンジン毎に優先順位を設定可能)
         - デフォルト: GPU+RAMDisk -> CPU+RAMDisk -> GPU+SSD -> CPU+SSD
+        - avoid_nodes: 同一発話内で別チャンクが割り当て済みのノード (分散ロードバランシング)
         - 全ノードがビジーの場合は空くまで最大 timeout 秒待機
         """
         now_ts = time.time()
@@ -1067,6 +1091,8 @@ class TTSNodePool:
                     await asyncio.wait_for(best.semaphore.acquire(), timeout=0.05)
                     best.active_count += 1
                     best.total_requests += 1
+                    if avoid_nodes is not None and getattr(best, "machine_name", None):
+                        avoid_nodes.add(best.machine_name)
                     return NodeLease(self, best, text_len=text_len)
                 except asyncio.TimeoutError:
                     continue  # 50ms ごとに再評価 (他ノードの予測が下回れば乗り換え)
@@ -1075,12 +1101,19 @@ class TTSNodePool:
                 available,
                 text_len=text_len,
                 is_longest_chunk=is_longest_chunk,
-                model_name=model_name
+                model_name=model_name,
+                avoid_nodes=avoid_nodes
             )
-            logger.debug(
-                f"🎯 [{self.engine_name} Dynamic Routing] model={model_name or 'any'} | "
-                f"Candidate => {ordered_nodes[0].machine_name if ordered_nodes else 'None'}"
-            )
+            if avoid_nodes and ordered_nodes:
+                logger.debug(
+                    f"🔀 [{self.engine_name} Anti-Affinity] Avoiding={avoid_nodes} | "
+                    f"Candidate => {ordered_nodes[0].machine_name}"
+                )
+            else:
+                logger.debug(
+                    f"🎯 [{self.engine_name} Dynamic Routing] model={model_name or 'any'} | "
+                    f"Candidate => {ordered_nodes[0].machine_name if ordered_nodes else 'None'}"
+                )
 
             # 1. 即座に空いているノードを最優先で確保
             for node in ordered_nodes:
@@ -1089,6 +1122,8 @@ class TTSNodePool:
                         await asyncio.wait_for(node.semaphore.acquire(), timeout=0.01)
                         node.active_count += 1
                         node.total_requests += 1
+                        if avoid_nodes is not None and getattr(node, "machine_name", None):
+                            avoid_nodes.add(node.machine_name)
                         return NodeLease(self, node, text_len=text_len)
                     except asyncio.TimeoutError:
                         continue
@@ -1104,6 +1139,8 @@ class TTSNodePool:
                     await asyncio.wait_for(best_cand.semaphore.acquire(), timeout=wait_time)
                     best_cand.active_count += 1
                     best_cand.total_requests += 1
+                    if avoid_nodes is not None and getattr(best_cand, "machine_name", None):
+                        avoid_nodes.add(best_cand.machine_name)
                     return NodeLease(self, best_cand, text_len=text_len)
                 except asyncio.TimeoutError:
                     pass
@@ -1114,6 +1151,8 @@ class TTSNodePool:
                     await asyncio.wait_for(best_cand.semaphore.acquire(), timeout=wait_time)
                     best_cand.active_count += 1
                     best_cand.total_requests += 1
+                    if avoid_nodes is not None and getattr(best_cand, "machine_name", None):
+                        avoid_nodes.add(best_cand.machine_name)
                     return NodeLease(self, best_cand, text_len=text_len)
                 except asyncio.TimeoutError:
                     pass

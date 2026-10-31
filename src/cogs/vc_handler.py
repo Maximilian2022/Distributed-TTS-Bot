@@ -1289,6 +1289,16 @@ class VCHandlerCog(commands.Cog):
             except Exception as plan_err:
                 logger.debug(f"Head planning skipped: {plan_err}")
 
+        # 同一発話内チャンクの別ノード分散 (Anti-Affinity) 用セット:
+        # 先頭本文パーツが完了最短と予測されたノードを後続チャンクの回避ノードに事前登録し、同一GPU競合を防止
+        turn_avoid_nodes: Set[str] = set()
+        if head_pred:
+            pred_m = head_pred.get("machine_name")
+            if pred_m:
+                turn_avoid_nodes.add(pred_m)
+            elif head_pred.get("node") and getattr(head_pred.get("node"), "machine_name", None):
+                turn_avoid_nodes.add(head_pred.get("node").machine_name)
+
         # 分割パーツの中で推論対象となる本文チャンクの最長チャンクを特定（最強GPUへ優先ルーティングするため）
         # ※ 発言者名プレフィックス (is_name_prefix=True) やピー音 (is_beep=True) は除外し、
         #    エンジン別動的チャンク上限 (8〜30文字) に合わせて固定文字数足切りを行わず最長本文を特定する。
@@ -1325,7 +1335,13 @@ class VCHandlerCog(commands.Cog):
             stream_source=stream_source,
         )
 
-        async def _synth_chunk(ch, is_longest: bool, chunk_idx: int = 0, est_headroom_sec: float = 0.0):
+        async def _synth_chunk(
+            ch,
+            is_longest: bool,
+            chunk_idx: int = 0,
+            est_headroom_sec: float = 0.0,
+            avoid_nodes: Optional[Set[str]] = None
+        ):
             t_s = time.time()
             if getattr(ch, "is_beep", False):
                 beep_pcm = get_beep_pcm(getattr(ch, "beep_duration_sec", 0.4))
@@ -1359,6 +1375,9 @@ class VCHandlerCog(commands.Cog):
                 if tl_mode == "on":
                     deadline_fn = _deadline
 
+            is_head = (route_mode == "on" and chunk_idx == head_idx)
+            chunk_avoid = None if is_head else avoid_nodes
+
             b, p, w, c = await self.tts_manager.get_chunk_audio(
                 text=ch.text,
                 speaker_id=item.speaker_id,
@@ -1368,7 +1387,8 @@ class VCHandlerCog(commands.Cog):
                 is_longest_chunk=is_longest,
                 speculative_timeout=chunk_spec_timeout,
                 speculative_deadline_fn=deadline_fn,
-                prefer_earliest_finish=(route_mode == "on" and chunk_idx == head_idx)
+                prefer_earliest_finish=is_head,
+                avoid_nodes=chunk_avoid
             )
             t_e = time.time()
             c_meta = (
@@ -1397,14 +1417,26 @@ class VCHandlerCog(commands.Cog):
             # 名前なしで先頭が本文の場合、先頭パーツを最初に起動して完了予測最短ノードを確実に確保する
             head_first_task: Optional[asyncio.Task] = None
             if route_mode == "on" and head_idx == 0:
-                head_first_task = asyncio.create_task(_synth_chunk(first_chunk, first_is_longest, chunk_idx=0, est_headroom_sec=0.0))
+                head_first_task = asyncio.create_task(_synth_chunk(
+                    first_chunk,
+                    first_is_longest,
+                    chunk_idx=0,
+                    est_headroom_sec=0.0,
+                    avoid_nodes=turn_avoid_nodes
+                ))
                 all_created_tasks.append(head_first_task)
 
             if len(all_chunks) > 1:
                 cum_headroom_sec = _estimate_chunk_play_sec(first_chunk)
                 for idx, ch in enumerate(all_chunks[1:], start=1):
                     is_long = (idx == longest_idx)
-                    t = asyncio.create_task(_synth_chunk(ch, is_long, chunk_idx=idx, est_headroom_sec=cum_headroom_sec))
+                    t = asyncio.create_task(_synth_chunk(
+                        ch,
+                        is_long,
+                        chunk_idx=idx,
+                        est_headroom_sec=cum_headroom_sec,
+                        avoid_nodes=turn_avoid_nodes
+                    ))
                     remaining_tasks.append(t)
                     all_created_tasks.append(t)
                     cum_headroom_sec += _estimate_chunk_play_sec(ch)
@@ -1414,7 +1446,11 @@ class VCHandlerCog(commands.Cog):
                 c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await head_first_task
             else:
                 c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await _synth_chunk(
-                    first_chunk, first_is_longest, chunk_idx=0, est_headroom_sec=0.0
+                    first_chunk,
+                    first_is_longest,
+                    chunk_idx=0,
+                    est_headroom_sec=0.0,
+                    avoid_nodes=turn_avoid_nodes
                 )
 
             # 第1チャンクをストリームに投入

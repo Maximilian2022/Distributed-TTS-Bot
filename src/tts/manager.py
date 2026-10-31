@@ -574,7 +574,13 @@ class TTSManager:
         node, eta_ms = pool.peek_earliest_finish(text_len, model_name=model_name, guild_id=guild_id)
         if node is None:
             return {}
-        return {"node": node, "worker_label": node.short_label, "has_gpu": bool(node.has_gpu), "eta_ms": eta_ms}
+        return {
+            "node": node,
+            "worker_label": node.short_label,
+            "machine_name": getattr(node, "machine_name", ""),
+            "has_gpu": bool(node.has_gpu),
+            "eta_ms": eta_ms
+        }
 
     def get_planning_nodes(
         self,
@@ -798,7 +804,8 @@ class TTSManager:
         pitch: str,
         speed: float,
         is_longest_chunk: bool = False,
-        prefer_earliest_finish: bool = False
+        prefer_earliest_finish: bool = False,
+        avoid_nodes: Optional[Set[str]] = None
     ) -> Optional[bytes]:
         """
         ローカルTTSエンジン（VOICEVOX, SHAREVOX, COEIROINK）の共通合成処理 (A-5, E-4)。
@@ -806,7 +813,11 @@ class TTSManager:
         """
         if not client.is_available():
             return None
-        route_kwargs = {"prefer_earliest_finish": True} if prefer_earliest_finish else {}
+        route_kwargs = {}
+        if prefer_earliest_finish:
+            route_kwargs["prefer_earliest_finish"] = True
+        if avoid_nodes:
+            route_kwargs["avoid_nodes"] = avoid_nodes
 
         # 外部GPUノードが稼働している場合は、Master自機コンテナ起動とホスト排他ロックをバイパスして即時並行実行
         if pool.has_active_external_gpu_node():
@@ -858,13 +869,15 @@ class TTSManager:
         speculative_timeout: Optional[float] = None,
         speculative_deadline_fn: Optional[Callable[[], float]] = None,
         prefer_earliest_finish: bool = False,
-        local_only: bool = False
+        local_only: bool = False,
+        avoid_nodes: Optional[Set[str]] = None
     ) -> Tuple[bytes, str, str]:
         """
         単一のテキストパーツを合成。
         - speculative_deadline_fn: 投機発火の絶対時刻 (time.time() 基準) を返す関数。指定時は毎回再評価しながら待つ
           (再生タイムライン基準)。未指定時は従来の speculative_timeout (相対秒)
         - local_only: ローカルエンジンのみで合成し、投機・フォールバックしない (先行合成のキャッシュ温め用)
+        - avoid_nodes: 同一発話内で別チャンクが割り当て済みのノード (分散ロードバランシング)
         - プライマリプロバイダーを最優先
         - Google 95% (950,000文字) 到達時は課金防止のため自動バイパス
         - 障害時は Azure ➔ Google ➔ VOICEVOX の多層セーフティネットで自動フォールバック
@@ -873,13 +886,13 @@ class TTSManager:
         primary_provider = voice_cfg.provider
 
         async def _try_voicevox(style_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("voicevox", self.voicevox_client, self.voicevox_pool, text, style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish)
+            return await self._try_local_engine("voicevox", self.voicevox_client, self.voicevox_pool, text, style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
 
         async def _try_sharevox(style_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("sharevox", self.sharevox_client, self.sharevox_pool, text, style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish)
+            return await self._try_local_engine("sharevox", self.sharevox_client, self.sharevox_pool, text, style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
 
         async def _try_coeiroink(voice_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("coeiroink", self.coeiroink_client, self.coeiroink_pool, text, voice_val, pitch, speed, is_longest_chunk, prefer_earliest_finish)
+            return await self._try_local_engine("coeiroink", self.coeiroink_client, self.coeiroink_pool, text, voice_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
 
         preview_text = text[:30] + ("..." if len(text) > 30 else "")
 
@@ -1300,7 +1313,8 @@ class TTSManager:
         speculative_timeout: Optional[float] = None,
         speculative_deadline_fn: Optional[Callable[[], float]] = None,
         prefer_earliest_finish: bool = False,
-        local_only: bool = False
+        local_only: bool = False,
+        avoid_nodes: Optional[Set[str]] = None
     ) -> Tuple[bytes, str, str, bool]:
         """
         単一チャンク（文パーツや発言者名プレフィックス等）の音声バイト列を取得。
@@ -1336,7 +1350,8 @@ class TTSManager:
         # 2. 合成実行
         audio_bytes, used_provider, used_param = await self._synthesize_single_chunk(
             text, speaker_id, pitch, speed, is_longest_chunk=is_longest_chunk, speculative_timeout=speculative_timeout,
-            speculative_deadline_fn=speculative_deadline_fn, prefer_earliest_finish=prefer_earliest_finish, local_only=local_only
+            speculative_deadline_fn=speculative_deadline_fn, prefer_earliest_finish=prefer_earliest_finish, local_only=local_only,
+            avoid_nodes=avoid_nodes
         )
         worker_lbl = self._get_worker_label_for_provider(used_provider)
         is_fb = (used_provider != provider)

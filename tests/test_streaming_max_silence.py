@@ -151,7 +151,7 @@ def _make_manager(singleflight: str, local_delay: float, cloud_delay: float = 0.
     m._get_voice_config = lambda speaker_id: voice
     m._get_worker_label_for_provider = lambda prov: prov
 
-    async def fake_local(engine_name, client, pool, text, style_val, pitch, speed, is_longest_chunk=False, prefer_earliest_finish=False):
+    async def fake_local(engine_name, client, pool, text, style_val, pitch, speed, is_longest_chunk=False, prefer_earliest_finish=False, avoid_nodes=None, **kwargs):
         m.local_calls += 1
         await asyncio.sleep(local_delay)
         return WAV

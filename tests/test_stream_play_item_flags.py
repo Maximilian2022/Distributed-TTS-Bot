@@ -56,7 +56,7 @@ class FakeTTS:
 
     async def get_chunk_audio(self, text, speaker_id, pitch, speed, user_id=0, is_longest_chunk=False,
                               speculative_timeout=None, speculative_deadline_fn=None, prefer_earliest_finish=False,
-                              local_only=False):
+                              local_only=False, avoid_nodes=None, **kwargs):
         self.calls.append({
             "text": text,
             "deadline_rel": (speculative_deadline_fn() - time.time()) if speculative_deadline_fn else None,
