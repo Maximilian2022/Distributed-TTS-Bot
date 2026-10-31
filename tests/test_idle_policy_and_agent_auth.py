@@ -141,3 +141,29 @@ class TestAgentAuthDisabledWithoutToken(_AgentAppBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAgentComposeSelfHealGuard(unittest.TestCase):
+    """Docker Desktop 再起動直後などで compose が空に見えても、name 行だけで上書きしないこと"""
+
+    def test_empty_compose_is_left_untouched(self):
+        agent = _load_agent("x")
+        with tempfile.TemporaryDirectory() as d:
+            w = os.path.join(d, "docker-compose.worker.yml")
+            a = os.path.join(d, "docker-compose.agent.yml")
+            open(w, "w").close()
+            open(a, "w").close()
+            agent.ensure_compose_project_isolation(d)
+            self.assertEqual(os.path.getsize(w), 0)
+            self.assertEqual(os.path.getsize(a), 0)
+
+    def test_name_is_added_to_real_compose(self):
+        agent = _load_agent("x")
+        with tempfile.TemporaryDirectory() as d:
+            w = os.path.join(d, "docker-compose.worker.yml")
+            with open(w, "w") as f:
+                f.write("services:\n  worker-voicevox:\n    image: x\n")
+            agent.ensure_compose_project_isolation(d)
+            content = open(w).read()
+            self.assertTrue(content.startswith("name: ttsbot-worker-engines"))
+            self.assertIn("worker-voicevox", content)

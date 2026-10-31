@@ -248,7 +248,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.14.0"
+    AGENT_VERSION = "3.14.1"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -1442,7 +1442,11 @@ def ensure_compose_project_isolation(work_dir: str) -> bool:
         try:
             with open(w_path, "r", encoding="utf-8") as f:
                 w_content = f.read()
-            if "name: ttsbot-worker-engines" not in w_content:
+            if not w_content.strip():
+                # Docker Desktop の再起動直後などでバインドマウントが未準備だと空に見える。
+                # ここで書き戻すと本来の定義を「name 行だけ」で上書きしてしまうため触らない
+                logger.warning(f"⚠️ {w_path} が空に見えるため、プロジェクト名の自動設定をスキップします (マウント未準備の可能性)")
+            elif "name: ttsbot-worker-engines" not in w_content:
                 if re.search(r"^name:\s*.*$", w_content, re.MULTILINE):
                     w_new = re.sub(r"^name:\s*.*$", "name: ttsbot-worker-engines", w_content, flags=re.MULTILINE)
                 else:
@@ -1460,6 +1464,9 @@ def ensure_compose_project_isolation(work_dir: str) -> bool:
         try:
             with open(a_path, "r", encoding="utf-8") as f:
                 a_content = f.read()
+            if not a_content.strip():
+                logger.warning(f"⚠️ {a_path} が空に見えるため、自動設定をスキップします (マウント未準備の可能性)")
+                return updated
             changed = False
             a_new = re.sub(r'image:\s*["\']?python:[0-9.]+(-slim)?["\']?', 'image: python:3.14-slim', a_content)
             if a_new != a_content:
@@ -3390,6 +3397,14 @@ hosts allow = *
                         fallback = os.path.join(work_dir, "docker-compose.agent.yml")
                         if os.path.exists(fallback):
                             agent_compose = fallback
+                        elif not (os.path.isdir(work_dir) and os.listdir(work_dir)):
+                            # 作業ディレクトリが無い・空 = バインドマウント未準備の可能性。
+                            # ここで標準構成を生成すると、ホスト側の本来の構成 (Windows はポート公開・GPU 情報・トークン) を失う
+                            logger.warning(f"⚠️ {work_dir} が空に見えるため、agent compose の自動生成をスキップします (マウント未準備の可能性)")
+                        elif "docker-desktop" in (socket.gethostname() or "").lower():
+                            # Docker Desktop (Windows/macOS) では network_mode: host がホストへポートを公開しないため、
+                            # Linux 用の標準構成は生成しない (セットアップスクリプトの再実行で復元する)
+                            logger.warning("⚠️ docker-compose.agent.yml が見つかりません。Docker Desktop 環境のため自動生成せず、セットアップスクリプトでの復元を推奨します")
                         else:
                             # 存在しない場合は標準構成で自動生成
                             try:
