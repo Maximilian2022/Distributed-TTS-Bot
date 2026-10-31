@@ -151,7 +151,7 @@ class WebServer:
             middlewares=[self._security_and_rate_limit_middleware]
         )
         self._start_time = time.time()
-        self.master_instance_id = f"master_{uuid.uuid4().hex[:12]}"
+        self.master_instance_id = self._load_or_create_master_instance_id()
         self._previous_secret_warned: Dict[str, float] = {}
         self.ha_slaves: Dict[str, Dict[str, Any]] = {}
         self.ha_revoked_nodes: set = set()
@@ -1157,6 +1157,25 @@ class WebServer:
             "Content-Disposition": 'attachment; filename="ttsbot-volunteer-worker.zip"'
         }
         return web.Response(body=buf.read(), content_type="application/zip", headers=headers)
+
+    def _load_or_create_master_instance_id(self) -> str:
+        """
+        HA 用の Master インスタンス ID。再起動で変わると、Slave が LAN 直通検証で別インスタンスと誤認するため
+        data/ha_master_instance_id に永続化する (Slave 昇格時の app は自分の data/ で別 ID を持つ)。
+        """
+        id_file = Path(self.config.db_path).parent / "ha_master_instance_id"
+        try:
+            if id_file.exists():
+                saved = id_file.read_text(encoding="utf-8").strip()
+                if saved:
+                    return saved
+            new_id = f"master_{uuid.uuid4().hex[:12]}"
+            id_file.parent.mkdir(parents=True, exist_ok=True)
+            id_file.write_text(new_id, encoding="utf-8")
+            return new_id
+        except Exception as e:
+            logger.warning(f"[HA] Failed to persist master instance id: {e}")
+            return f"master_{uuid.uuid4().hex[:12]}"
 
     def _verify_ha_auth(self, request: web.Request) -> bool:
         """HA API 共有シークレット認証 (Master-Slave間)"""

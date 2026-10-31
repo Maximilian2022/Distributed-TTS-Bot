@@ -7,8 +7,8 @@ from pathlib import Path
 デプロイ・更新時に更新することで、ブラウザキャッシュの無効化と画面上でのバージョン確認を可能にします。
 """
 
-BUILD_VERSION = "v2026.10.30-2211"
-BUILD_DATE = "2026-10-30 22:11:00 JST"
+BUILD_VERSION = "v2026.10.31-1256"
+BUILD_DATE = "2026-10-31 12:56:00 JST"
 APP_NAME = "Distributed TTS Discord Bot"
 AGENT_VERSION = "3.13.8"  # 最新 Worker Agent バージョン (単一管理元: SSOT)
 

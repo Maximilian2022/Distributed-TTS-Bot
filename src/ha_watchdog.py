@@ -159,6 +159,8 @@ class HAWatchdog:
                 self.master_url = self.master_url[:-7]
 
         self.ha_secret = os.getenv("TTSBOT_HA_SECRET", os.getenv("HA_SECRET", "")).strip()
+        # 起動時 LAN 判定で最優先に試す Master の LAN URL (任意、カンマ区切り)
+        self.master_lan_urls = [u.strip().rstrip("/") for u in os.getenv("TTSBOT_MASTER_LAN_URL", "").split(",") if u.strip()]
         self.check_interval = float(os.getenv("TTSBOT_CHECK_INTERVAL", "5.0"))
         self.base_fail_threshold = int(os.getenv("TTSBOT_FAIL_THRESHOLD", "18"))  # 基本: 18回 (約90秒: Cloudflare Tunnel再確立遅延30〜45秒を確実に吸収)
         self.priority = int(os.getenv("TTSBOT_HA_PRIORITY", "1"))  # 優先度 (1=最速昇格、2=待機昇格)
@@ -450,23 +452,25 @@ class HAWatchdog:
                 with urllib.request.urlopen(req, timeout=1.5) as resp:
                     if resp.status == 200:
                         data = json.loads(resp.read().decode("utf-8"))
-                        # 厳格な実体照合: role が master かつ instance_id が完全一致するか確認
-                        if data.get("role") == "master" and data.get("master_instance_id") == expected_instance_id:
+                        # 照合の根拠は HA シークレット認証 (200 応答) と role == master。
+                        # 同じシークレットを持つのは同一クラスタのみ。instance_id は Master 再起動で変わり得るため
+                        # 不一致でも受け入れてキャッシュを更新する (旧実装では WAN 断と重なると誤昇格し得た)
+                        if data.get("role") == "master":
+                            got_id = data.get("master_instance_id")
+                            if got_id and got_id != expected_instance_id:
+                                logger.info(
+                                    f"🔄 [HA Direct Handshake] Master at {candidate_url} reports a new instance ID "
+                                    f"({expected_instance_id} -> {got_id}). Accepting (HA secret verified)."
+                                )
+                                self.master_instance_id = got_id
                             if not self.is_direct_verified or self.direct_master_url != candidate_url:
                                 logger.info(
-                                    f"🟢 [HA Direct Handshake] Verified LAN Direct connection to Master at {candidate_url} "
-                                    f"(Instance ID matched: {expected_instance_id})! Direct sync enabled."
+                                    f"🟢 [HA Direct Handshake] Verified LAN Direct connection to Master at {candidate_url}! Direct sync enabled."
                                 )
                             self.is_direct_verified = True
                             self.direct_master_url = candidate_url
                             self._save_master_cache()
                             return True
-                        else:
-                            logger.warning(
-                                f"⚠️ [HA Direct Handshake] IP {ip}:{master_port} responded, but instance ID mismatch! "
-                                f"(Expected {expected_instance_id}, got {data.get('master_instance_id')}). "
-                                f"Subnet collision or different cluster detected. Ignoring candidate."
-                            )
             except Exception as e:
                 logger.debug(f"[HA Direct Handshake] Candidate {candidate_url} unreachable: {e}")
 
@@ -475,6 +479,64 @@ class HAWatchdog:
         self.is_direct_verified = False
         self.direct_master_url = ""
         return False
+
+    def _startup_lan_candidates(self) -> List[str]:
+        """起動時 LAN 判定の候補 URL (重複除去・順序維持)"""
+        cands: List[str] = list(self.master_lan_urls)
+        if self.direct_master_url:
+            cands.append(self.direct_master_url.rstrip("/"))
+        try:
+            from urllib.parse import urlparse
+            import ipaddress
+            host = urlparse(self.master_url).hostname or ""
+            if host and ipaddress.ip_address(host).is_private:
+                cands.append(self.master_url.rstrip("/"))
+        except ValueError:
+            pass  # ホスト名 (ドメイン) は WAN として扱う
+        except Exception:
+            pass
+        for ip in self.cached_master_local_ips:
+            if ip and not ip.startswith("127."):
+                cands.append(f"http://{ip}:{self.cached_master_port}")
+        seen = set()
+        return [c for c in cands if not (c in seen or seen.add(c))]
+
+    def probe_master_route_at_startup(self) -> str:
+        """
+        起動時に Master への LAN 直通を判定する。LAN で HA 認証付き /api/ha/status が role=master を返せば LAN、
+        どれも不可なら WAN。以後の死活確認・同期は既存の「LAN 優先 → WAN フォールバック」に乗る。
+        """
+        headers = self._get_common_headers()
+        headers["X-HA-Handshake"] = "startup_probe"
+        for base in self._startup_lan_candidates():
+            try:
+                req = urllib.request.Request(f"{base}/api/ha/status", headers=headers)
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if data.get("role") != "master":
+                        continue
+                    self.is_direct_verified = True
+                    self.direct_master_url = base
+                    self.last_direct_check_time = time.time()
+                    if data.get("master_instance_id"):
+                        self.master_instance_id = data["master_instance_id"]
+                    self.cached_master_local_ips = data.get("master_local_ips", self.cached_master_local_ips) or self.cached_master_local_ips
+                    self.cached_master_port = int(data.get("master_port", self.cached_master_port) or self.cached_master_port)
+                    self._save_master_cache()
+                    logger.info(f"🟢 [Startup] Master route: LAN ({base})")
+                    return "lan"
+            except urllib.error.HTTPError as e:
+                if e.code == 410:
+                    self._handle_revocation()
+                logger.debug(f"[Startup] LAN candidate {base} rejected: HTTP {e.code}")
+            except Exception as e:
+                logger.debug(f"[Startup] LAN candidate {base} unreachable: {e}")
+        self.is_direct_verified = False
+        self.direct_master_url = ""
+        logger.info(f"🌐 [Startup] Master route: WAN ({self.master_url}) — LAN direct connection not available")
+        return "wan"
 
     def check_internet_connectivity(self) -> bool:
         """外向きインターネット接続 (Cloudflare/Discord) 疎通検証"""
@@ -1067,6 +1129,9 @@ class HAWatchdog:
         if not self.master_url:
             logger.error("FATAL: TTSBOT_MASTER_URL is not set. Please specify Master URL.")
             return
+
+        # 起動時に LAN 直通を判定 (LAN で繋がれば LAN、無理なら WAN)
+        self.probe_master_route_at_startup()
 
         # 初回起動時に即座に初回DBプルを試行
         logger.info("Initiating first DB snapshot synchronization from Master...")

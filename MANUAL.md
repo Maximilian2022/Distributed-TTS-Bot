@@ -172,7 +172,9 @@ Discord APIの制約（1クライアントは同時に単一VCのみ接続可能
 | **OpenJTalk** | スタンドアロン (C言語) | 不要 | 外部通信を行わないローカルセーフティネット |
 
 - **投機的デュアルストリーミング (Speculative Dual-Streaming)**:
-  - ローカル推論ノードへの要求発行後、設定秒数（デフォルト: 1.5秒）以内に先頭チャンクの応答が得られない場合、バックグラウンドで即座にクラウドエンジン（Edge-TTS/Azure）への投機的並行リクエストを発行し、待機時間を短縮します。
+  - ローカル推論ノードの応答が締切までに得られない場合、クラウドエンジン（Azure）へ並行リクエストを発行し、先に完成した方を採用します。
+  - `STREAM_TL_SPECULATIVE=on` のときの締切は、各パーツの再生予定時刻からクラウド応答マージン（0.45 秒）を引いた時刻で、再生の進行に合わせて再評価します。ギルド設定の「最大許容沈黙」（既定 1.5 秒、1.0〜2.5 秒）が、再生の順番が来てから最初の音が出るまでの上限になります。
+  - `off` / `shadow` のときは従来どおり、合成開始からの秒数（ギルド設定 `speculative_timeout_seconds` を上限）で判定します。
 
 ### 3.5 モデレーション & 辞書システム
 - **NGワードフィルタ (モデレーション)**:
@@ -183,18 +185,55 @@ Discord APIの制約（1クライアントは同時に単一VCのみ接続可能
   - ギルド共通の読み替え辞書（`/dict`）およびユーザー個人の専用辞書（`/userdict`）をサポート。
 
 ### 3.6 高可用性 (HA) 冗長化仕様
-主系（Master）と副系（Slave）による Active-Standby 冗長化機構を備えています。
+主系（Master）と 1 台以上の副系（Standby Slave）による Active-Standby 構成です。Slave は通常 Master と同じ LAN に置きますが、物理的に別拠点に置き、Cloudflare Tunnel 経由（WAN）で Master と通信する構成にも対応します。
 
-- **HA Watchdog (`ha_watchdog.py`)**:
-  - 副系ノード上で常駐デーモンとして動作し、Docker Engine API（`/var/run/docker.sock`）を直接制御します。
-  - Master の `/api/ha/status` を定期的に監視（デフォルト: 5秒間隔）。
-- **オンラインデータベース同期**:
-  - Master の `/api/ha/db_snapshot` から定期的に最新データベース（SQLite）を取得。SQLite オンラインバックアップ API を経由することで、トランザクション整合性を保った状態でレプリカを生成します。
-- **自動フェイルオーバー & 昇格**:
-  - Master の連続無応答を検知（デフォルト: 6回連続）した場合、Slave は自律的に `ttsbot-app` コンテナを起動して主系に昇格します。
-- **Split-Brain 防護機構**:
-  - 旧 Master が復帰した場合、Slave は即座に自律降格（Preempt Demote）します。
-  - システムアップデート時には `data/.ha_updating` シグナルを発行し、一時的な停止に伴う副系の誤昇格を確実に防止します。
+#### 3.6.1 構成
+- **Slave の構成要素**: 監視デーモン `standby-watchdog`（`src/ha_watchdog.py`、compose の profile `standby`）と、通常は停止している `app`（および `CLOUDFLARE_TUNNEL_TOKEN` 設定時は `tunnel`、profile `active`）。
+- **Watchdog** は Docker Engine API（`/var/run/docker.sock`）で `app` / `tunnel` の起動・停止を行います。
+- **認証**: Master ⇔ Slave 間の API（`/api/ha/*`）は HA 共有シークレット（`TTSBOT_HA_SECRET`）で認証します。
+- **ノード識別**: Slave はノード ID（`data/ha_node_id`）、Master はインスタンス ID（`data/ha_master_instance_id`、再起動しても不変）を永続化します。
+
+#### 3.6.2 Master への経路（LAN / WAN）の決定
+1. **起動時判定**: Watchdog は起動直後に、次の候補へ HA シークレット付きで `/api/ha/status` を照会し、`role: master` が返った最初の候補を LAN 直通経路として採用します。どれも応答しなければ WAN（`TTSBOT_MASTER_URL`）を使います。
+   - `TTSBOT_MASTER_LAN_URL`（任意・カンマ区切り）
+   - 前回確定した LAN 直通 URL（`data/ha_master_cache.json`）
+   - `TTSBOT_MASTER_URL` 自体がプライベート IP の場合はそれ
+   - 前回取得した Master のローカル IP
+2. **稼働中の再検証**: WAN 経由の応答に含まれる Master のローカル IP を用いて、LAN 直通を定期的に再検証します（確立済みは 5 分ごと、未確立は 60 秒ごと）。照合の根拠は「HA シークレット認証が通り `role: master` であること」で、Master の再起動でインスタンス ID が変わっても受け入れます。
+3. **通信の優先順位**: 死活確認・DB 同期・キャッシュ同期は LAN 直通を優先し、失敗時は WAN にフォールバックします。
+
+#### 3.6.3 監視と同期
+| 処理 | 周期・契機 | 内容 |
+| :--- | :--- | :--- |
+| 死活確認 | 5 秒（+0.1〜0.8 秒のジッター） | `/api/ha/status`（認証付き）。失敗時は `/health` で生存確認 |
+| DB 同期 | 60 秒（`TTSBOT_SYNC_INTERVAL`） | `/api/ha/db_snapshot` から SQLite オンラインバックアップを取得（ETag で差分なしはスキップ、ヘッダ検証後にアトミック配置） |
+| コード同期 | Master のコードハッシュ変化時（60 秒のクールダウン） | `/api/ha/code_snapshot` を取得し、全 Python ファイルの構文検証に合格した場合のみ配置して Watchdog を再起動 |
+| 頻出キャッシュ同期 | 毎日 JST 5:00〜5:30、または WebUI から即時 | 再利用実績のある音声キャッシュを取得 |
+| キャッシュ容量ガード | 1 時間ごと | Slave のディスク空き容量に応じて古いキャッシュを削除 |
+
+#### 3.6.4 昇格（フェイルオーバー）
+- 死活確認の連続失敗が閾値に達すると昇格します。閾値は Slave の Priority（Master から割り当て）で変わります。
+
+  | Priority | 連続失敗回数 | 目安時間 |
+  | :--- | :--- | :--- |
+  | 1 | 18 回（`TTSBOT_FAIL_THRESHOLD`） | 約 90 秒 |
+  | 2 | 36 回 | 約 3 分 |
+  | 3 以降 | 36 + (Priority − 2) × 24 回 | 約 5 分〜 |
+
+- 昇格では `docker compose --profile active up -d app`（トンネル設定時は `tunnel` も）を実行します。CLI が使えない場合は Docker Engine API で直接起動します。
+
+#### 3.6.5 誤昇格（スプリットブレイン）の防止
+1. **LAN 最終確認**: 昇格直前に LAN 直通で Master の生存を再確認し、応答があれば WAN／トンネルのみの障害とみなして昇格しません。
+2. **自ノードの外部疎通確認**: Slave 自身がインターネットに出られない場合は、自分側の障害とみなして昇格しません。
+3. **上位ノードの確認**: Priority 2 以降は、昇格直前に Master と上位 Priority の Slave の稼働を確認します。稼働中の Active 時に上位ノードの稼働を検知した場合は、自ら降格します。
+4. **Master 復帰時の即時降格**: Active 中に Master の正常応答を検知すると、直ちに Standby へ戻ります。
+5. **計画更新中の猶予**: Master が `data/.ha_updating` を出している間（`update.sh` が自動で付与・解除）は失敗回数を数えません。
+6. **登録解除**: WebUI で解除した Slave には Master が HTTP 410 を返し、Watchdog は直ちに停止します。
+
+#### 3.6.6 Standby の追加手順
+- WebUI「Bot & ノード管理」の Manager Node 欄に表示されるワンライナーを、Slave にするサーバーで実行します。HA シークレットはワンライナーの引数（Windows は環境変数）として渡され、配信スクリプト自体には含まれません。
+- Slave の `.env` の主な設定: `TTSBOT_MASTER_URL`（必須）、`TTSBOT_HA_SECRET`（必須）、`TTSBOT_MASTER_LAN_URL`（任意）、`TTSBOT_HA_PRIORITY`（初期値。Master からの割り当てで上書き）、`CLOUDFLARE_TUNNEL_TOKEN`（昇格時にトンネルも引き継ぐ場合）。
+- `.env` を変更した場合は `docker compose --profile standby up -d standby-watchdog` で Watchdog を再作成します（停止中の `app` は起動しません）。
 
 ### 3.7 レイテンシ監視 & インシデント解析 (`LatencyTracker`)
 すべての発話において、発言検知から音声再生開始までの各工程（文分割、推論、ストリーミング供給）のミリ秒単位プロファイリングを実施します。
