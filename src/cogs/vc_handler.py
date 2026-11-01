@@ -2362,19 +2362,20 @@ class VCHandlerCog(commands.Cog):
                                 logger.error(f"[AutoJoinReconcile] Failed to join VC '{bot_vc.name}' with Bot #{assigned_idx}: {e}")
                                 continue
 
-                            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
                             bot_label = f" (Bot {assigned_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
                             embed = discord.Embed(
                                 title=f"🔊 ボイスチャンネル自動接続完了{bot_label}",
                                 description=(
                                     f"**{bot_vc.name}** に自動接続しました！\n"
                                     f"**#{bot_text.name}** のテキストを読み上げます。\n\n"
-                                    f"💡 [Webダッシュボード]({dashboard_url}) から声質のカスタマイズや単語辞書の登録が可能です。"
+                                    f"💡 Webダッシュボードから声質のカスタマイズや単語辞書の登録が可能です。"
                                 ),
                                 color=discord.Color.green()
                             )
                             try:
-                                await bot_text.send(embed=embed)
+                                from src.cogs.commands import WebDashboardButtonView
+                                view = WebDashboardButtonView(self.bot, label="Webダッシュボードにログイン")
+                                await bot_text.send(embed=embed, view=view)
                             except Exception as e:
                                 logger.warning(f"[AutoJoinReconcile] Failed to send announcement in {bot_text.name}: {e}")
             except asyncio.CancelledError:
@@ -2563,19 +2564,20 @@ class VCHandlerCog(commands.Cog):
                                     )
                                     return
 
-                            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
                             bot_label = f" (Bot {assigned_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
                             embed = discord.Embed(
                                 title=f"🔊 ボイスチャンネル自動接続完了{bot_label}",
                                 description=(
                                     f"**{bot_vc.name}** に自動接続しました！\n"
                                     f"**#{bot_text.name}** のテキストを読み上げます。\n\n"
-                                    f"💡 [Webダッシュボード]({dashboard_url}) から声質のカスタマイズや単語辞書の登録が可能です。"
+                                    f"💡 Webダッシュボードから声質のカスタマイズや単語辞書の登録が可能です。"
                                 ),
                                 color=discord.Color.green()
                             )
                             try:
-                                await bot_text.send(embed=embed)
+                                from src.cogs.commands import WebDashboardButtonView
+                                view = WebDashboardButtonView(self.bot, label="Webダッシュボードにログイン")
+                                await bot_text.send(embed=embed, view=view)
                             except Exception as e:
                                 logger.warning(f"Failed to send auto-join announcement in {bot_text.name}: {e}")
 

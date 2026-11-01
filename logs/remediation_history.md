@@ -8911,3 +8911,16 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 - **検証結果**:
   - `tests/test_auth_improvements.py` を作成（OAuth2フォールバック、スライディングセッション、マジックリンク単一消費・期限切れ、DM承認フロー・番号一致、レートリミット）。
   - 安全サンドボックスコンテナにて単体テスト（12 tests）および全体テスト（179 tests）がすべて完全パス（OK）。
+
+## 2026-11-01 20:40 ボイスチャンネル接続完了通知メッセージへの「Webダッシュボードにログイン」ボタン付与
+- **背景・目的**:
+  - VC自動接続時および手動接続時のアナウンス通知において、テキスト中のMarkdownリンクを直接押す代わりに、ワンタップで本人専用マジックリンクが発行されるボタンを添付し、利便性と操作性を向上。
+- **実施内容**:
+  1. `src/cogs/vc_handler.py`:
+     - 自動接続完了通知（バックグラウンド調整Reconcileループ ＆ VoiceStateUpdateイベント時）の埋め込み文言を維持したまま、Markdownリンク `[Webダッシュボード]({dashboard_url})` を通常テキスト `Webダッシュボード` に整理。
+     - 通知メッセージに永続View `WebDashboardButtonView(self.bot, label="Webダッシュボードにログイン")` をアタッチ。
+  2. `src/cogs/commands.py`:
+     - `WebDashboardButtonView` のラベルを `Webダッシュボードにログイン` に統一し、引数 `label` でカスタマイズ可能に対応。
+     - `/join` コマンド接続完了通知および `/voice` 内のボタンラベルを `Webダッシュボードにログイン` に統一。
+- **検証**:
+  - Python構文チェックおよびサンドボックス単体テスト（12 tests）全パス。

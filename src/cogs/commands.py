@@ -88,18 +88,20 @@ class OpenMagicLinkView(discord.ui.View):
 
 
 class WebDashboardButtonView(discord.ui.View):
-    """【A案】永続ボタン: [🌐 Web版で確認・設定する] (timeout=None で再起動後も永続)"""
-    def __init__(self, bot: Any):
+    """【A案】永続ボタン: [🌐 Webダッシュボードにログイン] (timeout=None で再起動後も永続)"""
+    def __init__(self, bot: Any, label: str = "Webダッシュボードにログイン"):
         super().__init__(timeout=None)
         self.bot = bot
+        self.dashboard_btn = discord.ui.Button(
+            label=label,
+            style=discord.ButtonStyle.secondary,
+            emoji="🌐",
+            custom_id="persistent_web_dashboard_btn"
+        )
+        self.dashboard_btn.callback = self.open_web_dashboard
+        self.add_item(self.dashboard_btn)
 
-    @discord.ui.button(
-        label="Web版で確認・設定する",
-        style=discord.ButtonStyle.secondary,
-        emoji="🌐",
-        custom_id="persistent_web_dashboard_btn"
-    )
-    async def open_web_dashboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def open_web_dashboard(self, interaction: discord.Interaction):
         magic_url, _ = generate_magic_login_url(
             bot=self.bot,
             user=interaction.user,
@@ -225,7 +227,7 @@ class VoiceSelectView(discord.ui.View):
 
         # Web版で設定・試聴するボタン (A案マジックリンク連携)
         self.dashboard_btn = discord.ui.Button(
-            label="Web版で設定する",
+            label="Webダッシュボードにログイン",
             style=discord.ButtonStyle.secondary,
             emoji="🌐",
             custom_id=f"voice_view_web_btn_{self.user_id}"
@@ -359,18 +361,18 @@ class CommandsCog(commands.Cog):
             if self.bot_pool and interaction.guild_id:
                 self.bot_pool.clear_vc_manual_disconnect(interaction.guild_id, voice_channel.id)
 
-            dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
             bot_label = f" (Bot {assigned_bot_idx}号機)" if self.bot_pool and len(self.bot_pool.tokens) > 1 else ""
             embed = discord.Embed(
                 title=f"🔊 ボイスチャンネル接続完了{bot_label}",
                 description=(
                     f"**{voice_channel.name}** に接続しました！\n"
                     f"**#{text_channel.name}** のテキストを読み上げます。\n\n"
-                    f"💡 [Webダッシュボード]({dashboard_url}) から声質のカスタマイズや単語辞書の登録が可能です。"
+                    f"💡 Webダッシュボードから声質のカスタマイズや単語辞書の登録が可能です。"
                 ),
                 color=discord.Color.green()
             )
-            await interaction.followup.send(embed=embed)
+            view = WebDashboardButtonView(self.bot, label="Webダッシュボードにログイン")
+            await interaction.followup.send(embed=embed, view=view)
         except VCConnectAborted as e:
             logger.info(f"Join VC aborted: {e}")
             await interaction.followup.send(f"ℹ️ ボイスチャンネル接続は安全に中断されました: {e}", ephemeral=True)
