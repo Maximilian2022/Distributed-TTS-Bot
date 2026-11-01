@@ -212,6 +212,10 @@ class TTSBot(commands.Bot):
             )
             await self.add_cog(cmd_cog)
 
+            # 永続View (Persistent View: Web版へのマジックリンク遷移ボタン) を登録
+            from src.cogs.commands import WebDashboardButtonView
+            self.add_view(WebDashboardButtonView(self))
+
             # メンバーキャッシュスロー巡回タスク (1号機のみが代表してバックグラウンド実行)
             cache_updater_cog = MemberCacheUpdaterCog(
                 bot=self,

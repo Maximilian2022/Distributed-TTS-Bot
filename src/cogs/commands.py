@@ -1,7 +1,7 @@
 import asyncio
 import re
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any, Dict
 
 import discord
 from discord import app_commands
@@ -24,8 +24,171 @@ from src.utils.alert_service import (
 
 logger = logging.getLogger(__name__)
 
+
+def generate_magic_login_url(
+    bot: Any,
+    user: Any,
+    guild: Optional[discord.Guild] = None,
+    target_path: str = "/"
+) -> Tuple[str, str]:
+    """ユーザー専用のワンタイム・マジックログインURLを発行 (有効期限10分)
+    戻り値: (magic_url, web_base_url)
+    """
+    web_server = getattr(bot, "web_server", None)
+    if not web_server and hasattr(bot, "bot_pool"):
+        web_server = getattr(bot.bot_pool, "web_server", None)
+
+    auth = getattr(web_server, "auth", None)
+    if not auth:
+        from src.web.auth import DiscordAuth
+        session_secret = getattr(bot.config, "web_session_secret", "") or "default_secret"
+        auth = DiscordAuth(
+            client_id=getattr(bot.config, "discord_client_id", ""),
+            client_secret=getattr(bot.config, "discord_client_secret", ""),
+            redirect_uri=getattr(bot.config, "discord_redirect_uri", ""),
+            session_secret=session_secret
+        )
+
+    # 管理者判定 (サーバーオーナー / サーバー管理者 / .env 指定管理者)
+    is_admin = False
+    if guild:
+        m = guild.get_member(user.id)
+        if m and (m.guild_permissions.administrator or guild.owner_id == user.id):
+            is_admin = True
+    admin_ids = getattr(bot.config, "admin_user_ids", []) or []
+    env_owner_id = int(getattr(bot.config, "discord_owner_user_id", 0) or 0)
+    if user.id in admin_ids or (env_owner_id > 0 and user.id == env_owner_id):
+        is_admin = True
+
+    username = getattr(user, "name", str(user.id))
+    token = auth.create_magic_login_token(
+        user_id=user.id,
+        username=username,
+        is_admin=is_admin,
+        target_path=target_path,
+        expires_in=600
+    )
+
+    base_url = (getattr(bot.config, "web_dashboard_url", "") or "http://localhost:8088").rstrip("/")
+    magic_url = f"{base_url}/magic?token={token}"
+    return magic_url, base_url
+
+
+class OpenMagicLinkView(discord.ui.View):
+    """マジックリンクを開くためのボタンView (ephemeralメッセージ用)"""
+    def __init__(self, magic_url: str):
+        super().__init__(timeout=600)
+        self.add_item(
+            discord.ui.Button(
+                label="🔓 タップしてマイページを開く（自動ログイン）",
+                style=discord.ButtonStyle.link,
+                url=magic_url
+            )
+        )
+
+
+class WebDashboardButtonView(discord.ui.View):
+    """【A案】永続ボタン: [🌐 Web版で確認・設定する] (timeout=None で再起動後も永続)"""
+    def __init__(self, bot: Any):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Web版で確認・設定する",
+        style=discord.ButtonStyle.secondary,
+        emoji="🌐",
+        custom_id="persistent_web_dashboard_btn"
+    )
+    async def open_web_dashboard(self, interaction: discord.Interaction, button: discord.ui.Button):
+        magic_url, _ = generate_magic_login_url(
+            bot=self.bot,
+            user=interaction.user,
+            guild=interaction.guild,
+            target_path="/"
+        )
+        view = OpenMagicLinkView(magic_url)
+        await interaction.response.send_message(
+            content=(
+                f"✨ **Webダッシュボードの本人専用ログインURLを発行しました** (有効期限: 10分)\n"
+                f"下のボタンをタップすると、パスワード不要で即座にログイン済みのWeb画面が開きます。\n\n"
+                f"⚠️ **注意**: このリンクはあなた専用です。他人に共有しないでください。"
+            ),
+            view=view,
+            ephemeral=True
+        )
+
+
+class DiscordAppLoginView(discord.ui.View):
+    """【B案】Discordアプリ ワンタップ承認ログイン (DM送信View, 番号確認付き)"""
+    def __init__(
+        self,
+        req_id: str,
+        auth: Any,
+        user_id: int,
+        user_data: dict,
+        verify_code: str,
+        is_admin: bool = False
+    ):
+        super().__init__(timeout=120)
+        self.req_id = req_id
+        self.auth = auth
+        self.user_id = user_id
+        self.user_data = user_data
+        self.verify_code = str(verify_code)
+        self.is_admin = is_admin
+
+        # ボタンを動的に追加
+        self.approve_btn = discord.ui.Button(
+            label=f"番号【 {self.verify_code} 】で承認する",
+            style=discord.ButtonStyle.success,
+            emoji="✅",
+            custom_id=f"app_login_approve_{req_id}"
+        )
+        self.approve_btn.callback = self.approve_callback
+        self.add_item(self.approve_btn)
+
+        self.reject_btn = discord.ui.Button(
+            label="拒否する",
+            style=discord.ButtonStyle.danger,
+            emoji="❌",
+            custom_id=f"app_login_reject_{req_id}"
+        )
+        self.reject_btn.callback = self.reject_callback
+        self.add_item(self.reject_btn)
+
+    async def approve_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ あなた向けのリクエストではありません。", ephemeral=True)
+            return
+
+        token = self.auth.create_session_token(self.user_data, is_admin=self.is_admin)
+        succ = self.auth.approve_app_login_request(self.req_id, token, verify_code=self.verify_code)
+        if succ:
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(
+                content=f"✅ **番号【 {self.verify_code} 】のWebログインを承認しました！**\nブラウザ画面に戻ると自動的にログインが完了します。",
+                view=self
+            )
+        else:
+            await interaction.response.send_message("⚠️ このリクエストはすでに期限切れか処理済みです。", ephemeral=True)
+
+    async def reject_callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ あなた向けのリクエストではありません。", ephemeral=True)
+            return
+
+        self.auth.reject_app_login_request(self.req_id)
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content=f"❌ **番号【 {self.verify_code} 】のWebログインリクエストを拒否しました。**",
+            view=self
+        )
+
+
 class VoiceSelectView(discord.ui.View):
-    """声質選択用セレクトメニュー"""
+    """声質選択用セレクトメニュー ＆ Web連携ボタン"""
     def __init__(self, config: AppConfig, database: Database, user_id: int, guild_id: Optional[int] = None):
         super().__init__(timeout=60)
         self.config = config
@@ -60,6 +223,16 @@ class VoiceSelectView(discord.ui.View):
         self.select.callback = self.select_callback
         self.add_item(self.select)
 
+        # Web版で設定・試聴するボタン (A案マジックリンク連携)
+        self.dashboard_btn = discord.ui.Button(
+            label="Web版で設定する",
+            style=discord.ButtonStyle.secondary,
+            emoji="🌐",
+            custom_id=f"voice_view_web_btn_{self.user_id}"
+        )
+        self.dashboard_btn.callback = self.open_web_dashboard
+        self.add_item(self.dashboard_btn)
+
     async def select_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("他のユーザーの設定は変更できません。", ephemeral=True)
@@ -78,6 +251,23 @@ class VoiceSelectView(discord.ui.View):
         await interaction.response.edit_message(
             content=f"✅ 声質を **{name}** に変更しました！",
             view=None
+        )
+
+    async def open_web_dashboard(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ 他のユーザーのログインリンクは発行できません。", ephemeral=True)
+            return
+        bot = interaction.client
+        magic_url, _ = generate_magic_login_url(bot, interaction.user, interaction.guild, target_path="/")
+        view = OpenMagicLinkView(magic_url)
+        await interaction.response.send_message(
+            content=(
+                f"✨ **Webダッシュボードの本人専用ログインURLを発行しました** (有効期限: 10分)\n"
+                f"下のボタンをタップすると、パスワード不要で即座にログイン済みのWeb画面が開きます。\n\n"
+                f"⚠️ **注意**: このリンクはあなた専用です。他人に共有しないでください。"
+            ),
+            view=view,
+            ephemeral=True
         )
 
 class CommandsCog(commands.Cog):
@@ -553,9 +743,11 @@ class CommandsCog(commands.Cog):
         dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         words = await self.db.get_dictionary_words(interaction.guild_id)
         if not words:
+            view = WebDashboardButtonView(self.bot)
             await interaction.response.send_message(
                 f"📖 単語辞書には現在何も登録されていません。\n"
-                f"💡 [Webダッシュボード]({dashboard_url}) からメンバー名の一括インポートも可能です。",
+                f"💡 下のボタンからWebダッシュボードを開き、メンバー名の一括インポートや単語登録が可能です。",
+                view=view,
                 ephemeral=True
             )
             return
@@ -574,7 +766,8 @@ class CommandsCog(commands.Cog):
         if len(words) > 25:
             embed.set_footer(text=f"他 {len(words) - 25} 件（表示上限により省略）")
 
-        await interaction.response.send_message(embed=embed)
+        view = WebDashboardButtonView(self.bot)
+        await interaction.response.send_message(embed=embed, view=view)
 
     # --- NGワードコマンド (/ng) ---
 
@@ -742,7 +935,8 @@ class CommandsCog(commands.Cog):
         )
 
         embed.set_footer(text="超低遅延インメモリ連結・スマート排他制御・多層フォールバック稼働中")
-        await interaction.response.send_message(embed=embed)
+        view = WebDashboardButtonView(self.bot)
+        await interaction.response.send_message(embed=embed, view=view)
 
     # --- 防災速報コマンドグループ ---
     disaster_group = app_commands.Group(name="disaster", description="防災速報（地震・津波・気象警報）の設定・テスト")

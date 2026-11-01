@@ -102,6 +102,47 @@
               Discordでログインして利用する
             </a>
 
+            <!-- 【B案】Discordアプリ ワンタップ承認ログイン (番号確認付き) -->
+            <div style="margin:24px 0 16px;border-top:1px solid rgba(255,255,255,0.1);position:relative;text-align:center;">
+              <span style="background:var(--bg-card, #1a1a2e);padding:0 12px;font-size:12px;color:var(--text-muted, #888);position:relative;top:-9px;">または Discordアプリでワンタップ承認</span>
+            </div>
+            <div id="discord-app-login-container" style="max-width:380px;margin:0 auto;text-align:left;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:16px;">
+              <!-- 入力フォーム -->
+              <div id="app-login-form-view">
+                <div style="font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text-main,#fff);display:flex;align-items:center;gap:6px;">
+                  <span>📱 スマホのDiscordアプリに承認ボタンを送る</span>
+                </div>
+                <div style="font-size:11px;color:var(--text-muted,#aaa);margin-bottom:12px;line-height:1.4;">
+                  自分のDiscordユーザー名またはIDを入力すると、BotからあなたのDMにワンタップ承認ボタンが届きます。
+                </div>
+                <div style="display:flex;gap:8px;">
+                  <input type="text" id="app-login-username" class="form-input" placeholder="ユーザー名 または ID" style="flex:1;min-width:160px;font-size:13px;" required onkeydown="if(event.key==='Enter'){event.preventDefault();submitDiscordAppLogin();}">
+                  <button type="button" id="app-login-submit-btn" class="btn btn-primary btn-sm" onclick="submitDiscordAppLogin()" style="white-space:nowrap;">送信 📲</button>
+                </div>
+                <div id="app-login-err" style="color:#f04747;font-size:12px;margin-top:8px;display:none;"></div>
+              </div>
+
+              <!-- 待機・番号確認UI (初期非表示) -->
+              <div id="app-login-waiting-view" style="display:none;text-align:center;padding:10px 0;">
+                <div style="font-size:13px;color:var(--text-main,#fff);margin-bottom:8px;">
+                  📲 <strong>Discordアプリを開いて承認してください</strong>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted,#aaa);margin-bottom:10px;">
+                  ブラウザに表示されている確認番号:
+                </div>
+                <div id="app-login-verify-badge" style="display:inline-block;background:linear-gradient(135deg, #5865F2, #4752C4);color:#fff;font-size:32px;font-weight:800;letter-spacing:4px;padding:8px 24px;border-radius:12px;box-shadow:0 4px 16px rgba(88,101,242,0.4);margin-bottom:12px;">
+                  --
+                </div>
+                <div style="font-size:11px;color:#f0b232;line-height:1.4;margin-bottom:14px;">
+                  ⚠️ スマホのDMに届いたメッセージの確認番号が一致していることを確かめて、<strong>[✅ 承認する]</strong> をタップしてください。
+                </div>
+                <div style="display:flex;justify-content:center;align-items:center;gap:12px;">
+                  <span id="app-login-timer" style="font-size:12px;color:var(--text-muted,#aaa);">残り 120 秒</span>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="cancelDiscordAppLogin()" style="padding:2px 10px;font-size:11px;">キャンセル</button>
+                </div>
+              </div>
+            </div>
+
             <div style="margin:28px 0 16px;border-top:1px solid rgba(255,255,255,0.1);position:relative;text-align:center;">
               <span style="background:var(--bg-card, #1a1a2e);padding:0 12px;font-size:12px;color:var(--text-muted, #888);position:relative;top:-9px;">または管理者パスワードでログイン</span>
             </div>
@@ -1124,10 +1165,31 @@
               <p style="font-size:13px;color:var(--text-muted);margin-bottom:14px;">
                 作成したBotアカウントをDiscordサーバーへ招待するための公式OAuth2リンクを生成します。必要な権限（ボイス接続・発言・メッセージ読み取り・スラッシュコマンド）が自動付与されます。
               </p>
-              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;">
                 <input type="text" id="invite-client-id-input" class="form-input" placeholder="Application Client ID (Discord Developer Portalより取得)" style="flex:1;min-width:240px;">
                 <button type="button" class="btn btn-secondary" onclick="generateBotInviteLink()">招待リンクを開く ↗</button>
               </div>
+
+              <!-- アコーディオン: 開発者ポータル設定用 リダイレクトURI案内 -->
+              <details class="oauth-redirect-details" style="background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.1);border-radius:8px;padding:12px 14px;cursor:pointer;">
+                <summary style="font-size:13px;font-weight:600;color:var(--text-main,#ddd);outline:none;user-select:none;display:flex;align-items:center;gap:6px;">
+                  <span>ℹ️ Discord OAuth2 ログイン用リダイレクト URI（開発者ポータル設定用）</span>
+                </summary>
+                <div style="margin-top:12px;font-size:12px;color:var(--text-muted,#aaa);line-height:1.6;cursor:default;" onclick="event.stopPropagation()">
+                  <p style="margin:0 0 8px;">
+                    DiscordアカウントでWebダッシュボードへログインするために、<a href="https://discord.com/developers/applications" target="_blank" rel="noopener" style="color:var(--primary,#5865F2);text-decoration:underline;">Discord Developer Portal</a> の <strong>OAuth2 ＞ Redirects</strong> に以下のURIを登録してください。<br>
+                    ※ 現在アクセスしているURLに合わせて動的に生成されています。
+                  </p>
+                  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+                    <code id="dynamic-oauth-redirect-uri" style="flex:1;min-width:240px;background:rgba(0,0,0,0.4);border:1px solid rgba(255,255,255,0.15);padding:8px 12px;border-radius:6px;font-family:monospace;font-size:12px;color:#10b981;word-break:break-all;">
+                      読み込み中...
+                    </code>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyDynamicRedirectUri()" style="padding:6px 14px;font-size:12px;display:flex;align-items:center;gap:4px;">
+                      <span>📋</span> コピー
+                    </button>
+                  </div>
+                </div>
+              </details>
             </div>
 
             <!-- 3. 🖥️ 分散コンピュートノード (Compute Worker) 稼働状況 -->

@@ -536,6 +536,8 @@ class WebServer:
         self.app.router.add_get("/", self.handle_index)
         self.app.router.add_get("/login", self.handle_login)
         self.app.router.add_get("/callback", self.handle_callback)
+        self.app.router.add_get("/magic", self.handle_magic_login)
+        self.app.router.add_get("/api/auth/magic", self.handle_magic_login)
         self.app.router.add_get("/logout", self.handle_logout)
         self.app.router.add_get("/setup-worker.sh", self.handle_setup_worker_sh)
         self.app.router.add_get("/static/setup-worker.sh", self.handle_setup_worker_sh)
@@ -635,6 +637,9 @@ class WebServer:
 
         # パスワード認証 & Bot管理 & クレデンシャル管理 API (OSS動的管理)
         self.app.router.add_post("/api/auth/login_password", self.api_auth_login_password)
+        self.app.router.add_get("/api/auth/config", self.api_auth_config)
+        self.app.router.add_post("/api/auth/discord_app_login/request", self.api_auth_discord_app_login_request)
+        self.app.router.add_get("/api/auth/discord_app_login/status", self.api_auth_discord_app_login_status)
         self.app.router.add_get("/api/system/bots", self.api_system_get_bots)
         self.app.router.add_post("/api/system/bots", self.api_system_save_bot)
         self.app.router.add_delete("/api/system/bots/{idx}", self.api_system_delete_bot)
@@ -737,6 +742,24 @@ class WebServer:
             resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
             if request.path.startswith("/static/"):
                 resp.headers.setdefault("Cache-Control", "public, max-age=86400")
+
+            # スライディングセッション (アクセスするたびにセッションCookieを30日間自動延長)
+            session_cookie = request.cookies.get("ttsbot_session")
+            if session_cookie and "ttsbot_session" not in resp.cookies:
+                try:
+                    user_data = self.auth.verify_session_token(session_cookie)
+                    if user_data:
+                        resp.set_cookie(
+                            "ttsbot_session",
+                            session_cookie,
+                            max_age=86400 * 30,
+                            path="/",
+                            httponly=True,
+                            samesite="Lax",
+                            secure=True
+                        )
+                except Exception:
+                    pass
         return resp
 
     async def _execute_security_and_rate_limit(self, request: web.Request, handler):
@@ -2281,8 +2304,13 @@ class WebServer:
                 content_type="text/html",
                 status=500
             )
+        # prompt パラメータ: 通常は 'none' (承認済み環境なら0クリック自動通過)
+        # 手動で承認画面を出したい場合 (?force_prompt=1 または ?prompt=consent) は 'consent'
+        force_prompt = request.query.get("force_prompt") == "1" or request.query.get("prompt") == "consent"
+        prompt = "consent" if force_prompt else "none"
+
         state = secrets.token_urlsafe(32)
-        login_url = self.auth.get_login_url(state=state)
+        login_url = self.auth.get_login_url(state=state, prompt=prompt)
         response = web.HTTPFound(login_url)
         response.set_cookie(
             "oauth_state",
@@ -2297,11 +2325,29 @@ class WebServer:
     async def handle_callback(self, request: web.Request) -> web.Response:
         code = request.query.get("code")
         error = request.query.get("error")
+        error_description = request.query.get("error_description", "")
         received_state = request.query.get("state")
         expected_state = request.cookies.get("oauth_state")
 
+        # prompt=none の場合、未承認ユーザーに対して Discord は interaction_required または consent_required を返す
+        # この場合、エラー画面にせず自動的に prompt=consent で通常認可画面へ再リダイレクトする (0クリック自動通過と初回アクセスの両立)
+        if error in ("interaction_required", "consent_required", "login_required"):
+            logger.info(f"OAuth2 prompt=none resulted in {error}. Automatically falling back to prompt=consent.")
+            state = secrets.token_urlsafe(32)
+            login_url = self.auth.get_login_url(state=state, prompt="consent")
+            resp = web.HTTPFound(login_url)
+            resp.set_cookie(
+                "oauth_state",
+                state,
+                max_age=600,
+                httponly=True,
+                samesite="Lax",
+                secure=True
+            )
+            raise resp
+
         if error or not code:
-            logger.warning(f"OAuth2 callback error or missing code: {error}")
+            logger.warning(f"OAuth2 callback error or missing code: {error} ({error_description})")
             resp = web.HTTPFound("/?error=oauth_cancelled")
             resp.del_cookie("oauth_state")
             raise resp
@@ -2367,20 +2413,269 @@ class WebServer:
         # Master (主系) / 同居 Worker の所有者自動バインド (アイデア A & B ハイブリッド)
         await self._auto_bind_host_nodes_owner(user_info, is_admin=is_admin)
 
-        # 認証成功: セッションCookieを設定
-        token = self.auth.create_session_token(user_info, is_admin=is_admin)
+        # 認証成功: セッションCookieを設定 (30日間有効)
+        token = self.auth.create_session_token(user_info, max_age=86400 * 30, is_admin=is_admin)
         response = web.HTTPFound("/")
         response.del_cookie("oauth_state")
         response.set_cookie(
             "ttsbot_session",
             token,
-            max_age=86400 * 7,
+            max_age=86400 * 30,
             path="/",
             httponly=True,
             samesite="Lax",
             secure=True
         )
         return response
+
+    async def handle_magic_login(self, request: web.Request) -> web.Response:
+        """
+        【A案】本人専用ワンタイム・マジックリンク (HMAC署名 + 単一消費) ハンドラ
+        GET /magic?token=... または GET /api/auth/magic?token=...
+        """
+        token = request.query.get("token", "").strip()
+        if not token:
+            raise web.HTTPFound("/?error=missing_magic_token")
+
+        payload = self.auth.verify_and_consume_magic_login_token(token)
+        if not payload:
+            logger.warning("Invalid or expired magic login token consumed.")
+            error_html = (
+                "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
+                "<title>マジックリンク期限切れ - Distributed TTS</title>"
+                "<style>body{background:#121316;color:#e1e2e6;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}"
+                ".card{background:#1e1f22;padding:40px;border-radius:12px;max-width:500px;text-align:center;box-shadow:0 8px 24px rgba(0,0,0,0.4);border:1px solid #ff4757;}"
+                "h2{color:#ff4757;margin-top:0;}p{line-height:1.6;color:#a0a4ab;}.btn{display:inline-block;margin-top:20px;padding:10px 24px;background:#5865F2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;}"
+                "</style></head><body><div class='card'>"
+                "<h2>⚠️ マジックリンクの有効期限切れ</h2>"
+                "<p>このワンタイムログインURLはすでに使用されたか、有効期限（10分）が切れています。</p>"
+                "<p style='font-size:13px;'>Discord のコマンド返答ボタンから再度リンクを発行するか、通常のログインを行ってください。</p>"
+                "<a href='/' class='btn'>トップページへ</a>"
+                "</div></body></html>"
+            )
+            return web.Response(text=error_html, content_type="text/html", status=403)
+
+        user_id = payload["user_id"]
+        username = payload.get("username", "DiscordUser")
+        is_admin = bool(payload.get("is_admin", False))
+        target_path = payload.get("path", "/")
+        if not target_path.startswith("/") or target_path.startswith("//"):
+            target_path = "/"
+
+        user_data = {
+            "id": user_id,
+            "username": username,
+            "global_name": username,
+            "avatar": ""
+        }
+
+        # Master / 同居 Worker の所有者自動バインド
+        await self._auto_bind_host_nodes_owner(user_data, is_admin=is_admin)
+
+        # 30日セッショントークン発行
+        session_token = self.auth.create_session_token(user_data, max_age=86400 * 30, is_admin=is_admin)
+        resp = web.HTTPFound(target_path)
+        resp.set_cookie(
+            "ttsbot_session",
+            session_token,
+            max_age=86400 * 30,
+            path="/",
+            httponly=True,
+            samesite="Lax",
+            secure=True
+        )
+        logger.info(f"✨ [MagicLogin] User {username} ({user_id}) successfully logged in via one-time magic link.")
+        raise resp
+
+    async def api_auth_config(self, request: web.Request) -> web.Response:
+        """フロントエンド用の認証構成情報 (動的 Redirect URI 等) を返却"""
+        proto = "https" if ("https" in (request.headers.get("X-Forwarded-Proto") or request.headers.get("CF-Visitor", ""))) else (request.scheme or "http")
+        host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or request.host or "localhost:8088"
+        dynamic_redirect_uri = f"{proto}://{host}/callback"
+        return web.json_response({
+            "is_configured": self.auth.is_configured(),
+            "client_id": self.auth.client_id,
+            "dynamic_redirect_uri": dynamic_redirect_uri,
+            "configured_redirect_uri": self.auth.redirect_uri
+        })
+
+    async def api_auth_discord_app_login_request(self, request: web.Request) -> web.Response:
+        """
+        【B案】Discordアプリ ワンタップ承認ログイン要求 (番号確認付き)
+        """
+        # IPレートリミット確認 (1分間に3回まで)
+        client_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or request.remote or "unknown"
+        if "," in client_ip:
+            client_ip = client_ip.split(",")[0].strip()
+
+        if not self.auth.check_ip_rate_limit(client_ip, max_requests=3, window_sec=60.0):
+            return web.json_response({
+                "success": False,
+                "error": "リクエスト回数が多すぎます。少し時間をおいてから再試行してください（1分間に最大3回まで）。"
+            }, status=429)
+
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "無効なJSONリクエストです。"}, status=400)
+
+        query = str(data.get("username_or_id", "")).strip()
+        if not query:
+            return web.json_response({"success": False, "error": "Discordのユーザー名またはユーザーIDを入力してください。"}, status=400)
+
+        # 対象ユーザーの特定
+        target_user = None
+
+        # 1. ID指定の場合
+        if query.isdigit():
+            uid = int(query)
+            if self.bot:
+                target_user = self.bot.get_user(uid)
+                if not target_user:
+                    try:
+                        target_user = await self.bot.fetch_user(uid)
+                    except Exception:
+                        target_user = None
+
+        # 2. ユーザー名 / グローバル名 / 表示名で検索
+        if not target_user and self.bot and getattr(self.bot, "guilds", None):
+            query_lower = query.lower().lstrip("@")
+            for guild in self.bot.guilds:
+                for member in guild.members:
+                    if (
+                        str(member.id) == query or
+                        member.name.lower() == query_lower or
+                        (member.global_name and member.global_name.lower() == query_lower) or
+                        (member.nick and member.nick.lower() == query_lower)
+                    ):
+                        target_user = member
+                        break
+                if target_user:
+                    break
+
+        if not target_user:
+            return web.json_response({
+                "success": False,
+                "error": f"ユーザー「{query}」が見つかりませんでした。Botが参加しているサーバーのメンバーであるか、正しいDiscord ID / ユーザー名を入力してください。"
+            }, status=404)
+
+        user_id = target_user.id
+        username = getattr(target_user, "name", query)
+
+        # ユーザー単位のクールダウン (60秒)
+        if not self.auth.can_request_app_login_for_user(user_id, cooldown_sec=60.0):
+            return web.json_response({
+                "success": False,
+                "error": f"ユーザー「{username}」宛ての承認リクエストは直前に送信されたばかりです。60秒以上あけてから再度お試しください。"
+            }, status=429)
+
+        # 管理者判定
+        is_admin = False
+        if self.bot and getattr(self.bot, "guilds", None):
+            for guild in self.bot.guilds:
+                m = guild.get_member(user_id)
+                if m and (m.guild_permissions.administrator or guild.owner_id == user_id):
+                    is_admin = True
+                    break
+        admin_ids = getattr(self.config, "admin_user_ids", []) or []
+        env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+        if user_id in admin_ids or (env_owner_id > 0 and user_id == env_owner_id):
+            is_admin = True
+
+        user_agent = request.headers.get("User-Agent", "Unknown Browser")
+        req_id, verify_code = self.auth.create_app_login_request(
+            user_id=user_id,
+            username=username,
+            ip=client_ip,
+            user_agent=user_agent,
+            expires_in=120
+        )
+
+        user_data = {
+            "id": user_id,
+            "username": username,
+            "global_name": getattr(target_user, "global_name", username) or username,
+            "avatar": getattr(target_user, "avatar", None).key if getattr(target_user, "avatar", None) else ""
+        }
+
+        from src.cogs.commands import DiscordAppLoginView
+        view = DiscordAppLoginView(
+            req_id=req_id,
+            auth=self.auth,
+            user_id=user_id,
+            user_data=user_data,
+            verify_code=verify_code,
+            is_admin=is_admin
+        )
+
+        ua_summary = user_agent[:60] + ("..." if len(user_agent) > 60 else "")
+        embed = discord.Embed(
+            title="📱 Webダッシュボード ログイン承認リクエスト",
+            description=(
+                f"ブラウザからあなたのDiscordアカウントでWebダッシュボードへのログインがリクエストされました。\n\n"
+                f"ブラウザに表示されている確認番号が **【 {verify_code} 】** であることを確認し、\n"
+                f"一致している場合のみ下の **[✅ 番号【 {verify_code} 】で承認する]** を押してください。"
+            ),
+            color=discord.Color.green()
+        )
+        embed.add_field(name="確認番号 (Number)", value=f"**{verify_code}**", inline=True)
+        embed.add_field(name="接続元 IP", value=f"`{client_ip}`", inline=True)
+        embed.add_field(name="端末 / ブラウザ", value=f"`{ua_summary}`", inline=False)
+        embed.add_field(name="有効期限", value="**2分間 (120秒)**", inline=True)
+        embed.set_footer(text="⚠️ 番号が一致しない場合や身に覚えがない場合は、絶対に承認せず [❌ 拒否する] を押すか無視してください。")
+
+        try:
+            await target_user.send(embed=embed, view=view)
+        except discord.Forbidden:
+            logger.warning(f"Could not send DM to user {user_id} (Forbidden).")
+            return web.json_response({
+                "success": False,
+                "error": f"Botから「{username}」様へのDMを送信できませんでした（DMが拒否またはブロックされています）。Discordのプライバシー設定で「ダイレクトメッセージ」を許可するか、通常のOAuth2ログインをご利用ください。"
+            }, status=403)
+        except Exception as e:
+            logger.error(f"Failed to send login approval DM: {e}")
+            return web.json_response({
+                "success": False,
+                "error": f"承認メッセージの送信に失敗しました: {e}"
+            }, status=500)
+
+        return web.json_response({
+            "success": True,
+            "req_id": req_id,
+            "verify_code": verify_code,
+            "expires_in": 120,
+            "username": username,
+            "user_id": user_id
+        })
+
+    async def api_auth_discord_app_login_status(self, request: web.Request) -> web.Response:
+        """
+        【B案】Discordアプリ 承認状態ポーリング
+        承認されたらレスポンスCookieに ttsbot_session を自動セットして返す
+        """
+        req_id = request.query.get("req_id", "").strip()
+        if not req_id:
+            return web.json_response({"status": "error", "error": "req_id is required"}, status=400)
+
+        info = self.auth.get_app_login_status(req_id)
+        resp = web.json_response(info)
+
+        if info.get("status") == "approved" and info.get("session_token"):
+            token = info["session_token"]
+            resp.set_cookie(
+                "ttsbot_session",
+                token,
+                max_age=86400 * 30,
+                path="/",
+                httponly=True,
+                samesite="Lax",
+                secure=True
+            )
+            user_data = self.auth.verify_session_token(token)
+            if user_data:
+                safe_create_task(self._auto_bind_host_nodes_owner(user_data, is_admin=bool(user_data.get("is_admin", False))))
+
+        return resp
 
     async def handle_logout(self, request: web.Request) -> web.Response:
         response = web.HTTPFound("/")

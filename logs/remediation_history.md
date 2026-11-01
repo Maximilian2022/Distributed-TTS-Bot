@@ -8880,3 +8880,34 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   - 両ノードで停止中の `ttsbot-app` コンテナを `--force-recreate` で再作成し、次回フェイルオーバー時に確実に全機能が即座に動作する状態へ整備完了。
 
 
+
+## 2026-11-01 20:15 Discord OAuth2 ログイン改善 ＆ マジックリンク ＆ 番号確認付きDM承認ログイン実装
+- **背景・目的**:
+  - Webダッシュボードへのアクセス時、毎回Discord認可画面を経由する手間や、スマホ等からのスムーズなログインを求めるニーズに対応。
+  - 公開OSSリポジトリとして、個人情報や環境固有情報を含めず、かつMFA疲労攻撃やうっかり誤承認（なりすまし）を防止する強固なセキュリティを両立。
+- **実施内容**:
+  1. **Discord Bot 招待URL生成セクションの動的リダイレクトURIアコーディオン追加**:
+     - `src/web/templates/index.html`: Bot招待URL生成カード内に `<details class="oauth-redirect-details">` アコーディオンを追加。
+     - `src/web/static/app.js`: アクセス中ドメインに合わせて `window.location.origin + '/callback'` を動的に生成し、Developer Portal 設定用のリダイレクトURIを表示＆ワンクリックコピー（`copyDynamicRedirectUri()`）機能を実装。
+  2. **通常 OAuth2 の 0クリック自動通過化 ＆ 30日間スライディングセッション**:
+     - `src/web/server.py`: `/login` で `prompt=none` を指定。承認済みユーザーはボタン押下なしで0クリック即時ログイン。
+     - 未承認時（`error=interaction_required` / `consent_required` / `login_required`）を検知した場合、自動的に `prompt=consent` で認可画面付きURLへ再リダイレクトし、初回アクセスと自動通過をシームレスに両立。
+     - セッションCookie（`ttsbot_session`）の有効期限を 7 日から 30 日間（`max_age=86400 * 30`）へ拡張。
+     - ミドルウェア（`_security_and_rate_limit_middleware`）にスライディングセッション処理を組み込み、アクセスするたびにCookie有効期限を自動で30日間延長。
+  3. **【A案】コマンド返答・通知ボタン化 ＆ 本人専用ワンタイム・マジックリンク**:
+     - `src/cogs/commands.py`: 永続View `WebDashboardButtonView(discord.ui.View)`（`custom_id="persistent_web_dashboard_btn"`, `timeout=None`）を定義。
+     - `src/main.py`: `setup_hook` にて `self.add_view(WebDashboardButtonView(self))` を登録し、Bot再起動後もメッセージ上のボタンが永続動作。
+     - `/voice`, `/dict list`, `/info` コマンド返答にボタン `[🌐 Web版で確認・設定する]` をアタッチ。
+     - ボタン押下時に本人検証＋HMAC-SHA256署名付きワンタイムマジックリンク（有効期限10分、単一消費ノンス管理でリプレイ完全防御）を発行し、`ephemeral=True` で本人専用メッセージとして返却。
+     - `src/web/server.py`: `/magic` および `/api/auth/magic` エンドポイントを実装。トークンを検証・単一消費し、30日セッションCookieをセットして目的のWeb画面へ自動ログイン遷移。
+  4. **【B案】直アクセス時の「Discordアプリでワンタップ承認ログイン（番号確認付き）」**:
+     - ログイン画面に「📱 スマホのDiscordアプリに承認ボタンを送る」フォームと待機UIを追加。
+     - ユーザー名またはDiscord IDを入力してリクエストすると、10〜99の2桁の確認番号（Number Matching）を発行。
+     - ブラウザ画面に「確認番号: **XX**」と大きく表示し、スマホのDiscord DMに `[✅ 番号【 XX 】で承認する]` / `[❌ 拒否する]` ボタンを送信。
+     - 番号一致確認により、他人が勝手にリクエストした際の誤タップ（MFA疲労攻撃）を完全防止。
+     - IPレートリミット（1分3回）、ユーザー単位クールダウン（60秒）によりDM爆撃を完全防止。
+     - ユーザーがDiscord側で承認ボタンを押した瞬間、ブラウザのポーリングが検知して自動でログイン画面遷移完了。
+     - localStorage にユーザー名を記憶し、次回以降入力不要。
+- **検証結果**:
+  - `tests/test_auth_improvements.py` を作成（OAuth2フォールバック、スライディングセッション、マジックリンク単一消費・期限切れ、DM承認フロー・番号一致、レートリミット）。
+  - 安全サンドボックスコンテナにて単体テスト（12 tests）および全体テスト（179 tests）がすべて完全パス（OK）。

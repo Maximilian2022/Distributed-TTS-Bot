@@ -15,6 +15,8 @@ let guildRoles = [];
 document.addEventListener("DOMContentLoaded", () => {
   setupTabs();
   updateVolunteerOneliner();
+  initDynamicRedirectUri();
+  initAppLoginUsername();
 
   // ログイン済みの場合にデータを初期ロード
   if (window.APP_IS_LOGGED_IN) {
@@ -7239,6 +7241,179 @@ async function handlePasswordLogin(event) {
     if (btn) btn.disabled = false;
   }
 }
+
+// ==========================================
+// 【B案】Discordアプリ ワンタップ承認ログイン (番号確認付き)
+// ==========================================
+let appLoginPollTimer = null;
+let appLoginCountdownTimer = null;
+
+function initAppLoginUsername() {
+  const input = document.getElementById("app-login-username");
+  if (!input) return;
+  try {
+    const saved = localStorage.getItem("ttsbot_last_login_user");
+    if (saved && !input.value) {
+      input.value = saved;
+    }
+  } catch (e) {}
+}
+
+async function submitDiscordAppLogin() {
+  const input = document.getElementById("app-login-username");
+  const errDiv = document.getElementById("app-login-err");
+  const btn = document.getElementById("app-login-submit-btn");
+  if (!input) return;
+
+  const username = input.value.trim();
+  if (!username) {
+    if (errDiv) {
+      errDiv.textContent = "❌ ユーザー名またはIDを入力してください";
+      errDiv.style.display = "block";
+    }
+    input.focus();
+    return;
+  }
+
+  // localStorage に記憶
+  try {
+    localStorage.setItem("ttsbot_last_login_user", username);
+  } catch (e) {}
+
+  if (errDiv) errDiv.style.display = "none";
+  if (btn) btn.disabled = true;
+
+  try {
+    const res = await fetch("/api/auth/discord_app_login/request", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username_or_id: username })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      if (errDiv) {
+        errDiv.textContent = `❌ ${data.error || "リクエスト送信に失敗しました"}`;
+        errDiv.style.display = "block";
+      }
+      showToast(data.error || "リクエスト送信失敗", "error");
+      if (btn) btn.disabled = false;
+      return;
+    }
+
+    // 成功: 待機画面へ切り替え
+    const formView = document.getElementById("app-login-form-view");
+    const waitingView = document.getElementById("app-login-waiting-view");
+    const badge = document.getElementById("app-login-verify-badge");
+    if (formView) formView.style.display = "none";
+    if (waitingView) waitingView.style.display = "block";
+    if (badge) badge.textContent = data.verify_code || "--";
+
+    showToast("Discord DMへ承認メッセージを送信しました 📲", "info");
+
+    startAppLoginPolling(data.req_id, data.expires_in || 120);
+  } catch (err) {
+    if (errDiv) {
+      errDiv.textContent = `❌ 通信エラー: ${err.message}`;
+      errDiv.style.display = "block";
+    }
+    if (btn) btn.disabled = false;
+  }
+}
+window.submitDiscordAppLogin = submitDiscordAppLogin;
+
+function cancelDiscordAppLogin() {
+  if (appLoginPollTimer) clearInterval(appLoginPollTimer);
+  if (appLoginCountdownTimer) clearInterval(appLoginCountdownTimer);
+  appLoginPollTimer = null;
+  appLoginCountdownTimer = null;
+
+  const formView = document.getElementById("app-login-form-view");
+  const waitingView = document.getElementById("app-login-waiting-view");
+  const btn = document.getElementById("app-login-submit-btn");
+  if (waitingView) waitingView.style.display = "none";
+  if (formView) formView.style.display = "block";
+  if (btn) btn.disabled = false;
+}
+window.cancelDiscordAppLogin = cancelDiscordAppLogin;
+
+function startAppLoginPolling(reqId, expiresInSec) {
+  if (appLoginPollTimer) clearInterval(appLoginPollTimer);
+  if (appLoginCountdownTimer) clearInterval(appLoginCountdownTimer);
+
+  const formView = document.getElementById("app-login-form-view");
+  const waitingView = document.getElementById("app-login-waiting-view");
+  const timerSpan = document.getElementById("app-login-timer");
+  if (formView) formView.style.display = "none";
+  if (waitingView) waitingView.style.display = "block";
+
+  let remaining = expiresInSec;
+  if (timerSpan) timerSpan.textContent = `残り ${remaining} 秒`;
+
+  appLoginCountdownTimer = setInterval(() => {
+    remaining--;
+    if (timerSpan) timerSpan.textContent = `残り ${remaining} 秒`;
+    if (remaining <= 0) {
+      clearInterval(appLoginCountdownTimer);
+      clearInterval(appLoginPollTimer);
+      showToast("承認リクエストの有効期限が切れました。再度お試しください。", "warning");
+      cancelDiscordAppLogin();
+    }
+  }, 1000);
+
+  appLoginPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`/api/auth/discord_app_login/status?req_id=${encodeURIComponent(reqId)}`);
+      const data = await res.json();
+      if (data.status === "approved") {
+        clearInterval(appLoginCountdownTimer);
+        clearInterval(appLoginPollTimer);
+        showToast("Discordでの承認を確認しました！ログイン中... 🚀", "success");
+        setTimeout(() => {
+          window.location.href = "/";
+        }, 500);
+      } else if (data.status === "rejected") {
+        clearInterval(appLoginCountdownTimer);
+        clearInterval(appLoginPollTimer);
+        showToast("ログインリクエストが拒否されました ❌", "error");
+        cancelDiscordAppLogin();
+      } else if (data.status === "expired" || data.status === "not_found") {
+        clearInterval(appLoginCountdownTimer);
+        clearInterval(appLoginPollTimer);
+        showToast("リクエストが期限切れとなりました", "warning");
+        cancelDiscordAppLogin();
+      }
+    } catch (e) {
+      console.warn("App login polling error:", e);
+    }
+  }, 1500);
+}
+
+// ==========================================
+// Discord OAuth2 動的リダイレクト URI 表示＆コピー
+// ==========================================
+function initDynamicRedirectUri() {
+  const codeEl = document.getElementById("dynamic-oauth-redirect-uri");
+  if (!codeEl) return;
+  const redirectUri = window.location.origin.replace(/\/$/, "") + "/callback";
+  codeEl.textContent = redirectUri;
+}
+
+function copyDynamicRedirectUri() {
+  const codeEl = document.getElementById("dynamic-oauth-redirect-uri");
+  const text = codeEl ? codeEl.textContent.trim() : (window.location.origin.replace(/\/$/, "") + "/callback");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => {
+      showToast("リダイレクト URI をクリップボードにコピーしました 📋", "success");
+    }).catch(() => {
+      prompt("以下のリダイレクト URI をコピーしてください:", text);
+    });
+  } else {
+    prompt("以下のリダイレクト URI をコピーしてください:", text);
+  }
+}
+window.copyDynamicRedirectUri = copyDynamicRedirectUri;
+window.initDynamicRedirectUri = initDynamicRedirectUri;
+
 // ==========================================
 // 1.5. Manager Node (HA Active-Standby) 管理 & Worker ノード統制
 // ==========================================
