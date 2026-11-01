@@ -1,6 +1,60 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-11-01] HA ゼロ設定待機系 (Zero-Config Standby) 実装 & クレデンシャル暗号化同期パイプライン (v2026.11.01-1900)
+
+- **ユーザーフィードバック & 課題**:
+  - 「.envに設定しないといけないことが多すぎて、ちょっと面倒に思えるんだよね。DBの中に暗号化とかして入れておいて、安全に同期、かつSlave側ではわからない、的なのって難しいんかな」
+  - 「メモリ上に残るやつも、使うときだけ展開して終わったら即破棄できるなら、最低限のセキュリティは実装したといえるかな？結構大工事になる？」
+  - 副系 (Slave) ノードの `.env` に、Discord Bot トークン群、OAuth2 クレデンシャル、Cloudflare Tunnel トークン、Admin パスワード、Gemini API キーなど膨大な変数を手動同期する必要があり、運用負荷と漏洩リスクが生じていた。
+
+- **原因分析 & アーキテクチャ設計**:
+  1. **暗号化同期パイプライン**:
+     - すでに稼働している 60秒周期の DB スナップショット同期機構（`/api/ha/db_snapshot`）を活用。
+     - クラスタ共通シークレット `TTSBOT_HA_SECRET` から SHA-256 で導出した 256bit 暗号化鍵を用い、機密情報を AES-256-GCM + 12バイト nonce で暗号化（`enc:v1:<base64>` 形式）。
+     - 暗号化された状態で SQLite DB（`system_credentials` & `bot_tokens`）に格納（at-rest 暗号化）。
+     - DB スナップショット同期により、暗号化されたまま Slave ノードへ自動配布（in-transit 暗号化）。
+  2. **待機中・降格時のゼロフットプリント保護**:
+     - Slave 側のディスク上 `.env` ファイルには各種トークンや API キーを一切書き出さない。
+     - Standby 待機中は本体アプリ（`ttsbot-app`）およびトンネルコンテナ（`ttsbot-slave-tunnel`）が停止しており、ディスク・メモリ共に平文クレデンシャルはゼロ。
+     - Master 障害によるフェイルオーバー昇格時（Active 昇格）にのみ、Watchdog が暗号化 DB から復号してコンテナを起動し、アプリがメモリ上（`os.environ` および `config`）へ動的展開。
+     - Master 復旧による自動降格（Preempt Demote）時には、コンテナを即座に停止（stop）するため、メモリ上の展開データも完全破棄される。
+  3. **後方互換性 (100% Backward Compatibility)**:
+     - `enc:v1:` プレフィックスを持たないレガシー平文データはそのまま透過復号。
+     - 既存の平文データは `load_and_seed_system_credentials` 実行時に自動で暗号化マイグレーション。
+
+- **対応内容**:
+  1. **暗号化 & 復号ユーティリティ (`src/utils/security.py`)**:
+     - `get_ha_secret_key()`: `TTSBOT_HA_SECRET`（環境変数未設定時は DB の `ha_secret` を自動参照）から 256bit 鍵を導出。
+     - `encrypt_credential(plain_text, secret_key)`: AES-256-GCM による暗号化。二重暗号化防止ガード付き。
+     - `decrypt_credential(cipher_text, secret_key)`: `enc:v1:` 判定復号。鍵不一致時は警告ログを出力し安全に空文字を返却。平文は無傷透過。
+  2. **データベース層の暗号化 & 自動シード/ロード (`src/database.py`)**:
+     - `set_credential(key, value, is_secret=True)`: `is_secret=True` の場合に AES-256-GCM で暗号化して保存。
+     - `get_credential(key, default, decrypt=True)`: 自動復号取得。
+     - `save_bot_token()` / `get_bot_tokens()`: Bot トークンを暗号化保存し、取得時に透過復号。
+     - `load_and_seed_system_credentials(config)`:
+       - Master: `.env` から DB への自動暗号化シード、および既存平文の自動暗号化マイグレーション。
+       - Slave: 暗号化 DB から復号し、`os.environ` および `config` へ動的ロード。
+  3. **メイン起動シーケンス (`src/main.py`)**:
+     - 初期化時および Active 昇格直前に `await db.load_and_seed_system_credentials(config)` を呼び出し、最新クレデンシャルとトークンをメモリロード。
+  4. **HA Watchdog ゼロ設定昇格対応 (`src/ha_watchdog.py`)**:
+     - `_get_db_credential(key)`: ローカル SQLite DB（`bot.db`）から暗号化認証情報を直接復号取得。
+     - `refresh_credentials_from_db()`: DB から `cloudflare_tunnel_token` を動的検知し、`.env` 未設定でも `has_tunnel = True` に自律昇格判定。
+     - `ensure_tunnel_container()`: Docker Socket API 経由で既存トンネルコンテナのトークン一致検証・必要時の動的再作成。
+     - 昇格時（`promote_to_active`）に `CLOUDFLARE_TUNNEL_TOKEN` を動的注入して起動。
+  5. **設定層 & WebUI API (`src/config.py`, `src/web/server.py`)**:
+     - `apply_db_credentials` に OAuth2 クレデンシャル、Gemini AI 設定、セッションシークレットを統合。
+     - `/api/system/credentials` で `discord_client_id`, `discord_client_secret` (masked), `gemini_api_key` (masked) 等の入出力およびホットリロードに対応。
+  6. **単体テスト & サンドボックス自動検証**:
+     - `tests/test_credential_encryption.py` を新設し、暗号化・復号、鍵不一致、後方互換性、二重暗号化防止、DB at-rest 暗号化、自動シード＆ロードを網羅検証（全 7 テスト 100% PASS）。
+     - プロジェクト全体の全単体・結合テストスイート（167 テスト）をサンドボックス内で実行し、全件 PASS を確認。
+  7. **実機デプロイ & Zero-Config 待機系検証**:
+     - **MasterNode-Ubuntu (`192.168.1.10`)**: 本番 VC 通話（2ギルド接続中）の無停止運用を維持しつつ、DB 内の全トークン・認証情報を暗号化マイグレーション完了。
+     - **SlaveNode-Debian (`192.168.1.20`, Priority 1)**: `.env` を 3行程度（`TTSBOT_HA_ROLE=slave`, `TTSBOT_MASTER_URL`, `TTSBOT_HA_SECRET` 等）の最小構成に縮退。Watchdog が暗号化 DB スナップショットから自律復号し `Tunnel Failover: ENABLED` で待機完了。テストコンテナによる Zero-Config メモリ展開を実機確認。
+     - **SlaveNode-CentOS (`192.168.1.30`, Priority 2)**: `.env` を最小構成に縮退。Watchdog が暗号化 DB スナップショットを自律同期・復号し `Priority: 2`, `Tunnel Failover: ENABLED` で待機完了。
+
+---
+
 ## [2026-10-31] トークンベース所有権安全紐づけアーキテクチャ (Setup Token) の実装 ＆ 他者ノード所有権保護 (v2026.10.31-1620)
 
 - **ユーザーフィードバック & 課題**:
@@ -53,7 +107,7 @@
 
 - **原因分析**:
   - `src/web/static/app.js` の `escapeHtml(str)` において、`str.replace` を呼び出す前に引数の型チェック・文字列変換が行われていなかった。
-  - DB から取得した `owner_user_id`（例: `310034034690359308`）が数値（Number）として渡された際、`typeof str === "number"` のため `str.replace is not a function` の TypeError が発生。
+  - DB から取得した `owner_user_id`（例: `123456789012345678`）が数値（Number）として渡された際、`typeof str === "number"` のため `str.replace is not a function` の TypeError が発生。
   - これにより `loadManagerNodes` でキャッチされて警告表示になり、`renderWorkerNodes` では全ノードループ内で例外が発生して描画が中断され、ワーカーカードが表示されなくなっていた。
 
 - **対応内容**:
@@ -220,12 +274,12 @@
 
 - **ユーザーフィードバック & 課題**:
   - 「うーん？ Googleの声の設定なのにVoicevoxのタグがついて3090になってる？」
-  - 添付画像: `18:13:53`「えびちりこっこ、こえへん」話者 `WaveNet 男声B (Google)` なのにワーカーが `MASTERSOMEN2022 (RTX 3090) VOICEVOX` となり音飛び発生。
+  - 添付画像: `18:13:53`「えびちりこっこ、こえへん」話者 `WaveNet 男声B (Google)` なのにワーカーが `Worker-GPU-2 (RTX 3090) VOICEVOX` となり音飛び発生。
 
 - **原因分析 & 調査結果**:
   1. **データベース (playback_latency_history) レコード分析**:
      - 該当発話の `failed_providers` に `["google", "edge", "azure"]` が記録されていた。
-     - クラウドTTS（Google ➔ Edge ➔ Azure）がすべて失敗し、最後の砦であるローカル最速GPUノード（`MASTERSOMEN2022 (RTX 3090) VOICEVOX`）に多段フォールバックしていた。
+     - クラウドTTS（Google ➔ Edge ➔ Azure）がすべて失敗し、最後の砦であるローカル最速GPUノード（`Worker-GPU-2 (RTX 3090) VOICEVOX`）に多段フォールバックしていた。
   2. **ログ (logs/bot.log) のエラー特定**:
      - `Google Cloud TTS chunk synthesis failed: cannot access free variable 'latency_profiler' where it is not associated with a value in enclosing scope`
      - `Edge-TTS chunk synthesis failed: cannot access free variable 'latency_profiler' where it is not associated with a value in enclosing scope`
@@ -289,15 +343,15 @@
 
 ---
 
-## [2026-10-28] 投機的フォールバックの動的最適化＆最大許容遅延キャップ化 ＆ MasterUbuntu COEIROINK マウント復旧・自律修復ガード配備
+## [2026-10-28] 投機的フォールバックの動的最適化＆最大許容遅延キャップ化 ＆ MasterNode-Ubuntu COEIROINK マウント復旧・自律修復ガード配備
 
 - **ユーザーフィードバック & 課題**:
-  1. 「MasterUbuntuのCoeiroinkのログで以下のエラーがでている。発生した時刻はわからないが、、確認できないか調査してみてほしい: NameError: name 'meta_manager' is not defined」
+  1. 「MasterNode-UbuntuのCoeiroinkのログで以下のエラーがでている。発生した時刻はわからないが、、確認できないか調査してみてほしい: NameError: name 'meta_manager' is not defined」
   2. 「サーバー管理 ボット設定 (サーバー固有) 投機的フォールバック待機時間 (秒) の設定って、今の統計的に1-2秒って適切かな。今の本番設定は4秒にしてるけど ちょっとここ議論したい。この設定を消すか、意味を変えて、動的なものに変えたほうがいいかもと思っている」
   3. 「Aにした場合でも遅すぎる場合は切り替わるけど、待った時の最大秒がユーザー体感で耐えれるのかっていうのが問題としてでてくるよね。案Bもいいなと思うんだけど、案Bの1って実質案Aってことよね？」➔「うん、それでいこうか」
 
 - **原因分析 & 調査結果**:
-  1. **MasterUbuntu COEIROINK エラーの解明**:
+  1. **MasterNode-Ubuntu COEIROINK エラーの解明**:
      - 発生時刻: `2026-10-28 17:02:57 JST`
      - 原因: `ttsworker-coeiroink` コンテナのバインドマウントにおいて、`speaker_info` のみで `storage/ssd` と `storage/ram` がマウントされておらず、シンボリックリンクがすべてリンク切れ（Broken Symlinks）となっていた。
      - これにより、COEIROINK公式の `engine.py` がモデルをロードできず、内部の `meta_manager` が初期化されないまま `GET /v1/speakers` が呼ばれ、`NameError: name 'meta_manager' is not defined` (HTTP 500) を吐いていた。
@@ -310,7 +364,7 @@
      - さらに既存コードでは初動チャンクが内部で `min(2.5, ...)` により強制クランプされており、4秒設定が無効化されていた。
 
 - **対応内容**:
-  1. **MasterUbuntu COEIROINK マウント完全復旧 ＆ 自律修復機能**:
+  1. **MasterNode-Ubuntu COEIROINK マウント完全復旧 ＆ 自律修復機能**:
      - `docker-compose.worker.yml` に従い 3 本のマウントを再適用（`GET /v1/speakers` 200 OK、17名認識復帰）。
      - `src/web/static/agent.py`: `CoeiroinkWorkerRamManager` に `persistent_dir` プロパティを追加、`work_dir` パス結合バグを修正。
      - `ensure_coeiroink_mount_healthy` および `start_engine` において、`storage/ssd` 欠落または HTTP 500 を検知した際に自律修復（`fix_coeiroink_mount` による `--force-recreate`）を発動する安全ネットを配備。
@@ -470,7 +524,7 @@
   2. **② Edge-TTS 動的タイムアウト ＆ クラウド3社サーキットブレーカー**: 要求文字数に応じた動的タイムアウト（4.0s〜9.0s）を導入し、ストリーム受信自体も `asyncio.wait_for` で保護する。さらに Edge / Azure / Google の3社すべてにサーキットブレーカーを導入する。
   3. **③ 重複Bot調停時の `push_back` クラッシュ修正 & `QueueItem.speculative_timeout` 伝播**: 存在しない `target_state.push_back(item)` を `target_state.queue.put(item)` に修正し、`on_message` で取得済みの `speculative_timeout` を `QueueItem` に保持させて再生ホットパスでの重複DBアクセスを排除する。
   4. **④ フォールバック時の失敗・成功統計の分離記録**: Aで失敗してBで成功した際、統計上も「Aの失敗（`failed_requests` / `fail_count`）」「Bの成功＆フォールバック生成（`fallback_requests` / `fallback_win_count`）」および `is_fallback=True` として正確に記録する。
-  5. **⑤ Adaptive Preroll の現在稼働ノード参照 ＆ GitHub公開OSSとしての環境非依存化**: 過去の `last_worker_label` ではなく現在利用可能な最優先ノード（`peek_best_node`）を参照して Preroll を算出し、さらに特定個人環境のホスト名・CPU/GPU型番ハードコード（`OMEN2022`, `OMEN2017`, `i7-7700K`, `MasterUbuntu` 等）を完全撤廃して VRAM 容量と EWMA 実測推論速度に基づく汎用ロジックへ刷新する。
+  5. **⑤ Adaptive Preroll の現在稼働ノード参照 ＆ GitHub公開OSSとしての環境非依存化**: 過去の `last_worker_label` ではなく現在利用可能な最優先ノード（`peek_best_node`）を参照して Preroll を算出し、さらに特定個人環境のホスト名・CPU/GPU型番ハードコード（`Worker-GPU-2`, `Worker-GPU-1`, `i7-7700K`, `MasterNode-Ubuntu` 等）を完全撤廃して VRAM 容量と EWMA 実測推論速度に基づく汎用ロジックへ刷新する。
   6. **⑥ オフライン外部Workerへの無駄な起動・停止ブロードキャスト抑止**: `TTSNode.is_agent_reachable` を新設し、未接続・ハートビート途絶（90秒超）の外部PCへの無駄なHTTPリクエストとタイムアウト待ちを排除する。
   7. **⑦ 投機的プリウォームのキャッシュ先行確認・不要同期スキップ・ログ静音化**: エンジン起動前に未キャッシュ有無をスキャンし、全件キャッシュヒット時はローカルエンジンの起動・停止（約20秒）および不要な Standby キャッシュ同期をスキップする。
   8. **⑧ ホットパス正規表現の事前コンパイル化 ＆ `on_message` DB並列取得**: `text_cleaner.py`, `vc_handler.py`, `database.py` のインライン正規表現をモジュール定数化し、辞書とNGワード取得を `asyncio.gather` で並列化する。
@@ -516,9 +570,9 @@
 - **原因分析 & 定量調査結果**:
   1. **マシンスペック・エンジン種別による文字数推論速度の極端な格差**:
      - 直近ログ（`bot.db`）および実測プロファイルの解析により、以下の事実を確認：
-       - **RTX 3090 (OMEN2022)**: 約 29ms/字 ➔ 30文字でも 600〜700ms（上限30文字で超余裕）。
-       - **GTX 1080 Ti (OMEN2017)**: 約 60ms/字 ➔ 30文字でも 約1.4秒（余裕）。
-       - **Core i7 CPU (MasterUbuntu)**: COEIROINKで 約 120〜150ms/字 ➔ 15文字超で 4.5秒を超え、投機フォールバック（4秒）が直撃。
+       - **RTX 3090 (Worker-GPU-2)**: 約 29ms/字 ➔ 30文字でも 600〜700ms（上限30文字で超余裕）。
+       - **GTX 1080 Ti (Worker-GPU-1)**: 約 60ms/字 ➔ 30文字でも 約1.4秒（余裕）。
+       - **Core i7 CPU (MasterNode-Ubuntu)**: COEIROINKで 約 120〜150ms/字 ➔ 15文字超で 4.5秒を超え、投機フォールバック（4秒）が直撃。
        - **VOICEVOX (CPU)**: 約 65ms/字 ➔ 20文字でも 約1.5秒で完了。
      - 一律固定値（例: 14文字）で決め打ちすると、GPU機でイントネーション分断・往復オーバーヘッドが増大し、逆に非力CPUや重いエンジンでフォールバックを防ぎきれない問題が生じる。
   2. **既存統計基盤の発見**:
@@ -545,7 +599,7 @@
 ## [2026-10-28] Debian環境Worker COEIROINK HTTP 500（シンボリックリンク切れ）の究明・修復 ＆ agent.py 自動マウント補完
 
 - **ユーザーフィードバック & 課題**:
-  1. 「こーれいい題材かも。フォールバックした理由とか、もともとのCoeiroinkで生成に何秒かかったかとか、諸々調査してほしい（画像添付: 00:24:07 チェインドベル様発話、Edge-TTS 4830ms/4721ms）」
+  1. 「こーれいい題材かも。フォールバックした理由とか、もともとのCoeiroinkで生成に何秒かかったかとか、諸々調査してほしい（画像添付: 00:24:07 AdminUser様発話、Edge-TTS 4830ms/4721ms）」
   2. 「必要ならMasterdebianにつないでもいい、MasterdebianのCoeiroinkがわりとよく500エラーになってるっぽい」
 
 - **原因分析 & 調査結果**:
@@ -639,7 +693,7 @@
   - `touch data/.ha_updating` 誤昇格抑止のもと `docker compose restart app` で安全反映。
   - `POST /api/system/cache/speculative_trigger` 実行検証:
     - VOICEVOX外部ノードへのウェイクアップ送出（`Wake-up broadcast for 'voicevox' returned: [True, True, True]`）。
-    - COEIROINKにて `MasterUbuntu`（CPU）がフォールバックなしで本来の `coeiroink` 音声として正常に合成完了（`Saved new cache (coeiroink): ...wav (39180 bytes)`）。
+    - COEIROINKにて `MasterNode-Ubuntu`（CPU）がフォールバックなしで本来の `coeiroink` 音声として正常に合成完了（`Saved new cache (coeiroink): ...wav (39180 bytes)`）。
     - 完了後に自動スリープ停止され、メモリ返却も正常動作を確認。
 
 ## [2026-10-27] WebUI分散コンピュートワーカーカード描画時の ReferenceError (resolvedHostname 未定義) の即時解消
@@ -653,7 +707,7 @@
 - **対応内容**:
   - `src/web/static/app.js` の Line 2995 に `const resolvedHostname = workerHostDisplay || cleanCandidate || "";` を追加。
   - ホスト名・クリーン名が安全に解決され、例外なく確実に全Workerカードがレンダリングされるよう修復。
-  - 実機ブラウザ検証（`browser_subagent`）により、`http://127.0.0.1:8088/#bots` にて全4台のWorkerカード（MASTEROMEN2017, MASTERSOMEN2022, Debian環境Worker, MasterUbuntu）が正常かつ美しく表示されることを確認完了（画面撮影: `bots_management_page_1793096449865.png`）。
+  - 実機ブラウザ検証（`browser_subagent`）により、`http://127.0.0.1:8088/#bots` にて全4台のWorkerカード（Worker-GPU-1, Worker-GPU-2, Debian環境Worker, MasterNode-Ubuntu）が正常かつ美しく表示されることを確認完了（画面撮影: `bots_management_page_1793096449865.png`）。
 
 ## [2026-10-27] 分散コンピュートワーカーの登録永続化（Master再起動保護）＆ ハートビート時オートレジスター ＆ WebUI 5秒リアルタイム自動ポーリング新設
 
@@ -683,7 +737,7 @@
      - `renderWorkerNodes` において、Master再起動直後の初期待機状態ノードに対して「`🟡 接続待機中 (ハートビート待機)`」「`🟡 再接続待機中`」バッジを明示し、状態遷移を視覚化。
   5. **本番環境への最小瞬断適用 & 実機検証**:
      - `data/.ha_updating` 誤昇格抑止のもと `docker compose restart app` を実施。
-     - 起動直後のハートビート受信により、未登録ノード（`worker_MasterDebian`, `worker_MasterUbuntu` 等）が `⚡ [WorkerAPI] Auto-recovering unregistered worker ... directly from heartbeat...` として即座にオートレジスターされ、`data/cluster_workers.json` に全4台（MASTEROMEN2017, MASTERSOMEN2022, MasterUbuntu, MasterDebian）が永続化されたことを確認。
+     - 起動直後のハートビート受信により、未登録ノード（`worker_SlaveNode-Debian`, `worker_MasterNode-Ubuntu` 等）が `⚡ [WorkerAPI] Auto-recovering unregistered worker ... directly from heartbeat...` として即座にオートレジスターされ、`data/cluster_workers.json` に全4台（Worker-GPU-1, Worker-GPU-2, MasterNode-Ubuntu, SlaveNode-Debian）が永続化されたことを確認。
      - 実機ブラウザ検証（`browser_subagent`）により、`http://127.0.0.1:8088/#bots` にて全4台のWorkerがリアルタイムに表示され、「状態更新 🔄」ボタンおよび5秒ごとの自動更新が正常動作することを確認完了（画面撮影: `workers_realtime_verified_1793095571008.png`）。
 
 ## [2026-10-27] 投機的ホットワード候補のハイブリッド化（歴代定番 TOP 30 ＋ 直近急上昇 TOP 30、最大60枠）＆ WebUI プレビュー・事前生成バッチ連動
@@ -737,7 +791,7 @@
   3. **Botプロセス計測のフォールバック強化 (`src/resource_manager.py`)**:
      - 対象コンテナ名に `ttsbot-app-1` 等を追加。さらに Docker stats が取得できない場合でも、`psutil.Process(os.getpid())` により自プロセスおよび全子プロセスの実メモリ（RSS）とCPU使用率を直接合算集計する多段フォールバックを完備（計測値が 0.0% や 0MB にならないよう保護）。
   4. **分散コンピュートワーカーの直近推移スパークライン実装 (`app.js`)**:
-     - 各ワーカーカード（MASTEROMEN2017, MASTERSOMEN2022, MasterDebian, MasterUbuntu）の下部に、直近のCPU使用率（青紫）、RAM使用率（水色）、GPU使用率（緑）の推移を軽量 Canvas スパークラインとして埋め込み描画。
+     - 各ワーカーカード（Worker-GPU-1, Worker-GPU-2, SlaveNode-Debian, MasterNode-Ubuntu）の下部に、直近のCPU使用率（青紫）、RAM使用率（水色）、GPU使用率（緑）の推移を軽量 Canvas スパークラインとして埋め込み描画。
   5. **API認証 & 描画タイミングの堅牢化 (`server.py`, `app.js`)**:
      - `api_get_system_metrics` において、`guild_id` が未指定の場合でも管理者権限（`_require_admin`）で即座にメトリクスを取得できるよう改善。
      - タブ切り替え直後や初期ロード時でも DOM 寸法を正しく解決して確実にチャートを描画。
@@ -823,7 +877,7 @@
   2. **手動実行自体の動作状況**:
      - ログ上、事前生成自体は正常に実行され `Finished in 28.96s: 13 generated, 17 skipped` で完了し、Standbyノードへのキャッシュアーカイブ同期（281ファイル、31.7MB）まで連動して完了していた。
   3. **ユーザー名プレフィックスが混入していた原因**:
-     - Discordの「話者ユーザー名読み上げ」によって生成された名前キャッシュ（`サバス、` `やどん、` `チェインドベル、` 等）が、末尾読点「、」付きで `cache_metadata` に保存されていた。
+     - Discordの「話者ユーザー名読み上げ」によって生成された名前キャッシュ（`サバス、` `やどん、` `AdminUser、` 等）が、末尾読点「、」付きで `cache_metadata` に保存されていた。
      - ユーザーの指摘通り、話者読み上げはその人自身の声で発言時にキャッシュされ、他話者での一括先行生成はリソースの無駄になるため、明示的に除外する必要があった。
 - **対応内容**:
   1. **名前プレフィックスおよび記号単体の完全除外 (`src/database.py`)**:
@@ -851,8 +905,8 @@
      - **【結論: 2台とも正常に更新済みであった】**
      - ログ検証（16:38:58 〜 16:39:03）:
        - 16:38:58 に「全Standby一括更新」シグナルを受信した直後、
-       - 16:39:01 に `slave_f960592ba045_00af7ef3` (192.168.11.248) が `GET /api/ha/code_snapshot HTTP/1.1 200 1264061` を実行。
-       - 16:39:03 に `slave_92db75a83282_e7fcf41e` (192.168.11.244) が `GET /api/ha/code_snapshot HTTP/1.1 200 1264061` を実行。
+       - 16:39:01 に `slave_f960592ba045_00af7ef3` (192.168.1.20) が `GET /api/ha/code_snapshot HTTP/1.1 200 1264061` を実行。
+       - 16:39:03 に `slave_92db75a83282_e7fcf41e` (192.168.1.30) が `GET /api/ha/code_snapshot HTTP/1.1 200 1264061` を実行。
        - 両ノードとも Master から最新のソースコード（キャッシュ同期対応コード）をダウンロードし、構文検証を経て自律リロード（`os.execv`）を完了していた。
   2. **エラー `Unexpected non-whitespace character after JSON at position 3 (line 1 column 4)` の真因**:
      - Standby Slave ではなく、**Master 側（本機 `ttsbot-app-1`）のプロセスが旧コードのまま稼働していた** ことが原因。
@@ -974,7 +1028,7 @@
      - 一方、Slave側のWatchdogは `os.execv` による再起動でメモリ空間がリセットされるため、`current_code_hash` が初期化され、起動直後のヘルスチェックで再び Master から `force_update: true` を受信。
      - これにより、コードダウンロード → 検証 → 再起動 → 受信 → 再起動… という無限ループに陥っていた。
   2. **Cloudflare Tunnel復旧遅延と閾値の逆転**:
-     - MasterUbuntuでコンテナを再作成・ロールオーバーした際、Cloudflare Tunnelがオリジン接続を再確立してエッジ全体で502が解消されるまでに30秒〜45秒程度を要する。
+     - MasterNode-Ubuntuでコンテナを再作成・ロールオーバーした際、Cloudflare Tunnelがオリジン接続を再確立してエッジ全体で502が解消されるまでに30秒〜45秒程度を要する。
      - 従来のPriority 1閾値 `TTSBOT_FAIL_THRESHOLD=6`（6回 × 5秒 = 30秒）はトンネル復帰時間より短く、正常な再起動・再接続サイクル中に誤ってStandbyが昇格を試みてしまっていた。
 - **対応内容**:
   1. **Master側 ワンショット消費フラグ導入 (`src/web/server.py`)**:
@@ -999,16 +1053,16 @@
 
 ## [2026-10-26] HA Watchdog WAN/LAN多段死活確認 & 誤フェイルオーバー防止機構 (Split-Brain Guard) 実装
 - **ユーザーフィードバック & 課題**:
-  - Standby側（MasterCentos）でヘルスチェックが連続失敗（502 Bad Gateway）し、フェイルオーバー誤昇格ループ（`Failed to start app/tunnel containers during promotion!`）が発生。
+  - Standby側（SlaveNode-CentOS）でヘルスチェックが連続失敗（502 Bad Gateway）し、フェイルオーバー誤昇格ループ（`Failed to start app/tunnel containers during promotion!`）が発生。
   - 「どのマシンがSSHでもつながらないの？」
 - **原因分析**:
-  - MasterUbuntu側でコンテナ再作成（ロールオーバー）を実施した際、Cloudflare Tunnelと新コンテナの接続再確立までの約10〜20秒間、外部URL（`https://ttsbot.kenko.land`）が一時的に `502 Bad Gateway` を返していた。
-  - 物理的に同一ローカルサブネット（192.168.11.0/24）に位置しているにもかかわらず、従来の `ha_watchdog.py` は外部WAN URL固定でヘルスチェックを行っていたため、MasterがLAN上で正常稼働しているにもかかわらず「Masterダウン」と誤判定してフェイルオーバー判定に入ってしまっていた。
+  - MasterNode-Ubuntu側でコンテナ再作成（ロールオーバー）を実施した際、Cloudflare Tunnelと新コンテナの接続再確立までの約10〜20秒間、外部URL（`https://ttsbot.example.com`）が一時的に `502 Bad Gateway` を返していた。
+  - 物理的に同一ローカルサブネット（192.168.1.0/24）に位置しているにもかかわらず、従来の `ha_watchdog.py` は外部WAN URL固定でヘルスチェックを行っていたため、MasterがLAN上で正常稼働しているにもかかわらず「Masterダウン」と誤判定してフェイルオーバー判定に入ってしまっていた。
   - また、昇格失敗時に `fail_count` がリセットされず、毎ループ昇格エラーを吐き続ける構造になっていた。
-  - SSH疎通に関しては、MasterUbuntu側から MasterCentos (`192.168.11.244`) および MasterDebian (`192.168.11.248`) に対して公開鍵が未配備（パスワード認証のみまたは別鍵）のため、MasterUbuntuからの自動SSHが `Permission denied` となっていた。
+  - SSH疎通に関しては、MasterNode-Ubuntu側から SlaveNode-CentOS (`192.168.1.30`) および SlaveNode-Debian (`192.168.1.20`) に対して公開鍵が未配備（パスワード認証のみまたは別鍵）のため、MasterNode-Ubuntuからの自動SSHが `Permission denied` となっていた。
 - **対応内容**:
   1. **WAN & LAN 多段死活確認の実装 (`src/ha_watchdog.py`)**:
-     - `is_master_healthy()` において、WAN（`https://ttsbot.kenko.land`）が 502 Bad Gateway やタイムアウト等で失敗した場合でも、直通検証済みのLAN URL（`http://192.168.11.245:8088`）に自動フォールバックしてMasterの生存を確認。WAN障害による誤フェイルオーバーを100%防止。
+     - `is_master_healthy()` において、WAN（`https://ttsbot.example.com`）が 502 Bad Gateway やタイムアウト等で失敗した場合でも、直通検証済みのLAN URL（`http://192.168.1.10:8088`）に自動フォールバックしてMasterの生存を確認。WAN障害による誤フェイルオーバーを100%防止。
   2. **Masterローカル直通情報の永続キャッシュ (`src/ha_watchdog.py`)**:
      - `data/ha_master_cache.json` にMasterのローカルIP・ポート・インスタンスIDを保存。Watchdog再起動直後でまだWANから情報を受信できていない場合でも、即座にLAN直通で生存確認を実施可能に。
   3. **フェイルオーバー昇格直前の Last-ditch LAN 直接検証 & 失敗時クールダウン (`src/ha_watchdog.py`)**:
@@ -1052,7 +1106,7 @@
      - 「ホスト名」「OS種類」「Docker version」「接続IP / URL」を明記。
      - カードタイトル（`nodeName`）の適切な解決（`local_master` やコンテナIDの物理ホスト名解決）。
   2. **ノードプールでのシステム情報補完 (`src/tts/node_pool.py`)**:
-     - `TTSNode.to_dict()` において、自機マスターノード（`local_master`）および外部ノードの `specs` に `get_host_system_info()`（ホスト名 `MasterUbuntu`、OS `Ubuntu 26.04.1 LTS`、Docker `29.4.2`）を安全に補完。
+     - `TTSNode.to_dict()` において、自機マスターノード（`local_master`）および外部ノードの `specs` に `get_host_system_info()`（ホスト名 `MasterNode-Ubuntu`、OS `Ubuntu 26.04.1 LTS`、Docker `29.4.2`）を安全に補完。
   3. **Master API のワーカーハートビート更新・Standby更新強化 (`src/web/server.py`)**:
      - `api_worker_heartbeat`: Worker Agentから届いた `specs`（OS詳細、Dockerバージョン、ホスト名）をノードプールへリアルタイムにマージ。
      - `api_ha_broadcast_update`: 特定ノード指定（`node_id`）および全ノード一括のStandby更新シグナル送信に対応。
@@ -1065,7 +1119,7 @@
   6. **Primary Master 安全最小瞬断ロールオーバー**:
      - `data/.ha_updating` によるHA誤昇格抑止を行い、`docker compose up -d --no-deps app` で安全にコンテナを新プロセスへ切り替え（瞬断約7秒、Bot接続即時復帰）。
 - **検証結果**:
-  - `ttsbot-app-1` コンテナ内で `get_host_system_info()` がホスト名 `MasterUbuntu`、OS `Ubuntu 26.04.1 LTS`、Docker `29.4.2` を正常返却することを確認。
+  - `ttsbot-app-1` コンテナ内で `get_host_system_info()` がホスト名 `MasterNode-Ubuntu`、OS `Ubuntu 26.04.1 LTS`、Docker `29.4.2` を正常返却することを確認。
   - `TTSNode.to_dict()` の `specs` 補完テスト合格。
   - `app.js` の構文検証（`node -c`）合格。
   - 本番Botおよび全Workerノードが自律再接続・正常稼働中であることを確認。
@@ -1080,7 +1134,7 @@
   - Slaveが外部URL（Cloudflare Tunnel 等）経由で通信していたためアクセス元WAN IPが記録されていた。また、拠点間でたまたま同一のプライベートIP帯（192.168.1.x 等）を使っている場合があり、IPの数値だけで「ローカル直通」と妄信すると誤接続・通信障害を起こすリスクがあった。
 - **対応内容**:
   1. **ホストシステム情報取得ユーティリティ新設 (`src/utils/system_info.py`)**:
-     - Unix Socket (`/var/run/docker.sock`) 経由で Docker Engine API を参照し、コンテナ内からホストマシンの真のホスト名（`MasterUbuntu` 等）、ホストOS（`Ubuntu 26.04.1 LTS` 等）、Dockerバージョン（`29.4.2` 等）を高速取得（TTL 300秒キャッシュ）。
+     - Unix Socket (`/var/run/docker.sock`) 経由で Docker Engine API を参照し、コンテナ内からホストマシンの真のホスト名（`MasterNode-Ubuntu` 等）、ホストOS（`Ubuntu 26.04.1 LTS` 等）、Dockerバージョン（`29.4.2` 等）を高速取得（TTL 300秒キャッシュ）。
      - Socket未接続環境への多段フォールバック（環境変数 `HOST_HOSTNAME`, `/etc/os-release` 等）も完備。
   2. **Active Handshake Verification（双方向ローカル実体照合機構）の実装 (`src/ha_watchdog.py`)**:
      - 「同一サブネットに見えても物理的別ネットワークである可能性」に対応するため、IPの数値やCIDRの一致だけでローカル接続と判定する妄信を完全排除。
@@ -1099,7 +1153,7 @@
   5. **セットアップスクリプト改善 (`src/web/static/setup-standby.sh`)**:
      - Slave新規セットアップ時にホスト名およびローカルIPを自動検出し、`.env` に書き込む処理を追加。
 - **実機検証結果**:
-  - サンドボックステストにおいて、ホスト名 `MasterUbuntu`、OS `Ubuntu 26.04.1 LTS`、Docker `29.4.2`、LAN IP `192.168.11.245` の正確な取得、Active Handshake による到達不能/別サブネット検出時の安全なWAN維持動作の完全合格を確認。
+  - サンドボックステストにおいて、ホスト名 `MasterNode-Ubuntu`、OS `Ubuntu 26.04.1 LTS`、Docker `29.4.2`、LAN IP `192.168.1.10` の正確な取得、Active Handshake による到達不能/別サブネット検出時の安全なWAN維持動作の完全合格を確認。
 
 ## [2026-10-26] システム動作仕様詳細説明書 (MANUAL.md) 全面改訂・最新化
 - **ユーザーフィードバック & 課題**:
@@ -1130,18 +1184,18 @@
 
 ## [2026-10-26] WebUI 502 Bad Gateway 障害調査・原因特定および復旧対応
 - **事象 & ユーザー報告**:
-  - `https://ttsbot.kenko.land/` の WebUI にアクセスできない（502 Bad Gateway）。
+  - `https://ttsbot.example.com/` の WebUI にアクセスできない（502 Bad Gateway）。
 - **原因調査 & 判明した真因**:
-  1. **副系ノード (MasterDebian: 192.168.11.248) 側の旧トンネル重複稼働**:
-     - 調査の結果、MasterDebian 上の旧ディレクトリ `/root/ttsbot` にて、過去のコンテナ `ttsbot-tunnel` が稼働し続けていた。
-     - このコンテナは主系 (MasterUbuntu) と同一の Cloudflare Tunnel トークンを使用していたため、Cloudflare エッジが両ノードへトラフィックをロードバランスしていた。
-     - しかし、MasterDebian 側は Standby のため本体コンテナ（`ttsbot`）が存在せず、Debian 側に転送されたリクエストがすべて `dial tcp: lookup ttsbot on 127.0.0.11:53: no such host` となり、502 Bad Gateway を発生させていた。
+  1. **副系ノード (SlaveNode-Debian: 192.168.1.20) 側の旧トンネル重複稼働**:
+     - 調査の結果、SlaveNode-Debian 上の旧ディレクトリ `/root/ttsbot` にて、過去のコンテナ `ttsbot-tunnel` が稼働し続けていた。
+     - このコンテナは主系 (MasterNode-Ubuntu) と同一の Cloudflare Tunnel トークンを使用していたため、Cloudflare エッジが両ノードへトラフィックをロードバランスしていた。
+     - しかし、SlaveNode-Debian 側は Standby のため本体コンテナ（`ttsbot`）が存在せず、Debian 側に転送されたリクエストがすべて `dial tcp: lookup ttsbot on 127.0.0.11:53: no such host` となり、502 Bad Gateway を発生させていた。
   2. **Cloudflare Zero Trust 側の Service Port 設定**:
      - Cloudflare Tunnel のコンテナ (`ttsbot-tunnel-1`) と WebUI コンテナ (`ttsbot-app-1`) は同一の Docker ネットワーク (`ttsbot_default`) 内で通信するため、Service の向き先はホスト側ポート (8088) ではなくコンテナ内部ポート (`http://ttsbot:8080`) である必要がある。
 - **実施した対策**:
-  1. MasterDebian (192.168.11.248) に SSH 接続し、旧プロジェクトに残存していた不要なコンテナ `ttsbot-tunnel` および再起動ループしていた `ttsbot-router` を安全に停止 (`docker stop ttsbot-tunnel ttsbot-router`)。
+  1. SlaveNode-Debian (192.168.1.20) に SSH 接続し、旧プロジェクトに残存していた不要なコンテナ `ttsbot-tunnel` および再起動ループしていた `ttsbot-router` を安全に停止 (`docker stop ttsbot-tunnel ttsbot-router`)。
   2. Cloudflare Zero Trust の Ingress 設定が `http://ttsbot:8080` となっていることを確認。
-  3. `https://ttsbot.kenko.land/` へのアクセス疎通確認を実施し、正常に `HTTP/2 200 OK` が返ることを確認。
+  3. `https://ttsbot.example.com/` へのアクセス疎通確認を実施し、正常に `HTTP/2 200 OK` が返ることを確認。
   4. 本番の通話中 Bot (`ttsbot-app-1`) には一切手を触れず、無瞬断・ゼロダウンタイムで復旧。
 
 ## [2026-10-26] Dependabot Pull Request (4件) 検証 & 安全マージ完了
@@ -1285,20 +1339,20 @@
   - 実機検証: Debian 248 の Watchdog が Master の更新を検知し、自律的に最新コードをプル・再起動して最新プロセスへ移行完了（実ログ確認済み）。
   - 本番運用中コンテナへの影響ゼロ（無停止稼働維持）。
 
-## [2026-10-26] クラスタ用Worker setup-worker agent.py取得エラー恒久修復・WAN/LAN自動判別・MasterDebian(248)ボランティア誤認識解消・WebUI表示崩れ修復・WORKER_SHARED_SECRET永続化
+## [2026-10-26] クラスタ用Worker setup-worker agent.py取得エラー恒久修復・WAN/LAN自動判別・SlaveNode-Debian(248)ボランティア誤認識解消・WebUI表示崩れ修復・WORKER_SHARED_SECRET永続化
 - **ユーザーフィードバック & 課題**:
   1. `setup-worker.sh` 実行時に `agent.py の取得に失敗しました。/root/ttsbot-worker/docker/agent/agent.py を手動で配置してください。` エラーが発生する。
   2. セットアップスクリプトが WAN 越しか LAN 内かを自動判別してくれるかの確認・改善要望。
-  3. `192.168.11.248`（MasterDebian）のマシンをクラスタ用 Worker として参加させたはずが、WebUI 上で「ボランティアワーカー」として認識されてしまう。
+  3. `192.168.1.20`（SlaveNode-Debian）のマシンをクラスタ用 Worker として参加させたはずが、WebUI 上で「ボランティアワーカー」として認識されてしまう。
   4. WebUI タイトルに `Worker (Master) <span style="background:rgba(88,101,242,0.25)...">🤝 ボランティア</span>` と生の HTML タグが文字化け・露出している。
   5. カード内で `voicevox` が 2 重に表示され、リソース情報が「リソース情報待機中...」のままになる。
-  6. Windows で `irm "https://ttsbot.kenko.land/setup-worker.ps1" | iex` を実行した際に一時的に 502 エラーが発生した。
+  6. Windows で `irm "https://ttsbot.example.com/setup-worker.ps1" | iex` を実行した際に一時的に 502 エラーが発生した。
 - **真因の究明**:
   1. **`agent.py` 取得失敗 (Connection refused)**:
      - `src/web/server.py` の `handle_setup_worker_sh` / `handle_setup_worker_ps1` 内の文字列置換が、スクリプト側の初期値ポート番号（8088）と不一致で置換スルーされ、クライアント側で `http://localhost:8088/static/agent.py`（Worker マシン自身のポート）にアクセスして失敗していた。
   2. **WAN / LAN 自動判別の欠落**:
      - アクセス元リクエストの Host / ヘッダー判別がなく、LAN からのアクセス時も外部公開 URL が一律に注入されていた。
-  3. **MasterDebian (248) のボランティア誤認識 & voicevox 2重表示**:
+  3. **SlaveNode-Debian (248) のボランティア誤認識 & voicevox 2重表示**:
      - 旧 `setup-worker.sh` が HTTPS 時に `MASTER_WS_URL=wss://.../api/worker/ws` を自動補完してしまい、クラスタ Worker がボランティア専用口に接続していた。
      - Master 側の `api_worker_ws` は接続クライアントを無条件でボランティア (`WSWorkerNode`) としてプールに追加していたため、HTTP クラスタノードと WS ボランティアノードの 2 重登録が発生。
      - WebUI（`app.js`）のマージ処理で 1 つでも WS ノードが含まれるとマシン全体をボランティアと誤判定していた。
@@ -1313,7 +1367,7 @@
      - `server.py` で `re.sub` を用いてポート番号（8080/8088）や書式を問わず確実に動的置換するよう改修。
      - `setup-worker.sh` および `setup-worker.ps1` に最大 3 回のリトライ、エラー詳細表示、ローカル既存ファイルの再利用フォールバックを実装。
   2. **WAN / LAN 自動判別の実装 (`src/web/server.py`)**:
-     - `_get_master_base_url` にて `_is_wan_request` を判定。LAN 内アクセス時はリクエスト元 Host/IP（`http://192.168.11.x:8088`）を、WAN アクセス時は `web_dashboard_url`（`https://ttsbot.kenko.land`）を自動注入。
+     - `_get_master_base_url` にて `_is_wan_request` を判定。LAN 内アクセス時はリクエスト元 Host/IP（`http://192.168.1.x:8088`）を、WAN アクセス時は `web_dashboard_url`（`https://ttsbot.example.com`）を自動注入。
   3. **WebUI 表示崩れ・重複エンジン・クラスタ優先判定の完全修正 (`src/web/static/app.js`)**:
      - `nodeName` から HTML タグを排除し、ボランティアバッジ（`volunteerBadge`）を独立させて `escapeHtml(nodeName)` の外側で安全に描画。
      - 同一マシン集約時に同じエンジン（`voicevox` 等）が存在する場合、HTTP 直接クラスタノードを優先し、WS 重複を統合。
@@ -1323,21 +1377,21 @@
      - `api_worker_ws` で、既に常設 HTTP クラスタノードとしてプール内に登録されているノード ID から接続があった場合、`WSWorkerNode` としてのプール二重追加をスキップしトンネル接続のみ保持するよう改修。
   5. **WORKER_SHARED_SECRET の永続化 (`.env`)**:
      - Master の `.env` に `WORKER_SHARED_SECRET=cf94f2cae9006ef84981affa1da0dd0d` を設定・固定。再起動による認証トークン不一致を根絶。
-  6. **248 (MasterDebian) の完全修復**:
+  6. **248 (SlaveNode-Debian) の完全修復**:
      - 248 上の旧環境 `ttsbot-tunnel` / `ttsbot-router` を停止し、トンネル競合を排除。
-     - 248 の `/root/ttsbot-worker/docker-compose.agent.yml` を `MASTER_URL=http://192.168.11.245:8088`、`MASTER_WS_URL=` に修復し、コンテナを再作成・起動。
-     - 248 が `http://192.168.11.248:50021` / `50025` / `50031` の常設クラスタノード（is_healthy: true）として Master に正常登録完了。
+     - 248 の `/root/ttsbot-worker/docker-compose.agent.yml` を `MASTER_URL=http://192.168.1.10:8088`、`MASTER_WS_URL=` に修復し、コンテナを再作成・起動。
+     - 248 が `http://192.168.1.20:50021` / `50025` / `50031` の常設クラスタノード（is_healthy: true）として Master に正常登録完了。
 - **検証結果**:
   - `tests/test_setup_worker_delivery.py`: 単体テスト 6 件合格。
   - リポジトリ全テストスイート (`python -m unittest discover tests`): 全 34 テスト完全合格 (Ran 34 tests in 5.766s, OK)。一時コンテナ破棄完了。
   - 本番 Master コンテナ (`ttsbot-app-1`): ヘルスチェック 200 OK、5 台の Discord Bot 正常接続維持。
-  - 248 (MasterDebian): `curl /health` にて `worker_MasterDebian_voicevox`, `worker_MasterDebian_sharevox`, `worker_MasterDebian_coeiroink` の 3 ノードが `is_healthy: true`、`is_available: true` で登録・稼働中であることを確認。
-  - Windows 用ワンライナー (`https://ttsbot.kenko.land/setup-worker.ps1`): 200 OK で最新スクリプトが即時配信されることを実機確認。
+  - 248 (SlaveNode-Debian): `curl /health` にて `worker_SlaveNode-Debian_voicevox`, `worker_SlaveNode-Debian_sharevox`, `worker_SlaveNode-Debian_coeiroink` の 3 ノードが `is_healthy: true`、`is_available: true` で登録・稼働中であることを確認。
+  - Windows 用ワンライナー (`https://ttsbot.example.com/setup-worker.ps1`): 200 OK で最新スクリプトが即時配信されることを実機確認。
   - Debian (248) 旧環境コンテナ完全撤去: `/root/ttsbot/docker-compose.yml` (10/7 旧Master環境) の `ttsbot-tunnel` および `ttsbot-router` を `docker compose down` で完全削除。二重起動・Act-Actマルチコネクタの物理的再発を根絶。
 
 ### 【深掘り調査】Debian (248) で Cloudflare Tunnel が常駐し Act-Act になっていた理由 & Watchdog 降格が働かなかった真因
 - **事象の概要**:
-  - 主系 (MasterUbuntu: 245) と副系 (Debian: 248) の両方で同一トークンによる `cloudflared` が同時接続され、Cloudflare Anycast エッジにおいて意図しない Act-Act（マルチコネクタ）状態が発生。
+  - 主系 (MasterNode-Ubuntu: 245) と副系 (Debian: 248) の両方で同一トークンによる `cloudflared` が同時接続され、Cloudflare Anycast エッジにおいて意図しない Act-Act（マルチコネクタ）状態が発生。
   - その結果、トラフィックが Debian 側にロードバランスされた際に upstream 不在により Windows 等で `502 Bad Gateway` が発生していた。
 - **なぜ過去のトンネルが起動しっぱなしだったのか？**:
   - Debian (248) 上には、10月7日に旧 Master / 単独構成として作成された `/root/ttsbot` と、10月24日に Slave（待機系）として新規構築された `/root/ttsbot-slave` の **2 つの異なる Compose プロジェクト** が混在していた。
@@ -1510,7 +1564,7 @@
   3. **Portainer ドキュメント (`docs/PORTAINER.md`) の不整合解消**:
      - コンテナ内に存在しない `curl` によるヘルスチェック記述を、`python -c 'import urllib.request...'` へ修正（`portainer-stack.yml` と完全同期）。
   4. **WebUI テンプレートの旧ドメインハードコード撤廃**:
-     - `src/web/templates/index.html` 内の `ttsbot.kenko.land` を `<YOUR_TTSBOT_DOMAIN>` へ汎用化。
+     - `src/web/templates/index.html` 内の `ttsbot.example.com` を `<YOUR_TTSBOT_DOMAIN>` へ汎用化。
   5. **Slave (Standby) フェイルオーバー昇格時の事前コンテナ作成**:
      - Docker CLI がない環境での Unix Socket 経由コンテナ起動を確実にするため、`src/web/static/setup-standby.sh` / `.ps1` で `app` コンテナを停止状態で事前生成。`src/ha_watchdog.py` に `find_app_containers` メソッドを新設。
   6. **ローリングアップデートスクリプト刷新 & レガシースクリプト非推奨化**:
@@ -1620,7 +1674,7 @@
      - 「4段階 RAMDisk Tier ルーティング」の見出しと説明を「ハードウェア性能に応じたスマート多段ルーティング」へ刷新（GPU有無、メモリ容量、ストレージ性能に応じた自動最適ディスパッチとして整理）。
   2. **コードベース内の固有マシン名除去**:
      - `src/cogs/commands.py`: テストアラート発報コマンド内のデモノード名を `GPU-Worker-01` 等に汎用化。
-     - `src/tts/node_pool.py`: docstring・コメント内の `OMEN` や `MasterDebian/Ubuntu` を汎用表現に統一。
+     - `src/tts/node_pool.py`: docstring・コメント内の `OMEN` や `SlaveNode-Debian/Ubuntu` を汎用表現に統一。
      - `src/utils/latency_tracker.py`: コメント例を `GPU-Worker (RTX 3090)` に統一。
      - `src/web/static/app.js`: 最強GPU判定のフォールバック条件から `2022` 決め打ちを排除。
   3. **`remediation_history.md` の .gitignore 登録 & リモート追跡解除**:
@@ -1697,7 +1751,7 @@
 
 ## [2026-10-24] クラスタ用 Worker セットアップスクリプト (`setup-worker.ps1` / `setup-worker.sh`) の WAN 403 解消 & URL・共有トークン自動注入
 - **ユーザーフィードバック & 課題**:
-  - インターネット経由（Cloudflare Tunnel `https://ttsbot.kenko.land/`）からクラスタ用 Worker のセットアップワンライナー（`irm "https://ttsbot.kenko.land/setup-worker.ps1" | iex`）を実行したところ、`{"error": "Forbidden: This endpoint is restricted to local LAN access only."}` が返りブロックされた。
+  - インターネット経由（Cloudflare Tunnel `https://ttsbot.example.com/`）からクラスタ用 Worker のセットアップワンライナー（`irm "https://ttsbot.example.com/setup-worker.ps1" | iex`）を実行したところ、`{"error": "Forbidden: This endpoint is restricted to local LAN access only."}` が返りブロックされた。
 - **真因の究明**:
   - `src/web/server.py` の WAN 境界セキュリティミドルウェアにおいて、`worker_sensitive_prefixes` に `/setup-worker.sh`, `/setup-worker.ps1`, `/static/agent.py` が登録されていた。
   - これらは単なるオープンソースの環境構築スクリプト・エージェントコードであり機密情報は含まないが、WAN からの直接アクセスが一律 403 Forbidden で遮断されていた。
@@ -1712,7 +1766,7 @@
      - `setup-worker.ps1` および `setup-worker.sh` での COEIROINK モデル同期時（`/api/worker/models/list` および `/api/worker/models/download/...`）に、`X-Worker-Token` 認証ヘッダーを付与するように改修。WAN 経由でのモデル取得も 403 にならずスムーズに自動同期可能に。
 - **検証**:
   - `curl -H "CF-Connecting-IP: 203.0.113.1"` による擬似 WAN リクエストで、`/setup-worker.ps1`, `/setup-worker.sh`, `/static/agent.py` の全エンドポイントが 200 OK を返すことを確認。
-  - スクリプト本文内に `https://ttsbot.kenko.land` および `cf94f2cae9006ef84981affa1da0dd0d` が正しく自動展開されていることを実機検証。
+  - スクリプト本文内に `https://ttsbot.example.com` および `cf94f2cae9006ef84981affa1da0dd0d` が正しく自動展開されていることを実機検証。
 
 ## [2026-10-24] COEIROINK等保有モデル差異のピンポイント・ルーティング & エンジンDL進捗プログレスバー実装
 - **ユーザーフィードバック & 課題**:
@@ -1794,7 +1848,7 @@
 
 ## [2026-10-24] WAN 接続時 403 Forbidden の完全解消・共有トークン必須化・Windows ボランティア GUI ランチャーの全面機能強化
 - **ユーザーフィードバック & 課題**:
-  1. Linux で実行時、`403, message='Invalid response status', url='wss://ttsbot.kenko.land/api/worker/ws'` が発生して接続できない不具合。
+  1. Linux で実行時、`403, message='Invalid response status', url='wss://ttsbot.example.com/api/worker/ws'` が発生して接続できない不具合。
   2. Cloudflare Tunnel 経由（WAN）アクセス環境のため、共有トークンをオプションではなく「必須」にしてほしい要求。
   3. Linux で破損した `config.json` 読み込み時に `JSONDecodeError: Expecting value: line 6 column 15` が発生する問題。
   4. Windows 向け GUI ランチャーへの新機能要求：
@@ -1937,7 +1991,7 @@
 
 ## [2026-10-24] Slave セットアップの Dockerfile 不在エラー解消 & 複数台待機 (推奨2台) カスケード Priority 制御の実装
 - **ユーザーフィードバック & 課題**:
-  1. `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` 実行時に `open Dockerfile: no such file or directory` が発生し、セットアップが途中で停止する不具合の報告。
+  1. `curl -sSL https://ttsbot.example.com/setup-standby.sh | sudo bash` 実行時に `open Dockerfile: no such file or directory` が発生し、セットアップが途中で停止する不具合の報告。
   2. 1:1 冗長化を基本としつつ、多様な利用環境に対応するため待機系を「推奨2台」構成とし、複数台 Slave が接続された場合の優先度（Priority: 参加順またはハイスペック順）に基づく安全なフェイルオーバー制御（方針②）の実装要求。
 - **真因の究明**:
   - `setup-standby.sh` において `git clone ... .` を実行する直前に `mkdir -p data logs` を実行していたため、対象ディレクトリが非空（non-empty）となり `git clone .` が失敗（`destination path '.' already exists and is not an empty directory`）していた。
@@ -1977,7 +2031,7 @@
   - フロントエンドおよびバックエンドの Lint エラー 0 件を確認。
 
 - **ユーザーフィードバック & 課題**:
-  - `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` でスクリプトを主系（Master）自身からダウンロードしているにもかかわらず、スクリプト実行時に対話プロンプト「Master (主系) サーバーのベースURLを入力してください:」が表示されるのは二度手間で不自然という指摘。
+  - `curl -sSL https://ttsbot.example.com/setup-standby.sh | sudo bash` でスクリプトを主系（Master）自身からダウンロードしているにもかかわらず、スクリプト実行時に対話プロンプト「Master (主系) サーバーのベースURLを入力してください:」が表示されるのは二度手間で不自然という指摘。
 - **抜本的改善内容**:
   1. **Master 配信時の動的テンプレート置換 (`src/web/server.py`)**:
      - `handle_setup_standby_sh` / `handle_setup_standby_ps1` において、アクセス元リクエストの Host / Protocol ヘッダーや `WEB_BASE_URL` 設定から Master 自身のベースURLを自動特定（`_get_master_base_url`）。
@@ -1985,18 +2039,18 @@
      - スクリプト内のプレースホルダー（`__DEFAULT_MASTER_URL__`, `__DEFAULT_HA_SECRET__`）を動的に置換して配信。
   2. **スクリプトの対話ゼロ化 (`src/web/static/setup-standby.sh` & `.ps1`)**:
      - Master からダウンロードされたスクリプトには、最初から接続先 Master URL と HA Secret が埋め込まれているため、対話プロンプトは一切表示されずに即座にスキップ。
-     - 「✓ 接続先 Master URL: https://ttsbot.kenko.land」「✓ HA 認証シークレット: 設定完了」と自動認識・表示され、即座に Docker チェックおよび Watchdog 起動へ進む完全全自動化を達成。
+     - 「✓ 接続先 Master URL: https://ttsbot.example.com」「✓ HA 認証シークレット: 設定完了」と自動認識・表示され、即座に Docker チェックおよび Watchdog 起動へ進む完全全自動化を達成。
   3. **WebUI のワンライナー表記最適化 (`src/web/static/app.js`)**:
-     - 余計な引数のない最も美しくシンプルなコマンド `curl -sSL https://ttsbot.kenko.land/setup-standby.sh | sudo bash` で100%確実に全自動セットアップが完了するように改修。
+     - 余計な引数のない最も美しくシンプルなコマンド `curl -sSL https://ttsbot.example.com/setup-standby.sh | sudo bash` で100%確実に全自動セットアップが完了するように改修。
 - **実機検証**:
-  - `curl -s http://localhost:8088/setup-standby.sh` の配信結果において、`AUTO_DETECTED_MASTER_URL="https://ttsbot.kenko.land"` および `AUTO_DETECTED_HA_SECRET="..."` が最初から埋め込まれていることを確認。
+  - `curl -s http://localhost:8088/setup-standby.sh` の配信結果において、`AUTO_DETECTED_MASTER_URL="https://ttsbot.example.com"` および `AUTO_DETECTED_HA_SECRET="..."` が最初から埋め込まれていることを確認。
   - パイプ実行テストで、Master URL / Secret の対話入力が一切要求されず、自動認識されて即座に進行することを確認。
 
 ## [2026-10-24] エラー通知先DM設定の動的化 & Standby待機ノードセットアップエラーの解消
 - **概要**:
   1. **エラー通知先DM設定の動的化**:
-     - これまで管理者Discord User ID（`310034034690359308`）が固定値としてコード内に存在していたのを改修し、サーバー固有設定（ボット設定タブ）およびシステム全体設定（API・連携設定タブ）から任意のエラー連絡先DiscordユーザーIDを指定可能にした。
-     - 現行の通知先ID（`310034034690359308`）を初期値（デフォルトフォールバック）として安全に維持・登録。
+     - これまで管理者Discord User ID（`123456789012345678`）が固定値としてコード内に存在していたのを改修し、サーバー固有設定（ボット設定タブ）およびシステム全体設定（API・連携設定タブ）から任意のエラー連絡先DiscordユーザーIDを指定可能にした。
+     - 現行の通知先ID（`123456789012345678`）を初期値（デフォルトフォールバック）として安全に維持・登録。
      - **例示・プレースホルダーにユーザーの実IDを一切使い回さず、ダミーID（`例: 123456789012345678`）のみを記載するプライバシー保護・安全設計**を徹底。
      - WebUIからワンクリックでDiscord DM疎通を確認できる「テスト送信 📨」ボタンを両画面に新設。
   2. **Standby (Slave) ノード登録エラー (`no such service: standby-watchdog`) の解消**:
@@ -2004,12 +2058,12 @@
      - WebUIのコピーワンライナーに最初から Master URL と HA Secret を引数として自動注入（`bash -s -- <URL> <SECRET>`）し、一切の対話入力不要で100%確実に起動できるように最適化。
 - **改修詳細**:
   1. **エラー通知サブシステム (`src/utils/alert_service.py` & `src/main.py`)**:
-     - `INITIAL_DEFAULT_CONTACT_ID = 310034034690359308` を定義。
+     - `INITIAL_DEFAULT_CONTACT_ID = 123456789012345678` を定義。
      - `resolve_target_user_id(guild_id, explicit_target_id)` を新設: ギルド固有設定 → システム全体設定 → デフォルトID の3段階フォールバック解決。
      - `notify` および `send_alert` で解決されたユーザー宛てにリアルタイムEmbed DMを送信。
   2. **データベース層 (`src/database.py`)**:
      - `guild_settings` テーブルに `error_contact_user_id INTEGER DEFAULT 0` カラムをマイグレーション追加。
-     - `system_credentials` テーブルの初期値として `('error_contact_user_id', '310034034690359308')` を `INSERT OR IGNORE`。
+     - `system_credentials` テーブルの初期値として `('error_contact_user_id', '123456789012345678')` を `INSERT OR IGNORE`。
   3. **バックエンドAPI (`src/web/server.py`)**:
      - `api_get_config` / `api_update_config`: サーバーごとの `error_contact_user_id` の取得・更新。
      - `api_system_get_credentials` / `api_system_save_credentials`: システム全体の `error_contact_user_id` および `ha_secret` の取得・保存。`ha_secret` 未設定時は安全なランダムキーを自動生成・永続化。
@@ -2026,7 +2080,7 @@
      - Standby ワンライナーを引数付き（`bash -s -- "${origin}" "${haSecret}"`）で動的生成。
 - **実機検証**:
   - `docker compose restart app` による安全なホットリロード。
-  - 実機ブラウザで全画面の正常描画、初期値（`310034034690359308`）の表示、プレースホルダーのダミー表記、Standbyワンライナーへのシークレット自動注入を確認（スクリーンショット記録済み）。
+  - 実機ブラウザで全画面の正常描画、初期値（`123456789012345678`）の表示、プレースホルダーのダミー表記、Standbyワンライナーへのシークレット自動注入を確認（スクリーンショット記録済み）。
   - `curl -s http://localhost:8088/docker-compose.yml` (200 OK)、`/setup-standby.sh` (200 OK) の疎通確認完了。
 
 ## [2026-10-24] docker-compose.yml の Manager 専任化（ローカルエンジンサービスの完全分離）
@@ -2197,7 +2251,7 @@
      - `docker-compose.yml` にネットワークエイリアス `router`, `ttsbot`, `ttsbot-router` を追加し、Cloudflare Tunnel および内部プロキシ互換性を100%担保。
   3. **Side-by-Side 切替実行 (瞬断約3秒)**:
      - 事前イメージビルド（キャッシュ済み）により、旧コンテナ停止から新コンテナ起動まで所要時間わずか 3秒 で切替完了。
-     - MasterDebian の HA Watchdog（30秒タイムアウト）の誤昇格を原理的に防止。
+     - SlaveNode-Debian の HA Watchdog（30秒タイムアウト）の誤昇格を原理的に防止。
      - 起動後ヘルスチェック: `status: ok`, `bot.is_ready: true`, `latency_ms: 168.27`, `guilds_count: 2`, 全12ノードWorker健全復帰を確認。
   4. **ディレクトリ構造再編 & GitHub同期先入替**:
      - 旧環境ファイル群を `/root/old-tts-bot` に完全退避（Remote: `Maximilian2022/ttsbot.git`）。
@@ -2205,7 +2259,7 @@
      - `.gitignore` を強化し、旧ディレクトリ（`docker/`, `cache_voicevox/`, `coeiroink_models/` 等）や本番機密ファイルの混入を完全遮断。
      - コンテナのバインドマウントを `/root/ttsbot` に移行・再起動し、一時ディレクトリ `ttsbot-oss` を完全処分（ゼロフットプリント）。
      - 両リポジトリの `main` ブランチへ最新コードをコミット＆プッシュ完了。
-  5. **副系ノード (MasterDebian: 192.168.11.248) の現状把握**:
+  5. **副系ノード (SlaveNode-Debian: 192.168.1.20) の現状把握**:
      - 新環境がポート 8088 で 200 OK を返しているため、Debian側の HA Watchdog は主系健全と判定し、スプリットブレインを起こさず安全に待機中。
      - Debian側の分散Worker Agent（50030）は新環境への登録を自動完了し、音声合成に参加可能。
 
@@ -2419,7 +2473,7 @@
      - ユーザーが作成した `gcp-key.json` をコンテナ内 `/app/gcp-key.json` に読み取り専用でマウント (`- ./gcp-key.json:/app/gcp-key.json:ro`)。
   4. コンテナを再ビルド・再起動し、Gateway接続、スラッシュコマンド同期（5件）、および `logs/bot.log` へのログ出力を確認。
 
-## [2026-09-27] WebUI実装 & Cloudflare Tunnel (ttsbot.kenko.land) 連携
+## [2026-09-27] WebUI実装 & Cloudflare Tunnel (ttsbot.example.com) 連携
 - **実装内容**:
   1. **WebUIアーキテクチャ (`src/web/`)**:
      - `auth.py`: Discord OAuth2 認証。Botが参加しているDiscordサーバー（`bot.guilds`）の所属判定によるアクセス制限、HMAC-SHA256署名付きセッションCookie管理。
@@ -2460,7 +2514,7 @@
 ## [2026-09-27] WebUI機能拡張 & サーバー別分離 & 権限制御 & TTS利用状況グラフ実装
 - **作業内容**:
   1. **設定コマンドへのWebUI案内追記**:
-     - `src/cogs/commands.py`: `/voice`, `/dict add`, `/dict delete`, `/dict list` 実行時の返答メッセージ（Embed footer等）に `💡 Webダッシュボードからも設定・試聴・インポートが可能です: https://ttsbot.kenko.land` を追加。
+     - `src/cogs/commands.py`: `/voice`, `/dict add`, `/dict delete`, `/dict list` 実行時の返答メッセージ（Embed footer等）に `💡 Webダッシュボードからも設定・試聴・インポートが可能です: https://ttsbot.example.com` を追加。
      - `/dict` コマンドで実行ギルドID（`interaction.guild_id`）を渡し、ギルド外での実行ブロック処理を追加。
   2. **サーバー単位の設定・辞書の保持 & 分離 (`src/database.py`, `src/cogs/vc_handler.py`, `src/utils/`)**:
      - `guild_dictionary`: `guild_id` カラムでサーバー別に単語辞書を完全分離。
@@ -2488,7 +2542,7 @@
   7. **検証**:
      - 全Pythonソースのコンパイルテスト通過。
      - `docker compose up -d --build ttsbot` で本番コンテナを安全に再構築・起動。
-     - WebUI（ローカルおよび `https://ttsbot.kenko.land` 経由）の正常稼働、未認証アクセスの 401 拒絶を確認。
+     - WebUI（ローカルおよび `https://ttsbot.example.com` 経由）の正常稼働、未認証アクセスの 401 拒絶を確認。
 
 ## [2026-09-27] 発言者名（サーバーネーム）前置読み上げオプション & 初回発言時ランダム声質選定の実装
 - **作業内容**:
@@ -2562,7 +2616,7 @@
 ## [2026-09-28] コマンド応答のWebUIリンク化、VC参加時WebUI案内投稿、および .gitignore 設定
 - **作業内容**:
   1. **コマンド応答のWebUIハイパーリンク対応 (`src/config.py`, `src/cogs/commands.py`)**:
-     - `AppConfig` に `web_dashboard_url` プロパティ（デフォルト: `https://ttsbot.kenko.land`）を追加。環境変数 `WEB_DASHBOARD_URL` または `DISCORD_REDIRECT_URI` のオリジンから自動設定。
+     - `AppConfig` に `web_dashboard_url` プロパティ（デフォルト: `https://ttsbot.example.com`）を追加。環境変数 `WEB_DASHBOARD_URL` または `DISCORD_REDIRECT_URI` のオリジンから自動設定。
      - Discord Embed の仕様上、footer内ではマークダウンリンクが無効化されプレーンテキストになるため、WebUI案内を `description` に配置。
      - `/voice`, `/dict add`, `/dict delete`, `/dict list` の各コマンドで `💡 [Webダッシュボード]({dashboard_url})` 形式のクリッカブルなハイパーリンクとして表示されるように改修。
   2. **VC接続時のWebUI案内投稿 (`src/cogs/commands.py`, `src/cogs/vc_handler.py`)**:
@@ -2660,7 +2714,7 @@
      - **Bot #4 (シヴァ3#1150)**: ワーカー機、正常接続
      - **Bot #5 (シヴァ4#4916)**: ワーカー機、正常接続
   3. 全5台のBotが参加先サーバー（「Anica01連合（HTW）」、「魔法少女連合」）に正常認識され、最大5VCの同時動的アサインが可能な状態を確認。
-  4. WebUI（https://ttsbot.kenko.land）の正常稼働（200 OK）、全14種類モデルの表示およびBotプールステータス表示を確認。
+  4. WebUI（https://ttsbot.example.com）の正常稼働（200 OK）、全14種類モデルの表示およびBotプールステータス表示を確認。
 
 ## [2026-09-28] 自動参加VC・読み上げテキストチャンネルのペアリングを最大5組へ拡張
 - **作業内容**:
@@ -2751,7 +2805,7 @@
      - Web API: `GET /api/me/voices_by_guild`（設定済みサーバー一覧取得）、`POST /api/me/sync_voice`（From ➔ To 個人設定同期）。
      - WebUI: マイ音声設定タブの上部に「🔄 サーバー間での音声設定同期」カードを配置。同期元サーバーを選択してワンクリックで現在のサーバーに声質・ピッチ・速度・括弧設定をコピー・同期。
   4. **サーバー表示名（ニックネーム）の括弧除去オプション (`src/cogs/vc_handler.py`, `src/database.py`)**:
-     - 要件: 「【わ】チェインドベル【鈍器】」等のサーバーネームについて、括弧および括弧の中身を除去して「チェインドベル」として読み上げるオプションを追加。**デフォルトでON**。
+     - 要件: 「【わ】AdminUser【鈍器】」等のサーバーネームについて、括弧および括弧の中身を除去して「AdminUser」として読み上げるオプションを追加。**デフォルトでON**。
      - 個人設定に `strip_name_brackets`（INTEGER DEFAULT 1）を追加。
      - 正規表現 `r"[（\(【\[〔〈《「『][^）\)】\]〕〉》」』]*[）\)】\]〕〉》」』]"` により隅付き括弧・丸括弧・角括弧等を一括除去し前後の空白を自動トリミング。
      - WebUIマイ音声設定にトグルチェックボックス（デフォルトON）を配置。
@@ -3495,7 +3549,7 @@
 - **要望・設計の背景**:
   - ホストマシン（物理4コア Core i5-9300H）のCPU負荷とVC音声配信（音飛びリスク）を分離し、ラッシュ時の最大瞬間風速に対応するため、別マシン（Debianサーバー、Windows GPU機）へ推論を分散させるマルチノード構成を設計。
   - 各マシンが他業務と「共用」であることを踏まえ、過負荷を起こさない厳格なリソース制限・同時実行数制御が必須。
-  - Debianマシン側は `curl -fsSL https://ttsbot.kenko.land/setup-worker.sh | bash` のワンライナーで、Windows側は `irm ... | iex` のワンライナーで、WebUI経由で全自動展開できる仕組みを実装。
+  - Debianマシン側は `curl -fsSL https://ttsbot.example.com/setup-worker.sh | bash` のワンライナーで、Windows側は `irm ... | iex` のワンライナーで、WebUI経由で全自動展開できる仕組みを実装。
 - **対処・実装内容**:
   1. **マルチノード対応データモデル & 設定拡張 (`src/config.py`, `config.yaml`)**:
      - `TTSNodeConfig` データクラス（`id`, `url`, `priority`, `max_concurrent`, `enabled`）を新設。
@@ -3513,13 +3567,13 @@
   5. **ワンライナー自動展開スクリプト & 配信ルーティング (`src/web/static/setup-worker.sh`, `setup-worker.ps1`, `src/web/server.py`)**:
      - スクリプト自身に Dockerfile や Compose 定義を内包し、単一完結で動作する `setup-worker.sh`（Debian用）と `setup-worker.ps1`（Windows用）を作成。
      - WebUI サーバーから `GET /setup-worker.sh`（および `.ps1`）をプレーンテキスト配信（`content_type="text/plain", charset="utf-8"`）。
-     - Cloudflare Tunnel 経由（`https://ttsbot.kenko.land/setup-worker.sh`）で外部からワンライナー実行可能。
+     - Cloudflare Tunnel 経由（`https://ttsbot.example.com/setup-worker.sh`）で外部からワンライナー実行可能。
   6. **WebUI ダッシュボード連携 (`src/web/templates/index.html`, `src/web/static/app.js`)**:
      - 「ℹ️ システム状況」タブに「🖥️ 分散コンピュートワーカー」カードを追加。
      - 全ノードのヘルス状態・優先度・累計処理数・応答速度（ms）をリアルタイム描画。
      - ワンライナーコマンドのコピーボタン（1クリックでクリップボードコピー）を設置。
 - **実測・検証結果**:
-  - `curl -fsSL https://ttsbot.kenko.land/setup-worker.sh` で正常に HTTP 200 OK & 完全なシェルスクリプトが配信されることを実機確認。
+  - `curl -fsSL https://ttsbot.example.com/setup-worker.sh` で正常に HTTP 200 OK & 完全なシェルスクリプトが配信されることを実機確認。
   - テストコンテナによる VOICEVOX 合成テストにおいて、`TTSNodePool` 経由で正常に合成（48,172 bytes WAV取得）され、統計情報（レイテンシ等）が記録されることを確認。
   - 最新ビルド `v2026.09.29-1545` で全Bot（1〜5号機）Gateway接続完了、エラーゼロで本番安定稼働中。
 
@@ -3653,13 +3707,13 @@ WebUI /stats ポーリング (30秒)
 
 ---
 
-## 2026-09-29: Windows Worker 3大エンジン対応 & 192.168.11.0/24 LAN IP検出改善 & Master自動登録確認
+## 2026-09-29: Windows Worker 3大エンジン対応 & 192.168.1.0/24 LAN IP検出改善 & Master自動登録確認
 
 ### 背景・課題
 1. **Windows WorkerでVOICEVOXしかデプロイされていなかった問題**:
    Debian用スクリプトでは VOICEVOX, SHAREVOX, COEIROINK の3エンジンが展開されていたが、Windows用スクリプト (`setup-worker.ps1`) では SHAREVOX のイメージ指定不備および COEIROINK の未定義があり、VOICEVOX のみしか起動していなかった。
 2. **IPアドレスが仮想NIC (192.168.79.1) になってしまう問題**:
-   Windowsマシン上で VMware や VirtualBox、WSL などの仮想NICが存在する場合、従来の `Get-NetIPAddress` では VMware アダプタ等の IP (192.168.79.1) が最優先で取得されてしまっていた。ユーザー環境の全ローカルマシンは `192.168.11.0/24` 内に存在する。
+   Windowsマシン上で VMware や VirtualBox、WSL などの仮想NICが存在する場合、従来の `Get-NetIPAddress` では VMware アダプタ等の IP (192.168.79.1) が最優先で取得されてしまっていた。ユーザー環境の全ローカルマシンは `192.168.1.0/24` 内に存在する。
    また、Docker Desktop (WSL2) 内で動く Agent コンテナ内では直接 Windows ホストの LAN IP を取得できない問題があった。
 3. **Masterへの自動登録完了メッセージの混乱**:
    スクリプト完了時に「Masterのconfig.yamlに追加してください」と表示されていたため、ユーザーが動的自動登録されていないと誤解した。
@@ -3674,8 +3728,8 @@ WebUI /stats ポーリング (30秒)
   - `docker-compose.worker.yml` に `worker-voicevox` (GPU/CPU自動判別), `worker-sharevox` (ポート50025), `worker-coeiroink` (ポート50031) を定義。
   - コンテナ名を `ttsworker-voicevox`, `ttsworker-sharevox`, `ttsworker-coeiroink`, `ttsworker-agent` に統一（Agentの死活監視と一致）。
   - RAM配分を3エンジンで均等配分（VV: 35%, SV: 30%, CI: 35%）。
-- **192.168.11.0/24 優先 IPアドレス検出**:
-  - `192.168.11.*` の IPv4 アドレスを最優先で取得。
+- **192.168.1.0/24 優先 IPアドレス検出**:
+  - `192.168.1.*` の IPv4 アドレスを最優先で取得。
   - 次点としてデフォルトルート (0.0.0.0/0) を持つ物理インターフェースを取得。
   - VMware / VirtualBox / WSL / vEthernet / Bluetooth / TAP 等の仮想NICを完全除外。
   - 検出した LAN IP を `docker-compose.agent.yml` の環境変数 `WORKER_IP` としてコンテナに注入。
@@ -3689,7 +3743,7 @@ WebUI /stats ポーリング (30秒)
 - `master_registered` フラグの追跡: Master への登録およびハートビート成功時に True とし、`/status` API レスポンスに含める。
 
 #### 3. Debian用セットアップスクリプト (`src/web/static/setup-worker.sh` v2.1)
-- `192.168.11.0/24` 優先 IP 検出ロジックを追加。
+- `192.168.1.0/24` 優先 IP 検出ロジックを追加。
 - `WORKER_IP` 環境変数を `docker-compose.agent.yml` に追加。
 - Master 自動登録の完了確認ポーリングとメッセージ刷新を同期。
 
@@ -3778,10 +3832,10 @@ WindowsマシンにGPUが搭載されているにもかかわらず、Masterへ�
 #### 2. ワーカーノード担当ログの可視化 (`src/tts/`)
 - **`TTSNode.summary_label` プロパティの追加 (`src/tts/node_pool.py`)**:
   - ノードID、ホスト名、GPU情報、URLをまとめた可読性の高いラベルを定義。
-  - 例: `'worker_MASTERSOMEN2022_voicevox' (MASTERSOMEN2022 / GPU: NVIDIA GeForce RTX 4070) [http://192.168.11.200:50021]`
+  - 例: `'worker_Worker-GPU-2_voicevox' (Worker-GPU-2 / GPU: NVIDIA GeForce RTX 4070) [http://192.168.1.50:50021]`
 - **各エンジン合成完了時のログ出力 (`voicevox_tts.py`, `sharevox_tts.py`, `coeiroink_tts.py`)**:
   - 音声合成完了時に、担当したワーカーの `summary_label`、処理レイテンシ（ms）、合成テキストプレビューを INFO レベルで出力。
-  - 例: `🎙️ [VOICEVOX] 音声合成完了 (145ms): worker='worker_MASTERSOMEN2022_voicevox' (MASTERSOMEN2022 / GPU: NVIDIA GeForce RTX 4070) [http://192.168.11.200:50021] | text='こんにちは...'`
+  - 例: `🎙️ [VOICEVOX] 音声合成完了 (145ms): worker='worker_Worker-GPU-2_voicevox' (Worker-GPU-2 / GPU: NVIDIA GeForce RTX 4070) [http://192.168.1.50:50021] | text='こんにちは...'`
   - ローカルエンジン使用時は `worker='local_master' (Masterローカル)` と出力。
 - **クラウドTTS（Google, Azure, Edge-TTS, OpenJTalk）のログ統一 (`src/tts/manager.py`)**:
   - クラウドAPIやローカルエンジンでの合成完了時にもレイテンシとエンジン種別を統一ログ出力。
@@ -3864,7 +3918,7 @@ WindowsマシンにGPUが搭載されているにもかかわらず、Masterへ�
 - `Invoke-RestMethod` による安定した JSON リスト取得。
 - 単なる `metas.json` の有無だけでなく、`model` フォルダおよびその配下の重みファイル存在を厳密にチェック。
 - 過去に中断・失敗した中途半端な展開フォルダが存在する場合、自動でクリーンアップ（削除）して最初から再展開する自己修復ロジックを追加。
-- 稼働中の本番コンテナへ `docker cp` で即座に反映し、`https://ttsbot.kenko.land/static/setup-worker.ps1` への配信を更新完了。
+- 稼働中の本番コンテナへ `docker cp` で即座に反映し、`https://ttsbot.example.com/static/setup-worker.ps1` への配信を更新完了。
 
 ---
 
@@ -3893,7 +3947,7 @@ WindowsマシンにGPUが搭載されているにもかかわらず、Masterへ�
 3. **COEIROINK モデル同期の厳密検証 & 自己修復**:
    - Windows 同様、`model/` 配下のファイル存在チェックによる同期済み判定と、中断残骸フォルダの自動削除処理を追加。
 4. **本番配信反映**:
-   - `docker cp` で稼働中の `discord-tts-bot` コンテナへ即座に反映し、`https://ttsbot.kenko.land/static/setup-worker.sh` への配信を更新完了。
+   - `docker cp` で稼働中の `discord-tts-bot` コンテナへ即座に反映し、`https://ttsbot.example.com/static/setup-worker.sh` への配信を更新完了。
 
 ---
 
@@ -3910,7 +3964,7 @@ WindowsマシンにGPUが搭載されているにもかかわらず、Masterへ�
    - `curl -sSL -I` にて 2.43GB（2,434,843,665 bytes）の完全な ZIP アーカイブが正常レスポンスされることを検証。
 2. **スクリプト修正 & 本番反映**:
    - `setup-worker.sh` および `setup-worker.ps1` の CPU 版 URL を最新の有効リンクへ更新。
-   - `docker cp` で稼働中の `discord-tts-bot` コンテナへ反映し、公開 URL（`https://ttsbot.kenko.land/static/setup-worker.sh` および `.ps1`）を更新完了。
+   - `docker cp` で稼働中の `discord-tts-bot` コンテナへ反映し、公開 URL（`https://ttsbot.example.com/static/setup-worker.sh` および `.ps1`）を更新完了。
 
 ## 2026-09-29: SHAREVOX 公式 GPU Docker イメージ検証と 3 大エンジン GPU 完全対応
 
@@ -4121,7 +4175,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 ### 1. AI 直接参照可能な Worker 診断 & ログビューアの整備
 - **実装ツール**: `/root/ttsbot/scripts/check_workers.sh`
 - **機能**:
-  - MasterDebian (192.168.11.248), MASTERSOMEN2022 (192.168.11.200), MASTEROMEN2017 (192.168.11.207) のネットワーク疎通、Agent 稼働状態、Node ID、Agent版、Python版、直近の実行ログを一括取得・整形表示。
+  - SlaveNode-Debian (192.168.1.20), Worker-GPU-2 (192.168.1.50), Worker-GPU-1 (192.168.1.40) のネットワーク疎通、Agent 稼働状態、Node ID、Agent版、Python版、直近の実行ログを一括取得・整形表示。
   - AI アシスタントから `bash scripts/check_workers.sh` でいつでも即座に Worker ログを直接確認可能に。
 
 ### 2. Windows Worker が Python 3.14 にならなかった原因の解明
@@ -4144,11 +4198,11 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 ### 4. Windows マシンでの昇格手順
 - **方法 A (最速 10秒 / Agent のみ Python 3.14 に昇格)**:
   ```powershell
-  cd $HOME\ttsbot-worker; Invoke-WebRequest -Uri "https://ttsbot.kenko.land/static/agent.py" -OutFile "docker\agent\agent.py"; docker compose -f docker-compose.agent.yml up -d --force-recreate
+  cd $HOME\ttsbot-worker; Invoke-WebRequest -Uri "https://ttsbot.example.com/static/agent.py" -OutFile "docker\agent\agent.py"; docker compose -f docker-compose.agent.yml up -d --force-recreate
   ```
 - **方法 B (SetupScript で全体再セットアップ)**:
   ```powershell
-  irm https://ttsbot.kenko.land/static/setup-worker.ps1 | iex
+  irm https://ttsbot.example.com/static/setup-worker.ps1 | iex
   ```
 - **効果**:
   - 本手順を一度実行すれば、次回以降の Master からのアップデートは Graceful Restart により自動かつ完全無人で正常完了する。
@@ -4258,20 +4312,20 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 - **WorkerAccess リモート管理環境の整備**:
   - `WorkerAccess/` フォルダを新設。
   - 共通 SSH 秘密鍵 `id_rsa` (chmod 600) および公開鍵 `id_rsa.pub` を配置。
-  - Linux Worker (`192.168.11.248`) および Windows Worker (`192.168.11.200`, `192.168.11.207`) の接続コマンド・手順を `WorkerAccess/README.md` に整備。
+  - Linux Worker (`192.168.1.20`) および Windows Worker (`192.168.1.50`, `192.168.1.40`) の接続コマンド・手順を `WorkerAccess/README.md` に整備。
   - Windows Worker 側の PowerShell に SSH 接続可能にする自動セットアップスクリプト `setup-windows-ssh.ps1` を作成（OpenSSH Server 自動インストール、ポート22許可、PowerShellシェル化、管理者/ユーザー両対応の公開鍵配置 & 厳格なACL自動構成）。
-  - `src/web/static/setup-windows-ssh.ps1` にも配備し、Windows 側からワンライナー `irm https://ttsbot.kenko.land/static/setup-windows-ssh.ps1 | iex` で実行可能に。
+  - `src/web/static/setup-windows-ssh.ps1` にも配備し、Windows 側からワンライナー `irm https://ttsbot.example.com/static/setup-windows-ssh.ps1 | iex` で実行可能に。
 
-### 5. Windows Worker (192.168.11.207: MASTEROMEN2017) の実機接続・動作検証完了
+### 5. Windows Worker (192.168.1.40: Worker-GPU-1) の実機接続・動作検証完了
 - **SSH 接続テスト成功**:
-  - `WorkerAccess/id_rsa` を使用して Master サーバー（MasterUbuntu）から `ssh -i /root/ttsbot/WorkerAccess/id_rsa shuns@192.168.11.207 "hostname"` を実行。
-  - Windows OpenSSH Server 経由で PowerShell にダイレクト接続され、応答 `MasterOMEN2017` を確認。
+  - `WorkerAccess/id_rsa` を使用して Master サーバー（MasterNode-Ubuntu）から `ssh -i /root/ttsbot/WorkerAccess/id_rsa shuns@192.168.1.40 "hostname"` を実行。
+  - Windows OpenSSH Server 経由で PowerShell にダイレクト接続され、応答 `MasterWorker-GPU-1` を確認。
 - **プロジェクト分離ヘッダーの適用確認**:
   - `C:\Users\shuns\ttsbot-worker\docker-compose.agent.yml`: `name: ttsbot-worker-agent`
   - `C:\Users\shuns\ttsbot-worker\docker-compose.worker.yml`: `name: ttsbot-worker-engines`
   - それぞれ物理分離されていることを確認。
 - **Worker Agent v3.4.8 の動作 & 0秒スキップ検証**:
-  - コンテナ `ttsworker-agent` を再起動し、Master への再登録完了（`worker_MASTEROMEN2017`, GTX 1080 Ti, 11GB VRAM, agent_version: 3.4.8, manifest_version: 2026.09.30.1）。
+  - コンテナ `ttsworker-agent` を再起動し、Master への再登録完了（`worker_Worker-GPU-1`, GTX 1080 Ti, 11GB VRAM, agent_version: 3.4.8, manifest_version: 2026.09.30.1）。
   - アップデート要求 `/update` を送信し、モデル同期ロジックの動作を検証。
   - **検証結果ログ**:
     - `✨ [1/17] モデル 'アメノちゃん' (ameno-2.0.0, 1071.9MB) は同期済みです (スキップ)`
@@ -4286,33 +4340,33 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 
 ### 6. ローカル LAN 直結化 (Cloudflare Tunnel バイパス) による高速化・切断根絶
 - **背景 & 発見された問題**:
-  - Worker Agent の `MASTER_URL` が `https://ttsbot.kenko.land` (Cloudflare Tunnel) に固定されていたため、Worker からの通信（自動登録、ハートビート、大容量モデルダウンロード）がすべて WAN を経由していた。
+  - Worker Agent の `MASTER_URL` が `https://ttsbot.example.com` (Cloudflare Tunnel) に固定されていたため、Worker からの通信（自動登録、ハートビート、大容量モデルダウンロード）がすべて WAN を経由していた。
   - Cloudflare Tunnel の無料枠仕様（大容量ストリーミングの 100秒タイムアウトやレートリミット）により、2GB を超える大型モデル（`amitaro`, `arma`, `croix` 等）の同期中に接続がリセット・切断される根本原因となっていた。
 - **実施した改修**:
   1. **Master 側ポート開放 (`docker-compose.yml`)**:
      - `ttsbot` サービスのポート定義を `127.0.0.1:8088:8080` → `8088:8080` (0.0.0.0 バインド) に変更。
      - `docker compose up -d --no-deps ttsbot` により本番の他エンジンを停止させることなくポートを即時反映。
   2. **Worker 側スクリプト・コードのデフォルト値変更**:
-     - `src/web/static/agent.py`: `MASTER_URL` デフォルトを `http://192.168.11.245:8088` に更新。
-     - `src/web/static/setup-worker.ps1`: `$MasterUrl` デフォルトを `http://192.168.11.245:8088` に更新。
-     - `src/web/static/setup-worker.sh`: `MASTER_URL` デフォルトを `http://192.168.11.245:8088` に更新。
+     - `src/web/static/agent.py`: `MASTER_URL` デフォルトを `http://192.168.1.10:8088` に更新。
+     - `src/web/static/setup-worker.ps1`: `$MasterUrl` デフォルトを `http://192.168.1.10:8088` に更新。
+     - `src/web/static/setup-worker.sh`: `MASTER_URL` デフォルトを `http://192.168.1.10:8088` に更新。
   3. **各稼働中 Worker への LAN 直結設定の反映**:
-     - **Windows Worker (`192.168.11.207: MASTEROMEN2017`)**:
-       - `docker-compose.agent.yml` の `MASTER_URL` を `http://192.168.11.245:8088` に遠隔更新しコンテナを再作成。
-       - Master への直接自動登録（`192.168.11.207` から `POST /api/worker/register` HTTP 200）を確認。
-     - **Debian Worker (`192.168.11.248: worker_MasterDebian`)**:
-       - `~/ttsbot-worker/docker-compose.agent.yml` の `MASTER_URL` を `http://192.168.11.245:8088` に遠隔更新しコンテナを再作成。
-       - Master への直接自動登録（`192.168.11.248` から `POST /api/worker/register` HTTP 200）を確認。
-     - **Windows Worker (`192.168.11.200: MASTERSOMEN2022`)**:
+     - **Windows Worker (`192.168.1.40: Worker-GPU-1`)**:
+       - `docker-compose.agent.yml` の `MASTER_URL` を `http://192.168.1.10:8088` に遠隔更新しコンテナを再作成。
+       - Master への直接自動登録（`192.168.1.40` から `POST /api/worker/register` HTTP 200）を確認。
+     - **Debian Worker (`192.168.1.20: worker_SlaveNode-Debian`)**:
+       - `~/ttsbot-worker/docker-compose.agent.yml` の `MASTER_URL` を `http://192.168.1.10:8088` に遠隔更新しコンテナを再作成。
+       - Master への直接自動登録（`192.168.1.20` から `POST /api/worker/register` HTTP 200）を確認。
+     - **Windows Worker (`192.168.1.50: Worker-GPU-2`)**:
        - OpenSSH Server 受信規則のプロファイル全許可（`Profile Any`）設定適用により、SSH 接続が開通（応答: `MastersOmen2022`）。
        - Compose ファイルのプロジェクト分離（`name: ttsbot-worker-agent` / `name: ttsbot-worker-engines`）を適用。
-       - `MASTER_URL` を `http://192.168.11.245:8088` に遠隔更新し、コンテナを再作成。
-       - Master への直接自動登録（`worker_MASTERSOMEN2022`, RTX 3090 24GB, RAM 31.3GB, CPU 20コア, concurrent=3, priority=1）を完了確認。
+       - `MASTER_URL` を `http://192.168.1.10:8088` に遠隔更新し、コンテナを再作成。
+       - Master への直接自動登録（`worker_Worker-GPU-2`, RTX 3090 24GB, RAM 31.3GB, CPU 20コア, concurrent=3, priority=1）を完了確認。
 - **検証結果**:
   - 全ワーカーノード（Debian 248, Windows 207, Windows 200）において：
     1. 共通秘密鍵による Master からの SSH 一元遠隔管理が開通。
     2. Compose プロジェクト名の物理分離によるコンテナ自己削除バグの根絶。
-    3. 宅内 LAN（`192.168.11.245:8088`）直結によるタイムアウト・切断ゼロおよびモデル同期の高速化。
+    3. 宅内 LAN（`192.168.1.10:8088`）直結によるタイムアウト・切断ゼロおよびモデル同期の高速化。
     4. 話者モデルの 0秒同期スキップ機能の有効化。
   - がすべて完了し、安定・高速な分散 TTS 基盤が確立。
 
@@ -4360,7 +4414,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   4. `scripts/sync_models_to_worker.sh`:
      - 初期の手動 rsync 転送スクリプト。現在は Worker Agent が HTTP 経由で 0 秒スキップ付き自動同期を行うため、役目を終えたものとして削除。
 - **ドキュメントの最新化 (`docs/DEBIAN_WORKER_SETUP.md`)**:
-  - 初期の手動 scp / 手動 rsync / 手動 Compose 起動という陳腐化した古い記述から、現在の最新仕様である「ワンライナー（`curl -sSL http://192.168.11.245:8088/setup-worker.sh | bash`）による完全自動セットアップ・Auto-Discovery・SSH リモート管理」に全面改訂。
+  - 初期の手動 scp / 手動 rsync / 手動 Compose 起動という陳腐化した古い記述から、現在の最新仕様である「ワンライナー（`curl -sSL http://192.168.1.10:8088/setup-worker.sh | bash`）による完全自動セットアップ・Auto-Discovery・SSH リモート管理」に全面改訂。
 - **本番・Workerへの影響確認**:
   - 本番コンテナ（`discord-tts-bot`, `ttsbot-tunnel`）および外部 Worker 3台（Debian 248, Windows 200, Windows 207）ともに影響ゼロ、正常稼働を確認。
 
@@ -4383,13 +4437,13 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   3. **Master 側マニフェスト更新 (`src/web/server.py`)**:
      - `manifest_version` を `2026.09.30.2`、`agent_version` を `3.4.9` に更新。
 - **各 Worker への反映 & 稼働検証**:
-  - **Windows 200 (MASTERSOMEN2022: RTX 3090, 31.3GB RAM, 20コア)**:
+  - **Windows 200 (Worker-GPU-2: RTX 3090, 31.3GB RAM, 20コア)**:
     - `RAM=31.3GB (割当計=15.65GB: VV=5G/SV=5G/CI=5G) CPU=20コア (割当=8コア/スレッド=8) GPU=あり`
     - `docker-compose.worker.yml`: 全エンジンメモリ 5GB、8スレッド、GPU 予約が反映。
-  - **Windows 207 (MASTEROMEN2017: GTX 1080 Ti, 15.6GB RAM, 8コア)**:
+  - **Windows 207 (Worker-GPU-1: GTX 1080 Ti, 15.6GB RAM, 8コア)**:
     - `RAM=15.6GB (割当計=7.8GB: VV=3G/SV=2G/CI=4G) CPU=8コア (割当=4コア/スレッド=4) GPU=あり`
     - `docker-compose.worker.yml`: メモリ 3〜4GB、4スレッド、GPU 予約が反映。
-  - **Debian 248 (worker_MasterDebian: 62.8GB RAM, 8コア, CPU共用機)**:
+  - **Debian 248 (worker_SlaveNode-Debian: 62.8GB RAM, 8コア, CPU共用機)**:
     - `RAM=62.8GB (割当計=8.0GB: VV=3G/SV=2G/CI=3G) CPU=8コア (割当=4コア/スレッド=4) GPU=なし`
     - `docker-compose.worker.yml`: 共用配慮のメモリ 3GB、4コア・4スレッド制限が反映。
   - 全ワーカーが最新 v3.4.9 で Master と正常疎通を継続していることを確認。
@@ -4401,7 +4455,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   3. 「実施してほしい。ステップ１，２全部よろ」
 - **ステップ1: GPUワーカー負荷調査 & COEIROINKクラッシュの真因究明と修復（80倍爆速化）**:
   - **負荷調査結果**:
-    - `MASTERSOMEN2022` (RTX 3090, 192.168.11.200): 空きVRAM 14.8GB、空きRAM 24GB。ゲーム等の他アプリ稼働中であってもリソースは極めて潤沢で、VOICEVOXは 111ms〜700ms で超高速稼働。他アプリによるリソース逼迫が原因ではないことを特定。
+    - `Worker-GPU-2` (RTX 3090, 192.168.1.50): 空きVRAM 14.8GB、空きRAM 24GB。ゲーム等の他アプリ稼働中であってもリソースは極めて潤沢で、VOICEVOXは 111ms〜700ms で超高速稼働。他アプリによるリソース逼迫が原因ではないことを特定。
   - **真因の特定**:
     - COEIROINK Linux GPU版バイナリが、起動スクリプト（`entrypoint.sh`）のカレントディレクトリ不整合（`/opt/coeiroink` で起動され `../speaker_info` が探索不能で話者0件 ➔ KeyError 500）、`LD_LIBRARY_PATH` に同梱の `$DIR/engine/torch/lib` が欠落していたことによる cuDNN/cuBLAS ロード失敗（SEGVクラッシュ）、引数渡しによる `coeirocore/meta.py` の `get_root_path` での `IndexError: 1` の4重不整合により、GPU推論に失敗してコンテナが落ちていた。
     - その結果、Master自機の低速CPU（1発言20秒〜25秒）へのフォールバックが発生し、タイムアウトと極度の遅延が生じていた。
@@ -4409,8 +4463,8 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
     - `entrypoint.sh` を `cd "$DIR/engine"` + `LD_LIBRARY_PATH="$DIR/engine:$DIR/engine/torch/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"` + 引数なし起動 に修正。
     - Windowsホスト側の自己参照シンボリックリンクを除去。
     - 実測合成速度:
-      - `MASTERSOMEN2022` (RTX 3090): **228.3ms 〜 284.9ms (0.2秒台！)**（従来の22秒から約80倍の爆速化）
-      - `MASTEROMEN2017` (GTX 1080 Ti): **489.1ms (0.4秒台！)**
+      - `Worker-GPU-2` (RTX 3090): **228.3ms 〜 284.9ms (0.2秒台！)**（従来の22秒から約80倍の爆速化）
+      - `Worker-GPU-1` (GTX 1080 Ti): **489.1ms (0.4秒台！)**
     - 自動更新スクリプト（`src/web/server.py` マニフェスト, `setup-worker.sh`, `setup-worker.ps1`）も恒久更新。
 - **ステップ2: 発話〜再生レイテンシのエンドツーエンド計測 & WebUIモニター実装**:
   - **計測モジュール (`src/utils/latency_tracker.py`)**:
@@ -4445,7 +4499,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - 30発言を 0.6秒〜1.1秒の高速な間隔で順次連投。
 - **ボトルネック診断結果（性能限界 vs 潜在的問題）**:
   1. **潜在的な問題（バグ・ファイル破損の特定）**:
-     - OMEN 2017 (`192.168.11.207` / GTX 1080 Ti) で COEIROINK「あみたろ (`ci_1564398633`)」の推論時に HTTP 500 が発生。
+     - OMEN 2017 (`192.168.1.40` / GTX 1080 Ti) で COEIROINK「あみたろ (`ci_1564398633`)」の推論時に HTTP 500 が発生。
      - 原因調査: コンテナログで `RuntimeError: PytorchStreamReader failed reading zip archive: failed finding central directory` を特定。
      - ファイルサイズ比較: Masterの正常ファイル `373,246,208` bytes に対し、OMEN 2017 側の `amitaro-10.0/model/1564398633/100epoch.pth` が `261,474,816` bytes（約110MB欠落した壊れたZIP）になっていた。
      - これにより、推論失敗時に Master CPU へのフォールバック（16.9秒）が発生し、再生キュー全体を激しく停滞させていた。
@@ -4563,7 +4617,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - 単語・文パーツごとのキャッシュ保存・照会（`get_chunk_audio` / `_check_chunk`）と連携。
   3. **【Phase 2】GPU最優先ルーティング ＆ VC入室プリウォーム (`src/tts/node_pool.py`, `src/tts/manager.py`, `src/cogs/vc_handler.py`)**:
      - `src/tts/node_pool.py`:
-       - `acquire_node` を刷新。外部GPUノード（OMEN2022 RTX 3090 / OMEN2017 GTX 1080 Ti）を絶対最優先化し、同時実行数と平均レイテンシに基づくロードバランシングを実装。
+       - `acquire_node` を刷新。外部GPUノード（Worker-GPU-2 RTX 3090 / Worker-GPU-1 GTX 1080 Ti）を絶対最優先化し、同時実行数と平均レイテンシに基づくロードバランシングを実装。
        - CPUノード（`local_master`）は「全GPUビジー（タイムアウト直前）またはGPU全断時」の緊急退避用フォールバックに限定（アムダールの法則による最遅律速を撲滅）。
      - `src/tts/manager.py`: 全ワーカーノードへ指定話者モデルの初期化をブロードキャストする `warmup_speaker` を新設。
      - `src/cogs/vc_handler.py`: `on_voice_state_update` にて、ユーザーのVC入室を検知した瞬間にそのユーザーの話者モデルを全GPUへ先行ロードし、発言者名プレフィックス（「〇〇さん、」）のキャッシュ事前生成を非同期起動。
@@ -4595,7 +4649,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
          - 全8件がわずか 9.74秒 でキュー滞留なく完全再生完了。
 ## [2026-10-01] 次世代レイテンシモニター刷新・WebUIリソース監視拡張・エンジンライフサイクル完全連動の実装および検証
 - **概要**:
-  ユーザーフィードバックに基づく「待たせないUX」のさらなる深化。生URL肥大化のスマートバッジ化、会話順序待ち（Queue Wait）を除外した純粋初動ラグ（`turn_ttfs_ms`）と投稿起点ラグ（`e2e_ttfs_ms`）の分離、音声工学指標RTFの導入、音飛び実時間（`underrun_ms`）計測、外部ワーカー（Master/OMEN2022/OMEN2017）リソース監視タブ化、ワンライナー集約、ならびにマスター＆外部ワーカー間のライフサイクル完全連動（VC在室連動スリープ・一斉停止・オンデマンド遠隔起動・外部GPU先行プリウォーム）を完全実装。
+  ユーザーフィードバックに基づく「待たせないUX」のさらなる深化。生URL肥大化のスマートバッジ化、会話順序待ち（Queue Wait）を除外した純粋初動ラグ（`turn_ttfs_ms`）と投稿起点ラグ（`e2e_ttfs_ms`）の分離、音声工学指標RTFの導入、音飛び実時間（`underrun_ms`）計測、外部ワーカー（Master/Worker-GPU-2/Worker-GPU-1）リソース監視タブ化、ワンライナー集約、ならびにマスター＆外部ワーカー間のライフサイクル完全連動（VC在室連動スリープ・一斉停止・オンデマンド遠隔起動・外部GPU先行プリウォーム）を完全実装。
 - **実装内容**:
   1. **【フェーズ1】レイテンシモニター刷新（バックエンド系） (`src/tts/node_pool.py`, `src/utils/streaming_audio.py`, `src/utils/text_cleaner.py`, `src/utils/latency_tracker.py`, `src/cogs/vc_handler.py`, `src/web/server.py`)**:
      - `src/tts/node_pool.py`: `TTSNode` に `machine_name`, `engine_name`, `short_label` を追加し、ワーカー列の生URL/コンテナID肥大化を完全解消。
@@ -4611,10 +4665,10 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - `src/web/templates/index.html`:
        - レイテンシKPIグリッドに「RTF (推論倍速比)」カードを追加。
        - 履歴テーブルヘッダーを9列（時刻/話者/テキスト/担当ノード/初動ラグ/RTF/音飛び判定/全体/詳細）へ刷新。
-       - システムメトリクス推移カードに外部ワーカー切り替えタブ（`Master`, `OMEN2022`, `OMEN2017`）を新設。
+       - システムメトリクス推移カードに外部ワーカー切り替えタブ（`Master`, `Worker-GPU-2`, `Worker-GPU-1`）を新設。
        - 不要となった「ワーカー簡単セットアップ (ワンライナー)」枠を削除。
      - `src/web/static/app.js`:
-       - `formatSmartWorker`: マシン名（`[OMEN2022 (RTX 3090)]`）とエンジン名（`[VOICEVOX]`）の2連スマートバッジ表示を実装。
+       - `formatSmartWorker`: マシン名（`[Worker-GPU-2 (RTX 3090)]`）とエンジン名（`[VOICEVOX]`）の2連スマートバッジ表示を実装。
        - `renderLatencyMonitorUI`:
          - 初動ラグ列に `turn_ttfs_ms`（太字強調）＋会話待ち時間補足（`[待機 8.3s]`）を表示。
          - 音声工学指標RTF列（`0.12x` 等）を表示。
@@ -4623,7 +4677,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
        - `renderWorkerNodes`: リソースバー（CPU/RAM/GPU）を削除し、運用情報（ステータス、IP、エンジン、モデル数、Ping等）に特化してスッキリ軽量化。
        - `switchMetricsNode`: ノード選択タブ切り替えロジックを実装。
   3. **【フェーズ3】ワンライナー整理 ＆ ドキュメント集約 (`WorkerAccess/README.md`)**:
-     - WebUIからワンライナー枠を削除し、`WorkerAccess/README.md` へローカルIP（`http://192.168.11.248:8080`）でDebian用およびWindows GPU用の自動構築ワンライナーを集約・マージ完了。
+     - WebUIからワンライナー枠を削除し、`WorkerAccess/README.md` へローカルIP（`http://192.168.1.20:8080`）でDebian用およびWindows GPU用の自動構築ワンライナーを集約・マージ完了。
   4. **【フェーズ4】マスター＆ワーカー エンジンライフサイクルの完全連動 (`src/web/static/agent.py`, `src/web/server.py`, `src/main.py`, `src/resource_manager.py`, `src/tts/node_pool.py`)**:
      - **課題A（ハイブリッド採用）**:
        - A-2（VC在室連動スリープ）: VCに通話者がいる間は外部ワーカーもスリープを抑制し、無人15分経過時にマスターから外部ワーカーへ `POST /engine/stop {"engine": "all"}` を一斉ブロードキャスト。
@@ -4644,23 +4698,23 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - `app.js`: 初期化完了時に保留イベント（`_pendingMetricsNode`）を自動実行する安全連携ロジックを追加。
   3. **分散コンピュートワーカーのWindowsコンテナ名（12文字Hex）ホスト名解決 (`src/web/static/app.js`, `src/tts/node_pool.py`, `src/web/server.py`, `src/web/static/agent.py`, `src/web/static/setup-worker.ps1`)**:
      - Windows上でDockerコンテナ稼働時に `socket.gethostname()` がコンテナID（`2741ecb41b41`, `636b0de163a5` 等）を報告してしまう問題を解消。
-     - フロントエンド (`app.js`): 12文字Hexを検知した際、IPアドレス（`192.168.11.200` ➔ `OMEN2022`, `192.168.11.207` ➔ `OMEN2017`, `192.168.11.248` ➔ `MasterDebian`）やGPU型番から本来のマシン名へ自動解決・表示。
+     - フロントエンド (`app.js`): 12文字Hexを検知した際、IPアドレス（`192.168.1.50` ➔ `Worker-GPU-2`, `192.168.1.40` ➔ `Worker-GPU-1`, `192.168.1.20` ➔ `SlaveNode-Debian`）やGPU型番から本来のマシン名へ自動解決・表示。
      - バックエンド (`node_pool.py`, `server.py`): 登録時・ハートビート時・マシン名プロパティ生成時にコンテナIDを検知して物理ホスト名へスマート自動マッピング。
      - スクリプト (`setup-worker.ps1`, `agent.py`): 環境変数 `HOST_HOSTNAME=$env:COMPUTERNAME` をコンテナへ渡し、`agent.py` の `get_effective_hostname()` で本物のホスト名を取得するように恒久改修。
 - **検証結果**:
   - 本番コンテナへ反映・再起動後、キャッシュエクスプローラーにて `2026-10-01 10:32:55`（JST）と正確な日本時刻が表示されることを確認。
-  - ワーカーノード登録において、`OMEN2022 (RTX 3090)`、`OMEN2017`、`MasterDebian`、`Master (自機)` のホスト名が綺麗に解決・反映されることを確認。
+  - ワーカーノード登録において、`Worker-GPU-2 (RTX 3090)`、`Worker-GPU-1`、`SlaveNode-Debian`、`Master (自機)` のホスト名が綺麗に解決・反映されることを確認。
 
 ## [2026-10-01] システムリソースグラフノード切替対応・Debianコンテナ競合解消・Windows COEIROINKリンク修正・完全新規多角ストレステスト
 - **対応内容**:
   1. **WebUI システムリソースグラフのノード別時系列メトリクス表示対応 (`src/web/server.py`, `src/web/static/app.js`, `src/version.py`)**:
-     - `server.py`: `api_worker_heartbeat` にて各Worker（OMEN2022, OMEN2017, MasterDebian）から届くリソース（CPU, GPU, RAM, VRAM）を `self.workers_metrics_history` (deque maxlen=60) に時系列蓄積。`/api/system/metrics` のレスポンスに `workers_history` および `workers_current` を追加。
-     - `app.js`: `switchMetricsNode` / `renderSystemMetricsUI` / `renderLineChart` を改修。ノード選択（Master / OMEN2022 / OMEN2017）に応じて、Worker専用の4系列（`CPU使用率`, `GPU使用率`, `RAM使用量`, `VRAM使用量`）、動的凡例（`updateMetricsLegend`）、現在値表示を即座に動的切り替えするよう実装。
+     - `server.py`: `api_worker_heartbeat` にて各Worker（Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian）から届くリソース（CPU, GPU, RAM, VRAM）を `self.workers_metrics_history` (deque maxlen=60) に時系列蓄積。`/api/system/metrics` のレスポンスに `workers_history` および `workers_current` を追加。
+     - `app.js`: `switchMetricsNode` / `renderSystemMetricsUI` / `renderLineChart` を改修。ノード選択（Master / Worker-GPU-2 / Worker-GPU-1）に応じて、Worker専用の4系列（`CPU使用率`, `GPU使用率`, `RAM使用量`, `VRAM使用量`）、動的凡例（`updateMetricsLegend`）、現在値表示を即座に動的切り替えするよう実装。
      - `version.py`: `BUILD_VERSION` を `v2026.10.01-1140` に更新。
-  2. **MasterDebian 完全再構成時のコンテナ名 Conflict エラー恒久解消 (`src/web/static/agent.py`)**:
+  2. **SlaveNode-Debian 完全再構成時のコンテナ名 Conflict エラー恒久解消 (`src/web/static/agent.py`)**:
      - `agent.py` の `DockerAPI` クラスに `remove_container(name, force=True)`（`DELETE /containers/{name}?force=true`）を追加。
      - `reconfigure_stack` 内の `docker compose up -d --build` 直前において、同名エンジンコンテナ（`ttsworker-voicevox`, `ttsworker-sharevox`, `ttsworker-coeiroink`）の存在有無に関わらず安全に強制クリーンアップする処理を実装し、Docker daemon による `Conflict. The container name is already in use` エラーを100%防止。
-  3. **Windows (OMEN2017) 完全再構成時の COEIROINK GPU版 Dropbox リンク切れ解消 (`src/web/server.py`, `src/web/static/agent.py`)**:
+  3. **Windows (Worker-GPU-1) 完全再構成時の COEIROINK GPU版 Dropbox リンク切れ解消 (`src/web/server.py`, `src/web/static/agent.py`)**:
      - `server.py` の `api_worker_manifest` に記載されていた古い無効な Dropbox 共有リンクを、セットアップスクリプトと同じ正常なダウンロード直リンク（`https://www.dropbox.com/scl/fi/pisvh3pwlinz6hdep2fcr/COEIROINK_LINUX_GPU_v.2025.4.1.zip?rlkey=4dg1368zzdbplahcjdbqoj2tg&st=3k7yonjs&dl=1`）へ更新。
      - `manifest_version` を `2026.10.01.1`、`agent_version` を `3.5.0` にインクリメント。
   4. **完全新規シナリオによる多角的ストレステスト再計測 (`scratch/test_multi_scenario.py`)**:
@@ -4689,12 +4743,12 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 - **検証結果**:
   - コンテナからの `/static/app.js` 配信において、修正済みコードが正常にサーブされることを確認。
 
-## [2026-10-01] エラー検知＆Discord DM通知機能の構築 (管理者ID: 310034034690359308)
+## [2026-10-01] エラー検知＆Discord DM通知機能の構築 (管理者ID: 123456789012345678)
 - **目的・背景**:
   - 本番運用中のTTS Botシステムにおいて、Bot本体のエラー、TTSエンジンのエラー、分散ワーカーノードのエラー、ワーカー上のエンジンエラーを即時に察知し、管理者宛てにDiscord DMで詳細な障害情報を通知する仕組みを導入。
 - **実装内容**:
   - **新規アラートサービス (`src/utils/alert_service.py`)**:
-    - 対象管理者ID `310034034690359308` 宛てに Discord DM (`user.send(embed=...)`) を非同期送信する専用サービスクラス `AlertService` を新設。
+    - 対象管理者ID `123456789012345678` 宛てに Discord DM (`user.send(embed=...)`) を非同期送信する専用サービスクラス `AlertService` を新設。
     - **4大分類のサポート**:
       - `BOT`: Bot本体のエラー（イベント例外、スラッシュコマンド例外、asyncioタスク未処理例外など）
       - `ENGINE_MASTER`: Master側TTSエンジンの障害（VOICEVOX/SHAREVOX/COEIROINK 応答不能、一時隔離、Edge-TTS退避、全プロバイダー停止など）
@@ -4714,11 +4768,11 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
     - `_synthesize_single_chunk`: ローカル/Workerエンジン失敗による EDGE / AZURE / GOOGLE 退避発生時に `WARNING` 通知を発火。
     - 全プロバイダー失敗時の完全合成停止時に `CRITICAL` 通知を発火。
   - **管理者専用テストコマンド (`src/cogs/commands.py`)**:
-    - 管理者（ID: 310034034690359308）のみ実行可能なスラッシュコマンド `/alert_test` を追加（引数で 4大分類を選択して即座にテストDMを送信・検証可能）。
+    - 管理者（ID: 123456789012345678）のみ実行可能なスラッシュコマンド `/alert_test` を追加（引数で 4大分類を選択して即座にテストDMを送信・検証可能）。
 - **検証結果**:
   - 実運用中のBotより管理者DM宛てにアラート通知が正常に届くことを確認:
-    - `[AlertService] 管理者 (310034034690359308) へエラーDM通知を送信しました: [ERROR] COEIROINK 推論失敗・一時隔離`
-    - `[AlertService] 管理者 (310034034690359308) へエラーDM通知を送信しました: [WARNING] TTSエンジン障害・EDGE退避`
+    - `[AlertService] 管理者 (123456789012345678) へエラーDM通知を送信しました: [ERROR] COEIROINK 推論失敗・一時隔離`
+    - `[AlertService] 管理者 (123456789012345678) へエラーDM通知を送信しました: [WARNING] TTSエンジン障害・EDGE退避`
 
 ## [2026-10-01] 全コンテナ・ログ出力の日本標準時 (JST) 統一
 - **目的・背景**:
@@ -4738,7 +4792,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 
 ## [2026-10-01] Windows/Debian環境でのワーカー再構成 Conflict エラーの恒久解消
 - **発生していた事象**:
-  - WebUIの「完全再構成」ボタン実行時、Debian (`MasterDebian`) および Windows (`MasterOmen2017`) で以下の Conflict エラーが発生し、コンテナ起動に失敗していた:
+  - WebUIの「完全再構成」ボタン実行時、Debian (`SlaveNode-Debian`) および Windows (`MasterOmen2017`) で以下の Conflict エラーが発生し、コンテナ起動に失敗していた:
     - `Error response from daemon: Conflict. The container name "/ttsworker-coeiroink" is already in use by container "..."`
     - `Error response from daemon: Conflict. The container name "/ttsworker-sharevox" is already in use by container "..."`
 - **原因の究明**:
@@ -4767,12 +4821,12 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 - **反映と検証**:
   - コンテナ内 `/app/src/web/static/app.js` へ同期完了。静的ファイルのため再起動なしで即時反映を確認。
 
-## [2026-10-01] OMEN2017/2022 COEIROINKマウントパス不整合・モデル破損自律修復、およびレイテンシモニター/WebUI改善
+## [2026-10-01] Worker-GPU-1/2022 COEIROINKマウントパス不整合・モデル破損自律修復、およびレイテンシモニター/WebUI改善
 - **対応課題と背景**:
-  1. **OMEN2017/OMEN2022 COEIROINK 応答失敗 (HTTP 500) および話者認識0件**:
-     - OMEN2017 (GTX 1080 Ti) 上の COEIROINK でエラー通知（HTTP 500）。
+  1. **Worker-GPU-1/Worker-GPU-2 COEIROINK 応答失敗 (HTTP 500) および話者認識0件**:
+     - Worker-GPU-1 (GTX 1080 Ti) 上の COEIROINK でエラー通知（HTTP 500）。
      - 調査の結果、2つの根本原因を特定：
-       - 原因①: Windows Docker Desktop 環境で helper コンテナ（`docker:cli`）経由で `docker compose up` を実行する際、Compose 内の `./coeiroink_models` がコンテナ内の `/work/coeiroink_models` として Docker デーモンに渡され、ホスト上の実ディレクトリ（約30GBのモデル群）がマウントされず空になり、話者数が 0人 となっていた。OMEN2022（RTX 3090）でも全く同一の構造により発生していた。
+       - 原因①: Windows Docker Desktop 環境で helper コンテナ（`docker:cli`）経由で `docker compose up` を実行する際、Compose 内の `./coeiroink_models` がコンテナ内の `/work/coeiroink_models` として Docker デーモンに渡され、ホスト上の実ディレクトリ（約30GBのモデル群）がマウントされず空になり、話者数が 0人 となっていた。Worker-GPU-2（RTX 3090）でも全く同一の構造により発生していた。
        - 原因②: ホスト上の `croix-2.1.0/model/113/100epoch.pth` が過去のダウンロード中断（373MB中362MBで切断）により壊れていたため、PyTorch が解凍できず `RuntimeError: PytorchStreamReader failed reading zip archive: failed finding central directory`（HTTP 500）となっていた。
   2. **レイテンシモニターのキャッシュ誤判定**:
      - 最初のサーバーネーム/ユーザー名読み上げ（チャンク0）が毎回キャッシュされるため、本文が新規推論であっても全体がキャッシュヒット（is_cached=True）と判定され、実推論レイテンシが隠蔽されていた。
@@ -4789,12 +4843,12 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   1. **Compose バインドマウントのホスト絶対パス化 (`setup-worker.ps1`, `agent.py` v3.5.8〜v3.5.9)**:
      - `setup-worker.ps1` で Compose を生成する際、`"$WorkDirUnix/coeiroink_models:/opt/coeiroink/$CoeiroinkDir/speaker_info"` としてホスト絶対パスを渡すよう改修。
      - `agent.py` に `fix_coeiroink_mount()` および即時修復 API（`POST /engine/fix_coeiroink`）を実装。稼働中の Compose 定義をホスト絶対パス（`C:/Users/shuns/ttsbot-worker/coeiroink_models`）へ自動正規化してコンテナを再作成。
-     - OMEN2017 および OMEN2022 の両ノードで即座に全17話者の認識に成功。
+     - Worker-GPU-1 および Worker-GPU-2 の両ノードで即座に全17話者の認識に成功。
   2. **モデルファイル破損検知・自律修復ロジックの実装 (`agent.py` v3.5.9)**:
      - `_is_model_synced` において、すべての `.pth` ファイルに対して `zipfile.is_zipfile(p)` による完全性検証を導入。
      - ダウンロード中断や破損残骸があれば即座に検知し、安全にクリーンアップして Master からストリーミング再取得・配置を自律実行。
      - 展開完了時に COEIROINK コンテナが起動中であれば自動再起動してモデルをリロード。
-     - OMEN2017 で過去に壊れていた `arma-2.0.0` および `croix-2.1.0` を自動検知し、自律的にクリーン再取得を完了。
+     - Worker-GPU-1 で過去に壊れていた `arma-2.0.0` および `croix-2.1.0` を自動検知し、自律的にクリーン再取得を完了。
   3. **レイテンシモニターのキャッシュ判定・代表ワーカー改善 (`src/cogs/vc_handler.py`)**:
      - `is_cached` の判定を `all(c.get("is_cached", False) for c in chunks_meta)`（全チャンクがキャッシュヒットした時のみ全体キャッシュ）に改修。名前がキャッシュされていても本文の実推論が正しく記録されるよう修正。
      - 代表ワーカー・プロバイダの選定も、実推論を行ったアクティブチャンクを優先採用するよう改善。
@@ -4810,8 +4864,8 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - バッジを `最新 Agent v3.5.9 (自律同期対応)` に更新し、マニフェストと自動連動。
 
 - **検証結果**:
-  - OMEN2022（RTX 3090）: 全17話者認識確認。あみたろ、および問題となったスタイル113（クロワちゃん・堕ちた女騎士B）の音声合成テスト（`POST /v1/synthesis`）を実行し、137,820バイトの WAV 音声がエラーなく正常生成（HTTP 200 OK）されることを実証。
-  - OMEN2017（GTX 1080 Ti）: 全17話者認識確認。あみたろでの音声合成成功（HTTP 200 OK、43,082バイト）。破損モデルのクリーン再取得・展開を完了。
+  - Worker-GPU-2（RTX 3090）: 全17話者認識確認。あみたろ、および問題となったスタイル113（クロワちゃん・堕ちた女騎士B）の音声合成テスト（`POST /v1/synthesis`）を実行し、137,820バイトの WAV 音声がエラーなく正常生成（HTTP 200 OK）されることを実証。
+  - Worker-GPU-1（GTX 1080 Ti）: 全17話者認識確認。あみたろでの音声合成成功（HTTP 200 OK、43,082バイト）。破損モデルのクリーン再取得・展開を完了。
   - WebUI / Bot本体: コンテナ停止なし（ゼロダウンタイム）でホット同期・反映完了。
 
 ## [2026-10-01] ハイブリッドテキスト前処理 ＆ Gemini 2.5 Flash 自己学習パイプラインの実装
@@ -4866,7 +4920,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   2. **ローカルエンジンの生成速度統計の不在**:
      - 各ノード・エンジンごとに文字数あたりどの程度の合成所要時間（基本オーバーヘッド + ms/文字）がかかっているかの統計データがなく、再生遅延の最適化や負荷分散の根拠が不足していた。
   3. **GPU性能差に応じた長文・短文の適切な役割分担**:
-     - プール内のGPU性能（RTX 3090のOMEN2022 vs GTX 1060のOMEN2017等）に差があるにもかかわらず、分割パーツの文字数に関係なく均等にラウンドロビンまたは短文が最強GPUに割り当てられて長文が詰まる非効率が存在した。
+     - プール内のGPU性能（RTX 3090のWorker-GPU-2 vs GTX 1060のWorker-GPU-1等）に差があるにもかかわらず、分割パーツの文字数に関係なく均等にラウンドロビンまたは短文が最強GPUに割り当てられて長文が詰まる非効率が存在した。
 
 - **実装内容**:
   1. **Phase 1: 推論速度プロファイラ新設 (`src/utils/latency_profiler.py`)**:
@@ -4892,16 +4946,16 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 
 - **検証結果**:
   - スクラッチ結合テスト（`scratch/test_profiler_routing.py`）を実行:
-    - OMEN2022（RTX 3090, 10.2 ms/字, パワースコア 74,086）が最強GPUとして自動判定。
-    - OMEN2017（GTX 1060, 26.6 ms/字, パワースコア 19,542）がサブGPUとして判定。
-    - 最長チャンク（40文字, is_longest=True）が確実に OMEN2022 に割り当てられ、短文チャンク（5文字）が OMEN2017 に割り当てられることを完全実証。
+    - Worker-GPU-2（RTX 3090, 10.2 ms/字, パワースコア 74,086）が最強GPUとして自動判定。
+    - Worker-GPU-1（GTX 1060, 26.6 ms/字, パワースコア 19,542）がサブGPUとして判定。
+    - 最長チャンク（40文字, is_longest=True）が確実に Worker-GPU-2 に割り当てられ、短文チャンク（5文字）が Worker-GPU-1 に割り当てられることを完全実証。
   - 本番環境へ最小影響（`discord-tts-bot` のみ再起動）でデプロイ完了。
   - 全5台のBot（柴ヴォ#1734, シヴァ1#6972, シヴァ2#4972, シヴァ3#1150, シヴァ4#4916）がDiscord Gatewayへ正常接続・ボイス復元・外部Worker自動登録完了を確認。エラーログゼロ。
 
 ## [2026-10-01] ワーカーノードログのMaster集約・オンデマンド閲覧・WebUIリアルタイムビューア実装
 - **背景と課題**:
   1. **ワーカーノードログ確認の手間解消**:
-     - ワーカーノード（OMEN2022, OMEN2017, MasterDebian）で動作する Agent や TTS エンジン（VOICEVOX, COEIROINK, SHAREVOX）のログを、Master側から確認する手段がなく、トラブルシューティングや AI への確認依頼時に各ノードへ個別ログインが必要だった。
+     - ワーカーノード（Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian）で動作する Agent や TTS エンジン（VOICEVOX, COEIROINK, SHAREVOX）のログを、Master側から確認する手段がなく、トラブルシューティングや AI への確認依頼時に各ノードへ個別ログインが必要だった。
   2. **共有マウント（Samba/NFS）方式のハングアップリスク回避**:
      - 共有フォルダをコンテナにマウントする方式は、Windows/Linux 混在環境での権限差異や、ネットワーク瞬断時に D-state（Uninterruptible Sleep）で TTS エンジンプロセスが巻き込まれてフリーズするリスクが存在した。
   3. **推奨アーキテクチャの採用**:
@@ -4912,7 +4966,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - `AGENT_VERSION = "3.6.0"` に更新。
      - `/logs` エンドポイントを拡張: `target`（`agent`, `voicevox`, `coeiroink`, `sharevox`, `all`）クエリパラメーターに対応。
      - エンジンコンテナログは Docker ソケット（`docker_api.get_container_logs(name, tail=lines)`）経由で直近ログを直接ストリーミング取得。
-     - Master から全3台の稼働中ワーカー（`worker_MasterDebian`, `worker_MASTERSOMEN2022`, `worker_MASTEROMEN2017`）へ `/update` を一斉送信し、外部エンジン無停止でエージェント自律再起動・即時更新完了。
+     - Master から全3台の稼働中ワーカー（`worker_SlaveNode-Debian`, `worker_Worker-GPU-2`, `worker_Worker-GPU-1`）へ `/update` を一斉送信し、外部エンジン無停止でエージェント自律再起動・即時更新完了。
   2. **Phase 2: Master側 ログ集約コレクター新設 (`src/utils/worker_log_collector.py`)**:
      - `WorkerLogCollector` クラスを新設。
      - バックグラウンド非同期ループ（60秒間隔）で登録済み全ワーカーからログを自動取得。
@@ -4932,15 +4986,15 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 
 - **検証結果**:
   - ホスト側の `/root/ttsbot/logs/workers/` 配下に全3ノード（計15ファイル）が自動生成され、サイズおよび最新更新時刻が維持されていることを確認。
-  - `GET /api/worker/logs?mode=list`、`GET /api/worker/logs?node_id=worker_MASTERSOMEN2022&target=voicevox&lines=10`、および `refresh=1` のオンデマンド取得がいずれも正常応答（HTTP 200 OK）することを確認。
+  - `GET /api/worker/logs?mode=list`、`GET /api/worker/logs?node_id=worker_Worker-GPU-2&target=voicevox&lines=10`、および `refresh=1` のオンデマンド取得がいずれも正常応答（HTTP 200 OK）することを確認。
   - 本番コンテナ（`discord-tts-bot`）への同期と再起動を実施。全5台のBotが正常接続、外部GPUワーカーが自動認識され、エラーログゼロ。
 
-## [2026-10-01] ワーカーログNULLバイト混入解消 ＆ OMEN2017 COEIROINK「おふとんP」エラー修復
+## [2026-10-01] ワーカーログNULLバイト混入解消 ＆ Worker-GPU-1 COEIROINK「おふとんP」エラー修復
 - **背景と課題**:
   1. **ワーカーCOEIROINKログ（および各エンジンログ）が空に見える問題**:
      - DockerデーモンのAPIログ（Tty=false）に含まれる8バイトMultiplexヘッダー（`\x02\x00\x00\x00\x00\x00\x01`等）により、ログ行にNULL文字（`\x00`）が混入。エディタやIDEが「バイナリファイル」と判定して中身を表示しなかったり、WebUIで文字切れが発生していた。
-  2. **OMEN2017 COEIROINK での KeyError: ('a60ebf6c-...', 23) 合成エラー**:
-     - 話者「おふとんP (きざ)」のモデルフォルダ（`ofutonp-2.1.1`, 7.8GB）がOMEN2017のディスク上で不完全（`has_metas: false`）な状態で残骸化しており、エンジンがモデルを認識できていなかった。
+  2. **Worker-GPU-1 COEIROINK での KeyError: ('a60ebf6c-...', 23) 合成エラー**:
+     - 話者「おふとんP (きざ)」のモデルフォルダ（`ofutonp-2.1.1`, 7.8GB）がWorker-GPU-1のディスク上で不完全（`has_metas: false`）な状態で残骸化しており、エンジンがモデルを認識できていなかった。
      - また、外部ワーカー合成失敗時にMasterフォールバックへ正常復帰する過程で、ノードに成功扱いが記録され、未所持ノードへ連続してリクエストが飛ぶ非効率が存在した。
 
 - **実装内容**:
@@ -4948,14 +5002,14 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - ホスト上の既存全ログファイル（`logs/workers/*/*.log`）からNULL文字およびバイナリ制御文字（`[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`）を一括サニタイズ（全ファイルで `null_bytes=0` を確認）。
      - `worker_log_collector.py` の保存時（`_write_logs_file`）および読取時（`get_log_content`）に制御文字除去フィルターを配備。
      - `agent.py`（v3.6.1）の `get_container_logs` においても、Docker Multiplexヘッダー（0x01/0x02等）の切り落としとサニタイズを実装。
-  2. **OMEN2017「おふとんP」モデルのクリーン再同期**:
-     - `POST http://192.168.11.207:50030/models/sync?clean_model=ofutonp-2.1.1` を発行し、壊れていた残骸フォルダを安全に削除してMasterからのクリーンな再ダウンロード・展開を開始。
+  2. **Worker-GPU-1「おふとんP」モデルのクリーン再同期**:
+     - `POST http://192.168.1.40:50030/models/sync?clean_model=ofutonp-2.1.1` を発行し、壊れていた残骸フォルダを安全に削除してMasterからのクリーンな再ダウンロード・展開を開始。
   3. **COEIROINK フォールバック時のノードクールダウン強化 (`src/tts/coeiroink_tts.py`)**:
      - 外部ノードでの合成例外発生時、Masterフォールバック前に即座に `node.mark_failed(cooldown_seconds=30.0)` を呼び出してノードを一時クールダウン。モデル未所持または障害中のノードへリクエストが連続送信されるのを防止。
 
 - **検証結果**:
   - ホスト上の全ワーカーログ（12ファイル）すべてで `null_bytes=0` を実証。テキストエディタ・WebUIで全行が純粋プレーンテキストとして正常表示されることを確認。
-  - Master側コンテナ内で `tar -cf - -C /app/coeiroink_models ofutonp-2.1.1` が約20MB/sでOMEN2017へ順調にストリーミング配信中であることを確認。
+  - Master側コンテナ内で `tar -cf - -C /app/coeiroink_models ofutonp-2.1.1` が約20MB/sでWorker-GPU-1へ順調にストリーミング配信中であることを確認。
   - 本番Botコンテナの再起動を最小影響で完了。全5台のBotが正常接続、WebUI稼働中、エラーログゼロ。
 
 ## [2026-10-01] VC複数人同時入室時のプリウォーム・ストーム（過負荷・フリーズ・8秒タイムアウト）抜本解消
@@ -4992,13 +5046,13 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   - 本番運用中のため、外部エンジンコンテナは停止させず `ttsbot` コンテナのみを5.8秒で安全に交代起動。
   - 起動直後のログにて、`✨ [Pre-warm] COEIROINK local container ready. Skipped local CPU dummy inference because external GPU worker is available.` を確認。45秒スタックが完全に消滅。
   - `🚀 [Pre-warm Batch] Processing aggregated pre-warm for 1 member(s)` により、入室時のデバウンスバッチが正常稼働することを確認。
-  - 全5台のBotが正常接続、外部ワーカー（OMEN2022, OMEN2017）がプールに登録され、エラーログゼロ。
+  - 全5台のBotが正常接続、外部ワーカー（Worker-GPU-2, Worker-GPU-1）がプールに登録され、エラーログゼロ。
 
 ## [2026-10-01] COEIROINK未実在スタイル根絶・ユーザー再抽選・SudachiPy形態素解析刷新・最強ノード王冠表示・Agent一元管理 (v3.6.1)
 - **背景と課題**:
   1. **20時台のエラー（500 Internal Server Error & 25秒タイムアウト）**:
      - 20:09/20:10 にユーザー（Charoさん等）が入室・発言した際、COEIROINK エンジンで `KeyError: 685839231` ➔ 500エラー ➔ 25秒タイムアウトが発生。
-     - 実機 COEIROINK（OMEN2022, OMEN2017, Master）に存在するスタイルは全93種類（松嘩りすくは6種類）のみであるのに対し、`voices_cache.json` に未実在スタイル（呼気・吸気などの物理モデル欠如スタイル 118件）が混入し、ユーザー設定として保存されていたことが根本原因。
+     - 実機 COEIROINK（Worker-GPU-2, Worker-GPU-1, Master）に存在するスタイルは全93種類（松嘩りすくは6種類）のみであるのに対し、`voices_cache.json` に未実在スタイル（呼気・吸気などの物理モデル欠如スタイル 118件）が混入し、ユーザー設定として保存されていたことが根本原因。
   2. **最強ノード判定結果の不在（WebUIで王冠マーク👑が出ない）**:
      - `latency_profiler` にノードが登録されるのが合成後のみだったため起動直後は判定が空だった上、フロントエンドのノードID照合キーの不整合により王冠マークが表示されなかった。
   3. **WebUI F5リロード時の権限エラートースト誤表示**:
@@ -5021,7 +5075,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - `TextCleaner.split_into_chunks` で SudachiPy (SplitMode.C) による自然な文節境界分割を実装。万一の失敗時にも Janome / 正規表現への多段フォールバックを確保。
   4. **最強GPUノード判定の根本改修 (`src/utils/latency_profiler.py`, `src/tts/node_pool.py`, `src/web/static/app.js`)**:
      - `NodeLatencyProfile` に `machine_name`, `ip`, `is_strongest_gpu` を追加。
-     - ノード初期化・登録時に即座にプロファイラに事前登録し、最強GPU（OMEN2022 RTX 3090）を判定。
+     - ノード初期化・登録時に即座にプロファイラに事前登録し、最強GPU（Worker-GPU-2 RTX 3090）を判定。
      - `app.js` で `strongestMachines` と `nodeProf.is_strongest_gpu` の複合キーで確実に王冠マーク👑を表示。
   5. **F5リロード時の権限エラートースト防止 (`src/web/static/app.js`)**:
      - `loadGuilds()` の権限取得完了コールバック内でタブ復元（`restoreActiveTab`）を実行。権限未所持タブの場合はトーストを出さずに `voice` タブに安全フォールバック。
@@ -5029,19 +5083,19 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - `src/version.py` に `AGENT_VERSION = "3.6.1"` を定義。マニフェストAPI、統計API、HTMLバッジ、JSノード集計で完全同期。
 
 
-## [2026-10-01] OMEN2017 COEIROINK エンジン完全復旧 & 多段合成タイムアウト・VCキュー保護実装
+## [2026-10-01] Worker-GPU-1 COEIROINK エンジン完全復旧 & 多段合成タイムアウト・VCキュー保護実装
 - **背景と課題**:
   1. **20:43〜20:44 の推論遅延・VCキューフリーズ**:
-     - ユーザー（`【わ】鶴の珍返し【双剣】` さん等）が発言した際、COEIROINK（松嘩りすく ci_685839226）が OMEN2017 (GTX 1080 Ti) にてモデルロード待ちおよびキュー集中により 25秒タイムアウト判定となった。
+     - ユーザー（`【わ】鶴の珍返し【双剣】` さん等）が発言した際、COEIROINK（松嘩りすく ci_685839226）が Worker-GPU-1 (GTX 1080 Ti) にてモデルロード待ちおよびキュー集中により 25秒タイムアウト判定となった。
      - タイムアウト後、Master ローカル（i7-7700K CPU）へフォールバックされたが、非力な CPU では 1 回の合成に 36.7秒＋25.7秒 を要し、VC 発言キュー全体が 60秒以上スタックして遅延が発生していた。
-  2. **OMEN2017 エンジンコンテナの不安定化**:
-     - OMEN2017 の COEIROINK コンテナが内部で高負荷状態となっており、リセットと最新 Agent 環境への同期が必要となっていた。
+  2. **Worker-GPU-1 エンジンコンテナの不安定化**:
+     - Worker-GPU-1 の COEIROINK コンテナが内部で高負荷状態となっており、リセットと最新 Agent 環境への同期が必要となっていた。
 
 - **実装内容**:
-  1. **OMEN2017 エンジンの完全再構成・アップデート**:
-     - OMEN2017 (192.168.11.207) の Agent を最新の `v3.6.1` へ更新。
+  1. **Worker-GPU-1 エンジンの完全再構成・アップデート**:
+     - Worker-GPU-1 (192.168.1.40) の Agent を最新の `v3.6.1` へ更新。
      - Docker helper 経由で全エンジン（voicevox, sharevox, coeiroink）をクリーン再ビルド・再起動完了。
-     - OMEN2017 COEIROINK が HTTP 200 で正常稼働し、`ci_685839226`（松嘩りすく）や `ci_44`、`ci_71` 等の実音声合成リクエストを次々と正常完了（WAV生成）することを確認。
+     - Worker-GPU-1 COEIROINK が HTTP 200 で正常稼働し、`ci_685839226`（松嘩りすく）や `ci_44`、`ci_71` 等の実音声合成リクエストを次々と正常完了（WAV生成）することを確認。
   2. **多段タイムアウト保護の実装 (`src/tts/coeiroink_tts.py`)**:
      - 外部 GPU ワーカーへのリクエストタイムアウトを 10.0秒 に短縮（従来の25秒から短縮し、万一のキュー詰まりや遅延時に速やかに次の安全処理へ移行）。
      - 外部ワーカー失敗時の Master ローカル CPU へのフォールバックタイムアウトを 6.0秒 に設定。非力 CPU による 30秒超のフリーズを完全遮断し、超過時は即座に 0.2秒 で即応する Azure / Edge-TTS 等のクラウドフォールバックへ委ねる安全設計を導入。
@@ -5052,7 +5106,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 - **検証結果**:
   - `docker cp` による高速コード同期と、VCセッション自動保存・即時復帰機能により、本番VC通話への影響を最小限（数秒）に抑えて反映完了。
   - 起動直後に Bot #2 が通話中 VC「GvG1」へ自動再接続完了。
-  - OMEN2017 および OMEN2022 での COEIROINK / VOICEVOX 音声合成が並行稼働し、QueueWait 0ms の超低遅延（Turn-TTFS 248ms）で安定運用されていることを確認。
+  - Worker-GPU-1 および Worker-GPU-2 での COEIROINK / VOICEVOX 音声合成が並行稼働し、QueueWait 0ms の超低遅延（Turn-TTFS 248ms）で安定運用されていることを確認。
 
 ## [2026-10-01] DisasterAlertService 外部API（P2PQuake）タイムアウト保護・例外分離・ログ抑制実装
 - **背景と課題**:
@@ -5226,12 +5280,12 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 
 
 ### [2026-10-02 06:05] ワーカーログの昨日23時以降エラー調査・対処 ＆ bot.log同等ハイブリッドローテーション適用
-- **対象ログ**: `logs/workers/*/*.log` (OMEN2017, MASTERSOMEN2022, MasterDebian の agent.log, voicevox.log, sharevox.log, coeiroink.log 計12ファイル)
+- **対象ログ**: `logs/workers/*/*.log` (Worker-GPU-1, Worker-GPU-2, SlaveNode-Debian の agent.log, voicevox.log, sharevox.log, coeiroink.log 計12ファイル)
 - **検出されたエラー・警告と根本原因**:
   1. `⚠️ '{engine}' のヘルスチェック待機がタイムアウトしました。` (voicevox, coeiroink, sharevox):
      - `agent.py` の `start_engine` 内で `http://127.0.0.1:{port}` を叩いてヘルスチェックを行っていたが、Windowsコンテナ内からホストに公開されたポートを叩く際に `127.0.0.1` ではコンテナ自身を指してしまい到達不能となりタイムアウト（60秒）が発生していた。
      - 対策: `agent.py` のヘルスチェック候補ホストに `127.0.0.1` だけでなく `get_local_ip()`（LAN IP）および `host.docker.internal` を追加し、Windowsコンテナ内外のネットワークトポロジを問わず即座に疎通可能に改修。`AGENT_VERSION` を `3.6.2` に更新（各ワーカーが自動アップデートを受信可能）。
-  2. `⚠️ Master (http://192.168.11.245:8088) に 250秒〜2500秒間接続できていません。`:
+  2. `⚠️ Master (http://192.168.1.10:8088) に 250秒〜2500秒間接続できていません。`:
      - Master（Debian自機）の一時停止・再起動時間帯にワーカーが送信した定期ハートビートの再試行ログ。Master復帰後は正常に `🎉 Master への自動登録成功！` と復旧しており正常動作。
   3. `RuntimeError: PytorchStreamReader... / KeyError: 'd31b5442...'`:
      - 過去（10/01 15:30以前）に「松嘩りすく」のモデル同期途中で発生した残骸ログであり、23:00以降は発生していないことを確認。
@@ -5243,7 +5297,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
     - `MAX_LOG_LINES_PER_FILE = 3000`（`bot.log` と同一）、`KEEP_LINES_ON_ROTATE = 100` に設定。
     - `_write_logs_file` において、マージ後行数が 3,000行を超えた場合、直近 100行を最新ログに保持し、あふれた古い行を自動的に `*-archive.log`（例: `agent-archive.log`, `voicevox-archive.log`, `coeiroink-archive.log`, `sharevox-archive.log`）へ追記退避。
     - `*-archive.log` が 100MB を超過した場合は別スレッドで高速 zstd 圧縮（`.zst`）を実施。
-    - 既存の 5,000行に達していた6ファイル（OMEN2017/2022/Debian の各ログ）に初期ローテーションを適用し、古いログを `*-archive.log` に安全退避し最新ファイルを100行に整流。
+    - 既存の 5,000行に達していた6ファイル（Worker-GPU-1/2022/Debian の各ログ）に初期ローテーションを適用し、古いログを `*-archive.log` に安全退避し最新ファイルを100行に整流。
 
 - **検証結果**:
   - 使い捨てコンテナ（`docker run --rm ...`）で構文チェック、3,500行ダミーログによるローテーション単体テスト（3,500 ➔ 最新100行 + アーカイブ3,400行の完全一致）、既存5,000行ログのローテーション適用を確認。テストコンテナは自動破棄。
@@ -5331,7 +5385,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
     - 全5台のBot（柴ヴォ、シヴァ1〜4）が Discord ゲートウェイへ正常接続完了。
     - 通話中VCセッション（`Anica01連合（HTW）` えぺAPEエペ）を完全自動復元。
     - 4,246件のキャッシュインテグリティスキャン正常完了。
-    - 外部ワーカー（OMEN2017, MasterDebian）が正常登録され、無人停止毎分連打が完全根絶されたことを確認。
+    - 外部ワーカー（Worker-GPU-1, SlaveNode-Debian）が正常登録され、無人停止毎分連打が完全根絶されたことを確認。
     - **ERROR / CRITICAL ログは完全 0 件** で極めて安定稼働中。
 
 ### [2026-10-02 07:44] COEIROINKモデルHTTP同期の「Rsync並み修復力」実装（SHA-256ツリー検証・アトミック昇格・差分修復）
@@ -5362,7 +5416,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   - 再起動後：
     - 全5台のBot（柴ヴォ、シヴァ1〜4）が Discord ゲートウェイへ正常接続完了。
     - 通話中VCセッション（`Anica01連合（HTW）` えぺAPEエペ）を完全自動復元。
-    - 外部GPUワーカー（MASTERSOMEN2022, MASTEROMEN2017, MasterDebian）全台が即座に再登録・正常疎通。
+    - 外部GPUワーカー（Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian）全台が即座に再登録・正常疎通。
     - `curl` による `manifest` API（即答）および `file` API（HTTP 200 OK, `Accept-Ranges: bytes`）の正常応答を確認。
     - **ERROR / CRITICAL ログは完全 0 件** で極めて安定稼働中。
 
@@ -5448,7 +5502,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 - **背景と課題**:
   - 19:02:29 の「電車降りたら…」は VOICEVOX で正常に合成・再生されたのに対し、直後の 19:02:30「リスキーダイス」で Edge-TTS にフォールバックされた事象を調査。
   - ログ精査の結果、エンジンやワーカーの故障ではなく、投機的デュアルストリーミング（Speculative Dual-Streaming）の仕様による動作であることを究明：
-    - 外部GPU（OMEN2022 RTX 3090）でも VOICEVOX 推論時間は 700ms 〜 1,500ms（1文目: 1,419ms, 3文目: 752ms）。
+    - 外部GPU（Worker-GPU-2 RTX 3090）でも VOICEVOX 推論時間は 700ms 〜 1,500ms（1文目: 1,419ms, 3文目: 752ms）。
     - 1文目は Edge 側も遅延（>1.4s）したためプライマリ（VOICEVOX）が勝利採用されたが、2文目「リスキーダイス」では Edge が 496ms で完了し、当時 800ms に設定されていた投機タイマーを超過した時点でまだ推論中だった VOICEVOX を追い抜いて Fast-path 採用された。
   - ユーザー指示「タイマー1500にしよう」に基づき、ローカルGPU推論の完了を十分に粘り強く待てるよう、投機タイマーを 1500ms（1.5秒）に緩和。
 - **対応内容**:
@@ -5461,7 +5515,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 - **検証結果**:
   - 使い捨てコンテナ（`docker run --rm ...`）で構文チェック通過（即時処分）。
   - 本番Botコンテナ（`discord-tts-bot`）を `docker compose restart ttsbot` にて安全再起動（約4秒）。
-  - 全5台Bot（柴ヴォ、シヴァ1〜4）正常接続、通話中VCセッション（`Anica01連合（HTW）` えぺAPEエペ）自動復元、外部分散ワーカー（MasterDebian, MASTEROMEN2017）自動登録、ERRORログ0件を確認。
+  - 全5台Bot（柴ヴォ、シヴァ1〜4）正常接続、通話中VCセッション（`Anica01連合（HTW）` えぺAPEエペ）自動復元、外部分散ワーカー（SlaveNode-Debian, Worker-GPU-1）自動登録、ERRORログ0件を確認。
 
 ### [2026-10-02 20:25] 投機的デュアルストリーミング待機時間の WebUI「ボット設定」統合＆ギルド別微調整対応
 - **背景と目的**:
@@ -5523,7 +5577,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
     - `user_settings`: 全203レコードが Azure/GCP 話者に再選定完了。
     - `guild_user_settings`: 全289レコードが Azure/GCP 話者に再選定完了。
     - `schema_migrations`: `20261002_reassign_cloud_speakers` が正常記録。
-  - 再起動後、全5台のBotがGateway正常再接続、外部分散ワーカー（OMEN2022, OMEN2017）自動登録、通話中VCセッション（喫煙所 全体VC）がシームレスに自動復旧完了、エラーログ完全0件を確認。
+  - 再起動後、全5台のBotがGateway正常再接続、外部分散ワーカー（Worker-GPU-2, Worker-GPU-1）自動登録、通話中VCセッション（喫煙所 全体VC）がシームレスに自動復旧完了、エラーログ完全0件を確認。
 
 ### [2026-10-02 21:25] AI提案単語（Gemini）承認時の ReferenceError (currentGuild is not defined) 修正
 - **事象と原因**:
@@ -5596,7 +5650,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
 
 ### [2026-10-02 22:55] VC無人誤判定によるワーカーエンジン自動停止の根本修正 (マルチBotプール連携)
 - **事象と背景**:
-  - VCに通話者が多数在室し、Botが読み上げを行っているにもかかわらず、外部ワーカー（worker_MasterDebian, OMEN2022 等）で「VC完全無人かつ15分間未使用のため自動停止します」と判定されてエンジンが停止（Auto Sleep）したり、Master側から強制停止指示（Remote Stop）が送られていた。
+  - VCに通話者が多数在室し、Botが読み上げを行っているにもかかわらず、外部ワーカー（worker_SlaveNode-Debian, Worker-GPU-2 等）で「VC完全無人かつ15分間未使用のため自動停止します」と判定されてエンジンが停止（Auto Sleep）したり、Master側から強制停止指示（Remote Stop）が送られていた。
 - **原因**:
   - システムは5台のBot（Bot #1〜#5）によるマルチBotプール運用であるが、`src/main.py` で `resource_manager.bot = bots[0]` と固定されており、リソースマネージャーが Bot #1（1号機）のみを参照していた。
   - 実際にVCに接続して読み上げを行っていたのは Bot #2（2号機）であったため、Bot #1 の `guild.voice_client` は常に `None` となり、`LocalEngineResourceManager.is_any_human_in_vc()` およびアイドル監視ループが常に「無人（False）」を返していた。
@@ -5639,7 +5693,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   - COEIROINKの音声合成が非常に遅く、ユーザーより原因究明および高速化の「ウルトラC」の検討（Cython化、CUDAバージョンの影響、実測比較など）が要請された。
 - **原因の徹底特定**:
   - **推論速度（voice-predicted-time）**:
-    - OMEN2022 (RTX 3090): **0.08秒〜0.24秒**（極めて高速、遅延全体の5%未満）。
+    - Worker-GPU-2 (RTX 3090): **0.08秒〜0.24秒**（極めて高速、遅延全体の5%未満）。
     - Master (i7-7700K CPU): **0.5秒〜0.8秒**（推論自体は十分高速）。
   - **真のボトルネック（model-loaded-time）**:
     - COEIROINK Engine（v2025.4.1）は、直近のモデル1つのみをインメモリキャッシュする仕様。
@@ -5667,7 +5721,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   3. ホストメモリ安全策（二段階セーフティネット: 警戒85%でLRU解放、緊急90%で全解放＆5分間凍結、70%以下で自動復帰）。
   4. **抜本的アーキテクチャ刷新（完全Worker分離）**:
      - 従来Bot本体（Master）に内蔵・同居していたローカルTTSエンジン（VOICEVOX, SHAREVOX, COEIROINK）を完全撤廃。
-     - Ubuntuホスト上でも他マシン（MasterDebian, OMEN）と同様に専用Worker（`agent.py`）を稼働させる構成へ全面統一。
+     - Ubuntuホスト上でも他マシン（SlaveNode-Debian, OMEN）と同様に専用Worker（`agent.py`）を稼働させる構成へ全面統一。
      - Bot本体は純粋なオーケストレーター（Discord通話制御、WebUI、クラウドTTS、ノードプール統括）に特化し、メモリ約200MBの超軽量・高耐障害性構成へ移行。
 
 - **対応内容**:
@@ -5699,29 +5753,29 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
      - `docker-compose.yml`:
        - 内蔵エンジン（`voicevox`, `sharevox`, `coeiroink`）を削除し、`ttsbot` と `tunnel` のみにスリム化。
        - 旧ローカルコンテナ（`ttsbot-voicevox`, `ttsbot-sharevox`, `ttsbot-coeiroink`）を安全に停止・削除。
-  4. **MasterUbuntu (`192.168.11.245`) ローカルWorker環境 (`/root/ttsbot-worker`) の構築**:
+  4. **MasterNode-Ubuntu (`192.168.1.10`) ローカルWorker環境 (`/root/ttsbot-worker`) の構築**:
      - `coeiroink_models`: `/var/lib/docker/volumes/coeiroink_models/_data` から全17モデルをハードリンク同期（0.1秒で容量消費ゼロ）。
      - `coeiroink_ram`: 31GB（総RAM60.8GBの50%）の tmpfs をマウントし、`/etc/fstab` に永続化設定。
      - `docker-compose.agent.yml` & `docker-compose.worker.yml`:
        - `worker-agent` のリソース上限を `memory: 2G`（大容量モデルコピー時のcgroup OOM防止）に設定。
        - 全コンテナ（`ttsworker-agent`, `ttsworker-voicevox`, `ttsworker-sharevox`, `ttsworker-coeiroink`）を正常起動。
-       - `worker_MasterUbuntu` としてポート 50030 で稼働し、Master に自動登録完了。
-  5. **MasterDebian (`192.168.11.248`) Worker環境の整備**:
+       - `worker_MasterNode-Ubuntu` としてポート 50030 で稼働し、Master に自動登録完了。
+  5. **SlaveNode-Debian (`192.168.1.20`) Worker環境の整備**:
      - `coeiroink_ram`: 32GB（総RAM62.8GBの50%）の tmpfs をマウントし、`/etc/fstab` に永続化設定。
      - 最新 `agent.py`（v3.10.0）を scp 転送し、`docker-compose.agent.yml` を `memory: 2G` に設定して再作成。
      - `docker-compose.worker.yml` をハイブリッドマウント構成に更新し、`ttsworker-coeiroink` を再作成。
-     - `worker_MasterDebian` として正常登録完了。
+     - `worker_SlaveNode-Debian` として正常登録完了。
 
 - **動作検証とテスト結果**:
   1. **RAMDisk ピン留め昇格テスト**:
-     - MasterUbuntu: リリンちゃん（`lilin-2.1.0`）昇格成功（`active_models: ["lilin-2.1.0"]`, `host_mem_percent: 12.6%`）。
-     - MasterDebian: リリンちゃん（`lilin-2.1.0`）昇格成功（`active_models: ["lilin-2.1.0"]`, `host_mem_percent: 10.8%`）。
+     - MasterNode-Ubuntu: リリンちゃん（`lilin-2.1.0`）昇格成功（`active_models: ["lilin-2.1.0"]`, `host_mem_percent: 12.6%`）。
+     - SlaveNode-Debian: リリンちゃん（`lilin-2.1.0`）昇格成功（`active_models: ["lilin-2.1.0"]`, `host_mem_percent: 10.8%`）。
   2. **実機音声合成テスト (COEIROINK リリンちゃん)**:
-     - MasterUbuntu: HTTP 200 応答、246KB WAV ファイル正常生成確認。
-     - MasterDebian: HTTP 200 応答、215KB WAV ファイル正常生成確認（推論所要時間: 5.2秒、ロード遅延なし）。
+     - MasterNode-Ubuntu: HTTP 200 応答、246KB WAV ファイル正常生成確認。
+     - SlaveNode-Debian: HTTP 200 応答、215KB WAV ファイル正常生成確認（推論所要時間: 5.2秒、ロード遅延なし）。
   3. **本番稼働安定性**:
      - Bot本体再起動時も通話中VCセッションは完全無停止・即時復元され、全5台のBotが正常接続維持。
-     - 全4台のWorkerノード（`OMEN2022`, `OMEN2017`, `MasterDebian`, `MasterUbuntu`）が正常稼働・ハートビート同期を確認。
+     - 全4台のWorkerノード（`Worker-GPU-2`, `Worker-GPU-1`, `SlaveNode-Debian`, `MasterNode-Ubuntu`）が正常稼働・ハートビート同期を確認。
   4. **クリーンアップ**:
      - 一時テスト用スクリプトおよび生成音声ファイル（`/tmp/test_*`）を完全破棄。
 
@@ -5737,13 +5791,13 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
        - ➔ コンテナ名探索を `["ttsworker-*", "ttsbot-*"]` の動的解決に更新。実機テストにて、`ttsworker-voicevox` (53MB), `ttsworker-sharevox` (411MB), `ttsworker-coeiroink` (1586MB) のメトリクスが完璧に取得・プロットされることを確認。
     3. **静的ノード定義とDNS解決エラーの排除 (`config.yaml`)**:
        - `config.yaml` の `local_master` が旧コンテナホスト名 `http://voicevox:50021` 等を参照したまま `enabled: true` になっていたため、内部DNS解決エラーを発生させていた。
-       - ➔ `enabled: false` に更新（ローカルWorkerは `worker_MasterUbuntu_*` として `192.168.11.245:50021` 等から動的自動登録されるため静的定義は不要）。`base_url` も実ホストIPに統一。
+       - ➔ `enabled: false` に更新（ローカルWorkerは `worker_MasterNode-Ubuntu_*` として `192.168.1.10:50021` 等から動的自動登録されるため静的定義は不要）。`base_url` も実ホストIPに統一。
     4. **WebUI・APIでのホスト名解決 (`src/web/server.py`)**:
-       - Worker自動登録処理（`api_worker_register`）の `hostname` マッピングに `clean_host.upper() == "MASTERUBUNTU"` ➔ `hostname = "MasterUbuntu"` を追加。表示名の一貫性を完全確保。
+       - Worker自動登録処理（`api_worker_register`）の `hostname` マッピングに `clean_host.upper() == "MASTERUBUNTU"` ➔ `hostname = "MasterNode-Ubuntu"` を追加。表示名の一貫性を完全確保。
 - **検証結果**:
   - `ttsbot-engine-logger.service` のジャーナルログにて、`[VOICEVOX]`, `[SHAREVOX]`, `[COEIROINK]` のリアルタイムログ追従再開を確認。
   - `_collect_system_metrics()` のコンテナ統計取得テスト合格（全コンテナ `running` 判定・実メモリ正常取得）。
-  - Bot本体再起動後のVC自動復元、全5台Botのオンライン接続、および全Worker（OMEN2022, OMEN2017, MasterDebian, MasterUbuntu）との同期維持を確認。
+  - Bot本体再起動後のVC自動復元、全5台Botのオンライン接続、および全Worker（Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian, MasterNode-Ubuntu）との同期維持を確認。
 
 ## [2026-10-03 02:05] bot.log Warning/Error 精査・対処 & Windows Worker (OMEN) COEIROINK ハイブリッドRAMDisk修復完了
 - **背景と課題抽出**:
@@ -5753,8 +5807,8 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
        - `Streaming playback failed in guild ... ('TextChunk' object has no attribute 'is_name_prefix'). Falling back to file playback.`
        - `src/cogs/vc_handler.py:700` および `src/web/server.py:1425` で `first_chunk.is_name_prefix` を参照していたが、`src/utils/text_cleaner.py` の dataclass `TextChunk` に属性が未定義だった。
     2. **COEIROINK 音声合成 HTTP 500 (Error / 01:36)**:
-       - ユーザー発言（銀芽ちゃん 呆れ）時に OMEN2017 / OMEN2022 で KeyError が発生し HTTP 500。
-       - 実機調査の結果、Linux Worker（MasterUbuntu, MasterDebian）は 17モデル認識・合成成功していたが、Windows Worker（OMEN2017, OMEN2022）で `Total speakers: 0`（認識0件）になっていた。
+       - ユーザー発言（銀芽ちゃん 呆れ）時に Worker-GPU-1 / Worker-GPU-2 で KeyError が発生し HTTP 500。
+       - 実機調査の結果、Linux Worker（MasterNode-Ubuntu, SlaveNode-Debian）は 17モデル認識・合成成功していたが、Windows Worker（Worker-GPU-1, Worker-GPU-2）で `Total speakers: 0`（認識0件）になっていた。
        - 真因: 初期生成された Compose ファイル内の相対マウントパス（`./coeiroink_hybrid`）が、Docker Desktop (WSL2) 上でコンテナ内パス `/work/coeiroink_hybrid` と解釈され、ホスト（Windows側）の作業ディレクトリとは別の空ボリュームがマウントされていた。
        - なお、この失敗時も Speculative TTS（投機的並行合成）が即座に働き、Edge-TTS へ 885ms で自動切り替えされたため通話断絶は防がれていた。
     3. **シャットダウン時の非同期DBエラー (Warning)**:
@@ -5766,9 +5820,9 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   2. **シャットダウン時のDBエラー抑制**:
      - `src/database.py`: `record_metric` にプールクローズ時の例外捕捉を追加しログ汚染を防止。
   3. **OMEN (Windows Worker) のハイブリッド RAM Disk 復旧 ＆ 実機検証**:
-     - OMEN2017 (`192.168.11.207`) & OMEN2022 (`192.168.11.200`) に対し `POST /engine/fix_coeiroink` を実行。マウント元をホスト絶対パス（`C:/Users/shuns/ttsbot-worker/coeiroink_hybrid` 等）に正規化。
-     - OMEN2017: 全17モデル認識（`Total speakers: 17`）、リリンちゃんの RAM Disk 昇格（`active_models: ["cb11bdbd..."]`）成功、音声合成テスト（HTTP 200, 139KB/114KB WAV 生成, 1.57秒）に完全成功。
-     - OMEN2022: 全17モデル認識（`Total speakers: 17`）、RTX 3090 による音声合成テスト（HTTP 200, 174KB WAV 生成）に完全成功。
+     - Worker-GPU-1 (`192.168.1.40`) & Worker-GPU-2 (`192.168.1.50`) に対し `POST /engine/fix_coeiroink` を実行。マウント元をホスト絶対パス（`C:/Users/shuns/ttsbot-worker/coeiroink_hybrid` 等）に正規化。
+     - Worker-GPU-1: 全17モデル認識（`Total speakers: 17`）、リリンちゃんの RAM Disk 昇格（`active_models: ["cb11bdbd..."]`）成功、音声合成テスト（HTTP 200, 139KB/114KB WAV 生成, 1.57秒）に完全成功。
+     - Worker-GPU-2: 全17モデル認識（`Total speakers: 17`）、RTX 3090 による音声合成テスト（HTTP 200, 174KB WAV 生成）に完全成功。
      - **Windows環境（Docker Desktop / WSL2）上でも、動的 RAM Disk（tmpfs / シンボリックリンク構成）が100%完全に機能することを確認。**
   4. **Worker Agent 自律健全性担保・Self-Healing 機構の実装 (`src/web/static/agent.py`)**:
      - `ensure_coeiroink_mount_healthy()` を新設:
@@ -5778,7 +5832,7 @@ OOMKilledで中断されると保存されず、次回起動時も "" → "2026.
   5. **バージョン更新 (`src/version.py`)**:
      - `BUILD_VERSION = "v2026.10.03-0205"`, `AGENT_VERSION = "3.10.1"`。
 - **検証結果**:
-  - 全4台のワーカー（MasterDebian, MasterUbuntu, OMEN2017, OMEN2022）で、全17モデル認識（`length: 17`）および動的 RAM Disk 構成での音声合成（HTTP 200）が完全に動作中であることを確認。
+  - 全4台のワーカー（SlaveNode-Debian, MasterNode-Ubuntu, Worker-GPU-1, Worker-GPU-2）で、全17モデル認識（`length: 17`）および動的 RAM Disk 構成での音声合成（HTTP 200）が完全に動作中であることを確認。
   - 一時テスト用音声ファイル（`/tmp/test_omen*`）は安全に破棄完了。
 
 
@@ -5812,14 +5866,14 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 - **対応内容**:
   1. `src/resource_manager.py`:
      - 8秒直列呼び出しを撤廃。タイムアウト90秒の並行ブロードキャスト `broadcast_ram_promote` を非同期バックグラウンドタスクとして発火させる方式へ抜本改修。
-     - コンテナ再起動後のVC自動復帰時、全4台のWorker（MasterUbuntu, MasterDebian, OMEN2017, OMEN2022）でリリンちゃん・青葉ちゃんの昇格が100%成功することを確認。
+     - コンテナ再起動後のVC自動復帰時、全4台のWorker（MasterNode-Ubuntu, SlaveNode-Debian, Worker-GPU-1, Worker-GPU-2）でリリンちゃん・青葉ちゃんの昇格が100%成功することを確認。
 
 ### 3. COEIROINK 4段階 Tier ルーティング ＆ GPU優先度設定
 - **方針**:
   - VOICEVOX / SHAREVOX: **GPU最優先**（RTX 3090 / GTX 1080 Ti）
   - COEIROINK: **`CPU+RAMDisk ➔ GPU+RAMDisk ➔ GPU+SSD ➔ CPU+SSD`**
-    - Tier 1: `CPU + RAMDisk`（MasterDebian / MasterUbuntu。RAM常駐で推論0.5秒、大容量RAMでモデル常駐保持率が高く、GPUリソースを温存可能）
-    - Tier 2: `GPU + RAMDisk`（OMEN2022 / OMEN2017。RAM常駐かつGPU推論0.1秒）
+    - Tier 1: `CPU + RAMDisk`（SlaveNode-Debian / MasterNode-Ubuntu。RAM常駐で推論0.5秒、大容量RAMでモデル常駐保持率が高く、GPUリソースを温存可能）
+    - Tier 2: `GPU + RAMDisk`（Worker-GPU-2 / Worker-GPU-1。RAM常駐かつGPU推論0.1秒）
     - Tier 3: `GPU + SSD`（GPU推論0.1秒、モデル初回ロード3〜4秒）
     - Tier 4: `CPU + SSD`（CPU推論0.6秒、モデル初回ロード20〜30秒の最終フォールバック）
 - **対応内容**:
@@ -5853,23 +5907,23 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 
 ---
 
-## [2026-10-03 17:50] WebUI システムリソース推移のノード名変更 (Master→MasterDebian) ＆ MasterUbuntu追加・スマートパーツキャッシュ節約の月毎集計完全化
+## [2026-10-03 17:50] WebUI システムリソース推移のノード名変更 (Master→SlaveNode-Debian) ＆ MasterNode-Ubuntu追加・スマートパーツキャッシュ節約の月毎集計完全化
 
 ### 1. システムリソース & 各エンジン負荷推移のノード表示更新
 - **課題**:
-  - WebUIの「システムリソース & 各エンジン負荷推移」タブにおいて、自機が「Master」と表記されており、分散Workerの「MasterDebian」との区別が曖昧だった。また、新設された外部CPUワーカー「MasterUbuntu (8 Core)」のタブおよびリソース推移グラフが存在しなかった。
+  - WebUIの「システムリソース & 各エンジン負荷推移」タブにおいて、自機が「Master」と表記されており、分散Workerの「SlaveNode-Debian」との区別が曖昧だった。また、新設された外部CPUワーカー「MasterNode-Ubuntu (8 Core)」のタブおよびリソース推移グラフが存在しなかった。
 - **対応内容**:
   1. `src/web/templates/index.html`:
-     - ノード選択タブの `🏢 Master (i7-7700K)` を `🏢 MasterDebian (i7-7700K)` に改称。
-     - `🐧 MasterUbuntu (8 Core)` タブボタンを新設（`onclick="switchMetricsNode('masterubuntu')"`）。
+     - ノード選択タブの `🏢 Master (i7-7700K)` を `🏢 SlaveNode-Debian (i7-7700K)` に改称。
+     - `🐧 MasterNode-Ubuntu (8 Core)` タブボタンを新設（`onclick="switchMetricsNode('masterubuntu')"`）。
   2. `src/web/server.py`:
-     - ハートビート受信処理（`api_worker_heartbeat`）にて、Worker IP `192.168.11.245` またはホスト名 `ubuntu` を検知した際、`host_k = "masterubuntu"` としてメトリクス履歴キュー（`workers_metrics_history`）へ自動蓄積するようマッピングを追加。
+     - ハートビート受信処理（`api_worker_heartbeat`）にて、Worker IP `192.168.1.10` またはホスト名 `ubuntu` を検知した際、`host_k = "masterubuntu"` としてメトリクス履歴キュー（`workers_metrics_history`）へ自動蓄積するようマッピングを追加。
   3. `src/web/static/app.js`:
-     - `nodeNames`: `master`, `masterdebian` を `MasterDebian (i7-7700K)`、`masterubuntu` を `MasterUbuntu (8 Core)` として登録。
+     - `nodeNames`: `master`, `masterdebian` を `SlaveNode-Debian (i7-7700K)`、`masterubuntu` を `MasterNode-Ubuntu (8 Core)` として登録。
      - `updateMetricsLegend`: `masterubuntu` 選択時は GPU非搭載（CPU専用ノード）向けの凡例（CPU、RAM）を表示するよう調整。
      - `renderSystemMetricsUI`: `masterubuntu` などのGPU非搭載ノードにおいて、GPU/VRAM 表示を「なし (CPU専用)」および「なし」とスマートにフォールバック表示。
-     - `renderWorkerNodes`: ワーカー一覧カードの名前解決に `MasterUbuntu` を追加し、自機ノード名を `MasterDebian (自機)` に統一。
-     - `formatSmartWorker`: スマートバッジ判定に `MasterDebian` および `MasterUbuntu` を追加。
+     - `renderWorkerNodes`: ワーカー一覧カードの名前解決に `MasterNode-Ubuntu` を追加し、自機ノード名を `SlaveNode-Debian (自機)` に統一。
+     - `formatSmartWorker`: スマートバッジ判定に `SlaveNode-Debian` および `MasterNode-Ubuntu` を追加。
 
 ### 2. クラウド / ローカル スマートパーツキャッシュ節約の月毎集計完全化
 - **課題**:
@@ -5897,7 +5951,7 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 
 ### 1. 課題と原因の究明
 - **ユーザー指摘**:
-  - 「Coeiroinkの優先度をCPU+RAMDisk ➔ GPU+RAMDisk ➔ GPU+SSD ➔ CPU+SSDにしてって言ったけど、そうなってる？ WebUIではOMEN2022が最強GPUとしてマークされてて、実際に変換ためしても3090が選ばれてて。」
+  - 「Coeiroinkの優先度をCPU+RAMDisk ➔ GPU+RAMDisk ➔ GPU+SSD ➔ CPU+SSDにしてって言ったけど、そうなってる？ WebUIではWorker-GPU-2が最強GPUとしてマークされてて、実際に変換ためしても3090が選ばれてて。」
 - **真因の特定**:
   1. ワーカー側（`agent.py`）の `CoeiroinkWorkerRamManager` は、RAMDisk常駐モデル一覧（`ram_models`）として **フォルダ名（例: `ginga-2.2.0`, `lilin-2.1.0`）** を報告していた。
   2. 一方、Master側で COEIROINK 音声合成時に `acquire_node(model_name=...)` に渡されるキーは、**`d312d0fb-d38d-434e-825d-cbcbfd105ad0_72`（UUID_styleId）** やキャラクターUUIDであった。
@@ -5905,9 +5959,9 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
   4. その結果、COEIROINK 4段階 Tier ルーティングにおいて：
      - Tier 1 (CPU + RAMDisk): 0 台
      - Tier 2 (GPU + RAMDisk): 0 台
-     - Tier 3 (GPU + SSD): `[OMEN2022 (RTX 3090), OMEN2017 (GTX 1080 Ti)]`
-     - Tier 4 (CPU + SSD): `[MasterDebian, MasterUbuntu]`
-     となり、Tier 3 のソート処理で GPU パワースコアが最高の **OMEN2022 (RTX 3090)** が選定されていた。
+     - Tier 3 (GPU + SSD): `[Worker-GPU-2 (RTX 3090), Worker-GPU-1 (GTX 1080 Ti)]`
+     - Tier 4 (CPU + SSD): `[SlaveNode-Debian, MasterNode-Ubuntu]`
+     となり、Tier 3 のソート処理で GPU パワースコアが最高の **Worker-GPU-2 (RTX 3090)** が選定されていた。
   5. なお、WebUI の「👑 最強GPU (長文担当)」バッジは、GPU搭載ノードの中で最もパワースコアが高いマシン（RTX 3090）を動的プロファイラがマークしている固定バッジであり（VOICEVOX/SHAREVOXの長文分割用）、COEIROINK の CPU優先ルーティングとは独立した表示である。
 
 ### 2. 対応内容
@@ -5926,13 +5980,13 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 
 ### 3. 検証結果
 - **使い捨てテストコンテナでの単体・結合テスト**:
-  - 全4ノード（MasterDebian, MasterUbuntu, OMEN2022, OMEN2017）の疑似プールにおいて：
-    - 銀芽ちゃん（`d312d0fb-d38d-434e-825d-cbcbfd105ad0_72`）: `has_model_in_ram` が全常駐ノードで `True` となり、**Tier 1 (CPU + RAMDisk) の `MasterDebian (CPU)` が最優先選定** されることを実証（ALL TESTS PASSED!）。
-    - おふとんP（RAM非常駐）: Tier 1/2 は0件となり、Tier 3 (GPU + SSD) の `OMEN2022 (RTX 3090)` にフォールバックされることを実証。
+  - 全4ノード（SlaveNode-Debian, MasterNode-Ubuntu, Worker-GPU-2, Worker-GPU-1）の疑似プールにおいて：
+    - 銀芽ちゃん（`d312d0fb-d38d-434e-825d-cbcbfd105ad0_72`）: `has_model_in_ram` が全常駐ノードで `True` となり、**Tier 1 (CPU + RAMDisk) の `SlaveNode-Debian (CPU)` が最優先選定** されることを実証（ALL TESTS PASSED!）。
+    - おふとんP（RAM非常駐）: Tier 1/2 は0件となり、Tier 3 (GPU + SSD) の `Worker-GPU-2 (RTX 3090)` にフォールバックされることを実証。
 - **本番環境反映**:
   - `docker compose restart ttsbot` を実施。
   - 全5台のBotがDiscordに正常接続、通話中VCセッション自動復帰。
-  - 実機ワーカー（MasterDebian, MasterUbuntu, OMEN2022, OMEN2017）すべてで銀芽ちゃん・リリンちゃんが RAMDisk 常駐中（`active_models: ['ginga-2.2.0', 'lilin-2.1.0']`）であり、COEIROINK リクエスト時に MasterDebian / MasterUbuntu が最優先選定される環境が整ったことを確認。
+  - 実機ワーカー（SlaveNode-Debian, MasterNode-Ubuntu, Worker-GPU-2, Worker-GPU-1）すべてで銀芽ちゃん・リリンちゃんが RAMDisk 常駐中（`active_models: ['ginga-2.2.0', 'lilin-2.1.0']`）であり、COEIROINK リクエスト時に SlaveNode-Debian / MasterNode-Ubuntu が最優先選定される環境が整ったことを確認。
 
 ---
 
@@ -5943,16 +5997,16 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
   1. `logs/bot.log`（Botオーケストレーター・VC通話制御・TTS合成パイプライン）
   2. `logs/web.log`（WebUI APIサーバー・Heartbeat受信ログ）
   3. `logs/engine.log`（Masterローカルエンジン集約ログ）
-  4. `logs/workers/` 配下の全ノード（`MasterDebian`, `MasterUbuntu`, `MASTEROMEN2017`, `MASTERSOMEN2022`）の `agent.log`, `voicevox.log`, `coeiroink.log`, `sharevox.log`
+  4. `logs/workers/` 配下の全ノード（`SlaveNode-Debian`, `MasterNode-Ubuntu`, `Worker-GPU-1`, `Worker-GPU-2`）の `agent.log`, `voicevox.log`, `coeiroink.log`, `sharevox.log`
 - **検出された Warning / Error と分析**:
   1. **【P0 要対処】`bot.log`: `404 Voice ja-JP-Neural2-F not found.`（計9件）**:
      - 19:48〜20:16 にかけて、複数ユーザー（じょおおさん、覇桜花さん、ギャンブラー一平さん、マヤ珍ゲールさん、こたまんさん等）の発言および入室時発言者名プレフィックス合成時に毎回 Google Cloud TTS SDK で `404 Voice ja-JP-Neural2-F not found.` が発生し、毎回 Edge-TTS へフォールバックしていた。
      - **原因**: Google Cloud Text-to-Speech API (ja-JP) の Neural2 モデルには `B`（女声）, `C`（男声）, `D`（男声）の3種しか存在しないが、`config.yaml`（`g_neural_f` および `mayu` のフォールバック先）と `src/database.py`（`CLOUD_INITIAL_SPEAKER_POOL`）に存在しない `ja-JP-Neural2-F` が誤登録されていた。その結果、本番DBの `user_settings`（18名）および `guild_user_settings`（26名）に `g_neural_f` が割り当てられ、毎回404エラーを引き起こしていた。
   2. **【P1 要対処】`web.log`: `AttributeError: 'WebServer' object has no attribute '_is_local_request'`（1件）**:
      - WebServer の `api_reload_config` 内でローカルリクエスト判定メソッド `_is_local_request` を呼ぼうとして属性エラーが発生していた（正しくは `not self._is_wan_request(request)`）。
-  3. **【正常自律動作・対処不要】`worker_MasterUbuntu/agent.log`: Watchdog による一時的無応答検知および Auto-Heal（20:00, 20:14）**:
+  3. **【正常自律動作・対処不要】`worker_MasterNode-Ubuntu/agent.log`: Watchdog による一時的無応答検知および Auto-Heal（20:00, 20:14）**:
      - 20:00: 直前の改修（18:05）に伴うバージョン更新を60分周期のAutoUpdateが検知し、`docker compose pull` & `up -d` が実行された。エンジン一斉起動中の高負荷でCOEIROINKの起動が一時的に60秒を超過したためWatchdogがAuto-Healを発動（直後にHealth OKで復帰）。
-     - 20:14: VC入室時にユーザー（嶽ちゃん `ci_90`: リリンちゃん）のモデルロードがMasterUbuntu（CPU）上で走った際、同期ロード処理で一時的にヘルスチェック応答が遅延（失敗 2/3 回）。ロード完了直後に自動復帰（Health OK）。
+     - 20:14: VC入室時にユーザー（嶽ちゃん `ci_90`: リリンちゃん）のモデルロードがMasterNode-Ubuntu（CPU）上で走った際、同期ロード処理で一時的にヘルスチェック応答が遅延（失敗 2/3 回）。ロード完了直後に自動復帰（Health OK）。
      - この間、Bot側の投機的デュアルストリーミング（Speculative Dual-Streaming）が1500ms超過を検知して即座にEdge-TTSへフォールバック採用したため、通話の読み上げスタック・会話停止は0ミリ秒（完全シームレス）で防衛された。
   4. **【正常動作・対処不要】`engine.log`: ライブラリ警告（Cython, distutils, FutureWarning）**:
      - COEIROINK (espnet2 / coeirocore) および SHAREVOX 内部のサードパーティライブラリ警告。動作および性能に影響なし。
@@ -6030,10 +6084,10 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 
 ### 3. 次回継続タスク
 - Phase 4: Agentヘルスチェック通信流用による自動更新頻度向上（Master主導の1台ずつ順次許可フラグ発行）
-- Phase 5: OMEN2017 COEIROINK 25秒周期 flapping の調査・恒久対策
+- Phase 5: Worker-GPU-1 COEIROINK 25秒周期 flapping の調査・恒久対策
 - 全VC無人確認後のBot安全再起動（1回のみ実施）
 
-## [2026-10-05] Phase 4・Phase 5 完了（ハートビート相乗り自動更新 / OMEN2017 COEIROINK 25秒周期 recovered 是正）
+## [2026-10-05] Phase 4・Phase 5 完了（ハートビート相乗り自動更新 / Worker-GPU-1 COEIROINK 25秒周期 recovered 是正）
 
 ### 1. Phase 4: Agent 自動更新頻度の向上（ハートビート通信の流用）
 - **目的**: 毎時1回だった `auto_version_check_loop` の検知遅延を、25秒周期のハートビートへ相乗りさせて短縮。
@@ -6045,7 +6099,7 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 - **`src/web/static/agent.py`**: ハートビート応答の `update_available` を受けて、15秒（推論排出猶予）後に `self_update`。Agent側にも15分クールダウン。Master調停モード中は毎時ループをスキップ（全台同時更新防止）。
 - **検証**: 使い捨てコンテナ（`--rm`）で調停ロジック8シナリオ（1台ずつ許可・単発発行・復帰でドレイン解除→次ノード・タイムアウト+クールダウン・通話中保留・旧Agent除外・最新版は更新不要・ローリング中保留）全通過。コンテナと一時スクリプトは処分済み。
 
-### 2. Phase 5: OMEN2017 COEIROINK `recovered via heartbeat` が25秒毎に出る問題
+### 2. Phase 5: Worker-GPU-1 COEIROINK `recovered via heartbeat` が25秒毎に出る問題
 - **真因**: Watchdog が3回連続失敗で `engine_healthy=False` にした後、Auto Sleep（VC無人15分）でコンテナが停止。Watchdog は停止コンテナを `continue` でスキップするため `healthy=False` が永続し、Master 側が毎ハートビートで「20秒隔離→次HBでrecovered」を繰り返していた（08:44〜、約25秒間隔）。
 - **是正**:
   - `agent.py`: `stop_engine` 成功時、および Watchdog が停止中コンテナを検出した際に `engine_healthy=True` / `fail_count=0` へリセット。
@@ -6058,7 +6112,7 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 ### 4. 本番反映実績 (2026-10-05 11:00)
 - 全VC無人を確認した上で `docker compose restart ttsbot` を1回のみ実施。
 - Bot全5台が正常再接続。
-- ピギーバック自動更新が順調に作動し、全4ワーカー（MASTEROMEN2017, MASTERSOMEN2022, MasterDebian, MasterUbuntu）が順次 `v3.12.1` へ自律更新完了。
+- ピギーバック自動更新が順調に作動し、全4ワーカー（Worker-GPU-1, Worker-GPU-2, SlaveNode-Debian, MasterNode-Ubuntu）が順次 `v3.12.1` へ自律更新完了。
 - Phase 5 の是正により、`recovered via heartbeat`（Flapping）は 0件 となり完全沈静化。
 
 ---
@@ -6077,7 +6131,7 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 - **Phase 4: Heartbeatピギーバック自動更新** ➔ 【完了】
   - `src/web/server.py`: 1台ずつ更新許可発行、ドレイン連動、VC通話中保留、15分タイムアウト＆クールダウン。
   - `src/web/static/agent.py`: `update_available` 受信時の自律更新。全4ホストが自律更新成功。
-- **Phase 5: OMEN2017 COEIROINK 25秒毎 Flapping是正** ➔ 【完了】
+- **Phase 5: Worker-GPU-1 COEIROINK 25秒毎 Flapping是正** ➔ 【完了】
   - `src/web/static/agent.py`: stop時/watchdog停止中のヘルシー状態リセット。
   - `src/web/server.py`: 稼働中（`running==True`）のみ一時隔離。
   - 是正後ログ確認で Flapping は 0件（完全沈静化）。
@@ -6088,7 +6142,7 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
   - `LatencyIncident: QUEUE_CONGESTION` (47件): VC通話中に複数ユーザーが連続発言した際の正常な再生待ちキュー滞留（Turn-TTFS自体は3〜5msと爆速で問題なし）。
   - `Adaptive preroll timeout (2.0s) / UNDERRUN_CHUNK_1`: 一時的バッファ不足時にフォールバックが正常稼働し音声再生を維持。
   - `JMA / P2PQuake API Timeout`: 外部気象庁API等の夜間一時タイムアウト。次リトライで自動回復（正常動作）。
-- **ワーカーホストログ (OMEN2017 / SOMEN2022 / Ubuntu / Debian)**:
+- **ワーカーホストログ (Worker-GPU-1 / SWorker-GPU-2 / Ubuntu / Debian)**:
   - `AutoHeal`: ハング検知時の docker restart による自動復旧が正常機能。
   - `❌ コンテナ起動失敗: No such container: ttsworker-coeiroink / ttsworker-voicevox`:
     - **真因特定**:
@@ -6176,12 +6230,12 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 2. **構成・あるべきものの整合性是正**:
    - `src/web/server.py`:
      - `/health` エンドポイントで存在しない `node_pool` 属性を参照していた問題を修正。`voicevox_pool`, `sharevox_pool`, `coeiroink_pool` の全ノードを集約して台数・状態を正確に返却。
-     - ハートビートハンドラ（`api_worker_heartbeat`）に `MasterUbuntu`（`192.168.11.245`）のホスト名動的解決を追加。
+     - ハートビートハンドラ（`api_worker_heartbeat`）に `MasterNode-Ubuntu`（`192.168.1.10`）のホスト名動的解決を追加。
    - `src/utils/latency_tracker.py`:
-     - `parse_worker_smart_label` で OMEN2017 の IP を `192.168.11.207` / `GTX 1080 Ti` に是正。
-     - `MasterUbuntu (8 Core)`（`192.168.11.245`）のスマートラベル判定を追加。
+     - `parse_worker_smart_label` で Worker-GPU-1 の IP を `192.168.1.40` / `GTX 1080 Ti` に是正。
+     - `MasterNode-Ubuntu (8 Core)`（`192.168.1.10`）のスマートラベル判定を追加。
    - `src/tts/node_pool.py` & `src/utils/worker_log_collector.py`:
-     - `KNOWN_NODE_MAPPINGS` およびログ収集対象に `MasterUbuntu`（`192.168.11.245`）を追加。
+     - `KNOWN_NODE_MAPPINGS` およびログ収集対象に `MasterNode-Ubuntu`（`192.168.1.10`）を追加。
    - `src/cogs/commands.py`:
      - `/join` コマンドで Bot が満杯の際のエラーメッセージ（「最大4台」）を `self.bot_pool` の実稼働台数から動的算出するように是正。
 3. **高速化・通信効率化**:
@@ -6200,18 +6254,18 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 
 ---
 
-## [2026-10-06 09:46] 全ノードエンジンログ調査および障害是正（MasterUbuntu SHAREVOX復旧 / OMEN2017・OMEN2022 エンジンスタック再作成）
+## [2026-10-06 09:46] 全ノードエンジンログ調査および障害是正（MasterNode-Ubuntu SHAREVOX復旧 / Worker-GPU-1・Worker-GPU-2 エンジンスタック再作成）
 
 ### 1. 障害事象と根本原因の特定
-ユーザーより「OMEN2017でエンジンが含まれるStack自体が無いように見える」「全ノードのエンジンログを見て。一部でエラーが記録されている」との指摘を受け、全4ノードのログおよびコンテナ状態を網羅的に精査。
+ユーザーより「Worker-GPU-1でエンジンが含まれるStack自体が無いように見える」「全ノードのエンジンログを見て。一部でエラーが記録されている」との指摘を受け、全4ノードのログおよびコンテナ状態を網羅的に精査。
 
-1. **MasterUbuntu (`192.168.11.245`, ローカル)**:
+1. **MasterNode-Ubuntu (`192.168.1.10`, ローカル)**:
    - **事象**: `ttsworker-sharevox` が `Restarting (1)` を繰り返し、Watchdog による自律再起動が多発。
    - **ログ**: `FileNotFoundError: [Errno 2] No such file or directory: '/root/.local/share/sharevox-engine/model/official-v3-1/decoder_model.onnx'`
    - **真因**: 初回起動時のモデルコピー中に中断等が発生し、コンテナ内 `/root/.local/share/sharevox-engine/model/official-v3-1` ディレクトリが欠損した中途半端な状態で永続レイヤーに残存していた。
    - **対策**: 破損した `ttsworker-sharevox` コンテナを破棄（`docker rm -f`）し、`docker compose -f docker-compose.worker.yml up -d worker-sharevox` によりクリーンな状態から再生成。正常起動（`Uvicorn running on http://0.0.0.0:50025`, HTTP 200 OK）を確認。
 
-2. **OMEN2017 (`192.168.11.207`) & OMEN2022 (`192.168.11.200`)**:
+2. **Worker-GPU-1 (`192.168.1.40`) & Worker-GPU-2 (`192.168.1.50`)**:
    - **事象**: ログに `❌ コンテナ起動失敗 (ttsworker-voicevox): {'message': 'No such container: ttsworker-voicevox'}` が記録され、エンジンコンテナ群（Stack）が存在しない状態だった。
    - **真因**: 両機ともワーカーエージェントが古い `v3.12.1` で稼働しており、過去のクリーンアップ等でコンテナが消失した際に自動的に Compose からスタックを再生成するフォールバック機能（`v3.12.2` で導入）が動作していなかった。
    - **対策**: 両機に対して `POST /update {"update_agent": true, "update_engines": true, "full": true}` を発行。
@@ -6220,22 +6274,22 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
      - VOICEVOX, SHAREVOX, COEIROINK のエンジンスタック全コンテナが再作成され正常稼働。
 
 3. **全ノード Agent バージョン統一**:
-   - MasterDebian (`192.168.11.248`) および MasterUbuntu に対しても Agent 更新を実施し、全4ホストの Agent を `v3.12.2` に統一。
+   - SlaveNode-Debian (`192.168.1.20`) および MasterNode-Ubuntu に対しても Agent 更新を実施し、全4ホストの Agent を `v3.12.2` に統一。
 
 ### 2. 復旧後の全ノード・全エンジンヘルスチェック結果（全12エンジン 200 OK）
-- **MasterUbuntu (`192.168.11.245`)** [Agent: 3.12.2]:
+- **MasterNode-Ubuntu (`192.168.1.10`)** [Agent: 3.12.2]:
   - `voicevox`  (Port 50021): HTTP 200 OK (running)
   - `sharevox`  (Port 50025): HTTP 200 OK (running)
   - `coeiroink` (Port 50031): HTTP 200 OK (running)
-- **MasterDebian (`192.168.11.248`)** [Agent: 3.12.2]:
+- **SlaveNode-Debian (`192.168.1.20`)** [Agent: 3.12.2]:
   - `voicevox`  (Port 50021): HTTP 200 OK (running)
   - `sharevox`  (Port 50025): HTTP 200 OK (running)
   - `coeiroink` (Port 50031): HTTP 200 OK (running)
-- **OMEN2022 (`192.168.11.200`)** [RTX 3090, Agent: 3.12.2適用済]:
+- **Worker-GPU-2 (`192.168.1.50`)** [RTX 3090, Agent: 3.12.2適用済]:
   - `voicevox`  (Port 50021): HTTP 200 OK (running)
   - `sharevox`  (Port 50025): HTTP 200 OK (running)
   - `coeiroink` (Port 50031): HTTP 200 OK (running)
-- **OMEN2017 (`192.168.11.207`)** [GTX 1080 Ti, Agent: 3.12.2適用済]:
+- **Worker-GPU-1 (`192.168.1.40`)** [GTX 1080 Ti, Agent: 3.12.2適用済]:
   - `voicevox`  (Port 50021): HTTP 200 OK (running)
   - `sharevox`  (Port 50025): HTTP 200 OK (running)
   - `coeiroink` (Port 50031): HTTP 200 OK (running)
@@ -6264,10 +6318,10 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 
 | ノード | ホスト仕様 | Agent Version | 各エンジン状態 (VOICEVOX / SHAREVOX / COEIROINK) | 総合判定 |
 |---|---|:---:|:---:|:---:|
-| **MasterUbuntu** (192.168.11.245) | 8 Core CPU | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
-| **MasterDebian** (192.168.11.248) | 8 Core CPU | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
-| **OMEN2022** (192.168.11.200) | RTX 3090 / 20 Core | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
-| **OMEN2017** (192.168.11.207) | GTX 1080 Ti / 8 Core | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
+| **MasterNode-Ubuntu** (192.168.1.10) | 8 Core CPU | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
+| **SlaveNode-Debian** (192.168.1.20) | 8 Core CPU | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
+| **Worker-GPU-2** (192.168.1.50) | RTX 3090 / 20 Core | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
+| **Worker-GPU-1** (192.168.1.40) | GTX 1080 Ti / 8 Core | **3.12.3** | voicevox: True / sharevox: True / coeiroink: True | **完全健全** |
 
 ---
 
@@ -6283,7 +6337,7 @@ Speculative TTS（投機的並行合成）でクラウドTTS（edge/azure）が�
 
 ### 2. 実施した恒久対策 (Master 主導の 2 重セーフティネット)
 1. **即時復旧の実施**:
-   - Master から全 Worker（MasterDebian, OMEN2022, OMEN2017）へ `d312d0fb-d38d-434e-825d-cbcbfd105ad0` (銀河), `cb11bdbd-78fc-4f16-b528-a400bae1782d` (リリン), `d41bcbd9-f4a9-4e10-b000-7a431568dd01` (カナエ) の `POST /models/ram_promote` を発行。
+   - Master から全 Worker（SlaveNode-Debian, Worker-GPU-2, Worker-GPU-1）へ `d312d0fb-d38d-434e-825d-cbcbfd105ad0` (銀河), `cb11bdbd-78fc-4f16-b528-a400bae1782d` (リリン), `d41bcbd9-f4a9-4e10-b000-7a431568dd01` (カナエ) の `POST /models/ram_promote` を発行。
    - ディスク上既存ファイルとのアトミックリンクにより 0 秒で全ノードの `active_models` が復帰完了。
 2. **Worker 登録・再接続時の自動同期 (`src/web/server.py`)**:
    - `api_worker_register` において、Worker からの登録リクエスト受信時、`rm.sync_desired_ram_models_to_worker(ip)` を非同期起動。
@@ -6342,7 +6396,7 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 - **稼働検証結果**:
   1. **Bot クライアント**: Bot #1 〜 Bot #5 の全 5 台が Gateway への再接続・ギルド認識を正常完了。
   2. **Worker 登録時同期**:
-     - 起動直後に全 4 台の Worker（OMEN2022, OMEN2017, MasterDebian, MasterUbuntu）が Master に登録され、Master から Desired Models（銀河、リリン、カナエ）が即時プッシュされ全台で昇格成功（`pinned=True`）。
+     - 起動直後に全 4 台の Worker（Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian, MasterNode-Ubuntu）が Master に登録され、Master から Desired Models（銀河、リリン、カナエ）が即時プッシュされ全台で昇格成功（`pinned=True`）。
   3. **プリウォーム先行配信**:
      - 全 Worker に対する VOICEVOX / SHAREVOX プリウォームのブロードキャスト完了。
   4. **COEIROINK ルーティング**:
@@ -6366,7 +6420,7 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
    - Bot本体は `ttsbot-blue` と `ttsbot-green` の2スロット交代制とし、ホストポートを持たせないことで、裏起動時のポート競合エラーを原理的に根絶。
    - WebUIおよびCloudflare Tunnelのトラフィックは Nginx の upstream 切り替え（`nginx -s reload`）によりダウンタイム0秒で切り替え可能にした。
 3. **Nginxプロキシ経由のLANアクセスWAN誤判定是正 (`src/web/server.py`)**:
-   - `ttsbot-router` を経由した際、`X-Forwarded-For` ヘッダーが付与されることで宅内LAN（192.168.11.*）からのWorker通信がWAN境界セキュリティで誤遮断（403 Forbidden）される事象を検知。
+   - `ttsbot-router` を経由した際、`X-Forwarded-For` ヘッダーが付与されることで宅内LAN（192.168.1.*）からのWorker通信がWAN境界セキュリティで誤遮断（403 Forbidden）される事象を検知。
    - `_is_wan_request` において `X-Forwarded-For` の実クライアントIPがプライベートIPの場合は正常にLAN通信として通すよう厳密判定を是正。
 4. **全自動ローリングアップデートスクリプト配備 (`scripts/rolling_update.sh`)**:
    - 稼働中スロット（blue/green）を自動判定し、非アクティブ側を裏でビルド・起動 ➔ `/tmp/ttsbot_ready` 監視 ➔ Nginxリロード ➔ 旧スロット安全停止 ➔ 新スロットアクティベート ➔ 古いイメージのクリーンアップ（`--clean`）を全自動実行するスクリプトを配備。
@@ -6379,7 +6433,7 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 - **実運用ローリング切り替え（`ttsbot-blue` ➔ `ttsbot-green`）**:
   - `./scripts/rolling_update.sh` を実行。`ttsbot-green` が裏で3秒で起動・ウォームアップ完了し、VC瞬断約1秒で `ttsbot-blue` からハンドオフ完了。
   - 通話中VC（喫煙所　全体VC）への自動復帰が 100% 成功。
-  - WebUI（https://ttsbot.kenko.land & http://localhost:8088）および Worker ノード（MasterUbuntu, MasterDebian 等）のハートビート・登録が 200 OK 正常稼働を確認。
+  - WebUI（https://ttsbot.example.com & http://localhost:8088）および Worker ノード（MasterNode-Ubuntu, SlaveNode-Debian 等）のハートビート・登録が 200 OK 正常稼働を確認。
 
 ---
 
@@ -6469,7 +6523,7 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ### 1. 障害事象とタイムライン
 - **事象**: ユーザーより「なんかBotが突然止まったんだけど」との通報。
 - **タイムライン**:
-  - `02:00:36`: Linuxホストマシン（MasterUbuntu）がシステムシャットダウン（`systemd-poweroff.service`）により電源断。
+  - `02:00:36`: Linuxホストマシン（MasterNode-Ubuntu）がシステムシャットダウン（`systemd-poweroff.service`）により電源断。
   - `02:22:00` 頃: ホストマシンが電源再投入され再起動。
   - `02:26:56`: Dockerデーモンが `restart: unless-stopped` に基づき `ttsbot-blue` コンテナを自動起動。
   - `02:27:52`: `ttsbot-blue` が `⏸️ [STANDBY MODE] Warm-up completed! Waiting for activation signal (SIGUSR1 or /tmp/ttsbot_activate)...` と出力したまま停止（待機）。Discord Gatewayへの接続が行われない状態が継続。
@@ -6504,8 +6558,8 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
   - `python:3.14-slim` テストコンテナを起動し、4パターンのスタンバイ・アクティブ判定シナリオ（同一スロット時バイパス、異スロット時スタンバイ維持、スタンバイ無効時通常起動等）が100%期待通り動作することを検証。テストコンテナは即時自動破棄。
 - **本番稼働状況**:
   - 緊急アクティベートにより、Bot全5台（柴ヴォ#1734, シヴァ1〜4）がDiscord Gatewayへ接続完了。
-  - スラッシュコマンド（11件）同期完了、WebUI（https://ttsbot.kenko.land & http://localhost:8088）HTTP 200 OK 正常稼働。
-  - Workerノード全台（MasterDebian, MasterUbuntu, OMEN2017, OMEN2022）のTTSエンジン認識およびRAM常駐モデル再プロモート完了。
+  - スラッシュコマンド（11件）同期完了、WebUI（https://ttsbot.example.com & http://localhost:8088）HTTP 200 OK 正常稼働。
+  - Workerノード全台（SlaveNode-Debian, MasterNode-Ubuntu, Worker-GPU-1, Worker-GPU-2）のTTSエンジン認識およびRAM常駐モデル再プロモート完了。
   - `/app/data/active_slot.txt` に現在の稼働スロット（`blue`）を正常配備。次回以降のホスト再起動時も完全自動復旧を担保。
 ---
 
@@ -6535,22 +6589,22 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 
 ---
 
-## [2026-10-07 04:45] MasterUbuntu ⇄ MasterDebian ノード間高可用性 (HA) 案B (VIPレス・アプリ主導HA & 自動Preempt) の完全配備と実機検証
+## [2026-10-07 04:45] MasterNode-Ubuntu ⇄ SlaveNode-Debian ノード間高可用性 (HA) 案B (VIPレス・アプリ主導HA & 自動Preempt) の完全配備と実機検証
 
 ### 1. 目的と背景
 - **背景**: Linux ホストマシンの定期カーネル更新・再起動、またはハードウェア障害時にも、ユーザーのDiscord通話を途切れさせず、Botの停止を回避する高可用性（HA）基盤が求められた。
 - **制約と方針**:
   - IPアドレスの枯渇懸念から VIP（仮想IP / Keepalived）を用いず、追加IP消費ゼロで構築（**案B: アプリ主導HA**）。
   - ノード内のゼロダウンタイム更新（Blue-Green ローリングアップデート）と完全に共存。
-  - 通常時は `MasterUbuntu`（`192.168.11.245`）が主系として本番運用し、障害時に `MasterDebian`（`192.168.11.248`）が副系として自動昇格。
-  - `MasterUbuntu` 復旧時には自動で主権を奪還（**自動 Preempt**）し、Ubuntuへ稼働を戻す。
+  - 通常時は `MasterNode-Ubuntu`（`192.168.1.10`）が主系として本番運用し、障害時に `SlaveNode-Debian`（`192.168.1.20`）が副系として自動昇格。
+  - `MasterNode-Ubuntu` 復旧時には自動で主権を奪還（**自動 Preempt**）し、Ubuntuへ稼働を戻す。
   - スプリットブレイン（Gateway二重接続）の物理的遮断、およびデータ先祖返り（failover中のDB変更消失）ゼロを保証。
 
 ### 2. 実施内容とアーキテクチャ詳細
 
 #### Phase 1: Debian 側基盤配備 ＆ 静的構成同期
-- **双方向 SSH 認証確立**: Ubuntu ⇄ Debian 間で鍵オプション不要（`ssh root@192.168.11.248` / `ssh root@192.168.11.245`）の相互信頼関係を設定。
-- **リポジトリ ＆ ボリューム同期**: MasterDebian 上の `/root/ttsbot` に設定・ソースを完全同期。Dockerイメージ（`ttsbot_ttsbot-blue`, `ttsbot_ttsbot-green`）をビルド。
+- **双方向 SSH 認証確立**: Ubuntu ⇄ Debian 間で鍵オプション不要（`ssh root@192.168.1.20` / `ssh root@192.168.1.10`）の相互信頼関係を設定。
+- **リポジトリ ＆ ボリューム同期**: SlaveNode-Debian 上の `/root/ttsbot` に設定・ソースを完全同期。Dockerイメージ（`ttsbot_ttsbot-blue`, `ttsbot_ttsbot-green`）をビルド。
 - **辞書・モデルキャッシュ同期**: `/var/lib/docker/volumes/tts_cache/_data`（396MB）を同期し、Debian 側でも起動時ウォームアップ（プレビューキャッシュ生成）を 40秒 ➔ 0.5秒 に短縮。
 
 #### Phase 2: 双方向 DB 同期基盤 (`scripts/sync_db.sh`)
@@ -6562,10 +6616,10 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 
 #### Phase 3: Worker Agent Multi-Master Fallback 対応 (`agent.py`)
 - **分散音声合成 Worker 連携**:
-  - `MASTER_CANDIDATE_URLS = ["http://192.168.11.245:8088", "http://192.168.11.248:8088"]`
+  - `MASTER_CANDIDATE_URLS = ["http://192.168.1.10:8088", "http://192.168.1.20:8088"]`
   - Ubuntu 不通時には Debian へ自動フォールバック（`switch_to_next_master()`）。
   - 通常稼働時は 60秒周期で主系 Ubuntu への復帰をバックグラウンド試行（`try_switch_to_primary_master()`）。
-- **ピギーバック自動更新**: `AGENT_VERSION = "3.13.0"` を配備し、全12個のWorker（OMEN2017, OMEN2022, MasterUbuntu, MasterDebian）への相乗り更新を確立。
+- **ピギーバック自動更新**: `AGENT_VERSION = "3.13.0"` を配備し、全12個のWorker（Worker-GPU-1, Worker-GPU-2, MasterNode-Ubuntu, SlaveNode-Debian）への相乗り更新を確立。
 
 #### Phase 4: HA Watchdog & Preempt オーケストレーション配備
 - **Debian HA Watchdog (`scripts/ha_watchdog.sh`)**:
@@ -6601,8 +6655,8 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
   - 再度テストを実施し、降格後の再アクティベートが完全かつ高速（0.5秒でWarm-Standby化）に動作することを実証。
 
 ### 4. 運用ステータス
-- **主系 (MasterUbuntu)**: Active 稼働中 (全Bot Gateway接続、Cloudflare Tunnel経由 WebUI正常、crontab 10分DB同期稼働、Preempt Service有効)。
-- **副系 (MasterDebian)**: Warm-Standby 待機中 (辞書展開済み・メモリ温存、Gateway切断、HA Watchdog 稼働中)。
+- **主系 (MasterNode-Ubuntu)**: Active 稼働中 (全Bot Gateway接続、Cloudflare Tunnel経由 WebUI正常、crontab 10分DB同期稼働、Preempt Service有効)。
+- **副系 (SlaveNode-Debian)**: Warm-Standby 待機中 (辞書展開済み・メモリ温存、Gateway切断、HA Watchdog 稼働中)。
 - **分散 Worker**: 全12ノード健全稼働中。
 
 ---
@@ -6649,10 +6703,10 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 - **使い捨てコンテナでの単体検証**:
   - `python:3.14-slim` テストコンテナを起動し、構文チェック（`py_compile`）、動的推定関数 `get_estimated_synthesis_time` の動作、およびP90統計計算が100%期待通り動作することを検証（コンテナ即時処分）。
 - **Debianノードへの完全同期**:
-  - `rsync` により、MasterDebian（`192.168.11.248`）上のスクリプト群（`ha_watchdog.sh`, `ha_demote_to_standby.sh`, `sync_db.sh`）およびソースコードを完全同期。
+  - `rsync` により、SlaveNode-Debian（`192.168.1.20`）上のスクリプト群（`ha_watchdog.sh`, `ha_demote_to_standby.sh`, `sync_db.sh`）およびソースコードを完全同期。
 - **Blue-Green ローリングアップデート実施**:
   - `./scripts/rolling_update.sh` を実行し、`ttsbot-blue` ➔ `ttsbot-green` への1秒瞬断ハンドオフ完了。
-  - 通話中VCセッション、Workerノード4台（MasterUbuntu, MasterDebian, OMEN2017, OMEN2022）、RAMDisk常駐モデル昇格がエラー0件で継続稼働。
+  - 通話中VCセッション、Workerノード4台（MasterNode-Ubuntu, SlaveNode-Debian, Worker-GPU-1, Worker-GPU-2）、RAMDisk常駐モデル昇格がエラー0件で継続稼働。
 - **WebUI & API 疎通確認**:
   - `curl -s -I http://localhost:8088/` ➔ `HTTP/1.1 200 OK`, `X-App-Build: v2026.10.07-0530`。
   - WebUI、Discord Gateway接続、全5台Bot（柴ヴォ#1734, シヴァ1〜4）正常稼働。
@@ -6694,14 +6748,14 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ### 3. 検証結果
 - **使い捨てコンテナでの単体検証**:
   - `python:3.14-slim` テストコンテナを起動し、構文チェック（`py_compile`）、カテゴリ判定、独立バッファ（30件上限）、ベイズ平滑化計算の単体テストを全件パス（コンテナおよびスクリプト即時破棄）。
-- **MasterDebian へのソース同期**:
-  - `rsync` により副系 MasterDebian（`192.168.11.248`）へ更新コードを完全同期。
+- **SlaveNode-Debian へのソース同期**:
+  - `rsync` により副系 SlaveNode-Debian（`192.168.1.20`）へ更新コードを完全同期。
 - **Blue-Green ローリングアップデート実施**:
   - `./scripts/rolling_update.sh` を実行し、`ttsbot-green` ➔ `ttsbot-blue` への1秒瞬断ハンドオフ完了。
   - `/app/data/standby_trigger` がアクティベート後に正常消去され、`active_slot.txt` が `blue` に更新されたことを実機確認。
 - **本番稼働状況**:
   - WebUI（http://localhost:8088/health）にて `v2026.10.07-0635`（HTTP 200 OK）の配信を確認。
-  - 全5台Bot（柴ヴォ#1734, シヴァ1〜4）が Discord Gateway に接続され、全4台Worker（MasterUbuntu, MasterDebian, OMEN2022, OMEN2017）のRAMDiskモデル昇格がエラー0件で継続稼働。
+  - 全5台Bot（柴ヴォ#1734, シヴァ1〜4）が Discord Gateway に接続され、全4台Worker（MasterNode-Ubuntu, SlaveNode-Debian, Worker-GPU-2, Worker-GPU-1）のRAMDiskモデル昇格がエラー0件で継続稼働。
 
 
 
@@ -6743,8 +6797,8 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
   - 通常3パーツ文（「はい。その件については、明日確認してお返事します。」）: $W_1 = -0.15\text{s}, W_2 = -1.80\text{s} \to$ 待機時間 0.000s（即時発声開始）を確認。
   - エッジケース文（「あ。うん。ここはものすごく長い文章〜〜」＋COEIROINKコールド）: $W^* = 2.30\text{s} \to$ 400msで確実にハードキャップ（`dynamic_wait_timeout = 0.400s`）されることを確認。
   - テストコンテナは使用後即座に破棄。
-- **MasterDebian へのソース同期**:
-  - `rsync` により副系 MasterDebian（`192.168.11.248`）へ更新コードを完全同期。
+- **SlaveNode-Debian へのソース同期**:
+  - `rsync` により副系 SlaveNode-Debian（`192.168.1.20`）へ更新コードを完全同期。
 - **Blue-Green ローリングアップデート実施**:
   - `./scripts/rolling_update.sh` を実行し、`ttsbot-blue` ➔ `ttsbot-green` への1秒瞬断ハンドオフ完了。
   - 一時スタンバイトリガー消去を確認。
@@ -6758,8 +6812,8 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 
 ### 1. 現象と真因
 1. **停止中エンジンへの誤選定ゾンビループ (事象A)**:
-   - `logs/bot.log` にて `COEIROINK network error during synthesis on http://192.168.11.245:50031: Cannot connect to host 192.168.11.245:50031 ssl:default [Connect call failed ('192.168.11.245', 50031)]` が複数回発生。
-   - `192.168.11.245` (MasterUbuntu) の COEIROINK エンジンコンテナが停止中であるにもかかわらず、Agent から RAMDisk 常駐モデル情報が報告されていたため、`node_pool.py` の Tier 1 (CPU+RAMDisk) に誤選定されていた。
+   - `logs/bot.log` にて `COEIROINK network error during synthesis on http://192.168.1.10:50031: Cannot connect to host 192.168.1.10:50031 ssl:default [Connect call failed ('192.168.1.10', 50031)]` が複数回発生。
+   - `192.168.1.10` (MasterNode-Ubuntu) の COEIROINK エンジンコンテナが停止中であるにもかかわらず、Agent から RAMDisk 常駐モデル情報が報告されていたため、`node_pool.py` の Tier 1 (CPU+RAMDisk) に誤選定されていた。
    - `node_pool.py` の `is_available` が `engine_running` を判定しておらず、一時隔離後もハートビート受信で誤って `is_healthy = True` に復帰して選定され続けるゾンビループが発生していた。
    - なお、エラーログの `ssl:default` 表示は、`aiohttp` の `ClientConnectorError` が URL スキームに関わらずデフォルトの接続キー設定（`ssl:default`）を展開するライブラリ仕様であり、実態は純粋な HTTP (ポート50031) への TCP 接続拒否 (Connection refused) であることを究明。
 2. **タイムアウト緩和コードが実行中プロセスに未反映 (事象B)**:
@@ -6777,13 +6831,13 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ## [2026-10-07 15:50] HA スプリットブレイン & Cloudflare Tunnel 競合の真因究明と恒久対策
 
 ### 1. 現象
-- 外部 WebUI（`https://ttsbot.kenko.land/`）において、別ブラウザ（Firefox）やキャッシュクリア後も `Build: v2026.10.07-0717` のまま変わらず、「登録されているWorkerノードがありません」と表示され続ける。
+- 外部 WebUI（`https://ttsbot.example.com/`）において、別ブラウザ（Firefox）やキャッシュクリア後も `Build: v2026.10.07-0717` のまま変わらず、「登録されているWorkerノードがありません」と表示され続ける。
 - `logs/bot.log` にて `WebSocket closed with 4006` によるボイス切断・再接続が時折発生していた。
 
 ### 2. 真因分析 (なぜ Split Brain になり、なぜ継続したのか)
 1. **なぜ Split Brain になったのか？ (発生契機)**:
    - `src/main.py` に単一ホストのローリングアップデート孤立防止用として `STANDBY_AUTO_PROMOTE_TIMEOUT_SECONDS = 60.0`（60秒無条件自律昇格ガード）が実装されていた。
-   - このガードに「主系ノードか副系ノードか」の判定が存在しなかったため、副系 `MasterDebian`（192.168.11.248）で Standby（`TTSBOT_STANDBY=1`）起動されたコンテナが、主系 `MasterUbuntu`（192.168.11.245）が健全稼働中であるにもかかわらず、**起動からわずか 60 秒後に自律昇格タイマーが発火し、勝手に Active 昇格して Discord Gateway / Voice に二重接続** していた。
+   - このガードに「主系ノードか副系ノードか」の判定が存在しなかったため、副系 `SlaveNode-Debian`（192.168.1.20）で Standby（`TTSBOT_STANDBY=1`）起動されたコンテナが、主系 `MasterNode-Ubuntu`（192.168.1.10）が健全稼働中であるにもかかわらず、**起動からわずか 60 秒後に自律昇格タイマーが発火し、勝手に Active 昇格して Discord Gateway / Voice に二重接続** していた。
    - さらに、主系のローリング再起動時の一時的無応答（3回連続＝15秒）で Debian の `ha_watchdog.sh` がフェイルオーバーを発動し、Debian 側の Cloudflare Tunnel を起動していた。
 2. **なぜ Split Brain が継続したのか？ (継続理由)**:
    - **欠陥①: `ha_watchdog.sh` の片道切符**: 主系復旧時（Ubuntu /health 200 OK）に Debian のトンネルを落としコンテナを Standby へ自動降格させる処理が存在しなかった。
@@ -6799,19 +6853,19 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 2. **`scripts/ha_watchdog.sh` に双方向自動調停（Auto-Demote）を実装**:
    - `is_ubuntu_healthy` が true の際、もし `is_debian_active` であれば即座に `/root/ttsbot/scripts/ha_demote_to_standby.sh` を自律実行するループを追加。
    - 主系健全時は、Debian 側のトンネル停止およびコンテナ Standby 待機を 100% 自律維持。
-3. **副系 MasterDebian への最新コード同期 & 反映**:
-   - `main.py`, `ha_watchdog.sh`, `version.py`, `server.py` を MasterDebian へ rsync 同期し、`ttsbot-ha-watchdog` サービスを再起動。
+3. **副系 SlaveNode-Debian への最新コード同期 & 反映**:
+   - `main.py`, `ha_watchdog.sh`, `version.py`, `server.py` を SlaveNode-Debian へ rsync 同期し、`ttsbot-ha-watchdog` サービスを再起動。
    - Debian 側コンテナを再起動し、60秒経過後も STANDBY 状態が完全に維持されることを実機確認。
-4. **主系（MasterUbuntu）のローリング反映**:
+4. **主系（MasterNode-Ubuntu）のローリング反映**:
    - `src/version.py`: `BUILD_VERSION = "v2026.10.07-1536"`。
    - `src/web/server.py`: `_get_guild_and_perms` にボット管理者（`admin_user_ids`）の無条件許可判定を追加。
    - `scripts/rolling_update.sh` を実行し、主系スロットを最新コードで反映完了。
 
 ### 4. 稼働検証結果
-- 外部 URL（`https://ttsbot.kenko.land/`）より `v2026.10.07-1536` および `Agent v3.13.1` が即時返却されることを確認。
-- MasterDebian 側は 60秒経過後も確実に Standby 待機を継続（`docker exec ttsbot-blue ... -> STANDBY`）。
+- 外部 URL（`https://ttsbot.example.com/`）より `v2026.10.07-1536` および `Agent v3.13.1` が即時返却されることを確認。
+- SlaveNode-Debian 側は 60秒経過後も確実に Standby 待機を継続（`docker exec ttsbot-blue ... -> STANDBY`）。
 - Discord Voice 接続の二重接続キック（4006 エラー）が完全根絶。
-- MasterDebian の HA Watchdog も平常監視ループ（FAIL_COUNT=0）で正常待機中。
+- SlaveNode-Debian の HA Watchdog も平常監視ループ（FAIL_COUNT=0）で正常待機中。
 
 ---
 
@@ -6819,7 +6873,7 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 
 ### 1. 現象と根本原因
 - **現象**:
-  - 15:52 に副系 MasterDebian 上で `ttsbot-blue` が Warm-Standby 起動。
+  - 15:52 に副系 SlaveNode-Debian 上で `ttsbot-blue` が Warm-Standby 起動。
   - 起動からちょうど 15 分後（16:07:26〜16:07:28）、スタンバイ中の `ttsbot-blue` 内の `_idle_monitor_loop` が「VC 通話者 0 人（Gateway 未接続のため）」を誤検知。
   - `stop_all_active_engines(reason="Vacancy Sleep (15m)")` を実行し、自ホストの Worker エンジン（`ttsworker-voicevox`, `ttsworker-sharevox`, `ttsworker-coeiroink`）を停止させた。
   - さらに、スタンバイ待機中に外部 Worker への RAM モデル Reconcile（`reconcile_worker_ram_models`）やピン留めモデル昇格リクエスト（`broadcast_pinned_models_to_workers`）、試聴用音声の事前生成（`delayed_precache_previews`）が無条件で発動していた。
@@ -6845,22 +6899,22 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ### 3. デプロイと稼働検証結果
 1. **使い捨て隔離コンテナでの安全性検証**:
    - `docker run --rm` により `py_compile` およびスタンバイガード単体テストを実行し、即座にコンテナを破棄。
-2. **主系（MasterUbuntu）の Blue-Green ゼロダウンタイム反映**:
+2. **主系（MasterNode-Ubuntu）の Blue-Green ゼロダウンタイム反映**:
    - `scripts/rolling_update.sh` を実行し、`ttsbot-blue` ➔ `ttsbot-green` へ通話断なしで切り替え完了。
-3. **副系（MasterDebian）への同期 & 反映**:
+3. **副系（SlaveNode-Debian）への同期 & 反映**:
    - `src/` 配下を rsync 同期し、`ttsbot-blue` を再起動。
    - スタンバイ起動時に「`⏸️ [ResourceManager] スタンバイモード有効化: エンジン自動停止およびWorker Reconcileを停止ガードします。`」が出力され、一切の余計なタスクが起動しないことを確認。
 4. **停止中 Debian Worker エンジンの復旧**:
    - `cd /root/ttsbot-worker && docker compose -f docker-compose.worker.yml up -d` により、`ttsworker-voicevox`, `ttsworker-sharevox`, `ttsworker-coeiroink` を正常稼働（Up）へ復帰。
-   - `scripts/check_workers.sh` で全3台のWorkerノード（Debian, OMEN2022, OMEN2017）がすべて健全稼働中であることを確認。
+   - `scripts/check_workers.sh` で全3台のWorkerノード（Debian, Worker-GPU-2, Worker-GPU-1）がすべて健全稼働中であることを確認。
 
 ---
 
-## [2026-10-07 17:32] MasterUbuntu 側 Worker エンジン停止事象の調査・同一性判定および完全復旧
+## [2026-10-07 17:32] MasterNode-Ubuntu 側 Worker エンジン停止事象の調査・同一性判定および完全復旧
 
 ### 1. 調査結果 (事象の同一性確認)
 - **事象**:
-  - MasterUbuntu（192.168.11.245）の `/health` API において、`worker_MasterUbuntu` の全3エンジン（VOICEVOX, SHAREVOX, COEIROINK）が `is_available: false`（利用不可）になっていた。
+  - MasterNode-Ubuntu（192.168.1.10）の `/health` API において、`worker_MasterNode-Ubuntu` の全3エンジン（VOICEVOX, SHAREVOX, COEIROINK）が `is_available: false`（利用不可）になっていた。
   - ホスト上の Docker コンテナ `ttsworker-voicevox`, `ttsworker-sharevox`, `ttsworker-coeiroink` が `Exited` 状態。
 - **原因判定**:
   - **Debian と完全に同一事象（15分無人スリープによる自ホストエンジン停止）**。
@@ -6872,8 +6926,8 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 - 各エンジンの HTTP エンドポイント（50021, 50025, 50031）から 200 OK 応答を確認。
 
 ### 3. 稼働検証結果
-- `/health` API を再取得し、`worker_MasterUbuntu` の全3エンジンが `is_available: true`, `is_healthy: true` に完全復帰したことを確認。
-- 分散システム全体の全12ノード（OMEN2017 x 3, OMEN2022 x 3, MasterDebian x 3, MasterUbuntu x 3）がすべて `is_available: true` で健全稼働中。
+- `/health` API を再取得し、`worker_MasterNode-Ubuntu` の全3エンジンが `is_available: true`, `is_healthy: true` に完全復帰したことを確認。
+- 分散システム全体の全12ノード（Worker-GPU-1 x 3, Worker-GPU-2 x 3, SlaveNode-Debian x 3, MasterNode-Ubuntu x 3）がすべて `is_available: true` で健全稼働中。
 
 ---
 
@@ -6909,9 +6963,9 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ### 3. デプロイと稼働検証結果
 1. **使い捨て隔離コンテナでの安全性検証**:
    - `docker run --rm` により `py_compile` および `to_dict()` の出力構造検証テストを実施し、合格を確認後コンテナを即時自動破棄。
-2. **主系（MasterUbuntu）の Blue-Green ゼロダウンタイム反映**:
+2. **主系（MasterNode-Ubuntu）の Blue-Green ゼロダウンタイム反映**:
    - `./scripts/rolling_update.sh` を実行し、`ttsbot-green` ➔ `ttsbot-blue` への高速ハンドオフ（VC瞬断目標達成）完了。
-3. **副系（MasterDebian）への同期 & 反映**:
+3. **副系（SlaveNode-Debian）への同期 & 反映**:
    - `rsync` により `src/` 配下を同期し、スタンバイコンテナ `ttsbot-blue` を安全に再起動完了。
 4. **本番稼働確認**:
    - WebUI（http://localhost:8088/）から最新の `app.js?v=v2026.10.07-1742` が正常配信されていることを確認。
@@ -6945,9 +6999,9 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ### 3. デプロイと稼働検証結果
 1. **使い捨て隔離コンテナでの安全性検証**:
    - `docker run --rm` により `py_compile` および他ギルドVC通話中判定（3ケース）の単体テストを実施し、全テスト合格を確認。一時テストファイルは即時削除。
-2. **主系（MasterUbuntu）の Blue-Green ゼロダウンタイム反映**:
+2. **主系（MasterNode-Ubuntu）の Blue-Green ゼロダウンタイム反映**:
    - `./scripts/rolling_update.sh` を実行し、`ttsbot-blue` ➔ `ttsbot-green` への無停止ローリングアップデート完了。
-3. **副系（MasterDebian）への同期 & 反映**:
+3. **副系（SlaveNode-Debian）への同期 & 反映**:
    - `rsync` で `src/` 配下を同期し、スタンバイコンテナ `ttsbot-blue` を安全に再起動完了。
 4. **本番稼働確認**:
    - `/health` API より最新バージョン `v2026.10.07-2123`、全12ワーカーノード正常、Discord Gateway 正常接続（2ギルド）を確認。
@@ -6978,9 +7032,9 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ### 3. デプロイと稼働検証結果
 1. **使い捨て隔離コンテナでの安全性検証**:
    - `docker run --rm` により `py_compile` および単体テスト（`（パテダンは？）` の単一チャンク化、Edge-TTS ボイスマッピング全6ケース）を実施し、全テスト合格を確認。一時テストファイルは即時削除。
-2. **主系（MasterUbuntu）の Blue-Green ゼロダウンタイム反映**:
+2. **主系（MasterNode-Ubuntu）の Blue-Green ゼロダウンタイム反映**:
    - `./scripts/rolling_update.sh` を実行し、`ttsbot-green` ➔ `ttsbot-blue` への無停止ローリングアップデート完了。
-3. **副系（MasterDebian）への同期 & 反映**:
+3. **副系（SlaveNode-Debian）への同期 & 反映**:
    - `rsync` で `src/` 配下を同期し、スタンバイコンテナ `ttsbot-blue` を安全に再起動完了。
 4. **本番稼働確認**:
    - `/health` API より最新バージョン `v2026.10.08-0100`、全12ワーカーノード正常、Discord Gateway 正常接続（2ギルド）を確認。
@@ -7018,28 +7072,28 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 ### 3. デプロイと稼働検証結果
 1. **使い捨て隔離コンテナでの安全性検証**:
    - 構文チェック（`py_compile`）およびシャットダウン動作単体テスト（クローズ前の正常記録、およびクローズ後の各メソッド呼び出しで例外なく静かにスキップされること）を検証完了。
-2. **主系（MasterUbuntu）の Blue-Green ゼロダウンタイム反映**:
+2. **主系（MasterNode-Ubuntu）の Blue-Green ゼロダウンタイム反映**:
    - `./scripts/rolling_update.sh` を実行し、`ttsbot-blue` ➔ `ttsbot-green` への無停止ローリングアップデート完了。
-3. **副系（MasterDebian）への同期 & 反映**:
+3. **副系（SlaveNode-Debian）への同期 & 反映**:
    - `rsync` で `src/` 配下を同期し、スタンバイコンテナ `ttsbot-blue` を安全に再起動完了。
 4. **本番稼働確認**:
    - `/health` API より最新バージョン `v2026.10.08-0130`、稼働状態正常を確認。
 
 ---
 
-## [2026-10-08 12:55] WebUI 分散ワーカーノード リアルタイムログへの Ubuntu (MasterUbuntu) ノード追加
+## [2026-10-08 12:55] WebUI 分散ワーカーノード リアルタイムログへの Ubuntu (MasterNode-Ubuntu) ノード追加
 
 ### 1. 課題と背景
 - **課題**:
-  - WebUIダッシュボードの「システム & ワーカー状況」タブ内にある「🖥️ 分散ワーカーノード リアルタイムログ」カードにおいて、ノード選択セレクトボックス（`#worker-log-node-select`）の選択肢に OMEN2022, OMEN2017, MasterDebian のみが静的配置されており、Ubuntu（`worker_MasterUbuntu`）が含まれていなかった。
+  - WebUIダッシュボードの「システム & ワーカー状況」タブ内にある「🖥️ 分散ワーカーノード リアルタイムログ」カードにおいて、ノード選択セレクトボックス（`#worker-log-node-select`）の選択肢に Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian のみが静的配置されており、Ubuntu（`worker_MasterNode-Ubuntu`）が含まれていなかった。
 - **現状調査結果**:
-  - バックエンド側（`WorkerLogCollector` および `GET /api/worker/logs`）では、既に `worker_MasterUbuntu`（`192.168.11.245`）が既知ワーカーとして完全サポートされており、`logs/workers/worker_MasterUbuntu/` 配下に `agent.log`, `voicevox.log`, `coeiroink.log`, `sharevox.log` 等の各種ログが正常に自動収集・保持されていた。
+  - バックエンド側（`WorkerLogCollector` および `GET /api/worker/logs`）では、既に `worker_MasterNode-Ubuntu`（`192.168.1.10`）が既知ワーカーとして完全サポートされており、`logs/workers/worker_MasterNode-Ubuntu/` 配下に `agent.log`, `voicevox.log`, `coeiroink.log`, `sharevox.log` 等の各種ログが正常に自動収集・保持されていた。
   - フロントエンドのセレクトボックスの選択肢欠落のみが原因であり、UIへの追加で即座に参照可能となる状態であった。
 
 ### 2. 実施した改修内容
 1. **テンプレートへの選択肢追加 (`src/web/templates/index.html`)**:
-   - `#worker-log-node-select` に `<option value="worker_MasterUbuntu">MasterUbuntu (8 Core)</option>` を追加。
-   - メトリクス表示タブ（`MasterUbuntu (8 Core)`）と統一した表記を採用。
+   - `#worker-log-node-select` に `<option value="worker_MasterNode-Ubuntu">MasterNode-Ubuntu (8 Core)</option>` を追加。
+   - メトリクス表示タブ（`MasterNode-Ubuntu (8 Core)`）と統一した表記を採用。
 2. **動的ワーカー同期・補完機能の追加 (`src/web/static/app.js`)**:
    - `syncWorkerLogNodes()` を新設。
    - `loadWorkerLogs()` 呼び出し時に、初回のみ `GET /api/worker/logs?mode=list` と照合し、セレクトボックスに未登録のノードがあれば動的補完する二重安全機構を導入。
@@ -7049,8 +7103,8 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 1. **ゼロダウンタイム即時反映**:
    - 本改修は WebUI テンプレートおよび静的 JS のみであり、Aiohttp サーバーのリクエスト時動的ファイル読み込みおよびキャッシュバスター機能により、コンテナ再起動を伴わずに即時反映（本番影響ゼロ）。
 2. **動作確認**:
-   - `curl -s http://127.0.0.1:8088/` にて、HTML内に `worker_MasterUbuntu` の `<option>` が正常配信されていることを確認。
-   - `GET /api/worker/logs?node_id=worker_MasterUbuntu&target=agent&lines=3` 等により、Ubuntu ノードの Agent ログおよび各TTSエンジン（VOICEVOX / SHAREVOX / COEIROINK）のログが正常に応答（HTTP 200 OK）することを確認。
+   - `curl -s http://127.0.0.1:8088/` にて、HTML内に `worker_MasterNode-Ubuntu` の `<option>` が正常配信されていることを確認。
+   - `GET /api/worker/logs?node_id=worker_MasterNode-Ubuntu&target=agent&lines=3` 等により、Ubuntu ノードの Agent ログおよび各TTSエンジン（VOICEVOX / SHAREVOX / COEIROINK）のログが正常に応答（HTTP 200 OK）することを確認。
 
 ---
 
@@ -7058,9 +7112,9 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 
 ### 1. 課題と背景
 - **調査契機**:
-  - 各ワーカーノード（MasterUbuntu, MasterDebian, OMEN2022, OMEN2017）へSSH接続し、コンテナ実稼働状況（`docker ps`）とBot内部ノードプール認識状況（`/health` API）の突合調査を実施。
+  - 各ワーカーノード（MasterNode-Ubuntu, SlaveNode-Debian, Worker-GPU-2, Worker-GPU-1）へSSH接続し、コンテナ実稼働状況（`docker ps`）とBot内部ノードプール認識状況（`/health` API）の突合調査を実施。
 - **検出された不整合**:
-  - MasterUbuntu / OMEN2022 / OMEN2017 において、VOICEVOX および SHAREVOX コンテナが `Exited (0)`（停止中）であるにもかかわらず、Bot側のステータスが `is_available: true`（利用可能）と誤判定されていた。
+  - MasterNode-Ubuntu / Worker-GPU-2 / Worker-GPU-1 において、VOICEVOX および SHAREVOX コンテナが `Exited (0)`（停止中）であるにもかかわらず、Bot側のステータスが `is_available: true`（利用可能）と誤判定されていた。
 - **なぜなぜ分析による原因究明**:
   1. なぜ VOICEVOX / SHAREVOX が全台停止していたか？
      ➔ 朝07:40に、VC完全無人（15分間）を検知した自律制御機能「Vacancy Sleep」が発動し、リソース解放のため全エンジンのコンテナを正常安全停止したため。
@@ -7072,12 +7126,12 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 - **途中計画変更に伴う潜在的設計不整合の総点検結果**:
   - DebianからUbuntuへのMaster移行、およびCOEIROINKの「CPU+RAMDisk最優先（Tier 1）」への途中仕様変更に伴い、以下の8箇所の設計不整合がコード内に残存していたことを特定：
     1. `TTSNode.specs` 辞書参照共有バグによるステータス誤上書き
-    2. オンデマンド遠隔起動の除外IPリストに旧Master（Debian: `192.168.11.248`）が固定ハードコードされ、復帰不能だった問題
+    2. オンデマンド遠隔起動の除外IPリストに旧Master（Debian: `192.168.1.20`）が固定ハードコードされ、復帰不能だった問題
     3. オンデマンド遠隔起動トリガーが「GPU限定（`has_gpu`）」のまま残存し、COEIROINKのTier 1（CPU+RAMDisk）がオンデマンド起動されなかった問題
     4. Vacancy Sleep（一斉停止）の除外リストに旧Master（Debian）が残存し、現Master（Ubuntu）が欠落していた問題
-    5. `LOCAL_ENGINES` のヘルスチェックURLが `192.168.11.245` 固定のため、Debianへ昇格時の潜在リスクとなっていた問題
+    5. `LOCAL_ENGINES` のヘルスチェックURLが `192.168.1.10` 固定のため、Debianへ昇格時の潜在リスクとなっていた問題
     6. 外部ワーカーのコンテナ先行起動タイムアウト（5.0秒）が短く、CPUノード起動時にタイムアウト落ちする問題
-    7. `api_worker_register` のホスト名自動解決における `192.168.11.245`（Ubuntu）の欠落
+    7. `api_worker_register` のホスト名自動解決における `192.168.1.10`（Ubuntu）の欠落
     8. WebUIテンプレートの案内テキストおよび `scripts/check_workers.sh` の旧IP表記・Ubuntu欠落
 
 ### 2. 実施した改修内容
@@ -7092,30 +7146,30 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
      - `api_worker_heartbeat`: `node.engine_running = eng_running` を直接更新。
 2. **オンデマンド遠隔起動の除外IP解除 & COEIROINK Tier 1/2 最優先起動**:
    - `src/tts/node_pool.py`:
-     - `TTSNode.try_remote_start`: 除外IPから `192.168.11.248`（Debian）および `192.168.11.245`（Ubuntu）を解除。全ホストで自律的に `:50030/engine/start` を叩いてオンデマンド復帰可能化（タイムアウト8.0秒）。
-     - `TTSNodePool.acquire_node`: COEIROINK の場合、Tier 1（CPU+RAMDisk: MasterDebian/Ubuntu）および Tier 2（GPU+RAMDisk）が停止中であれば、優先度順（`has_gpu` 昇順）にオンデマンド遠隔起動をバックグラウンド発火するよう刷新。VOICEVOX/SHAREVOXはGPU優先オンデマンドを維持。
+     - `TTSNode.try_remote_start`: 除外IPから `192.168.1.20`（Debian）および `192.168.1.10`（Ubuntu）を解除。全ホストで自律的に `:50030/engine/start` を叩いてオンデマンド復帰可能化（タイムアウト8.0秒）。
+     - `TTSNodePool.acquire_node`: COEIROINK の場合、Tier 1（CPU+RAMDisk: SlaveNode-Debian/Ubuntu）および Tier 2（GPU+RAMDisk）が停止中であれば、優先度順（`has_gpu` 昇順）にオンデマンド遠隔起動をバックグラウンド発火するよう刷新。VOICEVOX/SHAREVOXはGPU優先オンデマンドを維持。
 3. **主系・副系の動的ホストIP解決 & Vacancy Sleep 制御**:
    - `src/resource_manager.py`:
-     - `LOCAL_HOST_IP` を `TTSBOT_NODE` 環境変数に基づき動的解決（Ubuntu: `192.168.11.245`、Debian: `192.168.11.248`）。
+     - `LOCAL_HOST_IP` を `TTSBOT_NODE` 環境変数に基づき動的解決（Ubuntu: `192.168.1.10`、Debian: `192.168.1.20`）。
      - `LOCAL_ENGINES` のヘルスチェックURLを `LOCAL_HOST_IP` で動的解決。
-     - `_broadcast_worker_stop`: 除外IPからハードコード `192.168.11.248` を撤廃し、`LOCAL_HOST_IP` を動的に除外（副系Debianもスリープ指示対象に含有）。
+     - `_broadcast_worker_stop`: 除外IPからハードコード `192.168.1.20` を撤廃し、`LOCAL_HOST_IP` を動的に除外（副系Debianもスリープ指示対象に含有）。
      - `_prewarm_one`: コンテナ遠隔起動タイムアウトを `5.0秒` ➔ `10.0秒` に延長。
 4. **UI案内テキスト・診断ツール・バージョン更新**:
    - `src/web/templates/index.html`: 旧IP表記を主系（Ubuntu: 8088）/副系（Debian: 8088）表記に更新。
-   - `scripts/check_workers.sh`: `NODES` 配列に `192.168.11.245:50030:MasterUbuntu (Linux)` を追加。
+   - `scripts/check_workers.sh`: `NODES` 配列に `192.168.1.10:50030:MasterNode-Ubuntu (Linux)` を追加。
    - `src/version.py`: `BUILD_VERSION = "v2026.10.08-1320"`, `BUILD_DATE = "2026-10-08 13:20:00 JST"` に更新。
 
 ### 3. デプロイと検証結果
 1. **構文チェック & 健全性確認**:
    - `python3 -m py_compile` により全修正ファイルの構文エラー0件を確認。
-2. **主系（MasterUbuntu）の無停止ローリングアップデート**:
+2. **主系（MasterNode-Ubuntu）の無停止ローリングアップデート**:
    - `./scripts/rolling_update.sh` を実行し、`ttsbot-green` ➔ `ttsbot-blue` へゼロダウンタイム切り替え完了。
-3. **副系（MasterDebian）への同期**:
+3. **副系（SlaveNode-Debian）への同期**:
    - `rsync` により `src/` および `scripts/` を副系へ完全同期完了。
 4. **本番稼働・不整合解消の検証**:
-   - `/health` API を確認し、実機で停止中（Exited）のコンテナ（OMEN2017, OMEN2022, MasterUbuntu の VOICEVOX / SHAREVOX）が正確に `is_available: false` と認識されることを確認。
+   - `/health` API を確認し、実機で停止中（Exited）のコンテナ（Worker-GPU-1, Worker-GPU-2, MasterNode-Ubuntu の VOICEVOX / SHAREVOX）が正確に `is_available: false` と認識されることを確認。
    - 稼働中コンテナ（COEIROINK 各機、Debian の VOICEVOX）が正確に `is_available: true` と認識されることを確認。
-   - `./scripts/check_workers.sh` を実行し、MasterUbuntu / MasterDebian / OMEN2022 / OMEN2017 の全4台が健全応答することを確認。
+   - `./scripts/check_workers.sh` を実行し、MasterNode-Ubuntu / SlaveNode-Debian / Worker-GPU-2 / Worker-GPU-1 の全4台が健全応答することを確認。
 
 ---
 
@@ -7130,16 +7184,16 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
 
 ### 2. 点検結果詳細
 1. **プロセス・コンテナ・リソース状況**:
-   - MasterUbuntu（主系）: `ttsbot-blue` (Up 3時間), `ttsbot-router` (Up 38時間), `ttsbot-tunnel` (Up 38時間), `ttsworker-agent` (Up 26時間)。
+   - MasterNode-Ubuntu（主系）: `ttsbot-blue` (Up 3時間), `ttsbot-router` (Up 38時間), `ttsbot-tunnel` (Up 38時間), `ttsworker-agent` (Up 26時間)。
    - システムリソース: メモリ 60GB中 50GB利用可能 (使用率16.7%), ディスク空き 339GB (使用率28%) と極めて潤沢・健全。
 2. **ノードプールと各実機エンジンの整合性**:
    - `/health` API（Bot内部認識）と各ホスト WorkerAgent（`http://<IP>:50030/status`）の実稼働状態を完全突合。
    - **突合結果: 100% 完全一致（不整合 0 件）**
-     - OMEN2017 & OMEN2022: オンデマンド起動により VOICEVOX および COEIROINK が正常稼働中（`is_available: true`）。
-     - MasterUbuntu: COEIROINK が稼働中、VOICEVOX / SHAREVOX はスリープ中（`is_available: false`）。
-     - MasterDebian: VOICEVOX が稼働中、COEIROINK / SHAREVOX はスリープ中（`is_available: false`）。
+     - Worker-GPU-1 & Worker-GPU-2: オンデマンド起動により VOICEVOX および COEIROINK が正常稼働中（`is_available: true`）。
+     - MasterNode-Ubuntu: COEIROINK が稼働中、VOICEVOX / SHAREVOX はスリープ中（`is_available: false`）。
+     - SlaveNode-Debian: VOICEVOX が稼働中、COEIROINK / SHAREVOX はスリープ中（`is_available: false`）。
      - SHAREVOX: 全4台ともスリープ中（`is_available: false`）。
-3. **副系ノード（MasterDebian）の冗長性・ファイルツリー点検**:
+3. **副系ノード（SlaveNode-Debian）の冗長性・ファイルツリー点検**:
    - `ttsbot-ha-watchdog.service` は active (running) で正常常駐。
    - Cloudflare Tunnel は停止維持（スプリットブレイン完全抑止）。
    - コンテナ `ttsbot-blue` は Warm-Standby 待機中（自律昇格・自動停止ガード有効）。
@@ -7154,7 +7208,7 @@ Master を信頼できる唯一の情報源（SSOT）とする設計方針に基
    - **対処が必要なエラー・ワーニング: なし**。
 5. **DB整合性 & 外部サービス疎通**:
    - SQLite データベース（`bot.db`）: `PRAGMA integrity_check` を実行し `ok` を確認。
-   - WebUI: ローカル（8088）および外部ドメイン（https://ttsbot.kenko.land）ともに HTTP 200 OK 応答。
+   - WebUI: ローカル（8088）および外部ドメイン（https://ttsbot.example.com）ともに HTTP 200 OK 応答。
    - 分散ワーカーログAPI（`/api/worker/logs?mode=list`）: Ubuntu を含む全4ノードのログを正常返却。
    - 防災情報API（P2PQuake）: HTTP 200 OK で正常疎通。
 
@@ -7267,7 +7321,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   - `ttsbot-green`: `Up (healthy)`（リソース制限 2CPU/2GB、`init: true`、二段階ヘルスチェック適用）。
   - 全5台のBot（Bot #1〜#5）が Discord Gateway に再接続完了。
   - キャッシュ整合性スキャン（9422件中9422件健全、エラーゼロ）完了。
-  - Worker ノード群（OMEN2022, OMEN2017, MasterDebian, MasterUbuntu）全12ノードと即座に自動再同期。
+  - Worker ノード群（Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian, MasterNode-Ubuntu）全12ノードと即座に自動再同期。
   - WebUI（`curl -i http://127.0.0.1:8088/health`）にて全セキュリティヘッダー（`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`）の付与を確認。
   - 本番運用中の通話断絶・他サービス影響ゼロでの完全反映を達成。
 
@@ -7283,7 +7337,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - `docker compose restart` やコンテナ直接停止等の破壊的操作を厳禁。
      - 本番反映時は `scripts/rolling_update.sh` による Blue-Green ゼロダウンタイム更新を強制。
      - テスト検証時は `scripts/run_sandbox_test.sh` による一時コンテナ・一時ボリューム完全自動破棄（ゼロフットプリント）を強制。
-     - 主系（MasterUbuntu）/副系（MasterDebian）の HA Split-Brain 防止と、`logs/remediation_history.md` / `scratch/memo.md` への記録義務付け。
+     - 主系（MasterNode-Ubuntu）/副系（SlaveNode-Debian）の HA Split-Brain 防止と、`logs/remediation_history.md` / `scratch/memo.md` への記録義務付け。
 
 2. **`ttsbot-latency-guard` (`.agents/skills/ttsbot-latency-guard/SKILL.md`)**:
    - **目的**: 超低遅延パイプライン保護・音響プロファイリング・レイテンシ回帰防止。
@@ -7312,13 +7366,13 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 ## [2026-10-09 19:50] 運用ログ調査・エンジン状態診断・ホスト再起動に伴う二重Active起動の解消と恒久対策
 
 ### 1. 調査と背景
-- **発生契機**: 2026-10-09 19:04 頃の MasterUbuntu OS 再起動。
+- **発生契機**: 2026-10-09 19:04 頃の MasterNode-Ubuntu OS 再起動。
 - **検知された事象**:
   1. `logs/bot.log` にて 19:12〜19:18 に Discord 切断（`WebSocket closed with 4006` / `Disconnected from voice` / `Attempting a reconnect`）が多発。
   2. 19:16 に `Docker start returned HTTP 404: {"message":"No such container: ttsworker-voicevox"}` およびヘルスチェック遅延警告が発生。
   3. 19:31:59 に `🛑 [Vacancy Sleep (15m)] Stopping running engine` が発動し、WebUI/API 上で全ノードが `is_available: false`（停止中）と表示され、エンジン状態の不整合が疑われた。
 - **真因の究明**:
-  - **エンジンの状態**: 不整合・破損は一切なし。15分通話者ゼロに伴う Vacancy Sleep（省電力無人スリープ）による仕様通りの停止。各ノード（Ubuntu, Debian, OMEN2022, OMEN2017）の Worker Agent は全台健全に稼働しており、ピン留めモデル 3 種（銀芽, かなえ, リリン）も RAMDisk に正常常駐完了していた。
+  - **エンジンの状態**: 不整合・破損は一切なし。15分通話者ゼロに伴う Vacancy Sleep（省電力無人スリープ）による仕様通りの停止。各ノード（Ubuntu, Debian, Worker-GPU-2, Worker-GPU-1）の Worker Agent は全台健全に稼働しており、ピン留めモデル 3 種（銀芽, かなえ, リリン）も RAMDisk に正常常駐完了していた。
   - **Discord 4006 切断の真因**: OS 起動時に `ttsbot-preempt.service`（`scripts/preempt_guard.sh`）が実行されたが、同スクリプト内で `ttsbot-blue` がハードコードで起動されていた。一方、朝 07:20 のローリングアップデートにより正規の Active スロットは `ttsbot-green`（Nginx ルーターも green を指向）であり、Docker デーモンの自動起動ポリシーで `ttsbot-green` も起動していた。この結果、同一ホスト上で `ttsbot-blue` と `ttsbot-green` の双方が Active 起動し、同一 Discord Bot トークンで二重接続してセッションの奪い合い（4006切断）が発生していた。
 
 ### 2. 実施した対処
@@ -7342,7 +7396,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 ## [2026-10-09 19:58] 外部Workerプリウォーム未定義属性バグの修正と全ノード（12/12）即時起動復旧
 
 ### 1. 課題と根本原因
-- **課題**: 19:45〜19:54 に通話者が VC 参加した際、`Pre-warm Batch` のログは流れているにもかかわらず、外部 Worker（OMEN2022, MasterDebian, OMEN2017）のエンジンが停止中のままになっていた。
+- **課題**: 19:45〜19:54 に通話者が VC 参加した際、`Pre-warm Batch` のログは流れているにもかかわらず、外部 Worker（Worker-GPU-2, SlaveNode-Debian, Worker-GPU-1）のエンジンが停止中のままになっていた。
 - **根本原因**:
   - `src/resource_manager.py` の `_broadcast_worker_prewarm` 内で、外部ノードへの先行起動タスク `_prewarm_one` の先頭で `async with self._prewarm_semaphore:` を参照していた。
   - しかし `LocalEngineResourceManager.__init__` に `_prewarm_semaphore` の初期化コードが存在しなかった。
@@ -7357,7 +7411,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 2. **一時サンドボックス検証 (`scripts/run_sandbox_test.sh`)**:
    - 一時隔離テストコンテナにて全ユニットテスト・統合テストを実行し完全合格（自動破棄・ゼロフットプリント維持）。
 3. **全ノード遠隔起動の即時実施**:
-   - 全 4 台の Worker（MasterUbuntu, MasterDebian, OMEN2022, OMEN2017）の全 12 エンジン（VOICEVOX, SHAREVOX, COEIROINK）に対して遠隔オンデマンド起動リクエストを送信。
+   - 全 4 台の Worker（MasterNode-Ubuntu, SlaveNode-Debian, Worker-GPU-2, Worker-GPU-1）の全 12 エンジン（VOICEVOX, SHAREVOX, COEIROINK）に対して遠隔オンデマンド起動リクエストを送信。
    - 全 12 ノードが即座に `Available: 12/12`（健全稼働）へ復帰。WebUI の表示も「● 全エンジン稼働」（緑色）に完全復帰したことを確認。
 
 ## [2026-10-09 20:25] スタンバイ残留フラグトラップ解消、Blue-Greenローリングアップデート無停止反映完了 & 外部Workerプリウォーム正常動作実証
@@ -7385,9 +7439,9 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   - Discord Bot: `is_ready: true`, レイテンシ 191ms, 参加ギルド 2。
   - データベース: `status: "connected"`, エラーなし。
   - 分散 Worker: 全 12 ノード（4 ホスト × 3 エンジン）すべて `is_healthy: true`, `is_available: true`（全開通・全稼働中）。
-- **WebUI 疎通**: `https://ttsbot.kenko.land/` からの全 API リクエストが `ttsbot-blue` へ正常ルーティングされ HTTP 200 応答。
+- **WebUI 疎通**: `https://ttsbot.example.com/` からの全 API リクエストが `ttsbot-blue` へ正常ルーティングされ HTTP 200 応答。
 - **外部 Worker プリウォーム実証**:
-  - コンテナ起動後、`src.resource_manager` による MasterUbuntu / MasterDebian での先行ウォームアップ（雨晴はう モデルロード）が自動実行され成功。
+  - コンテナ起動後、`src.resource_manager` による MasterNode-Ubuntu / SlaveNode-Debian での先行ウォームアップ（雨晴はう モデルロード）が自動実行され成功。
   - 先ほど修正した `_prewarm_semaphore` バグの恒久解消が、本番実機稼働ログ上で完全に実証された。
 
 ## [2026-10-14 15:02] TTS Bot 動的サーバーネーム（ニックネーム）変更・自動復元機能の実装およびBlue-Green無停止デプロイ完了
@@ -7488,7 +7542,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      `[AutoJoinReconcile] Detected 3 human(s) in auto-join VC 'わっしょい' of 'Anica01連合（HTW）' without Bot. Auto-joining with Bot #2...`
    - Bot #2（シヴァ1）が自動入室し、ニックネーム「わっしょい TTS」へ同期完了。
    - 通話中だったユーザー側には一切の再入室・コマンド操作を要求せず、自律完全復旧を達成。
-4. **副系ノード (MasterDebian: 192.168.11.248) 同期**:
+4. **副系ノード (SlaveNode-Debian: 192.168.1.20) 同期**:
    - `rsync` で `src/` を副系へ完全同期し、スタンバイコンテナ `ttsbot-blue` を安全に再起動完了。
 
 ---
@@ -7619,10 +7673,10 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 ---
 
-## 2026-10-18 12:15 JST - MasterDebian ttsworker-agent 再起動ループ障害の復旧とエフェメラルポート競合の恒久対策
+## 2026-10-18 12:15 JST - SlaveNode-Debian ttsworker-agent 再起動ループ障害の復旧とエフェメラルポート競合の恒久対策
 
 ### 1. 課題とインシデント現象
-- MasterDebian (192.168.11.248) 上で、ワーカー管理プロセスである `ttsworker-agent` コンテナが `Restarting (1)` を繰り返し、再起動ループ状態に陥っていた。
+- SlaveNode-Debian (192.168.1.20) 上で、ワーカー管理プロセスである `ttsworker-agent` コンテナが `Restarting (1)` を繰り返し、再起動ループ状態に陥っていた。
 - コンテナログ:
   ```
   OSError: [Errno 98] error while attempting to bind on address ('0.0.0.0', 50030): [errno 98] address already in use
@@ -7646,7 +7700,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - `agent.py` の `site.start()` で `OSError` が発生した際、リトライや待機機構が存在せず直ちに exit(1) していたため、Dockerの `restart: unless-stopped` ポリシーと合わさって再起動ループを継続させていた。
 
 ### 4. 恒久対処の内容 (多層防御)
-1. **OS/カーネル層のポート予約 (MasterDebian & MasterUbuntu)**:
+1. **OS/カーネル層のポート予約 (SlaveNode-Debian & MasterNode-Ubuntu)**:
    - `/etc/sysctl.d/99-ttsbot-ports.conf` を作成・永続化:
      ```ini
      # TTSBot Worker/Engine ports reservation (VOICEVOX:50021, SHAREVOX:50025, Agent:50030, COEIROINK:50031-50032)
@@ -7662,13 +7716,13 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 4. **バージョン管理・連携ファイルの整合性更新**:
    - `src/version.py`: `AGENT_VERSION = "3.13.2"` に更新。
    - `src/web/static/app.js` & `src/web/templates/index.html`: WebUI 上の表示・フォールバックを `v3.13.2` に更新。
-   - `.agents/skills/ttsbot-ops-guardian/SKILL.md`: 副系 Debian の IP アドレス誤記（`192.168.11.202` → `192.168.11.248`）を修正。
-   - MasterDebian / MasterUbuntu の双方に最新の `agent.py` を同期。
+   - `.agents/skills/ttsbot-ops-guardian/SKILL.md`: 副系 Debian の IP アドレス誤記（`192.168.1.202` → `192.168.1.20`）を修正。
+   - SlaveNode-Debian / MasterNode-Ubuntu の双方に最新の `agent.py` を同期。
 
 ### 5. 検証結果
-- MasterDebian (192.168.11.248) および MasterUbuntu (192.168.11.245) の両機にて、`sysctl net.ipv4.ip_local_reserved_ports` が `50020-50040` となっていることを確認。
+- SlaveNode-Debian (192.168.1.20) および MasterNode-Ubuntu (192.168.1.10) の両機にて、`sysctl net.ipv4.ip_local_reserved_ports` が `50020-50040` となっていることを確認。
 - 両ノードの `ttsworker-agent` を再起動し、`http://<IP>:50030/health` にて `agent_version: "3.13.2"` かつ `status: ok` で健全稼働していることを確認。
-- Master（8088）の `/health` エンドポイントにおいて、MasterDebian および MasterUbuntu を含む全12ノードが正常（`is_healthy: true`）に認識されていることを確認完了。
+- Master（8088）の `/health` エンドポイントにおいて、SlaveNode-Debian および MasterNode-Ubuntu を含む全12ノードが正常（`is_healthy: true`）に認識されていることを確認完了。
 
 ---
 
@@ -7709,7 +7763,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 - **無停止ローリングアップデート (`./scripts/rolling_update.sh`)**:
   - `ttsbot-blue` から新スロット `ttsbot-green` へ無停止切り替え（Blue-Green）を実施。
   - 切り替え後、Nginxルーター経由で `/health` が HTTP 200 OK（`v2026.10.21-1500`）を返し、Discord Gateway接続、全5台Botおよび全12ノードWorkerが正常稼働していることを確認。
-- **副系ノード (MasterDebian: 192.168.11.248) への完全同期**:
+- **副系ノード (SlaveNode-Debian: 192.168.1.20) への完全同期**:
   - `rsync` により `src/` 配下を副系へ安全に同期。
   - `ha_demote_to_standby.sh` により副系コンテナ（`ttsbot-blue`）を Warm-Standby で安全に再起動完了。
 
@@ -7719,7 +7773,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 ### 1. 課題と背景
 - 本番運用中の Discord TTS Bot は、本番固有の設定値（IPアドレス、パスワード、特定ドメイン、過去のGit履歴等）が密結合しており、第三者がGitHubからクローンして自分のサーバーやローカルPCで即座に動かすことが困難であった。
-- 本番環境（MasterUbuntu / MasterDebian）を無停止で維持しつつ、将来のOSS公開版へ安全かつ確実に移行できる独立環境（Side-by-Side 移行）の構築が求められた。
+- 本番環境（MasterNode-Ubuntu / SlaveNode-Debian）を無停止で維持しつつ、将来のOSS公開版へ安全かつ確実に移行できる独立環境（Side-by-Side 移行）の構築が求められた。
 - また、ユーザー要件として以下の仕様拡張が決定した：
   1. **Master-Worker分散構成の堅持**: ユーザーが後からWindows GPU機や別サーバーをWorkerとして追加できる強みを残す。
   2. **Edge-TTSファースト**: クラウドAPIキーが未登録でも、クローン直後から無料のEdge-TTS / OpenJTalkで通話読み上げが完全動作する。
@@ -8024,21 +8078,21 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 ## [2026-10-24 10:45] プロジェクト全体の汎用OSS化・旧開発環境固有情報の徹底クリーンアップ
 
 ### 1. 課題と背景
-- 新規OSSプロジェクト（`ttsbot-oss`）として公開・運用するにあたり、旧個人開発環境の固有情報（固定IP `192.168.11.x`、個人所有PC名 `OMEN2022/OMEN2017/MasterUbuntu/MasterDebian`、個人ドメイン `ttsbot.kenko.land`、特定サブネット決め打ち）がコードベース各所に残存していた。
+- 新規OSSプロジェクト（`ttsbot-oss`）として公開・運用するにあたり、旧個人開発環境の固有情報（固定IP `192.168.1.x`、個人所有PC名 `Worker-GPU-2/Worker-GPU-1/MasterNode-Ubuntu/SlaveNode-Debian`、個人ドメイン `ttsbot.example.com`、特定サブネット決め打ち）がコードベース各所に残存していた。
 - 誰でも自前環境（ローカル、自前サーバー、クラウド等）でそのままセットアップ・運用できるよう、プロジェクト全体を点検・汎用化を実施。
 
 ### 2. 実施した修正
 1. **Worker リモートアクセス管理 (`WorkerAccess/`)**:
    - `WorkerAccess/README.md`: 環境依存IPや特定ドメインを撤廃し、汎用プレースホルダー（`<WORKER_IP>`, `<USER>`）によるリモートアクセスガイド・鍵生成マニュアルへ刷新。
-   - `WorkerAccess/setup-windows-ssh.ps1` & `src/web/static/setup-windows-ssh.ps1`: 管理者公開鍵の引数・対話入力化（`param([string]$PublicKeyParam = "")`）および、`192.168.11.*` 固定サブネット依存を排除し、プライベートIP全般（`192.168.*`, `10.*`, `172.*`）の自動検出に対応。
+   - `WorkerAccess/setup-windows-ssh.ps1` & `src/web/static/setup-windows-ssh.ps1`: 管理者公開鍵の引数・対話入力化（`param([string]$PublicKeyParam = "")`）および、`192.168.1.*` 固定サブネット依存を排除し、プライベートIP全般（`192.168.*`, `10.*`, `172.*`）の自動検出に対応。
 2. **Worker 起動ツール & ドキュメント (`worker/`, `docs/`)**:
    - `worker/run_volunteer.bat` & `worker/run_volunteer.sh`: `SERVER_URL` の旧ドメインハードコードを撤廃し、引数・環境変数・対話入力に対応。
    - `worker/README.md`: ワンクリック起動ツールの詳細手順を追記。
-   - `docs/DEBIAN_WORKER_SETUP.md`: `192.168.11.245:8088` や `root@192.168.11.248` 等の旧環境記述を汎用プレースホルダー（`http://<MASTER_HOST>:<PORT>`, `<USER>@<WORKER_IP>`）に全面置換。
+   - `docs/DEBIAN_WORKER_SETUP.md`: `192.168.1.10:8088` や `root@192.168.1.20` 等の旧環境記述を汎用プレースホルダー（`http://<MASTER_HOST>:<PORT>`, `<USER>@<WORKER_IP>`）に全面置換。
 3. **設定ファイル (`config.yaml`)**:
-   - `192.168.11.245/248/200` などの固定IPを `127.0.0.1` およびコメント付きサンプルURLへ変更。
+   - `192.168.1.10/248/200` などの固定IPを `127.0.0.1` およびコメント付きサンプルURLへ変更。
 4. **Python バックエンドコード**:
-   - `src/cogs/commands.py` (全11箇所) & `src/cogs/vc_handler.py` (全2箇所): `"https://ttsbot.kenko.land"` のハードコードフォールバックを `self.config.web_dashboard_url or "http://localhost:8080"` に統一。
+   - `src/cogs/commands.py` (全11箇所) & `src/cogs/vc_handler.py` (全2箇所): `"https://ttsbot.example.com"` のハードコードフォールバックを `self.config.web_dashboard_url or "http://localhost:8080"` に統一。
    - `src/web/server.py`:
      - CSRF 防御の `allowed_hosts` を固定値から動的抽出（`localhost`, `127.0.0.1`, `request.host`, `web_dashboard_url`）に変更。
      - ノード名解決ロジック（Line 2831〜, Line 2971〜）において、固定IP・旧PC名の決め打ちを全廃し、GPU名（`Worker (RTX 3090)` 等）やOS名からのスペックベース動的解決に刷新。
@@ -8050,8 +8104,8 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - `scripts/migrate_from_prod.py`: `web_base_url` を環境変数からの動的取得に汎用化。
 5. **Web フロントエンド (HTML / JS / スクリプト)**:
    - `src/web/templates/index.html`:
-     - 外部公開URLの placeholder を `http://192.168.11.xxx:8080` から `http://localhost:8080` に変更。
-     - メトリクスタブの固定PC名タブ（MasterDebian, OMEN等）を「🏢 Primary Node (Master)」デフォルトおよび動的コンテナ化。
+     - 外部公開URLの placeholder を `http://192.168.1.xxx:8080` から `http://localhost:8080` に変更。
+     - メトリクスタブの固定PC名タブ（SlaveNode-Debian, OMEN等）を「🏢 Primary Node (Master)」デフォルトおよび動的コンテナ化。
      - 運用案内文の主系/副系固定IP表示を削除。
      - ログビューアの `<select>` 内の固定ノード option を汎用プレースホルダーに変更。
    - `src/web/static/app.js`:
@@ -8059,7 +8113,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - `parseEngineLabel` の固定PC名・IP判定を汎用化。
    - `src/web/static/setup-worker.sh` & `setup-worker.ps1`:
      - デフォルトの `MASTER_URL` を `http://localhost:8080` に汎用化。
-     - LAN IP 検出を `192.168.11.0/24` 固定サブネット最優先から、物理NIC優先および全プライベートIP（`192.168.*`, `10.*`, `172.*`）対応の汎用ロジックへ改善。
+     - LAN IP 検出を `192.168.1.0/24` 固定サブネット最優先から、物理NIC優先および全プライベートIP（`192.168.*`, `10.*`, `172.*`）対応の汎用ロジックへ改善。
 6. **運用スクリプト (`scripts/`)**:
    - `scripts/check_workers.sh`: コマンドライン引数および環境変数 `TTSBOT_WORKER_NODES` をサポート。
    - `scripts/ha_watchdog.sh`, `scripts/sync_db.sh`, `scripts/preempt_guard.sh`: 環境変数 `TTSBOT_PRIMARY_HEALTH_URL` / `TTSBOT_STANDBY_IP` でオーバーライド可能に改善。
@@ -8120,7 +8174,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 ## 2026-10-24 11:25: Master-Slave HA (Cloudflare Tunnel経由の暗号化DB同期 ＆ Standbyワンライナー) 実装
 
 ### 1. 課題と背景
-- 従来の HA は同一LAN内（`192.168.11.x`）の直接SSH・直接ポート通信を前提としていた。
+- 従来の HA は同一LAN内（`192.168.1.x`）の直接SSH・直接ポート通信を前提としていた。
 - クラウドのデフォルトファイアウォール（全インバウンド閉鎖）や自宅ルーターのNAT/CGNAT配下の環境において、ポート開放やSSH鍵設定を不要にし、Cloudflare Tunnel（外向きHTTPS）のみで安全に疎通・DB同期・フェイルオーバーが完結するアーキテクチャが求められた。
 - 用語とモデルを「Manager（HA構成: Master=固定優先Active, Slave=Standby待機）」および「Worker（ボランティアPC）」に統一。
 
@@ -8298,7 +8352,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 ### 1. 課題と背景
 - **「[ERROR] COEIROINK 推論失敗・一時隔離」の管理者DM通知多発**:
-  - 管理者宛てに「ノード `MasterUbuntu` 上の `COEIROINK` が応答に失敗したため、一時隔離されました (25秒)」というエラーDM通知が頻繁に届いていた。
+  - 管理者宛てに「ノード `MasterNode-Ubuntu` 上の `COEIROINK` が応答に失敗したため、一時隔離されました (25秒)」というエラーDM通知が頻繁に届いていた。
 - **真因分析**:
   - ユーザーの指摘通り、VC無人かつ15分未使用で発動する Worker Agent の Auto Sleep (Vacancy Sleep: `docker stop ttsworker-coeiroink`) が起点。
   - COEIROINK は Pythonプロセス起動、numba JIT事前コンパイル、FastAPI/uvicorn初期化に約15秒〜25秒のウォームアップ時間を要する。
@@ -8357,8 +8411,8 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
    - 稼働中旧プロセスの文字列置換でも即座にマッチするようスクリプト側デフォルト値を 8080 に調整し、新旧プロセス双方向互換を確保（ゼロダウンタイム即時解決）。
 2. **WAN / LAN 自動判別ロジックの実装 (`src/web/server.py` `_get_master_base_url`)**:
    - リクエスト発信元を `_is_wan_request(request)` で自動判定。
-   - **宅内LAN・ローカルからのアクセス時**: リクエスト先の Host/IP（例: `http://192.168.11.248:8088`）を注入し、宅内LAN直接通信（超低遅延・外部回線帯域非消費）を自動構成。
-   - **WAN（Cloudflare Tunnel・インターネット）からのアクセス時**: `self.config.web_dashboard_url`（例: `https://ttsbot.kenko.land`）を注入し、NAT/ルーター越え用の WebSocket トンネル（`wss://.../api/worker/ws`）を自動補完。
+   - **宅内LAN・ローカルからのアクセス時**: リクエスト先の Host/IP（例: `http://192.168.1.20:8088`）を注入し、宅内LAN直接通信（超低遅延・外部回線帯域非消費）を自動構成。
+   - **WAN（Cloudflare Tunnel・インターネット）からのアクセス時**: `self.config.web_dashboard_url`（例: `https://ttsbot.example.com`）を注入し、NAT/ルーター越え用の WebSocket トンネル（`wss://.../api/worker/ws`）を自動補完。
 3. **Worker Agent 取得処理の多段リトライ・詳細エラー表示・既存ファイル再利用 (`src/web/static/setup-worker.sh`, `setup-worker.ps1`)**:
    - 最大3回のリトライ（待機時間付き）を追加。
    - `curl` / `Invoke-WebRequest` のエラーメッセージをキャプチャし、失敗時に接続先URLと詳細エラーを表示。
@@ -8470,15 +8524,15 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 ## [2026-10-27] スリープ起動リミット撤廃 & VC入室時先行ウェイクアップ修正
 - **背景**:
-  - 複数チャンクの並行発話時、スリープ中のノード（OMEN2022 RTX 3090等）が起動してこず、特定ノード（Ubuntu 1台）に処理が集中して音飛び・フォールバックが発生した問題を調査。
+  - 複数チャンクの並行発話時、スリープ中のノード（Worker-GPU-2 RTX 3090等）が起動してこず、特定ノード（Ubuntu 1台）に処理が集中して音飛び・フォールバックが発生した問題を調査。
   - `src/tts/node_pool.py` のオンデマンド遠隔起動に `for n in candidates_to_start[:2]:` というハードリミットがあり、Tier順位で3番目以降のノードが起動シグナルすら受け取れず放置されていたことが判明。
-  - さらに `src/resource_manager.py` の `prewarm_for_users`（VC入室時事前起動）で、`self.config.voices.get(spk_id)` という静的config辞書のみを引いていたため、`ci_90` 等の動的話者（COEIROINK/VOICEVOX）のユーザーが入室しても `None` になり、外部ワーカー（OMEN2022等）への先行ウェイクアップが一切送出されていなかった設計漏れを特定。
+  - さらに `src/resource_manager.py` の `prewarm_for_users`（VC入室時事前起動）で、`self.config.voices.get(spk_id)` という静的config辞書のみを引いていたため、`ci_90` 等の動的話者（COEIROINK/VOICEVOX）のユーザーが入室しても `None` になり、外部ワーカー（Worker-GPU-2等）への先行ウェイクアップが一切送出されていなかった設計漏れを特定。
 - **改修内容**:
   1. **オンデマンド起動の `[:2]` 足切り撤廃 (`src/tts/node_pool.py`)**:
      - スリープ中のノードがあれば、Tier順位で足切りせず全ノードに対して並行して起動を試行。
   2. **動的話者（`ci_*`, `vv_*` 等）の先行プリウォーム対応 (`src/resource_manager.py`)**:
      - `tts_manager._get_voice_config` を優先的に使用して動的話者も正しくプロバイダ解決（`provider="coeiroink"` 等）。
-     - ローカルエンジンを使用するユーザーがVCに入室した際、外部ワーカー（OMEN2022等）を含めて確実に先行ウェイクアップを実行。
+     - ローカルエンジンを使用するユーザーがVCに入室した際、外部ワーカー（Worker-GPU-2等）を含めて確実に先行ウェイクアップを実行。
 - **検証結果**:
   - サンドボックス隔離テスト（全49テスト）を実行し、100%合格を確認（`Ran 49 tests in 6.531s, OK`）。
 
@@ -8517,7 +8571,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   4. クラスタ Worker 起動時にバージョンアップと Model Sync のどちらが先行するかに関する競合リスク。
 - **原因分析**:
   1. `connect_vc` にて多重ロック取得によるデッドロック、および直後に無条件切断する `await vc.disconnect(force=True); raise VCConnectAborted` が残存していた。
-  2. Worker Agent が同一ホスト（MasterUbuntu）または LAN 内にいるにもかかわらず `MASTER_URL=https://ttsbot.kenko.land` (Cloudflare Tunnel) 固定でアクセスしており、COEIROINK モデル（2.2GB）の Push アップロード時に Cloudflare の 100MB 上限に抵触（413）。
+  2. Worker Agent が同一ホスト（MasterNode-Ubuntu）または LAN 内にいるにもかかわらず `MASTER_URL=https://ttsbot.example.com` (Cloudflare Tunnel) 固定でアクセスしており、COEIROINK モデル（2.2GB）の Push アップロード時に Cloudflare の 100MB 上限に抵触（413）。
   3. Master でモデルが未受信のため毎回のハートビート（25秒）で `models_to_upload` が返され、Worker が毎回 `tar` 圧縮して POST 送信を試みる無限ループに突入。Master 側からの Pull でも Worker 側で `tar` 子プロセスが生成され続け、子プロセス増殖と高負荷を引き起こしていた。
   4. 起動シーケンス上、`register` で即時に Model Sync がキックされ、バージョンアップは25秒後のハートビートでしか判定されないため、古い Agent のまま Sync が先行して再び 413 エラーを起こす構造になっていた。
 - **改修内容**:
@@ -8552,8 +8606,8 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 ## 2026-10-29 12:03 WebUIログイン不可(「サーバーに参加していません」)の是正 & HAキャッシュスナップショット例外の是正
 - **事象**:
-  1. 参加済みアカウント (maximilian_chainedbell) が WebUI ログイン時に「Bot導入中サーバーに参加していません」で拒否される。web.log に `Bot is currently not connected to any guild.` が毎回出力。
-  2. bot.log に `AttributeError: 'FileResponse' object has no attribute 'on_finish'` (`api_ha_frequent_cache_snapshot`) が HA スレーブ (192.168.11.244/.248) から約12秒間隔で発生 (05:29〜05:31)。
+  1. 参加済みアカウント (admin_user) が WebUI ログイン時に「Bot導入中サーバーに参加していません」で拒否される。web.log に `Bot is currently not connected to any guild.` が毎回出力。
+  2. bot.log に `AttributeError: 'FileResponse' object has no attribute 'on_finish'` (`api_ha_frequent_cache_snapshot`) が HA スレーブ (192.168.1.30/.248) から約12秒間隔で発生 (05:29〜05:31)。
 - **原因**:
   1. `main.py` は `WebServer(bot=None, ...)` で Bot より先行起動し、`DiscordAuth(bot=bot)` にも `None` が固定で渡る。`WebServer.bot` プロパティは BotPool から動的解決するが `DiscordAuth.bot` は解決されず、`is_user_in_bot_guilds` が常に False を返していた (エラー画面のサーバー名一覧は `WebServer.bot` 経由のため表示されていた)。
   2. aiohttp の `web.FileResponse` に `on_finish` 属性は存在しない。
@@ -8602,26 +8656,26 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   3. セットアップスクリプト拡張 (`setup-standby.sh`, `setup-standby.ps1`): `TTSBOT_HA_OWNER` 引数・環境変数対応。
   4. フロントエンド WebUI (`src/web/static/app.js`): Master/Slave カードに所有者バッジ表示・インライン編集対応。
 
-## 2026-10-31 15:15 既存全ManagerノードおよびクラスタワーカーのDiscordユーザーID (310034034690359308: チェインドベル) への紐づけ完了
+## 2026-10-31 15:15 既存全ManagerノードおよびクラスタワーカーのDiscordユーザーID (123456789012345678: AdminUser) への紐づけ完了
 - **要望**:
-  - WebUI 上での手動設定機能は今後使われない想定のため、既存の全 Manager ノードおよび全クラスタワーカーを、Discord ユーザー ID `310034034690359308` に一括で紐づけてほしい。
+  - WebUI 上での手動設定機能は今後使われない想定のため、既存の全 Manager ノードおよび全クラスタワーカーを、Discord ユーザー ID `123456789012345678` に一括で紐づけてほしい。
 - **原因・現状分析**:
   - ユーザー提示スクリーンショットにおいて「所有者: 未設定」となっていたのは、DB (`worker_settings`) にクラスタワーカーおよび待機ノードのレコードが存在せず、また Discord OAuth ログインセッションの `is_admin` フラグの扱いで編集用ペンアイコンバッジが表示されていなかったため。
-  - ユーザー ID `310034034690359308` は Discord ギルドメンバーキャッシュ（`guild_member_cache`）より `maximilian_chainedbell`（表示名: `チェインドベル` / `【わ】チェインドベル【鈍器】`）と判明。
+  - ユーザー ID `123456789012345678` は Discord ギルドメンバーキャッシュ（`guild_member_cache`）より `admin_user`（表示名: `AdminUser` / `【わ】AdminUser【鈍器】`）と判明。
 - **改修・データ紐づけ内容**:
   1. **データベース層 (`src/database.py` & `data/bot.db`)**:
      - `worker_settings` テーブルに `owner_user_id INTEGER DEFAULT 0` カラムを追加し自動マイグレーション。
-     - 以下の全ノードに対して、`owner_user_id = 310034034690359308`, `owner_name = 'チェインドベル'` を永続化:
-       - Manager ノード: `master_primary`, `slave_f960592ba045_00af7ef3` (MasterDebian), `slave_92db75a83282_e7fcf41e` (MasterCentos)
-       - クラスタワーカー: `worker_MASTEROMEN2017`, `worker_MASTERSOMEN2022`, `worker_MasterDebian`, `worker_MasterUbuntu`
+     - 以下の全ノードに対して、`owner_user_id = 123456789012345678`, `owner_name = 'AdminUser'` を永続化:
+       - Manager ノード: `master_primary`, `slave_f960592ba045_00af7ef3` (SlaveNode-Debian), `slave_92db75a83282_e7fcf41e` (SlaveNode-CentOS)
+       - クラスタワーカー: `worker_Worker-GPU-1`, `worker_Worker-GPU-2`, `worker_SlaveNode-Debian`, `worker_MasterNode-Ubuntu`
   2. **JSON 永続化ファイル同期 (`data/cluster_workers.json`, `data/ha_manager_nodes.json`)**:
-     - 全クラスタワーカーおよび全待機スレーブの `owner_name` に `"チェインドベル"`、`owner_user_id` に `310034034690359308` を設定・保存。
+     - 全クラスタワーカーおよび全待機スレーブの `owner_name` に `"AdminUser"`、`owner_user_id` に `123456789012345678` を設定・保存。
   3. **バックエンド API (`src/web/server.py`)**:
-     - `api_worker_nodes`: `owner_name` と `owner_user_id` を全ワーカーノードに付与。未設定時のフォールバックとしてクラスタワーカーを `チェインドベル (310034034690359308)` に自動解決。
+     - `api_worker_nodes`: `owner_name` と `owner_user_id` を全ワーカーノードに付与。未設定時のフォールバックとしてクラスタワーカーを `AdminUser (123456789012345678)` に自動解決。
      - `api_system_get_manager_nodes`: `master_info` および `slaves_list` に `owner_name` と `owner_user_id` を含めて返却。
   4. **フロントエンド WebUI (`src/web/static/app.js`)**:
-     - 権限（`is_admin`）の有無にかかわらず、全ワーカーカードおよび Manager Node カード（主系・待機系）の見出しに `👤 チェインドベル` バッジを表示。
-     - 情報グリッドに「所有者: 👤 **チェインドベル (310034034690359308)**」を表示。
+     - 権限（`is_admin`）の有無にかかわらず、全ワーカーカードおよび Manager Node カード（主系・待機系）の見出しに `👤 AdminUser` バッジを表示。
+     - 情報グリッドに「所有者: 👤 **AdminUser (123456789012345678)**」を表示。
   5. **テスト・本番反映**:
      - `tests/test_worker_owner.py`（全 22 テスト）がサンドボックス隔離環境で **100% PASS**。
      - `BUILD_VERSION = "v2026.10.31-1510"` に更新し、通話 0 件を確認後コンテナ再起動。`curl /health` にて健全稼働を確認。
@@ -8682,7 +8736,7 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
   - サーバー側 `src/web/server.py` の `_can_edit_node_settings` でも、クラスタワーカーの所有者（`owner_user_id`）一致チェックが抜けており管理者のみに制限されていた。
 - **改修内容**:
   1. **フロントエンド UI 是正 (`src/web/static/app.js`)**:
-     - `!isMaster`（主系Master本体以外）のすべてのカード（MASTERSOMEN2022, MASTEROMEN2017, MasterDebian 等）において、
+     - `!isMaster`（主系Master本体以外）のすべてのカード（Worker-GPU-2, Worker-GPU-1, SlaveNode-Debian 等）において、
        「💤 エンジン自動停止 (スリープ): [プルダウン ▼]」を枠付きの目立つデザイン（シアン枠）で常時表示。
      - 選択肢: 既定 (Worker の設定値) / 停止しない / 15分 / 30分 / 1時間 / 2時間 / カスタム...
      - `applyNodeSettingsToControls`: 未ログイン状態でも DB の設定値（`never` / `15` / `30` 等）を確実にプルダウンに反映。
@@ -8698,19 +8752,19 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 ## 2026-11-01 00:10 OSS向け環境固有値（固定ユーザーID・ユーザー名）の完全撤廃＆スリープ設定「💾保存」ボタン設置・即時フィードバック化 (v2026.11.01-0010)
 - **課題・背景**:
   1. ユーザーより「OSSで公開しているプロジェクトだから環境固有の書き方はしてない、でいいよね？」との懸念・確認。
-  2. 調査の結果、直前の改修や過去の実装において、特定の Discord ユーザーID（`310034034690359308`）やユーザー名（`チェインドベル`）がフォールバック値や権限ガードとしてコード内に直接ハードコード（ベタ書き）されている箇所が複数判明。
+  2. 調査の結果、直前の改修や過去の実装において、特定の Discord ユーザーID（`123456789012345678`）やユーザー名（`AdminUser`）がフォールバック値や権限ガードとしてコード内に直接ハードコード（ベタ書き）されている箇所が複数判明。
   3. 併せて「セーブボタンとかない認識だけど、保存されないかも」との指摘があり、UI上の保存確定ボタンや視覚的ステータスフィードバックの不足、未ログイン時の保存拒否リスクが判明。
 - **改修内容**:
   1. **コードベース内の環境固有値の完全一掃 (OSS化標準準拠)**:
-     - `src/cogs/commands.py`: `/alert_test` の固定管理者ID判定（`ADMIN_ID = 310034034690359308`）を撤廃し、Bot アプリケーションオーナー、サーバー管理者権限（`administrator`）、および `.env`（`DISCORD_OWNER_USER_ID`/`ADMIN_USER_ID`）による汎用認可へ刷新。
-     - `src/utils/alert_service.py`: `INITIAL_DEFAULT_CONTACT_ID = 310034034690359308` を撤廃し、環境変数または未設定（0）とする動的解決へ是正。
+     - `src/cogs/commands.py`: `/alert_test` の固定管理者ID判定（`ADMIN_ID = 123456789012345678`）を撤廃し、Bot アプリケーションオーナー、サーバー管理者権限（`administrator`）、および `.env`（`DISCORD_OWNER_USER_ID`/`ADMIN_USER_ID`）による汎用認可へ刷新。
+     - `src/utils/alert_service.py`: `INITIAL_DEFAULT_CONTACT_ID = 123456789012345678` を撤廃し、環境変数または未設定（0）とする動的解決へ是正。
      - `src/database.py`: `system_credentials` の初期化クエリにハードコードされていた ID を撤廃し、環境変数が明示された場合のみ登録する仕様に改修。`import os` を追加。
-     - `src/web/server.py`: Master / Slave / クラスタワーカーの未設定時フォールバック値（`310034034690359308`, `チェインドベル`）を完全に削除。未設定時は空文字および 0 に統一。
+     - `src/web/server.py`: Master / Slave / クラスタワーカーの未設定時フォールバック値（`123456789012345678`, `AdminUser`）を完全に削除。未設定時は空文字および 0 に統一。
      - `src/web/static/app.js`: ワーカーカード、Masterカード、Slaveカードに残留していた固定 ID / 名前のフォールバックを完全撤廃。
      - `src/cogs/vc_handler.py`: コメント例の個人名を中立的なダミー表記に変更。
      - `.env.example`: コメント例の固定 ID をダミー値（`123456789012345678`）に置換。
      - `tests/test_worker_owner.py`: テスト用 ID をダミー値に置換。
-     - ※ 本番 DB（`bot.db`）および本番 `.env` にはすでに正しく設定が保存されているため、チェインドベル様の本番環境での表示・動作には一切悪影響を与えず、第三者が OSS としてクローンした場合に汎用的に動作する完全な状態を実現。
+     - ※ 本番 DB（`bot.db`）および本番 `.env` にはすでに正しく設定が保存されているため、AdminUser様の本番環境での表示・動作には一切悪影響を与えず、第三者が OSS としてクローンした場合に汎用的に動作する完全な状態を実現。
   2. **スリープ待機時間設定の UI / UX 改善 (セーブボタン＆即時ステータス)**:
      - `src/web/static/app.js` (`idlePolicyControlHtml` / `saveIdlePolicy` / `triggerSaveIdlePolicy`):
        - プルダウンの横に **明示的な「💾 保存」ボタン** を常時設置。
@@ -8744,14 +8798,14 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 
 ## 2026-11-01 01:00 同一発話内チャンクの別ノード分散 (Anti-Affinity / ロードバランシング) 実装 (v2026.11.01-0100)
 - **課題・背景**:
-  - 10/31 22:36:25 の発話（ピー音等で分割されたチャンク #1「テストで」と #3「入れてたのよ」）において、クラスタ内に MASTERSOMEN2022 (RTX 3090, 3並列) と MASTEROMEN2017 (GTX 1080 Ti, 2並列) の両方が稼働していたにもかかわらず、両チャンクが RTX 3090 に同時に投入された。
+  - 10/31 22:36:25 の発話（ピー音等で分割されたチャンク #1「テストで」と #3「入れてたのよ」）において、クラスタ内に Worker-GPU-2 (RTX 3090, 3並列) と Worker-GPU-1 (GTX 1080 Ti, 2並列) の両方が稼働していたにもかかわらず、両チャンクが RTX 3090 に同時に投入された。
   - その結果、RTX 3090 内部での推論競合により後続の #3 (609ms) が先に終わり、先頭の #1 (844ms待機) が遅延して Azure 投機フォールバックが発動した。
 - **根本原因**:
   - 先頭パーツは完了最短予測（`predict_eta_ms`）で RTX 3090 を獲得。
   - 後続パーツは 153 マイクロ秒差で起動され、最長チャンク判定で「最強GPU優先」かつ RTX 3090 のセマフォ枠が空いていた（残り2枠）ため、別GPU（GTX 1080 Ti）が完全アイドルであるにもかかわらず 3090 に吸い込まれた。
 - **改修内容**:
   1. **同一発話分散アーキテクチャ (`turn_avoid_nodes`)**:
-     - `src/cogs/vc_handler.py`: 発話ごとに共有の `turn_avoid_nodes: Set[str]` を生成。先頭本文パーツ（`head_idx`）が最短予測されたノード（例: `MASTERSOMEN2022`）を事前登録し、後続チャンクのタスクへ受け渡し。
+     - `src/cogs/vc_handler.py`: 発話ごとに共有の `turn_avoid_nodes: Set[str]` を生成。先頭本文パーツ（`head_idx`）が最短予測されたノード（例: `Worker-GPU-2`）を事前登録し、後続チャンクのタスクへ受け渡し。
      - 先頭パーツは最速完了ノードを最優先で獲得するため制約をかけず、後続チャンクのみに `avoid_nodes` を適用。
   2. **ノード選定・セマフォ獲得層 (`src/tts/node_pool.py`)**:
      - `_order_available_nodes`: `avoid_nodes` 引数および `is_avoided` 判定を追加。同一 Tier（GPU同格）内で、まだ同一発話で使われていない別ノード（`is_avoided == 0`）を最優先整列。
@@ -8770,4 +8824,59 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
 - **本番適用完了 (2026-11-01 03:00)**:
   - ユーザー指示に基づき、アイドル状態を確認の上で `docker compose restart app` を実施。
   - 本番コンテナ `ttsbot-app-1` が最新バージョン `v2026.11.01-0100` にて正常に起動し、**healthy** 状態へ復旧。
-  - 12ノード（MASTEROMEN2017, MASTERSOMEN2022, MasterDebian, MasterUbuntu）の音声合成エンジン、Discord Bot Pool (5台)、WebUI、データベースがすべて正常稼働中であることを確認。
+  - 12ノード（Worker-GPU-1, Worker-GPU-2, SlaveNode-Debian, MasterNode-Ubuntu）の音声合成エンジン、Discord Bot Pool (5台)、WebUI、データベースがすべて正常稼働中であることを確認。
+
+## 2026-11-01 17:30 HA Watchdog Docker Socket API 通信是正 & 昇格阻害バグ解消 (v2026.11.01-1730)
+- **問題事象**:
+  - HA フェイルオーバー試験時、副系 (Debian) が Master ダウンを検知して昇格処理を発火したものの、`Failed to start app/tunnel containers during promotion!` となり昇格に失敗。
+- **根本原因の徹底究明**:
+  1. **コンテナ内 Docker CLI 欠如**: Watchdog コンテナ (`python:3.14-slim`) 内に `docker` コマンドが存在せず、第1手段 `docker compose up -d` が失敗。
+  2. **Socket API クライアントの chunked パース障害 (致命的潜在バグ)**:
+     - CLI 不在時のフォールバックとして実装されていた `/var/run/docker.sock` 直接通信（`DockerSocketClient`）が HTTP/1.1 でリクエストを送出していた。
+     - Docker デーモンがレスポンスを `Transfer-Encoding: chunked`（例: `8d84\r\n[...]`）で返信したため、自作クライアント側で `json.loads()` が 100% `JSONDecodeError: Extra data` となり例外クラッシュ（空リスト `[]` 返却）。
+     - ホスト上にコンテナが作成されていたとしても、コンテナ一覧取得が 100% 失敗する構造的欠陥が存在していた。
+- **是正内容**:
+  1. **HTTP/1.0 採用 & Chunked デコード二重防御 (`src/ha_watchdog.py`)**:
+     - `_send_request`: リクエストプロトコルを `HTTP/1.0` に変更し、Docker デーモンからの chunked encoding を根本抑止。
+     - `_dechunk(data)`: 万が一 chunked レスポンスを受信した場合でも、チャンクサイズを解析してボディを正常復元するデコーダを新設。
+     - `find_app_containers` / `find_tunnel_containers`: エラー時の詳細ログ出力、ステータス判定を強化。
+     - `start_container` / `stop_container`: 204/304 以外の異常時に HTTP ステータスとエラー理由をログ記録。
+     - `promote_to_active` / `demote_to_standby`: `FileNotFoundError` をキャッチしてわかりやすい案内ログを出力、検索結果 0 件時の明示的な警告を追加。
+  2. **単体テスト作成 (`tests/test_docker_socket_client.py`)**:
+     - 単一・複数チャンクのデコード、非チャンクデータの透過、HTTP/1.0 送信検証、chunked 受信自動アンチャンク、コンテナ名フィルタリング、ステータスコード判定を含む全 9 件のユニットテストを新規実装。
+     - サンドボックス隔離テスト（`./scripts/run_sandbox_test.sh`）にて全 160 テストが **100% 合格（Ran 160 tests in 8.785s, OK）**。
+  3. **バージョン更新 & 自律同期検証**:
+     - `src/version.py`: `BUILD_VERSION = "v2026.11.01-1730"`
+     - MasterNode-Ubuntu 上でコード保存後、SlaveNode-Debian (192.168.1.20) の Watchdog が即座にコードハッシュ変化を自律検知（`60870bc851`）、検証・自動リロードを完了。
+     - 実機 Debian コンテナ内にて `find_app_containers()` を実行し、停止中コンテナ `ttsbot-slave-app-1` が即座かつ正常に検出（`State: created`）できることを確認済み。
+  4. **Cloudflare Tunnel 引き継ぎ (WebUI 冗長化) 仕様整理 & 適用**:
+     - **セキュリティ配慮と .env 統一**: トンネルトークンはドメイン公開権限を持つ重要機密のため、Masterからの自動配信ではなく各ノードの `.env` で明示的に管理・統一する方針を確立。
+     - **他サービス除外の厳格化 (`ha_watchdog.py`)**: `find_tunnel_containers` がホスト上の他サービス用トンネル（`mmo_cf_tunnel`, `discord-role-tunnel` 等）を誤検出・誤操作しないよう、`ttsbot` 専用トンネルのみにマッチする厳格な照合ルールを導入・単体テスト追加。
+     - **SlaveNode-Debian & SlaveNode-CentOS への適用**:
+       - `WorkerAccess/id_ed25519` を用いて SlaveNode-CentOS (192.168.1.30) への SSH 設定を構成。
+       - Debian (192.168.1.20) および Centos (192.168.1.30) の双方に対し、最新コード同期、`.env` へのトークン設定、`ttsbot-slave-tunnel` および `ttsbot-app` 事前生成、Watchdog 再起動（`Tunnel Failover: ENABLED`）を完全適用。
+       - 両ノードの実機 Watchdog にて、別サービスのトンネル（`mmo_cf_tunnel`, `cloudflared-SmartSpeaker-VoiceHub` 等）が安全に除外され、ttsbot の本体およびトンネルのみが正確に検出されることを検証完了。
+     - **ドキュメント & WebUI 更新**: `MANUAL.md` (3.6.6) および `src/web/templates/index.html` (Standbyノード追加案内アコーディオン) に、WebUI フェイルオーバーの仕組み・セキュリティ注釈・設定手順を明記。
+
+## 2026-11-01 18:31 HA フェイルオーバー・プリエンプト復旧試験 (Phase 1 & Phase 3) 完全成功
+- **試験検証結果**:
+  - **Phase 1 (主系停止 ➔ 副系自律昇格)**:
+    - MasterNode-Ubuntu コンテナ群（`app`, `tunnel`, Worker）を停止。
+    - SlaveNode-Debian (Priority 1) が 90秒後（18回連続失敗）にフェイルオーバーを発火。
+    - Docker Socket API 経由で `ttsbot-app` および `ttsbot-slave-tunnel` を 1秒以内で即座に自律起動。
+    - Cloudflare Tunnel が東京エッジと正常接続を確立し、外部 WebUI (`https://ttsbot.example.com`) が Debian 側へシームレスに開通。
+    - Discord Bot 5台がオンライン復帰し、本番 VC の発話を **Turn-TTFS: 61ms（超低遅延）** で音声合成・再生引き継ぎ成功。
+    - SlaveNode-CentOS (Priority 2) は上位ノード（Debian）の昇格を検知して Standby 待機を維持（スプリットブレイン防止）。
+  - **Phase 3 (主系再起動 ➔ 自動プリエンプト降格・切り戻し)**:
+    - MasterNode-Ubuntu 側のコンテナ群（`app`, `tunnel`, Worker）を再開。
+    - SlaveNode-Debian の Watchdog が Master の生存復旧（`/health 200 OK`）を即座に検知。
+    - `✨ [PREEMPT] Master is healthy again (/health 200 OK)! Demoting Slave to STANDBY...` を発動し、Debian の `app` と `tunnel` を自律停止して安全に Standby 待機へ復帰。
+    - Discord Bot および WebUI が MasterNode-Ubuntu へ自動切り戻り、通常運用状態に完全復帰。
+- **副系ノード環境変数（.env）の補完**:
+  - WebUI ログイン（Discord OAuth2）や管理機能に必要な変数を SlaveNode-Debian および SlaveNode-CentOS の双方へ同期：
+    - `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_REDIRECT_URI`
+    - `ADMIN_PASSWORD`, `WEB_SESSION_SECRET`
+    - `GEMINI_API_KEY`, `GEMINI_MODEL`, `DISCORD_OWNER_USER_ID`
+  - 両ノードで停止中の `ttsbot-app` コンテナを `--force-recreate` で再作成し、次回フェイルオーバー時に確実に全機能が即座に動作する状態へ整備完了。
+
+

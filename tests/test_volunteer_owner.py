@@ -81,7 +81,7 @@ class TestVolunteerWsClassification(_Base):
 
     @unittest_run_loop
     async def test_cluster_tunnel_is_not_volunteer(self):
-        ws, ack = await self._register("shared_secret_x", {"node_id": "worker_MasterUbuntu", "node_name": "Worker (MasterUbuntu)"})
+        ws, ack = await self._register("shared_secret_x", {"node_id": "worker_ubuntu", "node_name": "Worker (UbuntuNode)"})
         node = self.web_server.tts_manager.register_ws_worker_node.call_args[0][0]
         self.assertFalse(node.is_volunteer)
         self.assertFalse(node.to_dict()["is_volunteer"])

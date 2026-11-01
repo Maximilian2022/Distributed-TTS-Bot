@@ -230,10 +230,19 @@ Discord APIの制約（1クライアントは同時に単一VCのみ接続可能
 5. **計画更新中の猶予**: Master が `data/.ha_updating` を出している間（`update.sh` が自動で付与・解除）は失敗回数を数えません。
 6. **登録解除**: WebUI で解除した Slave には Master が HTTP 410 を返し、Watchdog は直ちに停止します。
 
-#### 3.6.6 Standby の追加手順
+#### 3.6.6 Standby の追加手順 (Zero-Config Standby)
 - WebUI「Bot & ノード管理」の Manager Node 欄に表示されるワンライナーを、Slave にするサーバーで実行します。HA シークレットはワンライナーの引数（Windows は環境変数）として渡され、配信スクリプト自体には含まれません。
-- Slave の `.env` の主な設定: `TTSBOT_MASTER_URL`（必須）、`TTSBOT_HA_SECRET`（必須）、`TTSBOT_MASTER_LAN_URL`（任意）、`TTSBOT_HA_PRIORITY`（初期値。Master からの割り当てで上書き）、`CLOUDFLARE_TUNNEL_TOKEN`（昇格時にトンネルも引き継ぐ場合）。
-- `.env` を変更した場合は `docker compose --profile standby up -d standby-watchdog` で Watchdog を再作成します（停止中の `app` は起動しません）。
+- **Zero-Config Standby (ゼロ設定待機系)**:
+  - クラスタ共通の `TTSBOT_HA_SECRET` から導出した 256bit 鍵（AES-256-GCM）により、全認証情報（Discord Bot トークン、OAuth2 設定、Cloudflare Tunnel トークン、各種 API キー等）が Master のデータベース内で暗号化管理されます。
+  - 毎分の DB スナップショット同期経由で副系（Slave）ノードへ安全に自動配布されるため、Slave 側の `.env` に各種トークンや API キーを手動設定する必要はありません。
+  - **待機中・降格時のゼロフットプリント保護**: Standby 待機中はアプリ・トンネルコンテナが停止しており、ディスク上にも平文データは一切存在しません。Master 障害による昇格時のみメモリ上へ一時展開され、Master 復旧時の自動降格（Preempt Demote）に伴いコンテナ停止によってメモリから即時破棄されます。
+- **Slave の `.env` 最小構成例**:
+  ```env
+  TTSBOT_HA_ROLE=slave
+  TTSBOT_MASTER_URL=https://ttsbot.example.com
+  TTSBOT_HA_SECRET=your_cluster_ha_secret
+  ```
+- `.env` を変更した場合は `docker compose -f docker-compose.slave.yml --profile standby up -d standby-watchdog` で Watchdog を再作成します（停止中の `app` は起動しません）。
 
 ### 3.7 レイテンシ監視 & インシデント解析 (`LatencyTracker`)
 すべての発話において、発言検知から音声再生開始までの各工程（文分割、推論、ストリーミング供給）のミリ秒単位プロファイリングを実施します。

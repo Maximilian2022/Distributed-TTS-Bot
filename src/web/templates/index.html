@@ -1015,8 +1015,10 @@
                   <div style="background:#1e1f22;padding:10px 12px;border-radius:6px;font-family:monospace;font-size:11px;color:#00ffcc;user-select:all;word-break:break-all;" id="standby-setup-command-box">
                     curl -sSL http://127.0.0.1:8088/setup-standby.sh | sudo bash
                   </div>
-                  <div style="font-size:11px;color:var(--text-dim);margin-top:6px;">
-                    ※ 事前に本Masterの <code>TTSBOT_HA_SECRET</code> が副系の環境変数と一致していることを確認してください。
+                  <div style="font-size:11px;color:var(--text-dim);margin-top:6px;line-height:1.6;">
+                    ※ 事前に本Masterの <code>TTSBOT_HA_SECRET</code> が副系の環境変数と一致していることを確認してください。<br>
+                    ※ <strong>Zero-Config Standby (ゼロ設定待機系)</strong>:
+                    Cloudflare Tunnel トークンや各種APIキー・OAuth2設定は暗号化 (AES-256-GCM) されて毎分のDBスナップショット同期経由で副系ノードへ自動配信されます。Slave側の <code>.env</code> にトークンや認証情報を手動設定する必要はありません。Master障害時にはWeb管理画面 (<code>https://ttsbot.example.com</code>) も含め、全機能が自動昇格・復旧します。
                   </div>
                 </div>
               </details>

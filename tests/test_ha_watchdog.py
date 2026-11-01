@@ -45,7 +45,7 @@ class TestDockerSocketClient(unittest.TestCase):
 class TestHAWatchdogTunnelFailover(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.env_patch = patch.dict(os.environ, {
-            "TTSBOT_MASTER_URL": "http://192.168.11.245:8088",
+            "TTSBOT_MASTER_URL": "http://192.168.1.245:8088",
             "TTSBOT_HA_SECRET": "test_secret",
             "CLOUDFLARE_TUNNEL_TOKEN": "eyJhIjoidGVzdCJ9",
         })
@@ -148,7 +148,7 @@ class TestHAWatchdogTunnelFailover(unittest.IsolatedAsyncioTestCase):
 class TestHAWatchdogAutoUpdate(unittest.TestCase):
     def setUp(self):
         self.env_patch = patch.dict(os.environ, {
-            "TTSBOT_MASTER_URL": "http://192.168.11.245:8088",
+            "TTSBOT_MASTER_URL": "http://192.168.1.245:8088",
             "TTSBOT_HA_SECRET": "test_secret",
         })
         self.env_patch.start()

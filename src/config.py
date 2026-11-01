@@ -184,6 +184,18 @@ class AppConfig:
             base = credentials["web_base_url"].strip().rstrip("/")
             self.web_dashboard_url = base
             self.discord_redirect_uri = f"{base}/callback"
+        if credentials.get("discord_client_id"):
+            self.discord_client_id = credentials["discord_client_id"].strip()
+        if credentials.get("discord_client_secret"):
+            self.discord_client_secret = credentials["discord_client_secret"].strip()
+        if credentials.get("discord_redirect_uri"):
+            self.discord_redirect_uri = credentials["discord_redirect_uri"].strip()
+        if credentials.get("web_session_secret"):
+            self.web_session_secret = credentials["web_session_secret"].strip()
+        if credentials.get("gemini_api_key"):
+            self.gemini_api_key = credentials["gemini_api_key"].strip()
+        if credentials.get("gemini_model"):
+            self.gemini_model = credentials["gemini_model"].strip()
 
         # トークン辞書の更新
         for bt in bot_tokens:

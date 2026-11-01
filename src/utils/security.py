@@ -136,3 +136,73 @@ def safe_json_for_html_script(data: Any) -> str:
     unicode_safe = raw.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     # CodeQL CWE-79 サニタイザ認識用
     return html.escape(unicode_safe)
+
+
+# ==============================================================================
+# クレデンシャル暗号化 & 復号 (AES-256-GCM / HA Secret 導出鍵)
+# ==============================================================================
+import base64
+import hashlib
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+_ENCRYPTION_PREFIX = "enc:v1:"
+
+
+def get_ha_secret_key(secret_str: Optional[str] = None) -> bytes:
+    """TTSBOT_HA_SECRET から 256bit (32 bytes) 暗号化鍵を導出 (環境変数未設定時はDB登録のha_secretを動的参照)"""
+    if not secret_str:
+        secret_str = os.getenv("TTSBOT_HA_SECRET", os.getenv("HA_SECRET", "")).strip()
+    if not secret_str:
+        # DBに保存されたクラスタ ha_secret を自動フォールバック
+        for candidate in [os.getenv("TTSBOT_LOCAL_DB_PATH", ""), "data/bot.db", "/app/data/bot.db"]:
+            if candidate and os.path.exists(candidate):
+                try:
+                    import sqlite3
+                    conn = sqlite3.connect(candidate, timeout=2.0)
+                    cur = conn.cursor()
+                    cur.execute("SELECT value FROM system_credentials WHERE key = 'ha_secret'")
+                    row = cur.fetchone()
+                    conn.close()
+                    if row and row[0]:
+                        secret_str = str(row[0]).strip()
+                        break
+                except Exception:
+                    pass
+    if not secret_str:
+        secret_str = "ttsbot_standalone_default_secret_salt_2026"
+    return hashlib.sha256(secret_str.encode("utf-8")).digest()
+
+
+def encrypt_credential(plain_text: str, secret_key: Optional[str] = None) -> str:
+    """機密情報を AES-256-GCM で暗号化し、enc:v1: プレフィックス付き Base64 文字列を返却"""
+    if not plain_text or not isinstance(plain_text, str):
+        return ""
+    if plain_text.startswith(_ENCRYPTION_PREFIX):
+        return plain_text  # 既に暗号化済みの場合は二重暗号化しない
+    key = get_ha_secret_key(secret_key)
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, plain_text.encode("utf-8"), None)
+    encoded = base64.urlsafe_b64encode(nonce + ciphertext).decode("ascii")
+    return f"{_ENCRYPTION_PREFIX}{encoded}"
+
+
+def decrypt_credential(cipher_text: str, secret_key: Optional[str] = None) -> str:
+    """enc:v1: プレフィックス付き暗号化データを復号 (平文データはそのまま透過返却)"""
+    if not cipher_text or not isinstance(cipher_text, str):
+        return ""
+    if not cipher_text.startswith(_ENCRYPTION_PREFIX):
+        return cipher_text  # 未暗号化のレガシー平文データは無傷で返却
+    key = get_ha_secret_key(secret_key)
+    try:
+        raw = base64.urlsafe_b64decode(cipher_text[len(_ENCRYPTION_PREFIX):].encode("ascii"))
+        if len(raw) <= 12:
+            return ""
+        nonce = raw[:12]
+        ciphertext = raw[12:]
+        aesgcm = AESGCM(key)
+        return aesgcm.decrypt(nonce, ciphertext, None).decode("utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to decrypt credential (key mismatch or corruption): {e}")
+        return ""
+

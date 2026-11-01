@@ -123,7 +123,7 @@ volumes:
 ```
 
 ### 必須環境変数 (Slave)
-- `TTSBOT_MASTER_URL`: Master サーバーのベースURL (例: `https://ttsbot.kenko.land`)
+- `TTSBOT_MASTER_URL`: Master サーバーのベースURL (例: `https://ttsbot.example.com`)
 - `TTSBOT_HA_SECRET`: Master 側と同じ共有シークレットキー
 - `TTSBOT_HA_PRIORITY`: 優先度 (`1`: 最優先 約30秒昇格, `2`: 第2待機 約3分昇格, `3`: 第3待機 約5分昇格)
 

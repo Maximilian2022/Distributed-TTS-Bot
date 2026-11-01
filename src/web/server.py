@@ -6665,7 +6665,17 @@ class WebServer:
             # システム共通エラー通知先
             "error_contact_user_id": str(system_contact_id),
             # HA共有認証シークレット
-            "ha_secret": self.config.ha_secret
+            "ha_secret": self.config.ha_secret,
+            # Discord OAuth2
+            "discord_client_id": self.config.discord_client_id,
+            "discord_client_id_configured": bool(self.config.discord_client_id),
+            "discord_client_secret": _mask(self.config.discord_client_secret),
+            "discord_client_secret_configured": bool(self.config.discord_client_secret),
+            "discord_redirect_uri": self.config.discord_redirect_uri,
+            # Gemini AI
+            "gemini_api_key": _mask(self.config.gemini_api_key),
+            "gemini_api_key_configured": bool(self.config.gemini_api_key),
+            "gemini_model": self.config.gemini_model
         })
 
     async def api_system_save_credentials(self, request: web.Request) -> web.Response:
@@ -6800,6 +6810,42 @@ class WebServer:
                     await self.db.set_credential("error_contact_user_id", raw_ec_id)
                 elif not raw_ec_id:
                     await self.db.set_credential("error_contact_user_id", str(alert_service.INITIAL_DEFAULT_CONTACT_ID))
+
+            # 10. Discord OAuth2 クレデンシャル
+            if "discord_client_id" in data:
+                d_cid = str(data["discord_client_id"]).strip()
+                await self.db.set_credential("discord_client_id", d_cid, is_secret=False)
+                self.config.discord_client_id = d_cid
+                os.environ["DISCORD_CLIENT_ID"] = d_cid
+
+            if "discord_client_secret" in data and not str(data["discord_client_secret"]).startswith("•"):
+                d_sec = str(data["discord_client_secret"]).strip()
+                if d_sec:
+                    await self.db.set_credential("discord_client_secret", d_sec, is_secret=True)
+                    self.config.discord_client_secret = d_sec
+                    os.environ["DISCORD_CLIENT_SECRET"] = d_sec
+
+            if "discord_redirect_uri" in data:
+                d_uri = str(data["discord_redirect_uri"]).strip()
+                if d_uri:
+                    await self.db.set_credential("discord_redirect_uri", d_uri, is_secret=False)
+                    self.config.discord_redirect_uri = d_uri
+                    os.environ["DISCORD_REDIRECT_URI"] = d_uri
+
+            # 11. Gemini AI 設定
+            if "gemini_api_key" in data and not str(data["gemini_api_key"]).startswith("•"):
+                g_key = str(data["gemini_api_key"]).strip()
+                if g_key:
+                    await self.db.set_credential("gemini_api_key", g_key, is_secret=True)
+                    self.config.gemini_api_key = g_key
+                    os.environ["GEMINI_API_KEY"] = g_key
+
+            if "gemini_model" in data:
+                g_mod = str(data["gemini_model"]).strip()
+                if g_mod:
+                    await self.db.set_credential("gemini_model", g_mod, is_secret=False)
+                    self.config.gemini_model = g_mod
+                    os.environ["GEMINI_MODEL"] = g_mod
 
             # ホットリロード
             if self.tts_manager:

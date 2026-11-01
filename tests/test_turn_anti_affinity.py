@@ -9,7 +9,7 @@ class TestTurnAntiAffinity(unittest.IsolatedAsyncioTestCase):
         # 2台のGPUノードを準備 (RTX 3090 と GTX 1080 Ti)
         cfg_3090 = TTSNodeConfig(
             id="worker_MASTERSOMEN2022_voicevox",
-            url="http://192.168.11.200:50021",
+            url="http://192.168.1.200:50021",
             priority=1,
             max_concurrent=3,
             enabled=True
@@ -27,7 +27,7 @@ class TestTurnAntiAffinity(unittest.IsolatedAsyncioTestCase):
 
         cfg_1080ti = TTSNodeConfig(
             id="worker_MASTEROMEN2017_voicevox",
-            url="http://192.168.11.207:50021",
+            url="http://192.168.1.207:50021",
             priority=1,
             max_concurrent=2,
             enabled=True

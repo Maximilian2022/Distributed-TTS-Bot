@@ -30,6 +30,11 @@ import random
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, List, Dict, Any
+import sqlite3
+try:
+    from src.utils.security import decrypt_credential
+except ImportError:
+    decrypt_credential = lambda c, k=None: c
 try:
     from src.utils.system_info import get_host_system_info
 except ImportError:
@@ -53,12 +58,41 @@ class DockerSocketClient:
     def is_available(self) -> bool:
         return os.path.exists(self.socket_path)
 
+    @staticmethod
+    def _dechunk(data: bytes) -> bytes:
+        """HTTP chunked transfer encoding のボディを展開"""
+        if not data:
+            return b""
+        result = bytearray()
+        offset = 0
+        total_len = len(data)
+        while offset < total_len:
+            crlf = data.find(b"\r\n", offset)
+            if crlf == -1:
+                break
+            size_str = data[offset:crlf].split(b";")[0].strip()
+            try:
+                chunk_size = int(size_str, 16)
+            except ValueError:
+                # チャンクサイズ行でない場合は chunked でないとみなして全体を返す
+                return data
+            if chunk_size == 0:
+                break
+            offset = crlf + 2
+            if offset + chunk_size > total_len:
+                result.extend(data[offset:])
+                break
+            result.extend(data[offset:offset + chunk_size])
+            offset += chunk_size + 2
+        return bytes(result) if result else data
+
     def _send_request(self, method: str, path: str, body: Optional[bytes] = None) -> Tuple[int, bytes]:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.settimeout(10.0)
             sock.connect(self.socket_path)
-            req = f"{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n"
+            # HTTP/1.0 を指定して chunked encoding を抑止
+            req = f"{method} {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n"
             if body:
                 req += f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
                 sock.sendall(req.encode("utf-8") + body)
@@ -76,13 +110,27 @@ class DockerSocketClient:
             header_part, _, body_part = res_data.partition(b"\r\n\r\n")
             lines = header_part.split(b"\r\n")
             status_code = 500
+            is_chunked = False
             if lines:
                 parts = lines[0].split(b" ")
                 if len(parts) >= 2 and parts[1].isdigit():
                     status_code = int(parts[1])
+                for line in lines[1:]:
+                    if b"transfer-encoding" in line.lower() and b"chunked" in line.lower():
+                        is_chunked = True
+
+            if is_chunked or (body_part and body_part[:1].isalnum() and b"\r\n" in body_part[:16]):
+                body_part = self._dechunk(body_part)
+
             return status_code, body_part
+        except Exception as e:
+            logger.debug(f"[Docker Socket] Request {method} {path} failed: {e}")
+            return 500, b""
         finally:
-            sock.close()
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     def find_containers_by_prefix(self, prefix: str) -> list:
         status, body = self._send_request("GET", "/containers/json?all=1")
@@ -103,6 +151,7 @@ class DockerSocketClient:
         """フェイルオーバー昇格対象の本体 (app) コンテナを確実に特定 (watchdog/tunnel等の補助コンテナは除外)"""
         status, body = self._send_request("GET", "/containers/json?all=1")
         if status != 200:
+            logger.warning(f"⚠️ [Docker Socket] GET /containers/json failed with HTTP {status}")
             return []
         try:
             containers = json.loads(body.decode("utf-8"))
@@ -115,13 +164,15 @@ class DockerSocketClient:
                         results.append(c)
                         break
             return results
-        except Exception:
+        except Exception as e:
+            logger.error(f"❌ [Docker Socket] Failed to parse app container list JSON: {e} (body snippet: {body[:150]!r})")
             return []
 
     def find_tunnel_containers(self) -> list:
-        """フェイルオーバー昇格・降格対象の Cloudflare Tunnel コンテナを特定 (watchdog等は除外)"""
+        """フェイルオーバー昇格・降格対象の Cloudflare Tunnel コンテナを特定 (ttsbot 専用 tunnel のみに厳密マッチ、他サービス除外)"""
         status, body = self._send_request("GET", "/containers/json?all=1")
         if status != 200:
+            logger.warning(f"⚠️ [Docker Socket] GET /containers/json for tunnel failed with HTTP {status}")
             return []
         try:
             containers = json.loads(body.decode("utf-8"))
@@ -129,21 +180,115 @@ class DockerSocketClient:
             for c in containers:
                 names = [n.lstrip("/") for n in c.get("Names", [])]
                 for n in names:
-                    # ttsbot-slave-tunnel, ttsbot-tunnel, tunnel 等にマッチし、自身(watchdog)や他アプリは除外
-                    if "tunnel" in n.lower() and not any(ex in n.lower() for ex in ("watchdog", "nginx", "proxy", "agent", "worker")):
+                    n_low = n.lower()
+                    # ttsbot の tunnel コンテナのみに厳密マッチ (mmo_cf_tunnel 等の他サービスは完全除外)
+                    is_tts_tunnel = ("ttsbot" in n_low and "tunnel" in n_low) or n_low in ("tunnel", "ttsbot-tunnel", "ttsbot-slave-tunnel")
+                    if is_tts_tunnel and not any(ex in n_low for ex in ("watchdog", "nginx", "proxy", "agent", "worker")):
                         results.append(c)
                         break
             return results
-        except Exception:
+        except Exception as e:
+            logger.error(f"❌ [Docker Socket] Failed to parse tunnel container list JSON: {e} (body snippet: {body[:150]!r})")
             return []
 
     def start_container(self, container_id: str) -> bool:
-        status, _ = self._send_request("POST", f"/containers/{container_id}/start")
-        return status in (204, 304)
+        status, body = self._send_request("POST", f"/containers/{container_id}/start")
+        if status in (204, 304):
+            return True
+        logger.warning(f"⚠️ [Docker Socket] Failed to start container {container_id[:12]} (HTTP {status}): {body.decode('utf-8', errors='ignore').strip()}")
+        return False
 
     def stop_container(self, container_id: str, timeout_sec: int = 5) -> bool:
-        status, _ = self._send_request("POST", f"/containers/{container_id}/stop?t={timeout_sec}")
-        return status in (204, 304)
+        status, body = self._send_request("POST", f"/containers/{container_id}/stop?t={timeout_sec}")
+        if status in (204, 304):
+            return True
+        logger.warning(f"⚠️ [Docker Socket] Failed to stop container {container_id[:12]} (HTTP {status}): {body.decode('utf-8', errors='ignore').strip()}")
+        return False
+
+    def inspect_container(self, container_id: str) -> Optional[dict]:
+        """コンテナの詳細設定（環境変数、ネットワーク等）を取得"""
+        status, body = self._send_request("GET", f"/containers/{container_id}/json")
+        if status != 200:
+            return None
+        try:
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+
+    def remove_container(self, container_id: str, force: bool = True) -> bool:
+        """コンテナを削除"""
+        force_param = "true" if force else "false"
+        status, body = self._send_request("DELETE", f"/containers/{container_id}?force={force_param}")
+        return status in (200, 204, 404)
+
+    def ensure_tunnel_container(self, token: str) -> Optional[str]:
+        """
+        Cloudflare Tunnel コンテナのトークン設定を確認し、最新トークンで起動可能なコンテナIDを返却。
+        トークンが未設定または不一致の場合は最新トークンで自動再作成。
+        """
+        if not token:
+            return None
+
+        # app コンテナのネットワークモードを取得
+        app_network = "ttsbot_default"
+        app_containers = self.find_app_containers()
+        if app_containers:
+            app_info = self.inspect_container(app_containers[0].get("Id", ""))
+            if app_info:
+                host_cfg = app_info.get("HostConfig", {})
+                net_mode = host_cfg.get("NetworkMode", "")
+                if net_mode and net_mode not in ("default", "bridge"):
+                    app_network = net_mode
+                else:
+                    networks = app_info.get("NetworkSettings", {}).get("Networks", {})
+                    if networks:
+                        app_network = list(networks.keys())[0]
+
+        # 既存 tunnel コンテナの確認
+        tunnel_containers = self.find_tunnel_containers()
+        for c in tunnel_containers:
+            c_id = c.get("Id", "")
+            c_info = self.inspect_container(c_id)
+            if c_info:
+                env_list = c_info.get("Config", {}).get("Env", [])
+                tok_in_container = ""
+                for env_item in env_list:
+                    if env_item.startswith("TUNNEL_TOKEN="):
+                        tok_in_container = env_item[len("TUNNEL_TOKEN="):]
+                        break
+                if tok_in_container == token:
+                    # トークンが一致していれば既存コンテナをそのまま利用
+                    return c_id
+                else:
+                    logger.info(f"🔄 [Docker Socket] Tunnel token changed or missing in {c_id[:12]}. Removing and recreating...")
+                    self.remove_container(c_id, force=True)
+
+        # 新規作成
+        create_payload = json.dumps({
+            "Image": "cloudflare/cloudflared:latest",
+            "Cmd": ["tunnel", "--no-autoupdate", "run"],
+            "Env": [
+                f"TUNNEL_TOKEN={token}",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
+            ],
+            "HostConfig": {
+                "RestartPolicy": {"Name": "unless-stopped"},
+                "NetworkMode": app_network
+            }
+        }).encode("utf-8")
+
+        status, body = self._send_request("POST", "/containers/create?name=ttsbot-slave-tunnel", body=create_payload)
+        if status in (200, 201):
+            try:
+                res_obj = json.loads(body.decode("utf-8"))
+                new_id = res_obj.get("Id", "")
+                logger.info(f"✓ [Docker Socket] Created new tunnel container: {new_id[:12]}")
+                return new_id
+            except Exception:
+                pass
+        logger.warning(f"⚠️ [Docker Socket] Failed to create tunnel container (HTTP {status}): {body.decode('utf-8', errors='ignore')}")
+        return None
 
 
 import platform
@@ -207,6 +352,8 @@ class HAWatchdog:
 
         self.tunnel_token = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", os.getenv("TUNNEL_TOKEN", "")).strip()
         self.has_tunnel = bool(self.tunnel_token)
+        # ローカル暗号化DBに保存された認証情報を動的取得 (Zero-Config Standby)
+        self.refresh_credentials_from_db()
 
         self.current_state = "standby"  # "standby" or "active"
         self.fail_count = 0
@@ -228,6 +375,35 @@ class HAWatchdog:
             f"Priority: {self.priority}, Failover threshold: {self.fail_threshold} checks = {self.fail_threshold * self.check_interval:.0f}s, "
             f"Tunnel Failover: {'ENABLED' if self.has_tunnel else 'DISABLED'})"
         )
+
+    def _get_db_credential(self, key: str) -> str:
+        """暗号化されたローカル SQLite DB から指定キーの認証情報を復号取得"""
+        if not self.db_path.exists():
+            return ""
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM system_credentials WHERE key = ?", (key,))
+            row = cur.fetchone()
+            conn.close()
+            if not row or not row[0]:
+                return ""
+            raw_val = str(row[0])
+            return decrypt_credential(raw_val, self.ha_secret)
+        except Exception as e:
+            logger.debug(f"Failed to read credential '{key}' from local DB: {e}")
+            return ""
+
+    def refresh_credentials_from_db(self) -> None:
+        """ローカル DB から Cloudflare Tunnel Token 等の最新認証情報を動的ロード (Zero-Config Standby)"""
+        tok = self._get_db_credential("cloudflare_tunnel_token")
+        if tok and tok != self.tunnel_token:
+            self.tunnel_token = tok
+            self.has_tunnel = True
+            logger.info("🔑 [Zero-Config] Loaded cloudflare_tunnel_token dynamically from encrypted local DB.")
+        elif tok and not self.has_tunnel:
+            self.tunnel_token = tok
+            self.has_tunnel = True
 
     def _calc_fail_threshold(self, priority: int) -> int:
         """
@@ -819,6 +995,8 @@ class HAWatchdog:
                     self.last_db_hash = sha256
                     self.last_sync_time = time.time()
                     logger.info(f"✨ DB snapshot synchronized successfully via {base_url}! (Size: {len(raw_bytes)} bytes, Hash: {sha256[:10]}...)")
+                    # 最新暗号化DBからトークン等を動的ロード (Zero-Config)
+                    self.refresh_credentials_from_db()
                     return True
             except urllib.error.HTTPError as e:
                 if e.code == 304:
@@ -1030,6 +1208,9 @@ class HAWatchdog:
         """Slave を ACTIVE に昇格 (Docker で app コンテナ、および設定時は tunnel コンテナを起動)"""
         logger.warning("🚨 [FAILOVER] Master outage detected! Promoting Slave to ACTIVE...")
 
+        # 0. 昇格直前にローカル暗号化DBから最新認証情報 (Tunnel Token 等) を再確認
+        self.refresh_credentials_from_db()
+
         promoted = False
         target_services = ["app"]
         if self.has_tunnel:
@@ -1037,8 +1218,12 @@ class HAWatchdog:
 
         # 1. Docker CLI による起動 (--profile active で app および tunnel を一括起動)
         try:
+            cmd_env = os.environ.copy()
+            if self.tunnel_token:
+                cmd_env["CLOUDFLARE_TUNNEL_TOKEN"] = self.tunnel_token
             proc = await asyncio.create_subprocess_exec(
                 "docker", "compose", "--profile", "active", "up", "-d", *target_services,
+                env=cmd_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
@@ -1046,12 +1231,22 @@ class HAWatchdog:
             if proc.returncode == 0:
                 logger.info(f"✓ [Docker Compose] {target_services} container(s) started successfully.")
                 promoted = True
+            else:
+                logger.warning(
+                    f"⚠️ [Docker Compose] 'docker compose up' failed (exit code {proc.returncode}): "
+                    f"{stderr.decode().strip() if stderr else 'unknown error'}. Falling back to Docker Socket API..."
+                )
+        except FileNotFoundError:
+            logger.info("ℹ️ [Docker CLI] docker command not found inside container. Using Docker Socket API fallback...")
         except Exception as e:
             logger.debug(f"Docker compose CLI exec failed: {e}")
 
         # 2. Unix Socket による直接起動 (CLI が無い環境のフォールバック)
         if not promoted and self.docker.is_available():
+            logger.info("🔧 Attempting container startup via Docker Socket API (/var/run/docker.sock)...")
             containers = self.docker.find_app_containers()
+            if not containers:
+                logger.warning("⚠️ [Docker Socket] No existing 'app' containers found matching filter! Ensure 'app' container was created.")
             started_app = False
             for c in containers:
                 c_id = c.get("Id", "")
@@ -1061,10 +1256,21 @@ class HAWatchdog:
 
             if self.has_tunnel:
                 tunnel_containers = self.docker.find_tunnel_containers()
-                for c in tunnel_containers:
-                    c_id = c.get("Id", "")
-                    if self.docker.start_container(c_id):
-                        logger.info(f"✓ [Docker Socket] Started tunnel container: {c_id[:12]}")
+                started_tunnel = False
+                if tunnel_containers:
+                    for c in tunnel_containers:
+                        c_id = c.get("Id", "")
+                        if self.docker.start_container(c_id):
+                            logger.info(f"✓ [Docker Socket] Started tunnel container: {c_id[:12]}")
+                            started_tunnel = True
+                elif self.tunnel_token:
+                    # 既存コンテナが無く、トークンが存在する場合は動的作成して起動
+                    t_id = self.docker.ensure_tunnel_container(self.tunnel_token)
+                    if t_id and self.docker.start_container(t_id):
+                        logger.info(f"✓ [Docker Socket] Created and started dynamic tunnel container: {t_id[:12]}")
+                        started_tunnel = True
+                if not started_tunnel and not tunnel_containers:
+                    logger.warning("⚠️ [Docker Socket] No 'tunnel' container found or created!")
 
             if started_app:
                 promoted = True
@@ -1099,6 +1305,8 @@ class HAWatchdog:
             if proc.returncode == 0:
                 logger.info(f"✓ [Docker Compose] {target_services} container(s) stopped successfully.")
                 demoted = True
+        except FileNotFoundError:
+            logger.info("ℹ️ [Docker CLI] docker command not found inside container. Using Docker Socket API fallback...")
         except Exception as e:
             logger.debug(f"Docker compose CLI stop failed: {e}")
 

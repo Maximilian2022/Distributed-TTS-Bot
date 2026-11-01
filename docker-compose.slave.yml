@@ -71,6 +71,12 @@ services:
     init: true
     ports:
       - "${HOST_WEB_PORT:-8088}:${WEB_PORT:-8080}"
+    networks:
+      default:
+        aliases:
+          - ttsbot
+          - router
+          - ttsbot-router
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app

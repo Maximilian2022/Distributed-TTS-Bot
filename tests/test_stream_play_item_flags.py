@@ -43,10 +43,10 @@ class FakeTTS:
         return prov
 
     def get_expected_worker_info(self, provider, model_name=None, text_len=10, guild_id=None):
-        return {"worker_label": "MasterDebian (CPU)", "has_gpu": False, "is_model_loaded": True, "estimated_node_ms": None}
+        return {"worker_label": "DebianNode (CPU)", "has_gpu": False, "is_model_loaded": True, "estimated_node_ms": None}
 
     def peek_earliest_finish(self, provider, text_len, model_name=None, guild_id=None):
-        return {"worker_label": "MasterDebian (CPU)", "has_gpu": False, "eta_ms": 78 + 55.4 * text_len}
+        return {"worker_label": "DebianNode (CPU)", "has_gpu": False, "eta_ms": 78 + 55.4 * text_len}
 
     def get_planning_nodes(self, provider, model_name=None, guild_id=None):
         return [DEBIAN, UBUNTU]
@@ -65,7 +65,7 @@ class FakeTTS:
         if text.endswith("、"):
             return _wav(0.4), "coeiroink", "L1/L2 キャッシュ", True
         await asyncio.sleep(0.01 * len(text) / 10)
-        return _wav(0.02 * len(text)), "coeiroink", "MasterDebian (CPU) / COEIROINK", False
+        return _wav(0.02 * len(text)), "coeiroink", "DebianNode (CPU) / COEIROINK", False
 
 
 class FakeVC:
@@ -140,7 +140,7 @@ class TestStreamPlayItemFlags(unittest.TestCase):
         self.assertIn("tl_deadline_rel_ms", head)
         self.assertIn("legacy_spec_ms", head)
         self.assertIsNotNone(head.get("head_chars_planned"))  # CPU のみ構成なので短縮計画は出る
-        self.assertEqual(head.get("pred_node"), "MasterDebian (CPU)")
+        self.assertEqual(head.get("pred_node"), "DebianNode (CPU)")
 
     def test_on_applies_deadline_route_and_head(self):
         ok, calls, rec = self._run("on")

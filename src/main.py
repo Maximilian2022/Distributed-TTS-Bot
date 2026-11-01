@@ -353,6 +353,8 @@ async def main():
 
     # DBに保存された認証情報およびBotトークンを config に動的適用
     try:
+        # Zero-Config Standby & 暗号化クレデンシャルの自動シード＆ロード
+        await db.load_and_seed_system_credentials(config)
         db_tokens = await db.get_bot_tokens()
         credentials = await db.get_all_credentials()
         config.apply_db_credentials(credentials, db_tokens)
@@ -669,6 +671,17 @@ async def main():
                 loop.add_signal_handler(sig, lambda: safe_create_task(shutdown_all(), name="shutdown_all"))
             except (NotImplementedError, RuntimeError):
                 pass
+
+        # 最新の暗号化クレデンシャルとBotトークンを再ロード
+        try:
+            await db.load_and_seed_system_credentials(config)
+            db_tokens = await db.get_bot_tokens()
+            credentials = await db.get_all_credentials()
+            config.apply_db_credentials(credentials, db_tokens)
+            tokens = config.get_discord_tokens()
+            logging.info(f"🔑 [Active Promotion] Credentials reloaded. Active bot tokens count: {len(tokens)}")
+        except Exception as e:
+            logging.warning(f"Failed to reload credentials on active promotion: {e}")
 
         # Active昇格: スタンバイ解除とバックグラウンドタスク群を開始
         start_active_background_tasks()

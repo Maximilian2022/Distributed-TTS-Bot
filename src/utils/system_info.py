@@ -121,11 +121,11 @@ def get_local_ip_candidates() -> List[str]:
 def get_host_system_info(force_refresh: bool = False) -> Dict[str, Any]:
     """
     ホストマシンの詳細システム情報を安全に取得。
-    - hostname: ホストマシンの真のホスト名 (例: MasterUbuntu)
+    - hostname: ホストマシンの真のホスト名 (例: HostServer-01)
     - container_hostname: コンテナID (例: f56ecdefd774)
-    - os_name: ホストOS名 (例: Ubuntu 26.04.1 LTS)
-    - kernel: カーネルバージョン (例: 7.0.0-38-generic)
-    - docker_version: Docker Engine バージョン (例: 29.4.2)
+    - os_name: ホストOS名 (例: Linux x86_64)
+    - kernel: カーネルバージョン (例: 6.8.0-generic)
+    - docker_version: Docker Engine バージョン (例: 27.0.0)
     - is_docker: Dockerコンテナ内かどうか
     - local_ips: ローカルIPアドレス候補リスト
     """

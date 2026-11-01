@@ -54,14 +54,14 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
     async def test_setup_worker_sh_delivery_lan(self):
         """宅内LANアクセス時 (プライベートIP直接): リクエスト先Hostヘッダーが優先注入されるか"""
         headers = {
-            "Host": "192.168.11.248:8088"
+            "Host": "192.168.1.248:8088"
         }
         resp = await self.client.get("/setup-worker.sh", headers=headers)
         self.assertEqual(resp.status, 200)
         text = await resp.text()
 
         # LAN内の直接通信URLが注入されていること
-        self.assertIn('MASTER_URL="${TTSBOT_MASTER_URL:-http://192.168.11.248:8088}"', text)
+        self.assertIn('MASTER_URL="${TTSBOT_MASTER_URL:-http://192.168.1.248:8088}"', text)
         # 共有トークンは公開配信に埋め込まない (管理画面のワンライナーが --secret で渡す)
         self.assertNotIn("test_secret_12345", text)
         self.assertIn('WORKER_SECRET="${TTSBOT_WORKER_SECRET:-}"', text)
@@ -89,10 +89,10 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
         self.assertNotIn("test_secret_12345", wan_text)
 
         # LAN
-        lan_resp = await self.client.get("/setup-worker.ps1", headers={"Host": "192.168.11.248:8088"})
+        lan_resp = await self.client.get("/setup-worker.ps1", headers={"Host": "192.168.1.248:8088"})
         self.assertEqual(lan_resp.status, 200)
         lan_text = await lan_resp.text()
-        self.assertIn('"http://192.168.11.248:8088"', lan_text)
+        self.assertIn('"http://192.168.1.248:8088"', lan_text)
         self.assertNotIn("test_secret_12345", lan_text)
 
     @unittest_run_loop
@@ -120,7 +120,7 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
         """常設HTTPクラスタノードが存在する場合、WSボランティアノードとしての二重登録が抑止されるか"""
         # 既存のHTTPノードをモックプールに配備
         http_node = MagicMock()
-        http_node.id = "worker_MasterDebian_voicevox"
+        http_node.id = "worker_debian_voicevox"
         http_node.is_ws = False
 
         self.web_server.tts_manager.voicevox_pool.nodes = [http_node]
@@ -131,8 +131,8 @@ class TestSetupWorkerDelivery(AioHTTPTestCase):
         ws_client = await self.client.ws_connect("/api/worker/ws?token=test_secret_12345")
         await ws_client.send_json({
             "type": "register",
-            "node_id": "worker_MasterDebian",
-            "node_name": "Worker (MasterDebian)",
+            "node_id": "worker_debian",
+            "node_name": "Worker (DebianNode)",
             "supported_engines": ["voicevox"],
             "capacity": 2
         })
@@ -170,7 +170,7 @@ class TestWorkerSecretRotationGrace(AioHTTPTestCase):
         if wan:
             headers["CF-Connecting-IP"] = "203.0.113.9"
         transport = MagicMock()
-        transport.get_extra_info.return_value = ("192.168.11.207", 50000)
+        transport.get_extra_info.return_value = ("192.168.1.207", 50000)
         return make_mocked_request("POST", "/api/worker/heartbeat", headers=headers, transport=transport)
 
     @unittest_run_loop

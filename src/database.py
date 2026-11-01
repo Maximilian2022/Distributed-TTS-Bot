@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 from contextlib import asynccontextmanager
 from src.utils.default_ng_words import DEFAULT_NG_WORDS
+from src.utils.security import encrypt_credential, decrypt_credential
 
 logger = logging.getLogger(__name__)
 
@@ -2962,12 +2963,15 @@ class Database:
 
     # --- システム認証情報 & 動的Botトークン管理 ---
 
-    async def get_credential(self, key: str, default: str = "") -> str:
-        """システム設定・認証情報値を取得"""
+    async def get_credential(self, key: str, default: str = "", decrypt: bool = True) -> str:
+        """システム設定・認証情報値を取得 (is_secret の値は自動復号)"""
         async with self.get_connection() as db:
             async with db.execute("SELECT value FROM system_credentials WHERE key = ?", (key,)) as cur:
                 row = await cur.fetchone()
-                return str(row[0]) if row else default
+                if not row:
+                    return default
+                val = str(row[0])
+                return decrypt_credential(val) if decrypt else val
 
     # --- ワーカー別設定 ---
 
@@ -3213,34 +3217,44 @@ class Database:
                 return [dict(r) for r in await cur.fetchall()]
 
     async def set_credential(self, key: str, value: str, is_secret: bool = False) -> None:
-        """システム設定・認証情報値を保存・更新"""
+        """システム設定・認証情報値を保存・更新 (is_secret=True の場合は AES-256-GCM で暗号化)"""
+        val_to_store = encrypt_credential(str(value)) if (is_secret and value) else str(value)
         async with self.get_connection() as db:
             await db.execute("""
                 INSERT INTO system_credentials (key, value, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
-            """, (key, str(value)))
+            """, (key, val_to_store))
             await db.commit()
 
-    async def get_all_credentials(self) -> Dict[str, str]:
+    async def get_all_credentials(self, decrypt: bool = True) -> Dict[str, str]:
         """全システム認証情報・キー設定を取得"""
         async with self.get_connection() as db:
             async with db.execute("SELECT key, value FROM system_credentials") as cur:
                 rows = await cur.fetchall()
-                return {r[0]: r[1] for r in rows}
+                if not decrypt:
+                    return {r[0]: r[1] for r in rows}
+                return {r[0]: decrypt_credential(r[1]) for r in rows}
 
     async def get_bot_tokens(self) -> List[Dict[str, Any]]:
-        """登録済みの全Botトークン一覧を取得 (1〜10号機昇順)"""
+        """登録済みの全Botトークン一覧を取得 (1〜10号機昇順、トークンは自動復号)"""
         async with self.get_connection() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM bot_tokens ORDER BY bot_index ASC") as cur:
                 rows = await cur.fetchall()
-                return [dict(r) for r in rows]
+                results = []
+                for r in rows:
+                    item = dict(r)
+                    if "token" in item:
+                        item["token"] = decrypt_credential(str(item["token"]))
+                    results.append(item)
+                return results
 
     async def save_bot_token(self, bot_index: int, token: str, label: str = "", is_enabled: bool = True) -> None:
-        """Botトークンを保存・更新 (1〜10号機)"""
+        """Botトークンを保存・更新 (1〜10号機、トークンは AES-256-GCM 暗号化して永続化)"""
         if not (1 <= bot_index <= 10):
             raise ValueError("bot_index must be between 1 and 10")
+        enc_token = encrypt_credential(str(token).strip())
         async with self.get_connection() as db:
             await db.execute("""
                 INSERT INTO bot_tokens (bot_index, token, label, is_enabled, updated_at)
@@ -3250,8 +3264,94 @@ class Database:
                     label=excluded.label,
                     is_enabled=excluded.is_enabled,
                     updated_at=CURRENT_TIMESTAMP
-            """, (bot_index, str(token).strip(), label, 1 if is_enabled else 0))
+            """, (bot_index, enc_token, label, 1 if is_enabled else 0))
             await db.commit()
+
+    async def load_and_seed_system_credentials(self, config_obj: Any = None) -> Dict[str, str]:
+        """
+        システム設定・認証情報の双方向自動同期:
+        1. 環境変数 (.env) に値があり、DB に未登録の場合は DB へ暗号化保存 (Master側の初回自動シード)
+        2. 環境変数が空で、DB に登録済みの場合は DB から復号して config / os.environ へ自動反映 (Slave側のゼロ設定ロード)
+        """
+        mapping = {
+            "discord_client_id": "DISCORD_CLIENT_ID",
+            "discord_client_secret": "DISCORD_CLIENT_SECRET",
+            "discord_redirect_uri": "DISCORD_REDIRECT_URI",
+            "cloudflare_tunnel_token": "CLOUDFLARE_TUNNEL_TOKEN",
+            "admin_password": "ADMIN_PASSWORD",
+            "web_session_secret": "WEB_SESSION_SECRET",
+            "gemini_api_key": "GEMINI_API_KEY",
+            "gemini_model": "GEMINI_MODEL",
+            "azure_speech_key": "AZURE_SPEECH_KEY",
+            "azure_speech_region": "AZURE_SPEECH_REGION",
+            "google_api_key": "GOOGLE_API_KEY",
+            "worker_shared_secret": "WORKER_SHARED_SECRET",
+            "error_contact_user_id": "DISCORD_OWNER_USER_ID",
+        }
+        loaded = {}
+        for db_key, env_var in mapping.items():
+            env_val = os.getenv(env_var, "").strip()
+            db_val = await self.get_credential(db_key, default="", decrypt=True)
+
+            if env_val and not db_val:
+                # Master側: .env から DB へ自動暗号化シード
+                await self.set_credential(db_key, env_val, is_secret=True)
+                loaded[db_key] = env_val
+                logger.info(f"🔐 [Credentials] Automatically seeded '{db_key}' from .env into encrypted database.")
+            elif db_val and not env_val:
+                # Slave側: 暗号化DBから復号して os.environ および config に自動展開
+                os.environ[env_var] = db_val
+                if config_obj and hasattr(config_obj, db_key):
+                    setattr(config_obj, db_key, db_val)
+                loaded[db_key] = db_val
+                logger.info(f"✨ [Zero-Config] Loaded '{db_key}' dynamically from encrypted database into memory.")
+            elif db_val:
+                loaded[db_key] = db_val
+                if config_obj and hasattr(config_obj, db_key) and not getattr(config_obj, db_key, None):
+                    setattr(config_obj, db_key, db_val)
+
+        # 既存の平文 bot_tokens の暗号化マイグレーション (at-rest セキュリティ強化)
+        try:
+            async with self.get_connection() as db:
+                async with db.execute("SELECT bot_index, token FROM bot_tokens") as cur:
+                    b_rows = await cur.fetchall()
+                for b_idx, tok in b_rows:
+                    tok_str = str(tok).strip()
+                    if tok_str and not tok_str.startswith("enc:v1:"):
+                        enc_tok = encrypt_credential(tok_str)
+                        await db.execute(
+                            "UPDATE bot_tokens SET token = ?, updated_at = CURRENT_TIMESTAMP WHERE bot_index = ?",
+                            (enc_tok, b_idx)
+                        )
+                        logger.info(f"🔐 [Credentials] Migrated legacy plaintext token for Bot #{b_idx} to encrypted.")
+                await db.commit()
+        except Exception as e:
+            logger.debug(f"bot_tokens encryption migration exception: {e}")
+
+        # 既存の平文機密 system_credentials (azure_speech_key 等) の暗号化マイグレーション
+        secret_keys = {
+            "azure_speech_key", "google_credentials_json", "google_api_key",
+            "worker_shared_secret", "admin_password", "web_session_secret",
+            "gemini_api_key", "cloudflare_tunnel_token", "discord_client_secret"
+        }
+        try:
+            async with self.get_connection() as db:
+                async with db.execute("SELECT key, value FROM system_credentials") as cur:
+                    c_rows = await cur.fetchall()
+                for k, v in c_rows:
+                    k_str, v_str = str(k), str(v).strip()
+                    if k_str in secret_keys and v_str and not v_str.startswith("enc:v1:"):
+                        enc_v = encrypt_credential(v_str)
+                        await db.execute(
+                            "UPDATE system_credentials SET value = ?, updated_at = CURRENT_TIMESTAMP WHERE key = ?",
+                            (enc_v, k_str)
+                        )
+                        logger.info(f"🔐 [Credentials] Migrated legacy plaintext credential '{k_str}' to encrypted.")
+                await db.commit()
+        except Exception as e:
+            logger.debug(f"system_credentials encryption migration exception: {e}")
+
+        return loaded
 
     async def delete_bot_token(self, bot_index: int) -> bool:
         """Botトークンを削除"""

@@ -818,10 +818,10 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         # 1. ローカル / プライベート URL 判定
         self.assertTrue(is_private_or_local_url("http://127.0.0.1:8088"))
         self.assertTrue(is_private_or_local_url("http://localhost:8088"))
-        self.assertTrue(is_private_or_local_url("http://192.168.11.245:8088"))
+        self.assertTrue(is_private_or_local_url("http://192.168.1.245:8088"))
         self.assertTrue(is_private_or_local_url("http://10.0.0.1:8088"))
         self.assertTrue(is_private_or_local_url("http://172.16.0.5:8088"))
-        self.assertFalse(is_private_or_local_url("https://ttsbot.kenko.land"))
+        self.assertFalse(is_private_or_local_url("https://example.com"))
         self.assertFalse(is_private_or_local_url("https://8.8.8.8:8088"))
         self.assertFalse(is_private_or_local_url(""))
 
@@ -836,11 +836,11 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
 
         # LAN リクエストのシミュレーション
         mock_req_lan = MagicMock()
-        mock_req_lan.headers = {"Host": "192.168.11.245:8088"}
+        mock_req_lan.headers = {"Host": "192.168.1.245:8088"}
         mock_req_lan.scheme = "http"
         server._is_wan_request = MagicMock(return_value=False)
         lan_url = server._get_master_lan_url(mock_req_lan)
-        self.assertEqual(lan_url, "http://192.168.11.245:8088")
+        self.assertEqual(lan_url, "http://192.168.1.245:8088")
 
         # WAN リクエスト時のローカル IP フォールバック
         mock_req_wan = MagicMock()
@@ -856,7 +856,7 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
 
         agent = WorkerAgent.__new__(WorkerAgent)
         agent.node_id = "test_node"
-        agent.local_ip = "192.168.11.200"
+        agent.local_ip = "192.168.1.200"
         agent.specs = {"recommended_max_concurrent": 1, "recommended_priority": 1}
         agent.ram_manager = None
         agent._update_lock = MagicMock()
