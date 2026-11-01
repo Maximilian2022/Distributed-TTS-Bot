@@ -5,7 +5,7 @@
 # ==============================================================================
 
 # --- Stage 1: Builder ---
-FROM python:3.14-slim AS builder
+FROM python:3.15-slim AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt -r requirem
 
 
 # --- Stage 2: Runtime ---
-FROM python:3.14-slim AS runner
+FROM python:3.15-slim AS runner
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
