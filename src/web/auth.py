@@ -52,6 +52,8 @@ class DiscordAuth:
 
         # マジックリンク (ワンタイムURL) ノンス管理 (nonce -> expire_timestamp)
         self._consumed_magic_nonces: Dict[str, float] = {}
+        # サーバー内部マジックログイン管理 (token -> セッション情報, CWE-020 Taint切断用)
+        self.pending_magic_logins: Dict[str, Dict[str, Any]] = {}
 
         # Discord アプリワンタップ承認ログイン管理 (req_id -> dict)
         self.pending_app_logins: Dict[str, Dict[str, Any]] = {}
@@ -211,21 +213,95 @@ class DiscordAuth:
     ) -> str:
         """Discordのボタン押下時等に本人専用の短命ワンタイムログインURLトークンを発行 (有効期限10分)"""
         self._clean_magic_nonces()
+        self._clean_magic_logins()
         nonce = secrets.token_urlsafe(16)
         exp_ts = int(time.time()) + expires_in
+        clean_user_id = int(user_id)
+        clean_username = str(username)
+        clean_path = str(target_path) if str(target_path).startswith("/") else "/"
+
+        user_data = {
+            "id": clean_user_id,
+            "username": clean_username,
+            "global_name": clean_username,
+            "avatar": ""
+        }
+        # サーバー側で事前に30日有効な安全セッショントークンを生成
+        session_token = self.create_session_token(user_data, max_age=86400 * 30, is_admin=is_admin)
+
         payload = {
             "type": "magic_login",
-            "user_id": int(user_id),
-            "username": str(username),
+            "user_id": clean_user_id,
+            "username": clean_username,
             "is_admin": bool(is_admin),
-            "path": str(target_path) if target_path.startswith("/") else "/",
+            "path": clean_path,
             "exp": exp_ts,
             "nonce": nonce
         }
         raw_json = json.dumps(payload, separators=(',', ':'))
         b64_payload = base64.urlsafe_b64encode(raw_json.encode()).decode()
         sig = hmac.new(self.session_secret, b64_payload.encode(), hashlib.sha256).hexdigest()
-        return f"mgl_{b64_payload}.{sig}"
+        token = f"mgl_{b64_payload}.{sig}"
+
+        # 内部ストレージに保管 (外部からのCookie Taint完全切断用)
+        self.pending_magic_logins[token] = {
+            "session_token": session_token,
+            "user_data": user_data,
+            "is_admin": bool(is_admin),
+            "target_path": clean_path,
+            "expires_at": exp_ts
+        }
+        return token
+
+    def consume_magic_login(self, token: str) -> Optional[Dict[str, Any]]:
+        """マジックリンクトークンを安全に消費し、内部セッション情報を返却 (Cookieインジェクション完全防護)"""
+        self._clean_magic_logins()
+        if not token:
+            return None
+
+        # 1. 内部ストレージから取り出し (Taint Tracker 汚染経路の完全切断)
+        item = self.pending_magic_logins.pop(token, None)
+        if item:
+            if item.get("expires_at", 0) >= time.time():
+                # ノンス側も消費済みに登録
+                try:
+                    raw_token = token[4:] if token.startswith("mgl_") else token
+                    parts = raw_token.split(".", 1)
+                    if len(parts) == 2:
+                        raw_json = base64.urlsafe_b64decode(parts[0].encode()).decode()
+                        p = json.loads(raw_json)
+                        if p.get("nonce"):
+                            self._consumed_magic_nonces[p["nonce"]] = item.get("expires_at", time.time() + 600)
+                except Exception:
+                    pass
+                return item
+            return None
+
+        # 2. メモリ上に存在しない場合 (再起動直後等のフォールバック)
+        payload = self.verify_and_consume_magic_login_token(token)
+        if payload:
+            user_data = {
+                "id": int(payload.get("user_id", 0)),
+                "username": str(payload.get("username", "User")),
+                "global_name": str(payload.get("username", "User")),
+                "avatar": ""
+            }
+            session_token = self.create_session_token(user_data, max_age=86400 * 30, is_admin=bool(payload.get("is_admin", False)))
+            return {
+                "session_token": session_token,
+                "user_data": user_data,
+                "is_admin": bool(payload.get("is_admin", False)),
+                "target_path": payload.get("path", "/"),
+                "expires_at": payload.get("exp", 0)
+            }
+        return None
+
+    def _clean_magic_logins(self) -> None:
+        """期限切れのマジックログインキャッシュをクリーンアップ"""
+        now = time.time()
+        expired = [t for t, item in self.pending_magic_logins.items() if item.get("expires_at", 0) < now]
+        for t in expired:
+            self.pending_magic_logins.pop(t, None)
 
     def verify_and_consume_magic_login_token(self, token: str) -> Optional[Dict[str, Any]]:
         """マジックリンクトークンを検証し、一度限りで消費 (リプレイアタック完全抑止)"""

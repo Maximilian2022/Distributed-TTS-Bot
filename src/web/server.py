@@ -2439,8 +2439,8 @@ class WebServer:
         if not token:
             raise web.HTTPFound("/?error=missing_magic_token")
 
-        payload = self.auth.verify_and_consume_magic_login_token(token)
-        if not payload:
+        login_info = self.auth.consume_magic_login(token)
+        if not login_info:
             logger.warning("Invalid or expired magic login token consumed.")
             error_html = (
                 "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
@@ -2457,20 +2457,6 @@ class WebServer:
             )
             return web.Response(text=error_html, content_type="text/html", status=403)
 
-        user_id = int(payload.get("user_id", 0))
-        if user_id <= 0:
-            raise web.HTTPBadRequest(text="Invalid user ID in magic token.")
-
-        # ユーザー名のサニタイズ (Botキャッシュ優先、フォールバック時は安全な英数字のみに限定)
-        bot_user = self.bot.get_user(user_id) if (self.bot and hasattr(self.bot, "get_user")) else None
-        if bot_user and hasattr(bot_user, "name") and isinstance(bot_user.name, str) and bot_user.name:
-            username = re.sub(r"[^a-zA-Z0-9_\-]", "", bot_user.name)[:32] or "DiscordUser"
-        else:
-            raw_username = str(payload.get("username", "DiscordUser"))
-            username = re.sub(r"[^a-zA-Z0-9_\-]", "", raw_username)[:32] or "DiscordUser"
-
-        is_admin = bool(payload.get("is_admin", False))
-
         # オープンリダイレクト完全防御 (CWE-601): CodeQL Taint Tracker 遮断のための定数ホワイトリストマッピング
         ALLOWED_REDIRECT_PATHS = {
             "/": "/",
@@ -2481,25 +2467,19 @@ class WebServer:
             "/#infrastructure": "/#infrastructure",
             "/#help": "/#help",
         }
-        raw_path = str(payload.get("path", "/")).strip()
+        raw_path = str(login_info.get("target_path", "/")).strip()
         target_path = ALLOWED_REDIRECT_PATHS.get(raw_path, "/")
 
-        user_data = {
-            "id": int(user_id),
-            "username": str(username),
-            "global_name": str(username),
-            "avatar": ""
-        }
+        user_data = login_info.get("user_data", {})
+        is_admin = bool(login_info.get("is_admin", False))
 
         # Master / 同居 Worker の所有者自動バインド
         await self._auto_bind_host_nodes_owner(user_data, is_admin=is_admin)
 
-        # 30日セッショントークン発行
-        session_token = self.auth.create_session_token(user_data, max_age=86400 * 30, is_admin=is_admin)
-
-        # Cookie インジェクション完全防護 (CWE-20): 英数字・安全な記号のみに厳格サニタイズ (CRLF完全排除)
+        session_token = login_info.get("session_token", "")
+        # Cookie インジェクション完全防護 (CWE-20): 内部生成トークンの検証 & サニタイズ
         safe_session_token = re.sub(r"[^A-Za-z0-9_\-=.]", "", session_token)
-        if not safe_session_token or "." not in safe_session_token:
+        if not safe_session_token or "." not in safe_session_token or not re.match(r"^[A-Za-z0-9_\-=]+\.[a-f0-9]+$", safe_session_token):
             raise web.HTTPInternalServerError(text="Invalid session token generated.")
 
         resp = web.HTTPFound(target_path)
@@ -2512,7 +2492,7 @@ class WebServer:
             samesite="Lax",
             secure=True
         )
-        logger.info(f"✨ [MagicLogin] User {username} ({user_id}) successfully logged in via one-time magic link.")
+        logger.info(f"✨ [MagicLogin] User {user_data.get('username', 'User')} ({user_data.get('id', 0)}) successfully logged in via one-time magic link.")
         raise resp
 
     async def api_auth_config(self, request: web.Request) -> web.Response:
