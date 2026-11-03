@@ -247,6 +247,27 @@ class TestWebServerAuthHandlers(AioHTTPTestCase):
         self.assertEqual(data["client_id"], "test_id")
         self.assertIn("/callback", data["dynamic_redirect_uri"])
 
+    @unittest_run_loop
+    async def test_magic_login_open_redirect_prevention(self):
+        # 悪意あるオープンリダイレクトURL (//attacker.com, https://...) を遮断し安全な / へ遷移すること
+        malicious_paths = [
+            "https://attacker.example.com",
+            "//attacker.example.com/steal",
+            "/\\attacker.example.com",
+            "javascript:alert(1)"
+        ]
+        for bad_path in malicious_paths:
+            token = self.web_server.auth.create_magic_login_token(
+                user_id=12345,
+                username="TestUser",
+                is_admin=False,
+                target_path=bad_path
+            )
+            resp = await self.client.get(f"/magic?token={token}", allow_redirects=False)
+            self.assertEqual(resp.status, 302)
+            # 外部URLではなく安全なルート / にリダイレクトされること
+            self.assertEqual(resp.headers.get("Location"), "/")
+
 
 if __name__ == "__main__":
     unittest.main()

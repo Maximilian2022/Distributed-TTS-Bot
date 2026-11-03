@@ -8924,3 +8924,22 @@ Docker 公式スキル群（`docker-destructive-guardrails`, `docker-sandboxes-*
      - `/join` コマンド接続完了通知および `/voice` 内のボタンラベルを `Webダッシュボードにログイン` に統一。
 - **検証**:
   - Python構文チェックおよびサンドボックス単体テスト（12 tests）全パス。
+
+## 2026-11-03 09:55 Code Scanning アラート (#98, #99) 対処 ＆ Dependabot PR 互換性検証
+- **背景・目的**:
+  - GitHub Code Scanning (CodeQL) から報告された 2件のセキュリティ警告（`py/url-redirection`, `py/cookie-injection`）の解消。
+  - Dependabot から提示された 2件の PR（#21: Python 3.15-slim, #22: docker/login-action v4）の安全性・互換性精査と対処。
+- **実施内容**:
+  1. **Code Scanning Alert #98 (`py/url-redirection` - CWE-601) 対処**:
+     - `src/web/server.py` の `handle_magic_login` 内にて、リダイレクト先パス `target_path` の厳格なバリデーションを実施。
+     - `urlparse` による `scheme` / `netloc` の空判定、および正規表現 `^/[a-zA-Z0-9_\-\?&=#]*$` 照合を導入し、`//attacker.com` や外部URLによるオープンリダイレクトを完全に排除。
+  2. **Code Scanning Alert #99 (`py/cookie-injection` - CWE-20) 対処**:
+     - `src/web/server.py` の `handle_magic_login` および `api_auth_discord_app_login_status` において、`user_id` を整数キャストし、`username` を Discord Bot キャッシュから優先解決（フォールバック時は安全な英数字のみに限定）。
+     - 生成された `session_token` に対し、Base64URL＋Hex署名形式（`^[A-Za-z0-9_\-=]+\.[a-f0-9]+$`）の厳格な正規表現バリデーションを実施。CRLF（`\r`, `\n`）やセミコロン（`;`）などの制御文字・不正記号混入を遮断し、Cookie Poisoning を完全抑止。
+  3. **単体・回帰テスト**:
+     - `tests/test_auth_improvements.py` にオープンリダイレクト攻撃遮断テスト（`test_magic_login_open_redirect_prevention`）を追加し、全13件の単体テストが完全パス。
+  4. **PR #21 (`python:3.15-slim`) の検証結果**:
+     - 一時コンテナにて Python 3.15-slim での依存関係インストールを実機検証した結果、`zstandard` などの重要ライブラリにおいて Python 3.15 向けの事前コンパイル済み wheel（pre-built binary wheel）が PyPI 未配布であることを特定。
+     - ビルド時に毎回 `gcc` による C 拡張ソースコードコンパイルが必要となりビルド時間の大幅増大およびランタイム環境でのインストール失敗リスクがあるため、現時点では Python 3.14-slim の維持を推奨・PR #21 を保留/クローズ判断。
+  5. **PR #22 (`docker/login-action from 3 to 4`) の検証結果**:
+     - CI チェック通過、破壊的変更なし、GitHub 公式アクションの正常更新であることを確認しマージ対象として承認。

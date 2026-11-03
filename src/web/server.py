@@ -2455,11 +2455,29 @@ class WebServer:
             )
             return web.Response(text=error_html, content_type="text/html", status=403)
 
-        user_id = payload["user_id"]
-        username = payload.get("username", "DiscordUser")
+        user_id = int(payload.get("user_id", 0))
+        if user_id <= 0:
+            raise web.HTTPBadRequest(text="Invalid user ID in magic token.")
+
+        # ユーザー名のサニタイズ (Botキャッシュ優先、フォールバック時は安全な英数字のみに限定)
+        bot_user = self.bot.get_user(user_id) if (self.bot and hasattr(self.bot, "get_user")) else None
+        if bot_user and hasattr(bot_user, "name") and isinstance(bot_user.name, str) and bot_user.name:
+            username = re.sub(r"[^a-zA-Z0-9_\-]", "", bot_user.name)[:32] or "DiscordUser"
+        else:
+            raw_username = str(payload.get("username", "DiscordUser"))
+            username = re.sub(r"[^a-zA-Z0-9_\-]", "", raw_username)[:32] or "DiscordUser"
+
         is_admin = bool(payload.get("is_admin", False))
-        target_path = payload.get("path", "/")
-        if not target_path.startswith("/") or target_path.startswith("//"):
+
+        # オープンリダイレクト完全防御 (CWE-601): 内部相対パスのみに厳格バリデーション
+        raw_path = str(payload.get("path", "/")).strip()
+        parsed = urlparse(raw_path)
+        if not parsed.scheme and not parsed.netloc and raw_path.startswith("/") and not raw_path.startswith(("//", "/\\")):
+            if re.match(r"^/[a-zA-Z0-9_\-\?&=#]*$", raw_path):
+                target_path = raw_path
+            else:
+                target_path = "/"
+        else:
             target_path = "/"
 
         user_data = {
@@ -2474,6 +2492,11 @@ class WebServer:
 
         # 30日セッショントークン発行
         session_token = self.auth.create_session_token(user_data, max_age=86400 * 30, is_admin=is_admin)
+
+        # Cookie インジェクション完全防護 (CWE-20): トークン形式の厳格検証 (Base64URL + hex hash)
+        if not re.match(r"^[A-Za-z0-9_\-=]+\.[a-f0-9]+$", session_token):
+            raise web.HTTPInternalServerError(text="Invalid session token format generated.")
+
         resp = web.HTTPFound(target_path)
         resp.set_cookie(
             "ttsbot_session",
@@ -2662,18 +2685,20 @@ class WebServer:
 
         if info.get("status") == "approved" and info.get("session_token"):
             token = info["session_token"]
-            resp.set_cookie(
-                "ttsbot_session",
-                token,
-                max_age=86400 * 30,
-                path="/",
-                httponly=True,
-                samesite="Lax",
-                secure=True
-            )
-            user_data = self.auth.verify_session_token(token)
-            if user_data:
-                safe_create_task(self._auto_bind_host_nodes_owner(user_data, is_admin=bool(user_data.get("is_admin", False))))
+            # Cookie インジェクション完全防護 (CWE-20): トークン形式検証
+            if re.match(r"^[A-Za-z0-9_\-=]+\.[a-f0-9]+$", token):
+                resp.set_cookie(
+                    "ttsbot_session",
+                    token,
+                    max_age=86400 * 30,
+                    path="/",
+                    httponly=True,
+                    samesite="Lax",
+                    secure=True
+                )
+                user_data = self.auth.verify_session_token(token)
+                if user_data:
+                    safe_create_task(self._auto_bind_host_nodes_owner(user_data, is_admin=bool(user_data.get("is_admin", False))))
 
         return resp
 
