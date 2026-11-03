@@ -1,6 +1,31 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-11-03] GitHub PR (#21, #22) 対処 & CodeQL セキュリティアラート (#98, #99) 解消 (v2026.11.03-1005)
+
+- **ユーザー要求**:
+  - GitHub 上に届いている PR（プルリクエスト）と Code Scanning（CodeQL）アラートの内容を確認し、適切に対処する。
+  - PR #21 (python 3.15-slim へのベースイメージ更新) は、wheel 提供状況等で時期尚早ならクローズする。
+  - Code Scanning の脆弱性警告（Alert #98: `py/url-redirection`, Alert #99: `py/cookie-injection`）を完全解消し、セキュアにする。
+  - 公開 OSS リポジトリとして開発環境の特定情報（実IP、実ドメイン、実トークン、個人ID等）の混入を絶対に防ぐ。
+
+- **対応内容 & 調査結果**:
+  1. **PR #22 のマージ完了**:
+     - `build(deps): bump docker/login-action from 3 to 4` (`.github/workflows/docker-publish.yml`)
+     - CI Checks 通過を確認後、`gh pr merge 22 --squash --delete-branch` でマージ完了。
+  2. **PR #21 の検証およびクローズ完了**:
+     - `build(deps): bump python from 3.14-slim to 3.15-slim` (`Dockerfile`)
+     - サンドボックス検証環境でビルド・テストを実行したところ、`zstandard` 等の重要 C 拡張ライブラリの pre-built binary wheel が Python 3.15 向けに PyPI 未提供であり、gcc コンパイル失敗による環境破綻を特定。
+     - `@dependabot ignore this minor version` コメントを送信し、`gh pr close 21 --delete-branch` でクローズ完了。
+  3. **CodeQL Alert #98 (`py/url-redirection` - CWE-601) 完全解消**:
+     - `handle_magic_login` において、静的データフロー解析（Taint Tracker）の汚染を完全に切断するため、サーバー側定義のホワイトリスト辞書マッピング `ALLOWED_REDIRECT_PATHS = {"/": "/", ...}` を導入。
+     - 外部入力由来の相対パスであっても辞書引きによってサーバー定義の定数文字列へとマッピングされ、外部へのオープンリダイレクトを完全に遮断。
+  4. **CodeQL Alert #99 (`py/cookie-injection` - CWE-020) 完全解消**:
+     - `handle_magic_login`, `api_auth_discord_app_login_status`, およびスライディングセッション処理において、外部入力由来のトークンおよびユーザー属性を厳格サニタイズ。
+     - `user_id` の `int` キャスト、ユーザー名の安全化、および `safe_session_token = re.sub(r"[^A-Za-z0-9_\-=.]", "", session_token)` による英数字・安全記号のみの抽出により、Cookie Poisoning (CRLF インジェクションやセミコロン挿入) を完全に防護。
+  5. **テスト検証**:
+     - `tests/test_auth_improvements.py` を含め、一時 Docker サンドボックス上で単体テスト・全テストスイートを実行し、100% PASS を確認。
+
 ## [2026-11-01] HA ゼロ設定待機系 (Zero-Config Standby) 実装 & クレデンシャル暗号化同期パイプライン (v2026.11.01-1900)
 
 - **ユーザーフィードバック & 課題**:
