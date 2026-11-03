@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import hmac
@@ -212,12 +213,10 @@ class DiscordAuth:
         expires_in: int = 600
     ) -> str:
         """Discordのボタン押下時等に本人専用の短命ワンタイムログインURLトークンを発行 (有効期限10分)"""
-        self._clean_magic_nonces()
         self._clean_magic_logins()
-        nonce = secrets.token_urlsafe(16)
-        exp_ts = int(time.time()) + expires_in
+        exp_ts = time.time() + expires_in
         clean_user_id = int(user_id)
-        clean_username = str(username)
+        clean_username = re.sub(r"[^a-zA-Z0-9_\-]", "", str(username))[:32] or f"User_{clean_user_id}"
         clean_path = str(target_path) if str(target_path).startswith("/") else "/"
 
         user_data = {
@@ -229,19 +228,8 @@ class DiscordAuth:
         # サーバー側で事前に30日有効な安全セッショントークンを生成
         session_token = self.create_session_token(user_data, max_age=86400 * 30, is_admin=is_admin)
 
-        payload = {
-            "type": "magic_login",
-            "user_id": clean_user_id,
-            "username": clean_username,
-            "is_admin": bool(is_admin),
-            "path": clean_path,
-            "exp": exp_ts,
-            "nonce": nonce
-        }
-        raw_json = json.dumps(payload, separators=(',', ':'))
-        b64_payload = base64.urlsafe_b64encode(raw_json.encode()).decode()
-        sig = hmac.new(self.session_secret, b64_payload.encode(), hashlib.sha256).hexdigest()
-        token = f"mgl_{b64_payload}.{sig}"
+        # ランダムワンタイムトークン (Reference Token: URLからユーザー情報・署名を完全分離)
+        token = f"mgl_{secrets.token_urlsafe(32)}"
 
         # 内部ストレージに保管 (外部からのCookie Taint完全切断用)
         self.pending_magic_logins[token] = {
@@ -259,41 +247,10 @@ class DiscordAuth:
         if not token:
             return None
 
-        # 1. 内部ストレージから取り出し (Taint Tracker 汚染経路の完全切断)
+        # 内部ストレージから単一消費で引き換え (Taint Tracker 汚染経路の完全切断)
         item = self.pending_magic_logins.pop(token, None)
-        if item:
-            if item.get("expires_at", 0) >= time.time():
-                # ノンス側も消費済みに登録
-                try:
-                    raw_token = token[4:] if token.startswith("mgl_") else token
-                    parts = raw_token.split(".", 1)
-                    if len(parts) == 2:
-                        raw_json = base64.urlsafe_b64decode(parts[0].encode()).decode()
-                        p = json.loads(raw_json)
-                        if p.get("nonce"):
-                            self._consumed_magic_nonces[p["nonce"]] = item.get("expires_at", time.time() + 600)
-                except Exception:
-                    pass
-                return item
-            return None
-
-        # 2. メモリ上に存在しない場合 (再起動直後等のフォールバック)
-        payload = self.verify_and_consume_magic_login_token(token)
-        if payload:
-            user_data = {
-                "id": int(payload.get("user_id", 0)),
-                "username": str(payload.get("username", "User")),
-                "global_name": str(payload.get("username", "User")),
-                "avatar": ""
-            }
-            session_token = self.create_session_token(user_data, max_age=86400 * 30, is_admin=bool(payload.get("is_admin", False)))
-            return {
-                "session_token": session_token,
-                "user_data": user_data,
-                "is_admin": bool(payload.get("is_admin", False)),
-                "target_path": payload.get("path", "/"),
-                "expires_at": payload.get("exp", 0)
-            }
+        if item and item.get("expires_at", 0) >= time.time():
+            return item
         return None
 
     def _clean_magic_logins(self) -> None:

@@ -54,7 +54,7 @@ class TestAuthImprovements(unittest.TestCase):
         self.assertLessEqual(verified["exp"], now + 86400 * 30 + 10)
 
     # ---------------------------------------------------------
-    # 2. 【A案】本人専用ワンタイム・マジックリンク
+    # 2. 【A案】本人専用ワンタイム・マジックリンク (安全参照トークン)
     # ---------------------------------------------------------
     def test_magic_login_token_lifecycle(self):
         user_id = 987654321
@@ -69,40 +69,32 @@ class TestAuthImprovements(unittest.TestCase):
         self.assertTrue(token.startswith("mgl_"))
 
         # 初回消費: 成功
-        payload = self.auth.verify_and_consume_magic_login_token(token)
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload["user_id"], user_id)
-        self.assertEqual(payload["username"], username)
-        self.assertTrue(payload["is_admin"])
+        info = self.auth.consume_magic_login(token)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["user_data"]["id"], user_id)
+        self.assertEqual(info["user_data"]["username"], username)
+        self.assertTrue(info["is_admin"])
+        self.assertIsNotNone(info["session_token"])
 
         # 2回目消費: 単一消費済みのため失敗
-        consumed = self.auth.verify_and_consume_magic_login_token(token)
+        consumed = self.auth.consume_magic_login(token)
         self.assertIsNone(consumed)
 
-    def test_magic_login_token_tampered(self):
-        token = self.auth.create_magic_login_token(user_id=111, username="Bob")
-        parts = token.split(".")
-        # 署名を改ざん
-        tampered_token = parts[0] + ".tampered_signature"
-        self.assertIsNone(self.auth.verify_and_consume_magic_login_token(tampered_token))
+    def test_magic_login_token_invalid(self):
+        # 不正なトークンは消費不可
+        self.assertIsNone(self.auth.consume_magic_login("mgl_invalid_fake_token"))
 
     def test_magic_login_token_expired(self):
-        # 過去の期限で手動作成
-        payload = {
-            "type": "magic_login",
-            "user_id": 222,
-            "username": "Charlie",
+        # 過去の期限で登録
+        expired_token = "mgl_expired_token_test"
+        self.auth.pending_magic_logins[expired_token] = {
+            "session_token": "dummy",
+            "user_data": {"id": 222, "username": "Charlie"},
             "is_admin": False,
-            "path": "/",
-            "exp": int(time.time()) - 100,
-            "nonce": "test_expired_nonce"
+            "target_path": "/",
+            "expires_at": time.time() - 10
         }
-        raw_json = json.dumps(payload, separators=(',', ':'))
-        b64_payload = base64.urlsafe_b64encode(raw_json.encode()).decode()
-        sig = hmac.new(self.auth.session_secret, b64_payload.encode(), hashlib.sha256).hexdigest()
-        expired_token = f"mgl_{b64_payload}.{sig}"
-
-        self.assertIsNone(self.auth.verify_and_consume_magic_login_token(expired_token))
+        self.assertIsNone(self.auth.consume_magic_login(expired_token))
 
     # ---------------------------------------------------------
     # 3. 【B案】Discordアプリ ワンタップ承認ログイン (番号確認付き)
