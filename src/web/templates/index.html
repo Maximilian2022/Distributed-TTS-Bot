@@ -297,17 +297,23 @@
             </div>
 
             <div class="card">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-                <h3 style="font-size:15px;">登録済み単語一覧 (<span id="dict-count">0件</span>)</h3>
-                <input type="text" id="dict-search-input" class="form-input" style="width:220px;" placeholder="単語または読みで検索..." oninput="filterDictionary()">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                <h3 style="font-size:15px;margin:0;">登録済み単語一覧 (<span id="dict-count">0件</span>)</h3>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <button type="button" id="dict-batch-delete-btn" class="btn btn-danger btn-sm" style="display:none;align-items:center;gap:4px;" onclick="deleteSelectedDictWords()">🗑️ 選択した 0件を削除</button>
+                  <input type="text" id="dict-search-input" class="form-input" style="width:220px;" placeholder="単語または読みで検索..." oninput="filterDictionary()">
+                </div>
               </div>
 
               <div class="dict-table-container">
                 <table class="table">
                   <thead>
                     <tr>
-                      <th style="width:40%;">単語</th>
-                      <th style="width:40%;">読み方</th>
+                      <th style="width:36px;text-align:center;">
+                        <input type="checkbox" id="dict-select-all" onchange="toggleSelectAllDictWords(this.checked)" style="cursor:pointer;" title="表示中の単語をすべて選択/解除">
+                      </th>
+                      <th style="width:38%;">単語</th>
+                      <th style="width:38%;">読み方</th>
                       <th style="width:20%;text-align:right;">操作</th>
                     </tr>
                   </thead>
@@ -339,16 +345,22 @@
             </div>
 
             <div class="card">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-                <h3 style="font-size:15px;">登録済みNGワード一覧 (<span id="ng-count">0件</span>)</h3>
-                <input type="text" id="ng-search-input" class="form-input" style="width:220px;" placeholder="NGワードで検索..." oninput="filterNgWords()">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px;">
+                <h3 style="font-size:15px;margin:0;">登録済みNGワード一覧 (<span id="ng-count">0件</span>)</h3>
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <button type="button" id="ng-batch-delete-btn" class="btn btn-danger btn-sm" style="display:none;align-items:center;gap:4px;" onclick="deleteSelectedNgWords()">🗑️ 選択した 0件を削除</button>
+                  <input type="text" id="ng-search-input" class="form-input" style="width:220px;" placeholder="NGワードで検索..." oninput="filterNgWords()">
+                </div>
               </div>
 
               <div class="dict-table-container">
                 <table class="table">
                   <thead>
                     <tr>
-                      <th style="width:70%;">NGワード</th>
+                      <th style="width:36px;text-align:center;">
+                        <input type="checkbox" id="ng-select-all" onchange="toggleSelectAllNgWords(this.checked)" style="cursor:pointer;" title="表示中のNGワードをすべて選択/解除">
+                      </th>
+                      <th style="width:65%;">NGワード</th>
                       <th style="width:30%;text-align:right;">操作</th>
                     </tr>
                   </thead>

@@ -571,9 +571,11 @@ class WebServer:
         self.app.router.add_get("/api/dict", self.api_get_dict)
         self.app.router.add_post("/api/dict", self.api_add_dict)
         self.app.router.add_put("/api/dict", self.api_update_dict)
+        self.app.router.add_post("/api/dict/delete_batch", self.api_delete_dict_batch)
         self.app.router.add_delete("/api/dict/{word}", self.api_delete_dict)
         self.app.router.add_get("/api/ng", self.api_get_ng)
         self.app.router.add_post("/api/ng", self.api_add_ng)
+        self.app.router.add_post("/api/ng/delete_batch", self.api_delete_ng_batch)
         self.app.router.add_delete("/api/ng/{word}", self.api_delete_ng)
         self.app.router.add_post("/api/ng/import_preset", self.api_import_ng_preset)
         self.app.router.add_post("/api/dict/import_users", self.api_import_users)
@@ -3038,6 +3040,31 @@ class WebServer:
             return web.json_response({"success": True, "purged_cache_count": purged})
         return web.json_response({"error": "Word not found"}, status=404)
 
+    async def api_delete_dict_batch(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to delete dictionary words."
+            }, status=403)
+
+        words = data.get("words") or []
+        if not isinstance(words, list) or not words:
+            return web.json_response({"error": "words list is required"}, status=400)
+
+        clean_words = [w.strip() for w in words if isinstance(w, str) and w.strip()]
+        if not clean_words:
+            return web.json_response({"error": "Valid words are required"}, status=400)
+
+        deleted_count = await self.db.delete_dictionary_words_batch(guild.id, clean_words)
+        purged = await self.cache_manager.purge_by_words(clean_words) if deleted_count > 0 else 0
+        return web.json_response({
+            "success": True,
+            "deleted_count": deleted_count,
+            "purged_cache_count": purged
+        })
+
     async def api_update_dict(self, request: web.Request) -> web.Response:
         data = await request.json()
         guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
@@ -3094,6 +3121,26 @@ class WebServer:
             purged = await self.cache_manager.purge_by_word(word)
             return web.json_response({"success": True, "purged_cache_count": purged})
         return web.json_response({"error": "Word not found"}, status=404)
+
+    async def api_delete_ng_batch(self, request: web.Request) -> web.Response:
+        data = await request.json()
+        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+
+        words = data.get("words") or []
+        if not isinstance(words, list) or not words:
+            return web.json_response({"error": "words list is required"}, status=400)
+
+        clean_words = [w.strip() for w in words if isinstance(w, str) and w.strip()]
+        if not clean_words:
+            return web.json_response({"error": "Valid words are required"}, status=400)
+
+        deleted_count = await self.db.delete_ng_words_batch(guild.id, clean_words)
+        purged = await self.cache_manager.purge_by_words(clean_words) if deleted_count > 0 else 0
+        return web.json_response({
+            "success": True,
+            "deleted_count": deleted_count,
+            "purged_cache_count": purged
+        })
 
     async def api_import_ng_preset(self, request: web.Request) -> web.Response:
         data = await request.json()

@@ -313,6 +313,8 @@ async function switchGuild(guildId) {
   updatePermissionsUI();
 
   // サーバー別データの読み込み
+  if (typeof selectedDictWords !== "undefined") selectedDictWords.clear();
+  if (typeof selectedNgWords !== "undefined") selectedNgWords.clear();
   loadDictionary(currentGuildId);
   loadNgWords(currentGuildId);
   loadUserProfile(currentGuildId);
@@ -1062,6 +1064,7 @@ async function testPreviewAudio() {
 
 let allNgWords = [];
 let currentFilteredNgWords = [];
+let selectedNgWords = new Set();
 
 async function loadNgWords(guildId) {
   if (!guildId) return;
@@ -1069,6 +1072,10 @@ async function loadNgWords(guildId) {
     const res = await fetch(`/api/ng?guild_id=${guildId}`);
     const data = await res.json();
     allNgWords = data.ng_words || [];
+    const validSet = new Set(allNgWords);
+    selectedNgWords.forEach(w => {
+      if (!validSet.has(w)) selectedNgWords.delete(w);
+    });
     filterNgWords();
   } catch (e) {
     console.error("Failed to load NG words:", e);
@@ -1088,26 +1095,130 @@ function filterNgWords() {
 function renderNgTable(words) {
   const tbody = document.getElementById("ng-table-body");
   const countSpan = document.getElementById("ng-count");
+  const selectAllEl = document.getElementById("ng-select-all");
   if (!tbody) return;
 
   if (countSpan) countSpan.textContent = `${words.length}件`;
   tbody.innerHTML = "";
+  updateNgBatchDeleteBtn();
 
   if (words.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="2" style="text-align:center;color:var(--text-muted);padding:24px;">登録されているNGワードはありません</td></tr>`;
+    if (selectAllEl) selectAllEl.checked = false;
+    tbody.innerHTML = `<tr><td colspan="3" style="text-align:center;color:var(--text-muted);padding:24px;">登録されているNGワードはありません</td></tr>`;
     return;
   }
 
+  let allSelected = true;
   words.forEach(word => {
+    const isChecked = selectedNgWords.has(word);
+    if (!isChecked) allSelected = false;
+    const encodedWord = encodeURIComponent(word);
+
     const tr = document.createElement("tr");
+    if (isChecked) tr.style.background = "rgba(237, 66, 69, 0.08)";
     tr.innerHTML = `
+      <td style="text-align:center;">
+        <input type="checkbox" class="ng-word-checkbox" data-word="${encodedWord}" ${isChecked ? "checked" : ""} onchange="onNgWordSelectChange(this)" style="cursor:pointer;">
+      </td>
       <td style="font-weight:600;color:#ff4757;">🚫 ${escapeHtml(word)}</td>
       <td style="text-align:right;white-space:nowrap;">
-        <button type="button" class="btn btn-danger btn-sm" onclick="deleteNgWord('${encodeURIComponent(word)}')">削除</button>
+        <button type="button" class="btn btn-danger btn-sm" onclick="deleteNgWord('${encodedWord}')">削除</button>
       </td>
     `;
     tbody.appendChild(tr);
   });
+
+  if (selectAllEl) {
+    selectAllEl.checked = words.length > 0 && allSelected;
+  }
+}
+
+function onNgWordSelectChange(cb) {
+  const encodedWord = cb.getAttribute("data-word") || "";
+  if (!encodedWord) return;
+  const word = decodeURIComponent(encodedWord);
+  if (cb.checked) {
+    selectedNgWords.add(word);
+    if (cb.closest("tr")) cb.closest("tr").style.background = "rgba(237, 66, 69, 0.08)";
+  } else {
+    selectedNgWords.delete(word);
+    if (cb.closest("tr")) cb.closest("tr").style.background = "";
+  }
+  updateNgBatchDeleteBtn();
+
+  const selectAllEl = document.getElementById("ng-select-all");
+  if (selectAllEl) {
+    const allChecked = currentFilteredNgWords.length > 0 && currentFilteredNgWords.every(w => selectedNgWords.has(w));
+    selectAllEl.checked = allChecked;
+  }
+}
+
+function toggleSelectAllNgWords(checked) {
+  currentFilteredNgWords.forEach(word => {
+    if (checked) {
+      selectedNgWords.add(word);
+    } else {
+      selectedNgWords.delete(word);
+    }
+  });
+  renderNgTable(currentFilteredNgWords);
+}
+
+function updateNgBatchDeleteBtn() {
+  const btn = document.getElementById("ng-batch-delete-btn");
+  if (!btn) return;
+  const count = selectedNgWords.size;
+  if (count > 0) {
+    btn.style.display = "inline-flex";
+    btn.textContent = `🗑️ 選択した ${count}件を削除`;
+  } else {
+    btn.style.display = "none";
+  }
+}
+
+async function deleteSelectedNgWords() {
+  const count = selectedNgWords.size;
+  if (count === 0 || !currentGuildId) return;
+  const targetWords = Array.from(selectedNgWords);
+  const previewList = targetWords.slice(0, 5).map(w => `・${w}`).join("\n") + (count > 5 ? `\n...他 ${count - 5}件` : "");
+  if (!confirm(`選択した ${count} 件のNGワードを一括削除しますか？\n\n${previewList}`)) return;
+
+  try {
+    const res = await fetch("/api/ng/delete_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ guild_id: currentGuildId, words: targetWords })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      selectedNgWords.clear();
+      updateNgBatchDeleteBtn();
+      showToast(`NGワード ${data.deleted_count ?? count} 件を一括削除しました`, "success");
+      await loadNgWords(currentGuildId);
+      return;
+    }
+
+    // 万一バックエンド一括APIが未反映の場合の個別削除フォールバック
+    if (res.status === 404 || res.status === 405) {
+      let deleted = 0;
+      for (const w of targetWords) {
+        const r = await fetch(`/api/ng/${encodeURIComponent(w)}?guild_id=${currentGuildId}`, { method: "DELETE" });
+        if (r.ok) deleted++;
+      }
+      selectedNgWords.clear();
+      updateNgBatchDeleteBtn();
+      showToast(`NGワード ${deleted} 件を一括削除しました`, "success");
+      await loadNgWords(currentGuildId);
+      return;
+    }
+
+    const err = await res.json().catch(() => ({}));
+    showToast(err.error || "NGワードの一括削除に失敗しました", "error");
+  } catch (err) {
+    console.error("Failed to batch delete NG words:", err);
+    showToast("通信エラーが発生しました", "error");
+  }
 }
 
 async function addNgWord(e) {
@@ -1187,6 +1298,7 @@ async function importDefaultNgWords() {
 let allDictWords = [];
 let currentFilteredWords = [];
 let currentlyEditingWord = null;
+let selectedDictWords = new Set();
 
 async function loadDictionary(guildId) {
   if (!guildId) return;
@@ -1194,6 +1306,10 @@ async function loadDictionary(guildId) {
     const res = await fetch(`/api/dict?guild_id=${guildId}`);
     const data = await res.json();
     allDictWords = data.dictionary || [];
+    const validSet = new Set(allDictWords.map(item => item.word));
+    selectedDictWords.forEach(w => {
+      if (!validSet.has(w)) selectedDictWords.delete(w);
+    });
     currentlyEditingWord = null;
     applyDictFilter();
     // AI提案単語も並行してロード
@@ -1399,23 +1515,35 @@ async function playDictWordPreview(encodedReading, btn) {
 function renderDictionaryTable(words) {
   const tbody = document.getElementById("dict-table-body");
   const countSpan = document.getElementById("dict-count");
+  const selectAllEl = document.getElementById("dict-select-all");
   if (!tbody) return;
 
   if (countSpan) countSpan.textContent = `${words.length}件`;
   tbody.innerHTML = "";
+  updateDictBatchDeleteBtn();
 
   if (words.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="3" style="text-align:center;color:var(--text-muted);padding:24px;">登録されている単語はありません</td></tr>`;
+    if (selectAllEl) selectAllEl.checked = false;
+    tbody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--text-muted);padding:24px;">登録されている単語はありません</td></tr>`;
     return;
   }
 
+  let allSelected = true;
   words.forEach((item, idx) => {
+    const isChecked = selectedDictWords.has(item.word);
+    if (!isChecked) allSelected = false;
+    const encodedWord = encodeURIComponent(item.word);
+
     const tr = document.createElement("tr");
     tr.id = `dict-row-${idx}`;
+    if (isChecked) tr.style.background = "rgba(237, 66, 69, 0.08)";
 
     if (currentlyEditingWord !== null && currentlyEditingWord === item.word) {
       // 編集モード
       tr.innerHTML = `
+        <td style="text-align:center;padding:6px 12px;">
+          <input type="checkbox" class="dict-word-checkbox" data-word="${encodedWord}" ${isChecked ? "checked" : ""} onchange="onDictWordSelectChange(this)" style="cursor:pointer;">
+        </td>
         <td style="padding:6px 12px;">
           <input type="text" id="edit-word-input" class="form-input" style="padding:6px 10px;font-size:13px;width:100%;font-weight:600;" value="${escapeHtml(item.word)}" placeholder="単語" required>
         </td>
@@ -1431,17 +1559,24 @@ function renderDictionaryTable(words) {
     } else {
       // 通常表示
       tr.innerHTML = `
+        <td style="text-align:center;">
+          <input type="checkbox" class="dict-word-checkbox" data-word="${encodedWord}" ${isChecked ? "checked" : ""} onchange="onDictWordSelectChange(this)" style="cursor:pointer;">
+        </td>
         <td style="font-weight:600;">${escapeHtml(item.word)}</td>
         <td>${escapeHtml(item.reading)}</td>
         <td style="text-align:right;white-space:nowrap;">
           <button type="button" class="btn btn-secondary btn-sm" onclick="playDictWordPreview('${encodeURIComponent(item.reading)}', this)" title="読み方を試聴" style="margin-right:6px;">🔊 試聴</button>
           <button type="button" class="btn btn-secondary btn-sm" onclick="startEditDictWord(${idx})" style="margin-right:6px;">編集</button>
-          <button type="button" class="btn btn-danger btn-sm" onclick="deleteDictWord('${encodeURIComponent(item.word)}')">削除</button>
+          <button type="button" class="btn btn-danger btn-sm" onclick="deleteDictWord('${encodedWord}')">削除</button>
         </td>
       `;
     }
     tbody.appendChild(tr);
   });
+
+  if (selectAllEl) {
+    selectAllEl.checked = words.length > 0 && allSelected;
+  }
 
   // 編集モードの場合、入力欄へのフォーカスとキーバインド設定
   if (currentlyEditingWord !== null) {
@@ -1465,6 +1600,94 @@ function renderDictionaryTable(words) {
     if (readInp) {
       readInp.addEventListener("keydown", onKey);
     }
+  }
+}
+
+function onDictWordSelectChange(cb) {
+  const encodedWord = cb.getAttribute("data-word") || "";
+  if (!encodedWord) return;
+  const word = decodeURIComponent(encodedWord);
+  if (cb.checked) {
+    selectedDictWords.add(word);
+    if (cb.closest("tr")) cb.closest("tr").style.background = "rgba(237, 66, 69, 0.08)";
+  } else {
+    selectedDictWords.delete(word);
+    if (cb.closest("tr")) cb.closest("tr").style.background = "";
+  }
+  updateDictBatchDeleteBtn();
+
+  const selectAllEl = document.getElementById("dict-select-all");
+  if (selectAllEl) {
+    const allChecked = currentFilteredWords.length > 0 && currentFilteredWords.every(item => selectedDictWords.has(item.word));
+    selectAllEl.checked = allChecked;
+  }
+}
+
+function toggleSelectAllDictWords(checked) {
+  currentFilteredWords.forEach(item => {
+    if (checked) {
+      selectedDictWords.add(item.word);
+    } else {
+      selectedDictWords.delete(item.word);
+    }
+  });
+  renderDictionaryTable(currentFilteredWords);
+}
+
+function updateDictBatchDeleteBtn() {
+  const btn = document.getElementById("dict-batch-delete-btn");
+  if (!btn) return;
+  const count = selectedDictWords.size;
+  if (count > 0) {
+    btn.style.display = "inline-flex";
+    btn.textContent = `🗑️ 選択した ${count}件を削除`;
+  } else {
+    btn.style.display = "none";
+  }
+}
+
+async function deleteSelectedDictWords() {
+  const count = selectedDictWords.size;
+  if (count === 0 || !currentGuildId) return;
+  const targetWords = Array.from(selectedDictWords);
+  const previewList = targetWords.slice(0, 5).map(w => `・${w}`).join("\n") + (count > 5 ? `\n...他 ${count - 5}件` : "");
+  if (!confirm(`選択した ${count} 件の単語を辞書から一括削除しますか？\n\n${previewList}`)) return;
+
+  try {
+    const res = await fetch("/api/dict/delete_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ guild_id: currentGuildId, words: targetWords })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      selectedDictWords.clear();
+      updateDictBatchDeleteBtn();
+      showToast(`単語 ${data.deleted_count ?? count} 件を一括削除しました（キャッシュ${data.purged_cache_count ?? 0}件パージ）`, "success");
+      await loadDictionary(currentGuildId);
+      return;
+    }
+
+    // 万一バックエンド一括APIが未反映の場合の個別削除フォールバック
+    if (res.status === 404 || res.status === 405) {
+      let deleted = 0;
+      for (const w of targetWords) {
+        const r = await fetch(`/api/dict/${encodeURIComponent(w)}?guild_id=${currentGuildId}`, { method: "DELETE" });
+        if (r.ok) deleted++;
+      }
+      selectedDictWords.clear();
+      updateDictBatchDeleteBtn();
+      showToast(`単語 ${deleted} 件を一括削除しました`, "success");
+      await loadDictionary(currentGuildId);
+      return;
+    }
+
+    const err = await res.json().catch(() => ({}));
+    showToast(err.error || "単語の一括削除に失敗しました", "error");
+  } catch (err) {
+    console.error("Failed to batch delete dictionary words:", err);
+    showToast("削除中にエラーが発生しました", "error");
   }
 }
 
@@ -3967,33 +4190,51 @@ function renderSystemMetricsUI(data) {
     botMemEl.textContent = `Bot: ${botMb != null ? Math.round(botMb) + " MB" : "-- MB"}`;
   }
 
-  // 5. グラフ描画 (ホスト全体 & Bot本体)
-  renderHostBotCpuChart(history);
-  renderHostBotMemoryChart(history);
-
-  // 6. 分散コンピュートワーカーカード内の直近推移スパークライン描画
-  renderAllWorkerSparklines();
-
-  // 7. 発話〜再生レイテンシ モニター描画
+  // 5. 発話〜再生レイテンシ モニター描画 (Canvas描画エラーの影響を受けないよう最優先で実行)
   if (data.latency) {
-    renderLatencyMonitorUI(data.latency, data.profiler);
+    try {
+      renderLatencyMonitorUI(data.latency, data.profiler);
+    } catch (e) {
+      console.error("Failed to render latency monitor UI:", e);
+    }
+  }
+
+  // 6. グラフ描画 (ホスト全体 & Bot本体)
+  try {
+    renderHostBotCpuChart(history);
+    renderHostBotMemoryChart(history);
+  } catch (e) {
+    console.warn("Skipped host/bot chart render:", e);
+  }
+
+  // 7. 分散コンピュートワーカーカード内の直近推移スパークライン描画
+  try {
+    renderAllWorkerSparklines();
+  } catch (e) {
+    console.warn("Skipped worker sparklines render:", e);
   }
 }
 
 // 分散コンピュートワーカー向け直近負荷推移スパークライン描画
 function renderWorkerSparkline(canvasId, history, hasGpu) {
   const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
+  if (!canvas || typeof canvas.getContext !== "function") return;
 
   const rect = canvas.getBoundingClientRect();
+  const parentW = canvas.parentElement ? canvas.parentElement.clientWidth : 0;
+  // 非表示タブ内などでサイズが0の場合は描画をスキップ
+  if (rect.width === 0 && rect.height === 0 && parentW === 0) return;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
   const dpr = window.devicePixelRatio || 1;
-  const width = rect.width || canvas.parentElement.clientWidth || 240;
+  const width = rect.width || parentW || 240;
   const height = rect.height || 52;
 
   canvas.width = width * dpr;
   canvas.height = height * dpr;
 
-  const ctx = canvas.getContext("2d");
   ctx.save();
   ctx.scale(dpr, dpr);
 
@@ -4353,7 +4594,11 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
   const valSynth = document.getElementById("lat-val-synth");
   if (valSynth) {
     if (summary.total_count > 0) {
-      valSynth.textContent = `${initialSynthMs.toFixed(1)} ms`;
+      if (initialSynthMs < 5.0 && totalSynthMs > initialSynthMs) {
+        valSynth.textContent = `${initialSynthMs.toFixed(1)} ms (総計 ${Math.round(totalSynthMs)}ms)`;
+      } else {
+        valSynth.textContent = `${initialSynthMs.toFixed(1)} ms`;
+      }
       valSynth.title = `初動推論: ${initialSynthMs.toFixed(1)}ms / 全文総推論: ${totalSynthMs.toFixed(1)}ms / 非キャッシュ実測: ${activeSynthMs.toFixed(1)}ms`;
     } else {
       valSynth.textContent = "-- ms";
@@ -4370,7 +4615,7 @@ function renderLatencyMonitorUI(latencyData, profilerData) {
   // 4. ワーカー別 推論速度サマリー
   const workerContainer = document.getElementById("latency-worker-summary-cards");
   if (workerContainer) {
-    const workerEntries = Object.entries(workerStats);
+    const workerEntries = Object.entries(workerStats).filter(([, st]) => st && st.count > 0);
     if (workerEntries.length === 0) {
       workerContainer.innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px;">計測データ待機中...</div>';
     } else {
@@ -4895,19 +5140,24 @@ function renderWorkerMemoryChart(history) {
 
 function renderLineChart(canvasId, history, options) {
   const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
+  if (!canvas || typeof canvas.getContext !== "function") return;
 
   const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
   const parentW = canvas.parentElement ? canvas.parentElement.clientWidth : 0;
-  const width = (rect.width > 30) ? rect.width : (parentW > 30 ? parentW : 360);
   const parentH = canvas.parentElement ? canvas.parentElement.clientHeight : 0;
+  // 非表示タブ内などでサイズが0の場合は描画をスキップ
+  if (rect.width === 0 && rect.height === 0 && parentW === 0 && parentH === 0) return;
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const width = (rect.width > 30) ? rect.width : (parentW > 30 ? parentW : 360);
   const height = (rect.height > 30) ? rect.height : (parentH > 30 ? parentH : 180);
 
   canvas.width = width * dpr;
   canvas.height = height * dpr;
 
-  const ctx = canvas.getContext("2d");
   ctx.save();
   ctx.scale(dpr, dpr);
 

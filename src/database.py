@@ -1418,6 +1418,28 @@ class Database:
             logger.info(f"Deleted dictionary word '{word}' from guild {guild_id}")
         return deleted
 
+    async def delete_dictionary_words_batch(self, guild_id: int, words: List[str]) -> int:
+        """指定ギルドの単語辞書から複数単語を一括削除"""
+        clean_words = [w.strip() for w in words if isinstance(w, str) and w.strip()]
+        if not clean_words:
+            return 0
+        deleted_total = 0
+        async with self.get_connection() as db:
+            # SQLite parameter limit safety (chunk by 500)
+            for i in range(0, len(clean_words), 500):
+                chunk = clean_words[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = await db.execute(
+                    f"DELETE FROM guild_dictionary WHERE (guild_id = ? OR guild_id = 0) AND word IN ({placeholders})",
+                    [guild_id] + chunk
+                )
+                deleted_total += max(0, cursor.rowcount)
+            await db.commit()
+        if deleted_total > 0:
+            self.invalidate_guild_cache(guild_id)
+            logger.info(f"Batch deleted {deleted_total} dictionary words from guild {guild_id}")
+        return deleted_total
+
     async def update_dictionary_word(self, guild_id: int, old_word: str, new_word: str, new_reading: str) -> bool:
         """指定ギルドの単語辞書エントリを更新"""
         old_w = old_word.strip()
@@ -1623,6 +1645,27 @@ class Database:
         if deleted:
             self.invalidate_guild_cache(guild_id)
         return deleted
+
+    async def delete_ng_words_batch(self, guild_id: int, words: List[str]) -> int:
+        """ギルドから複数のNGワードを一括削除"""
+        clean_words = [w.strip() for w in words if isinstance(w, str) and w.strip()]
+        if not clean_words:
+            return 0
+        deleted_total = 0
+        async with self.get_connection() as db:
+            for i in range(0, len(clean_words), 500):
+                chunk = clean_words[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = await db.execute(
+                    f"DELETE FROM guild_ng_words WHERE guild_id = ? AND word IN ({placeholders})",
+                    [guild_id] + chunk
+                )
+                deleted_total += max(0, cursor.rowcount)
+            await db.commit()
+        if deleted_total > 0:
+            self.invalidate_guild_cache(guild_id)
+            logger.info(f"Batch deleted {deleted_total} NG words from guild {guild_id}")
+        return deleted_total
 
     async def touch_ng_words(self, guild_id: int, words: List[str]) -> None:
         """検知されたNGワードの last_used_at を非同期更新 (LRU管理用)"""

@@ -409,33 +409,54 @@ class BotPoolManager:
         tokens = self.config.get_discord_tokens()
         return max(1, min(10, len(tokens) if tokens else 1))
 
+    @staticmethod
+    def _is_vc_active_or_reconnecting(vc: Optional[discord.VoiceClient]) -> bool:
+        """
+        VoiceClient が接続完了済み、または discord.py 内部の自動再接続 (1006/4015 等の _runner/_connector) 処理中かを判定。
+        瞬断再接続の約1秒間に is_connected() が一時的に False になった際、未接続と誤判定して二重接続するのを防ぐ。
+        """
+        if not vc:
+            return False
+        if vc.is_connected() or getattr(vc, "_connecting", False):
+            return True
+        conn = getattr(vc, "_connection", None)
+        if conn is not None:
+            for attr in ("_connector", "_runner"):
+                task = getattr(conn, attr, None)
+                if task is not None and not task.done():
+                    return True
+        return False
+
     def is_bot_busy(self, bot: commands.Bot) -> bool:
         """
         BotがいずれかのサーバーのVCに接続中（または接続処理中）かどうかを判定。
         Discord API仕様上、1つのBotアカウントは全サーバーを通じて同時に1つのVCにしか接続できない。
         """
-        # 1. 予約リスト (インフライト) の確認
+        # 1. 予約リスト (インフライト) の確認 (TTL考慮)
+        now = time.time()
         bot_idx = next((idx for idx, b in self.bots.items() if b == bot), None)
-        if bot_idx is not None and bot_idx in self._connecting_vcs.values():
-            return True
+        if bot_idx is not None:
+            for _, (b_idx, ts) in list(self._connecting_vcs.items()):
+                if b_idx == bot_idx and (now - ts) < self.RESERVATION_TTL_SECONDS:
+                    return True
 
         # 2. bot.voice_clients リストの確認 (discord.Client が保持する全接続中VoiceClient)
         for vc in getattr(bot, "voice_clients", []):
-            if vc and (vc.is_connected() or getattr(vc, "_connecting", False)):
+            if self._is_vc_active_or_reconnecting(vc):
                 return True
 
         # 3. 各ギルドの voice_client のフォールバック確認
         for g in getattr(bot, "guilds", []):
-            if g.voice_client and (g.voice_client.is_connected() or getattr(g.voice_client, "_connecting", False)):
+            if self._is_vc_active_or_reconnecting(g.voice_client):
                 return True
         return False
 
     def find_connected_bot_in_vc(self, guild_id: int, voice_channel_id: int) -> Optional[Tuple[int, commands.Bot]]:
-        """指定ギルド・指定VCに既に接続しているBotを探索"""
+        """指定ギルド・指定VCに既に接続している（または内部自動再接続中の）Botを探索"""
         for idx, bot in self.bots.items():
             guild = bot.get_guild(guild_id)
-            if guild and guild.voice_client and guild.voice_client.is_connected() and guild.voice_client.channel:
-                if guild.voice_client.channel.id == voice_channel_id:
+            if guild and guild.voice_client and guild.voice_client.channel:
+                if guild.voice_client.channel.id == voice_channel_id and self._is_vc_active_or_reconnecting(guild.voice_client):
                     return idx, bot
         return None
 

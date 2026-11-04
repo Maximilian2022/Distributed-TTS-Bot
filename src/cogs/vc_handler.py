@@ -77,10 +77,170 @@ class _VoiceCloseDiagFilter(logging.Filter):
 
 
 _voice_diag_installed = False
+_dave_compat_installed = False
+
+
+def _ensure_dave_session_ready(vc: Optional[discord.VoiceClient]) -> None:
+    """
+    davey >= 0.2.0 と discord.py 2.7.x の API 非互換に対する自己修復ガード:
+    MLS Welcome / Commit 処理後に prepare_transition / execute_transition が未実行で
+    dave_session.ready が False (NotReady) のままスタックしている場合、即時遷移を完了させて暗号化を有効化する。
+    """
+    if vc is None:
+        return
+    try:
+        conn = getattr(vc, "_connection", None)
+        if conn is None:
+            return
+        proto_ver = getattr(conn, "dave_protocol_version", 0)
+        dave = getattr(conn, "dave_session", None)
+        if proto_ver and proto_ver > 0 and dave is not None and not getattr(dave, "ready", True):
+            status_str = str(getattr(dave, "status", ""))
+            if "active" in status_str.lower():
+                if hasattr(dave, "prepare_transition"):
+                    dave.prepare_transition(0, proto_ver)
+                if hasattr(dave, "execute_transition"):
+                    dave.execute_transition(0)
+                logger.info(
+                    f"🔐 [DAVE Self-Heal] Activated pending DAVE E2EE transition (proto=v{proto_ver}, ready={getattr(dave, 'ready', None)})"
+                )
+    except Exception as e:
+        logger.debug(f"DAVE session readiness check ignored error: {e}")
+
+
+def _install_dave_compat_patch() -> None:
+    """
+    discord.py 2.7.x が davey 0.1.x 前提で実装されており、davey >= 0.2.0 で必須となった
+    dave_session.prepare_transition() / execute_transition() を呼ばないために
+    DAVE (E2EE) 音声パケットが暗号化されず Discord クライアント側で無音化される不具合をパッチする。
+    """
+    global _dave_compat_installed
+    if _dave_compat_installed:
+        return
+    try:
+        import struct
+        import discord.gateway
+        import discord.voice_state
+
+        try:
+            import davey  # type: ignore
+        except ImportError:
+            _dave_compat_installed = True
+            return
+
+        if not hasattr(davey.DaveSession, "prepare_transition") or not hasattr(davey.DaveSession, "execute_transition"):
+            _dave_compat_installed = True
+            return
+
+        _vs_log = logging.getLogger("discord.voice_state")
+
+        async def _patched_execute_transition(self, transition_id: int) -> None:
+            _vs_log.debug("Executing transition id %d", transition_id)
+            if self.dave_session and hasattr(self.dave_session, "execute_transition"):
+                try:
+                    self.dave_session.execute_transition(transition_id)
+                except Exception as e:
+                    _vs_log.debug("dave_session.execute_transition(%d) error: %s", transition_id, e)
+
+            if transition_id not in self.dave_pending_transitions:
+                if transition_id != 0:
+                    _vs_log.warning(
+                        "Received execute transition, but we don't have a pending transition for id %d",
+                        transition_id,
+                    )
+                return
+
+            old_version = self.dave_protocol_version
+            self.dave_protocol_version = self.dave_pending_transitions.pop(transition_id)
+
+            if old_version != self.dave_protocol_version and self.dave_protocol_version == 0:
+                self.dave_downgraded = True
+                _vs_log.debug("DAVE Session downgraded")
+            elif transition_id > 0 and self.dave_downgraded:
+                self.dave_downgraded = False
+                if self.dave_session:
+                    self.dave_session.set_passthrough_mode(True, 10)
+                _vs_log.debug("DAVE Session upgraded")
+
+            _vs_log.debug("Transition id %d executed", transition_id)
+
+        discord.voice_state.VoiceConnectionState._execute_transition = _patched_execute_transition
+
+        _orig_received_message = discord.gateway.DiscordVoiceWebSocket.received_message
+
+        async def _patched_received_message(self, msg: Dict[str, Any]) -> None:
+            op = msg.get("op")
+            data = msg.get("d")
+            state = getattr(self, "_connection", None)
+            if (
+                op == discord.gateway.DiscordVoiceWebSocket.DAVE_PREPARE_TRANSITION
+                and state
+                and getattr(state, "dave_session", None)
+                and isinstance(data, dict)
+            ):
+                try:
+                    state.dave_session.prepare_transition(data["transition_id"], data["protocol_version"])
+                except Exception:
+                    pass
+            await _orig_received_message(self, msg)
+
+        discord.gateway.DiscordVoiceWebSocket.received_message = _patched_received_message
+
+        async def _patched_received_binary_message(self, msg: bytes) -> None:
+            self.seq_ack = struct.unpack_from(">H", msg, 0)[0]
+            op = msg[2]
+            state = self._connection
+            if state.dave_session is None:
+                return
+
+            if op == self.MLS_EXTERNAL_SENDER:
+                state.dave_session.set_external_sender(msg[3:])
+            elif op == self.MLS_PROPOSALS:
+                optype = msg[3]
+                result = state.dave_session.process_proposals(
+                    davey.ProposalsOperationType.append if optype == 0 else davey.ProposalsOperationType.revoke,
+                    msg[4:],
+                )
+                if isinstance(result, davey.CommitWelcome):
+                    await self.send_binary(
+                        discord.gateway.DiscordVoiceWebSocket.MLS_COMMIT_WELCOME,
+                        result.commit + result.welcome if result.welcome else result.commit,
+                    )
+            elif op == self.MLS_ANNOUNCE_COMMIT_TRANSITION:
+                transition_id = struct.unpack_from(">H", msg, 3)[0]
+                try:
+                    state.dave_session.process_commit(msg[5:])
+                    state.dave_session.prepare_transition(transition_id, state.dave_protocol_version)
+                    if transition_id == 0:
+                        await state._execute_transition(0)
+                    else:
+                        state.dave_pending_transitions[transition_id] = state.dave_protocol_version
+                        await self.send_transition_ready(transition_id)
+                except Exception:
+                    await state._recover_from_invalid_commit(transition_id)
+            elif op == self.MLS_WELCOME:
+                transition_id = struct.unpack_from(">H", msg, 3)[0]
+                try:
+                    state.dave_session.process_welcome(msg[5:])
+                    state.dave_session.prepare_transition(transition_id, state.dave_protocol_version)
+                    if transition_id == 0:
+                        await state._execute_transition(0)
+                    else:
+                        state.dave_pending_transitions[transition_id] = state.dave_protocol_version
+                        await self.send_transition_ready(transition_id)
+                except Exception:
+                    await state._recover_from_invalid_commit(transition_id)
+
+        discord.gateway.DiscordVoiceWebSocket.received_binary_message = _patched_received_binary_message
+        _dave_compat_installed = True
+        logger.info("🔐 [DAVE Compat] Installed davey >= 0.2.0 E2EE transition compatibility patch for discord.py.")
+    except Exception as e:
+        logger.warning(f"Failed to install DAVE compatibility patch: {e}")
 
 
 def _install_voice_diag_filter() -> None:
     global _voice_diag_installed
+    _install_dave_compat_patch()
     if _voice_diag_installed:
         return
     logging.getLogger("discord.voice_state").addFilter(_VoiceCloseDiagFilter())
@@ -770,15 +930,42 @@ class VCHandlerCog(commands.Cog):
                             old_vc = channel.guild.voice_client
                             if old_vc is not None:
                                 if old_vc.is_connected() and old_vc.channel and old_vc.channel.id == channel.id:
+                                    _ensure_dave_session_ready(old_vc)
                                     vc = old_vc
                                     break
+                                # もし discord.py 内部の自動再接続タスク (_runner / _connector) が同一VCに対して稼働中なら、
+                                # まず少し待って内部再接続の完了を見届け、完了すれば二重接続せずにそのまま採用する
+                                old_conn = getattr(old_vc, "_connection", None)
+                                old_runner = getattr(old_conn, "_runner", None) if old_conn else None
+                                if (
+                                    old_vc.channel
+                                    and old_vc.channel.id == channel.id
+                                    and old_runner is not None
+                                    and not old_runner.done()
+                                ):
+                                    for _ in range(15):
+                                        await asyncio.sleep(0.2)
+                                        if old_vc.is_connected():
+                                            break
+                                    if old_vc.is_connected():
+                                        _ensure_dave_session_ready(old_vc)
+                                        vc = old_vc
+                                        break
                                 try:
+                                    # ゾンビ再接続タスク (_runner / _connector) が裏で残存するのを確実に防止
+                                    if old_conn is not None:
+                                        for task_attr in ("_connector", "_runner"):
+                                            t_obj = getattr(old_conn, task_attr, None)
+                                            if t_obj is not None and not t_obj.done():
+                                                t_obj.cancel()
+                                            setattr(old_conn, task_attr, None)
                                     await old_vc.disconnect(force=True)
                                     await asyncio.sleep(0.3)
                                 except Exception:
                                     pass
 
                             vc = await channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
+                            _ensure_dave_session_ready(vc)
                             break
                         except VCConnectAborted:
                             raise
@@ -1190,6 +1377,7 @@ class VCHandlerCog(commands.Cog):
                         vol = max(0.0, min(float(item.volume), 2.0))
                         audio_source = discord.PCMVolumeTransformer(audio_source, volume=vol)
 
+                        _ensure_dave_session_ready(vc)
                         vc.play(audio_source, after=after_playing)
                         t_play_start = time.time()
                         state.deduplicator.record_played(item.text)
@@ -1752,6 +1940,7 @@ class VCHandlerCog(commands.Cog):
                 preroll_wait_ms = (time.time() - t_preroll_start) * 1000.0
 
             # vc.play を開始！ (プレフィックスまたは第1文までの最適バッファでアンダーランゼロ再生)
+            _ensure_dave_session_ready(vc)
             vc.play(volume_transformer, after=after_playing)
             t_play_start = time.time()
             timeline.t_play = t_play_start

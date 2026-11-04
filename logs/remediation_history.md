@@ -1,6 +1,74 @@
 
 # 修正・作業履歴 (Remediation History)
 
+## [2026-11-05] 単語辞書管理・NGワード管理における複数選択からの一括削除機能の実装 (`src/database.py`, `src/web/server.py`, `src/web/templates/index.html`, `src/web/static/app.js`)
+
+- **ユーザー要求**:
+  - 「単語辞書管理, NGワード管理において、複数選択からの一括削除できるようにしたい」
+
+- **対応内容**:
+  1. **データベース層 (`src/database.py`)**:
+     - `delete_dictionary_words_batch(guild_id, words)`: 指定ギルドの単語辞書から複数単語を単一トランザクション（SQLite パラメータ上限考慮で500件チャンク分割）で一括削除し、ギルドキャッシュを無効化するメソッドを追加。
+     - `delete_ng_words_batch(guild_id, words)`: 指定ギルドのNGワードから複数単語を一括削除し、ギルドキャッシュを無効化するメソッドを追加。
+  2. **バックエンドAPI層 (`src/web/server.py`)**:
+     - `POST /api/dict/delete_batch` (`api_delete_dict_batch`): 権限チェック後、複数単語の一括削除および `cache_manager.purge_by_words(clean_words)` による関連音声キャッシュ一括パージを実行するエンドポイントを追加（動的ルート `/api/dict/{word}` より前に登録）。
+     - `POST /api/ng/delete_batch` (`api_delete_ng_batch`): 複数NGワードの一括削除および関連音声キャッシュ一括パージを実行するエンドポイントを追加（動的ルート `/api/ng/{word}` より前に登録）。
+  3. **フロントエンドUI層 (`src/web/templates/index.html`, `src/web/static/app.js`)**:
+     - 単語辞書一覧 (`#subtab-dict`) および NGワード一覧 (`#subtab-ng`) のテーブル先頭列に全選択チェックボックス (`#dict-select-all`, `#ng-select-all`) と各行の個別選択チェックボックスを追加（検索フィルタ中は表示中の項目のみを全選択/解除対象として連動）。
+     - 1件以上選択された際に検索ボックス横へ `🗑️ 選択した N件を削除` ボタン (`#dict-batch-delete-btn`, `#ng-batch-delete-btn`) を動的に表示し、確認ダイアログ（対象ワードのプレビュー付き）を経て一括削除を実行する機能を実装。
+  4. **本番コンテナへの無停止ライブ反映**:
+     - `sys.remote_exec` により稼働中の `ttsbot-app-1` プロセスへ `Database` / `WebServer` の一括削除メソッドと `UrlDispatcher` ルートを動的注入し、コンテナ再起動・VC切断なしで即時有効化完了。
+
+## [2026-11-04] WebUI「発話〜再生レイテンシ モニター」が初期状態のまま描画されない不具合の修正 (`src/web/static/app.js`)
+
+- **ユーザー要求 & 事象**:
+  - 「レイテンシ モニターも今気づいたら動いてなかったので確認してほしい」
+  - 「動いてない、というのはWeb上で何もスコアがない、添付のような状態ね」
+  - バックエンド (`/api/system/metrics`) では60件以上のレイテンシ履歴と統計が正常に返却されているにもかかわらず、WebUI 上の「⚡ 発話〜再生レイテンシ モニター」が `⚡ 計測待機中` / `更新: --:--:--` / `0 件` / `-- ms` の初期 HTML のまま一切更新されない状態が発生。
+
+- **原因分析 (Root Cause Analysis)**:
+  1. **主因: 非表示タブ内 `<canvas>` に対する `getContext("2d")` の `null` 返却による `TypeError` 例外中断**:
+     - `renderSystemMetricsUI(data)` 内において、`renderLatencyMonitorUI(data.latency, data.profiler)` よりも先に `renderHostBotCpuChart(history)` / `renderHostBotMemoryChart(history)` (`renderLineChart`) が呼ばれていた。
+     - 「📊 システム監視 & ログ (`#subtab-system`)」タブを表示中、「🤖 Bot & ノード管理 (`#subtab-bots`)」タブ内の `<canvas id="host-bot-cpu-chart">` は非表示状態 (`display: none`) にある。ブラウザ拡張 (MemWise 等) や Canvas ハイバネーション環境下で非表示 Canvas のサイズ (`canvas.width` / `canvas.height`) を変更した直後に `canvas.getContext("2d")` が `null` を返却し、直後の `ctx.save()` で `TypeError: Cannot read properties of null (reading 'save')` が発生していた。
+     - この例外により `renderSystemMetricsUI(data)` が途中終了し、後続の `renderLatencyMonitorUI()` および `loadStats()` が一度も実行されていなかった。
+  2. **副因: 内訳バーの初動推論表示およびワーカー別カードの 0件エントリ表示**:
+     - ストリーミング再生で第1チャンク（発言者名）がキャッシュヒット (`0.1〜0.4ms`) した場合、内訳の「TTS推論」欄に `0.4 ms` のみが表示され、全文推論時間が見えにくくなっていた。
+     - フォールバック元プロバイダー名の失敗カウント記録により、`count == 0` のダミーワーカーカード (`voicevox / VOICEVOX: 0件処理 / 0 ms` 等) が表示される状態になっていた。
+
+- **対応内容 (`src/web/static/app.js`)**:
+  1. `renderSystemMetricsUI(data)` 内で `renderLatencyMonitorUI()` を最優先で実行するよう順序を変更し、さらに `renderLatencyMonitorUI`、`renderHostBotCpuChart` / `renderHostBotMemoryChart`、`renderAllWorkerSparklines` の各セクションを個別の `try ... catch` で保護して相互影響を完全に遮断。
+  2. `renderLineChart()` および `renderWorkerSparkline()` において、非表示タブ等で描画領域サイズが `0` の場合や `canvas.getContext("2d")` が `null` を返した場合に `canvas.width` リサイズや `ctx.save()` を行わず安全に早期リターンするガードを追加。
+  3. レイテンシ内訳の「TTS推論 (`#lat-val-synth`)」で初動チャンクがキャッシュ即答 (`< 5.0ms`) の場合、`0.4 ms (総計 419ms)` のように全文総推論時間も併記するよう改善。
+  4. ワーカー別推論速度サマリー (`#latency-worker-summary-cards`) で `stat.count > 0` のエントリのみを描画するようフィルタリングを追加。
+  5. 静的ファイルバインドマウント + `st_mtime` ベースのキャッシュバスター (`{{ASSET_V}}`) により、本番コンテナ無停止のまま即時反映を確認。
+
+## [2026-11-04] VC接続中に読み上げ音声が出力されない障害の特定・無停止即時復旧 & 恒久対策 (v2026.11.04-2305)
+
+- **ユーザー要求 & 事象**:
+  - 「VCにBot入るのに読み上げが行われない」
+  - ログ上では音声合成および `Turn-TTFS`（再生完了計測）が出力されているにもかかわらず、Discord のボイスチャンネル上で読み上げ音声が一切聞こえない状態が発生。
+
+- **原因分析 (Root Cause Analysis)**:
+  1. **主因: `discord.py 2.7.1` と `davey 0.2.0` (Discord DAVE E2EE ライブラリ) の破壊的 API 非互換**:
+     - `discord.py[voice]>=2.7.1` の依存定義 (`davey>=0.1.0`) により、2026-11-04 のコンテナビルド時に `davey 0.2.0` がインストールされた。
+     - `davey 0.1.x` では `process_welcome()` / `process_commit()` 呼び出しのみで暗号鍵が有効化 (`ready = True`) されていたが、`davey 0.2.0` ではその後に `dave_session.prepare_transition(transition_id, protocol_version)` および `dave_session.execute_transition(transition_id)` を明示的に呼び出すことが必須化された。
+     - `discord.py 2.7.1` は `davey 0.1.x` 前提で実装されており上記2メソッドを呼び出さないため、全VC接続において `dave_session.status == SessionStatus.active` でありながら `dave_session.ready == False` (`Failed to encrypt: NotReady`, `can_encrypt == False`) で永久スタックしていた。
+     - その結果、`VoiceClient._get_voice_packet()` が DAVE E2EE 暗号化をスキップして平文 Opus パケットを送出し続け、E2EE が有効な Discord クライアント側で全音声パケットが破棄（完全無音化）されていた。
+  2. **副因: Voice WebSocket 1006 瞬断時の自動再接続と `_auto_join_reconcile_loop` の競合**:
+     - `src/bot_pool.py` の `is_bot_busy()` で `bot_idx in self._connecting_vcs.values()` がタプル `(bot_idx, ts)` と `int` を比較していたため常に `False` となっていた。
+     - また `discord.py` が 1006 瞬断から内部再接続 (`_poll_voice_ws` 内の 0.9秒待機〜再ハンドシェイク) を行う約1秒間、`vc.is_connected()` が一時的に `False` になった隙に `_auto_join_reconcile_loop` が未接続と誤判定して二重に `connect_vc()` を呼び出し、古い `VoiceConnectionState._runner` タスクがキャンセルされずに裏で残存していた。
+
+- **対応内容**:
+  1. **稼働中本番コンテナへの無停止ライブ・ホットパッチ適用**:
+     - Python 3.14 の `sys.remote_exec` を用い、稼働中の全 Bot (#1〜#5) を一切再起動・VC切断することなく、`DiscordVoiceWebSocket` / `VoiceConnectionState` に DAVE 0.2.0 遷移互換パッチを動的適用し、接続中 VC の `dave_session` を即座に `ready=True` / `can_encrypt=True` へ遷移させて無停止で音声出力を復旧。
+  2. **恒久対策 (`src/cogs/vc_handler.py`)**:
+     - `_install_dave_compat_patch()` を実装し、起動時に `discord.py` の `DiscordVoiceWebSocket.received_message`, `received_binary_message`, `VoiceConnectionState._execute_transition` へ `davey >= 0.2.0` の `prepare_transition()` / `execute_transition()` 呼び出しを自動ブリッジ。
+     - `_ensure_dave_session_ready(vc)` を実装し、VC接続完了時および `vc.play()` 開始直前に万一 `dave_session.ready == False` であった場合にも自己修復して暗号化を有効化するフェイルセーフを追加。
+     - `connect_vc()` で既存 `old_vc` が内部再接続タスク (`_runner`) 稼働中の場合は完了を待機して再利用し、破棄する場合は `_runner` / `_connector` タスクを明示的にキャンセルしてから `disconnect(force=True)` するよう修正。
+  3. **恒久対策 (`src/bot_pool.py`)**:
+     - `_is_vc_active_or_reconnecting(vc)` を新設し、`vc.is_connected()` だけでなく `_connection._runner` / `_connector` が稼働中の状態もアクティブと判定するよう修正。
+     - `is_bot_busy()` の `_connecting_vcs` タプル比較バグを修正。
+
 ## [2026-11-03] GitHub PR (#21, #22) 対処 & CodeQL セキュリティアラート (#98, #99, #100) 完全解消 (v2026.11.03-1010)
 
 - **ユーザー要求 & フィードバック**:
