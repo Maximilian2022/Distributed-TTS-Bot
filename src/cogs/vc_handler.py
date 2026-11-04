@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import re
+import sys
 import json
 import time
 import logging
@@ -23,8 +24,67 @@ from src.utils.stream_planner import plan_head_chars
 from src.utils.streaming_audio import StreamingAudioSource, get_beep_pcm
 from src.utils.gemini_tutor import GeminiTutorClient
 from src.utils.avatar_manager import cache_member_info_and_avatar
+from src.utils.alert_service import alert_service, CATEGORY_BOT, SEVERITY_ERROR
 
 logger = logging.getLogger(__name__)
+
+# Bot #N の voice WebSocket が最後に閉じられた際の詳細 (guild_id -> 情報)。VoiceDiag ログと切断検証で参照する
+_LAST_VOICE_CLOSE: Dict[int, Dict[str, Any]] = {}
+
+
+class _VoiceCloseDiagFilter(logging.Filter):
+    """discord.voice_state が切断系ログを出す瞬間に、処理中の ConnectionClosed から閉じコード・理由を記録する。
+
+    discord.py は 4014/4022 等の閉じコードをログに出さないため、except ブロック内で同期的に呼ばれる
+    ログフィルタから sys.exc_info() で取得する (診断専用。失敗しても本来のログ出力は妨げない)。
+    """
+    _TRIGGERS = (
+        "Disconnected from voice by force",
+        "Disconnected from voice by discord",
+        "Disconnecting from voice normally",
+        "Reconnect was unsuccessful",
+        "Disconnected from voice...",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if not msg.startswith(self._TRIGGERS):
+                return True
+            exc = sys.exc_info()[1]
+            code = getattr(exc, "code", None)
+            reason = getattr(exc, "reason", None)
+            guild_id = None
+            channel_id = None
+            frame = sys._getframe(1)
+            while frame is not None:
+                conn = frame.f_locals.get("self")
+                vclient = getattr(conn, "voice_client", None)
+                if vclient is not None and hasattr(vclient, "guild"):
+                    guild_id = vclient.guild.id
+                    channel_id = getattr(getattr(vclient, "channel", None), "id", None)
+                    break
+                frame = frame.f_back
+            if guild_id is not None and code is not None:
+                _LAST_VOICE_CLOSE[guild_id] = {"code": code, "reason": reason, "at": time.time(), "msg": msg}
+            logger.info(
+                f"🔬 [VoiceDiag] voice WebSocket closed: close_code={code} reason={reason!r} "
+                f"guild={guild_id} channel={channel_id} exc={type(exc).__name__ if exc else None} msg='{msg}'"
+            )
+        except Exception:
+            pass
+        return True
+
+
+_voice_diag_installed = False
+
+
+def _install_voice_diag_filter() -> None:
+    global _voice_diag_installed
+    if _voice_diag_installed:
+        return
+    logging.getLogger("discord.voice_state").addFilter(_VoiceCloseDiagFilter())
+    _voice_diag_installed = True
 
 # 発言者表示名の括弧除去用 事前コンパイル正規表現 (PERF: ホットパスでのインラインコンパイル排除)
 _RE_STRIP_NAME_BRACKETS = re.compile(r"[（\(【\[〔〈《「『][^）\)】\]〕〉》」』]*[）\)】\]〕〉》」』]")
@@ -220,6 +280,12 @@ class GuildVCState:
         self.connect_epoch: int = 0
         # 無人VC Watchdog: 最初に無人を検知した時刻 (0.0 = 有人/未検知)
         self.empty_since: float = 0.0
+        # 切断ループ (フラップ) 検知: 直近の接続完了時刻・切断時刻・バックオフ段階・自動再接続の抑止期限
+        self.last_connected_at: float = 0.0
+        self.flap_times: collections.deque = collections.deque()
+        self.flap_level: int = 0
+        self.flap_suppressed_until: float = 0.0
+        self.flap_gave_up: bool = False
 
     def get_all_items(self) -> List[QueueItem]:
         """現在キューにある全アイテムを抽出 (シャットダウン退避用)"""
@@ -296,6 +362,7 @@ class VCHandlerCog(commands.Cog):
         self._nick_reconcile_task: Optional[asyncio.Task] = None
         self._auto_join_reconcile_task: Optional[asyncio.Task] = None
         self._pending_bot_leave_tasks: Dict[int, asyncio.Task] = {}
+        _install_voice_diag_filter()
         # 遅延インシデント発生時のワーカーノード状態スナップショット取得元を登録 (1号機のみで十分)
         if bot_index == 1:
             latency_tracker.set_node_snapshot_provider(self._snapshot_worker_nodes)
@@ -473,6 +540,14 @@ class VCHandlerCog(commands.Cog):
     # 無人VC Watchdog 設定
     AUTO_LEAVE_CHECK_INTERVAL = 15.0   # 巡回周期 (秒) - 重複調停を迅速化
     AUTO_LEAVE_GRACE_SECONDS = 25.0    # 無人継続がこの秒数を超えたら退出 (= 2回連続無人検知)
+
+    # 切断ループ (フラップ) 検知・段階的バックオフ再接続
+    FLAP_WINDOW_SECONDS = 60.0                  # この秒数内に FLAP_THRESHOLD 回切断されたらループと判定
+    FLAP_THRESHOLD = 3
+    FLAP_EVENT_DEBOUNCE_SECONDS = 5.0           # 1回の切断で連続発火するイベントを1回に集約
+    FLAP_BACKOFF_SECONDS = (30.0, 60.0, 120.0)  # 再接続までの待機 (段階ごとに延長。使い切ったら Give up)
+    FLAP_STABLE_SECONDS = 60.0                  # この秒数切断なく接続できたら回復とみなす
+    FLAP_GIVEUP_SECONDS = 1800.0                # Give up 後に自動再接続を抑止する時間
 
     @staticmethod
     def _count_humans(channel: Optional[discord.abc.GuildChannel]) -> int:
@@ -736,6 +811,7 @@ class VCHandlerCog(commands.Cog):
                     raise VCConnectAborted(f"connect to '{channel.name}' aborted (empty channel)")
 
         state.empty_since = 0.0
+        state.last_connected_at = time.time()
         # 無人VC Watchdog を起動 (未起動 or 終了済みの場合のみ)
         if self._auto_leave_task is None or self._auto_leave_task.done():
             self._auto_leave_task = safe_create_task(
@@ -2225,6 +2301,159 @@ class VCHandlerCog(commands.Cog):
         except Exception as e:
             logger.warning(f"Failed to queue VC event announcement for {member.display_name}: {e}")
 
+    def _record_voice_flap(self, state: GuildVCState, now: float) -> int:
+        """Bot の voice 切断を記録し、直近 FLAP_WINDOW_SECONDS 内の切断回数を返す"""
+        if state.last_connected_at and now - state.last_connected_at >= self.FLAP_STABLE_SECONDS:
+            # 安定稼働後の切断は新規障害として扱う (前回のバックオフ段階を持ち越さない)
+            state.flap_times.clear()
+            state.flap_level = 0
+            state.flap_gave_up = False
+        if not state.flap_times or now - state.flap_times[-1] >= self.FLAP_EVENT_DEBOUNCE_SECONDS:
+            state.flap_times.append(now)
+        while state.flap_times and now - state.flap_times[0] > self.FLAP_WINDOW_SECONDS:
+            state.flap_times.popleft()
+        return len(state.flap_times)
+
+    def _is_vc_reconnect_suppressed(self, guild_id: int) -> bool:
+        """バックオフ待機中・Give up 中は自動再接続 (AutoJoinReconcile 等) を抑止する"""
+        state = self.guild_states.get(guild_id)
+        if not state or not state.flap_suppressed_until:
+            return False
+        if time.time() < state.flap_suppressed_until:
+            return True
+        state.flap_suppressed_until = 0.0
+        if state.flap_gave_up:
+            # Give up の抑止期間が明けたので通常運転に戻す
+            state.flap_gave_up = False
+            state.flap_level = 0
+            state.flap_times.clear()
+            logger.info(f"[Bot #{self.bot_index}] Voice reconnect suppression expired for guild {guild_id}. Resuming auto-join.")
+        return False
+
+    def _log_voice_leave_detail(self, guild: discord.Guild, vc_ch: discord.abc.GuildChannel, state: GuildVCState, flap_count: int, now: float) -> None:
+        """切断時の状態を1行で記録 (原因調査用)"""
+        try:
+            vc = guild.voice_client
+            close = _LAST_VOICE_CLOSE.get(guild.id)
+            close_txt = (
+                f"code={close['code']} reason={close['reason']!r} {now - close['at']:.1f}s ago" if close else "unknown"
+            )
+            uptime = f"{now - state.last_connected_at:.1f}s" if state.last_connected_at else "n/a"
+            vc_txt = "None"
+            if vc is not None:
+                vc_txt = (
+                    f"connected={vc.is_connected()} channel={getattr(getattr(vc, 'channel', None), 'id', None)} "
+                    f"latency={getattr(vc, 'latency', float('nan')):.3f}s"
+                )
+            logger.info(
+                f"🔬 [VoiceDiag] Bot #{self.bot_index} leave detail: guild={guild.id} vc={vc_ch.id} humans={self._count_humans(vc_ch)} "
+                f"uptime_since_connect={uptime} flaps_in_window={flap_count}/{self.FLAP_THRESHOLD} backoff_level={state.flap_level} "
+                f"last_close[{close_txt}] voice_client[{vc_txt}] gateway_latency={self.bot.latency:.3f}s "
+                f"endpoint_hint={getattr(getattr(vc, 'ws', None), 'endpoint', None) if vc is not None else None}"
+            )
+        except Exception as e:
+            logger.debug(f"[Bot #{self.bot_index}] Failed to log voice leave detail: {e}")
+
+    async def _handle_voice_flapping(self, guild: discord.Guild, before_channel: discord.abc.GuildChannel) -> None:
+        """切断ループ検知時: 段階的に待機を延ばして再接続し、上限に達したら Give up して管理者へ通知する"""
+        state = self.get_guild_state(guild.id)
+        try:
+            level = state.flap_level
+            if level >= len(self.FLAP_BACKOFF_SECONDS):
+                await self._give_up_voice_flapping(guild, before_channel, state)
+                return
+
+            wait = self.FLAP_BACKOFF_SECONDS[level]
+            state.flap_level = level + 1
+            # 自己切断で発生する leave イベントを無視させ、待機中は AutoJoinReconcile にも触らせない
+            state.flap_suppressed_until = time.time() + wait + 15.0
+            logger.warning(
+                f"🛑 [Bot #{self.bot_index}] Voice flapping in VC '{before_channel.name}' of '{guild.name}' "
+                f"({len(state.flap_times)} disconnects within {self.FLAP_WINDOW_SECONDS:.0f}s). "
+                f"Backoff {level + 1}/{len(self.FLAP_BACKOFF_SECONDS)}: waiting {wait:.0f}s before reconnecting."
+            )
+            vc = guild.voice_client
+            if vc is not None:
+                try:
+                    await vc.disconnect(force=True)
+                except Exception as e:
+                    logger.warning(f"[Bot #{self.bot_index}] Exception while dropping flapping voice client: {e}")
+            await asyncio.sleep(wait)
+            state.flap_suppressed_until = 0.0
+
+            ch = guild.get_channel(before_channel.id)
+            manual = bool(self.bot_pool and self.bot_pool.is_vc_manually_disconnected(guild.id, before_channel.id))
+            if not isinstance(ch, (discord.VoiceChannel, discord.StageChannel)) or self._count_humans(ch) == 0 or manual:
+                logger.info(f"[Bot #{self.bot_index}] Flapping backoff ended without reconnect (VC empty/removed/manually disconnected).")
+                state.flap_level = 0
+                state.flap_times.clear()
+                return
+
+            bound_text_id = state.bound_text_channel_id or await self._resolve_bound_text_channel(guild, before_channel.id)
+            text_ch = guild.get_channel(bound_text_id) if bound_text_id else None
+            if not isinstance(text_ch, discord.TextChannel):
+                logger.warning(f"[Bot #{self.bot_index}] No bound text channel for VC '{ch.name}'. Cannot reconnect after backoff.")
+                return
+
+            try:
+                await self.connect_vc(ch, text_ch)
+            except VCConnectAborted as e:
+                logger.info(f"[Bot #{self.bot_index}] Reconnect after backoff aborted: {e}")
+                return
+            except Exception as e:
+                logger.error(f"[Bot #{self.bot_index}] Reconnect after backoff failed: {e}")
+                # 接続自体に失敗した場合は次の段階へ (再帰せずループで処理)
+                self._pending_bot_leave_tasks[guild.id] = safe_create_task(
+                    self._handle_voice_flapping(guild, before_channel),
+                    name=f"verify_bot_leave_{guild.id}_{self.bot_index}"
+                )
+                return
+
+            logger.info(
+                f"✨ [Bot #{self.bot_index}] Reconnected to VC '{ch.name}' of '{guild.name}' after backoff {level + 1}. "
+                f"Watching stability for {self.FLAP_STABLE_SECONDS:.0f}s..."
+            )
+            await asyncio.sleep(self.FLAP_STABLE_SECONDS)
+            cur = guild.voice_client
+            if cur is not None and cur.is_connected() and state.flap_level > 0:
+                logger.info(f"✅ [Bot #{self.bot_index}] Voice connection stable in '{guild.name}'. Flapping resolved.")
+                state.flap_level = 0
+                state.flap_times.clear()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Error in _handle_voice_flapping for guild {guild.id}: {e}")
+        finally:
+            if self._pending_bot_leave_tasks.get(guild.id) is asyncio.current_task():
+                self._pending_bot_leave_tasks.pop(guild.id, None)
+
+    async def _give_up_voice_flapping(self, guild: discord.Guild, before_channel: discord.abc.GuildChannel, state: GuildVCState) -> None:
+        """バックオフ再接続でも回復しない場合: VCから退出し、一定時間自動再接続を止めて管理者へ通知"""
+        state.flap_gave_up = True
+        state.flap_suppressed_until = time.time() + self.FLAP_GIVEUP_SECONDS
+        close = _LAST_VOICE_CLOSE.get(guild.id)
+        close_txt = f"code={close['code']} reason={close['reason']!r}" if close else "unknown"
+        logger.error(
+            f"❌ [Bot #{self.bot_index}] Giving up on VC '{before_channel.name}' of '{guild.name}': voice keeps disconnecting "
+            f"even after {len(self.FLAP_BACKOFF_SECONDS)} backoff reconnects (last close: {close_txt}). "
+            f"Auto reconnect suppressed for {self.FLAP_GIVEUP_SECONDS / 60:.0f} min."
+        )
+        try:
+            await self.disconnect_vc(guild)
+        except Exception as e:
+            logger.warning(f"[Bot #{self.bot_index}] Exception while disconnecting on give-up: {e}")
+        alert_service.notify(
+            title="[ERROR] VC接続が回復しないため自動再接続を停止",
+            message=(
+                f"Bot #{self.bot_index} が VC「{before_channel.name}」(サーバー: {guild.name}) で切断を繰り返し、"
+                f"段階的な再接続でも回復しなかったため退出しました。{self.FLAP_GIVEUP_SECONDS / 60:.0f}分間は自動参加を停止します。"
+            ),
+            category=CATEGORY_BOT,
+            severity=SEVERITY_ERROR,
+            details=f"last voice close: {close_txt}",
+            guild_id=guild.id,
+        )
+
     async def _handle_bot_voice_leave(self, guild: discord.Guild, before_channel: discord.abc.GuildChannel) -> None:
         """Bot自身がVCから退出したイベントの検証（回線瞬断再接続と管理者キックの分離調停）"""
         try:
@@ -2311,6 +2540,13 @@ class VCHandlerCog(commands.Cog):
                             # 通話終了: 手動切断フラグをリセット (次回新しい通話時には再度自動参加可能に)
                             if self.bot_pool:
                                 self.bot_pool.clear_vc_manual_disconnect(guild.id, target_vc_id)
+                            continue
+
+                        # 切断ループのバックオフ中・Give up 中は自動参加しない
+                        flap_cogs = [self] + [
+                            b.get_cog("VCHandlerCog") for b in (self.bot_pool.bots.values() if self.bot_pool else [])
+                        ]
+                        if any(c is not None and c._is_vc_reconnect_suppressed(guild.id) for c in flap_cogs):
                             continue
 
                         # 手動切断されたVCは、通話が終了する（人間が0人になる）まで自動再接続を抑止
@@ -2400,14 +2636,28 @@ class VCHandlerCog(commands.Cog):
                 # Discordの回線瞬断やVoice WebSocket再接続中の一時的イベントを誤認しないよう、
                 # 即時切断せず遅延検証を行う
                 vc_ch = before.channel
+                flap_state = self.get_guild_state(guild.id)
+                now = time.time()
+                if now < flap_state.flap_suppressed_until:
+                    # バックオフ待機中・Give up 中の切断 (自己切断を含む) は再接続させない
+                    logger.info(
+                        f"⏸️ [Bot #{self.bot_index}] Voice leave event from VC '{vc_ch.name}' in '{guild.name}' ignored "
+                        f"(reconnect suppressed for {flap_state.flap_suppressed_until - now:.0f}s more)."
+                    )
+                    return
+                flap_count = self._record_voice_flap(flap_state, now)
+                is_flapping = flap_count >= self.FLAP_THRESHOLD or flap_state.flap_level > 0
                 logger.info(
-                    f"⚠️ [Bot #{self.bot_index}] Received voice leave event from VC '{vc_ch.name}' in '{guild.name}'. Verifying if temporary reconnection..."
+                    f"⚠️ [Bot #{self.bot_index}] Received voice leave event from VC '{vc_ch.name}' in '{guild.name}'. "
+                    f"{'Voice connection is flapping' if is_flapping else 'Verifying if temporary reconnection'}..."
                 )
+                self._log_voice_leave_detail(guild, vc_ch, flap_state, flap_count, now)
                 prev_task = self._pending_bot_leave_tasks.get(guild.id)
                 if prev_task and not prev_task.done():
                     prev_task.cancel()
+                handler = self._handle_voice_flapping(guild, vc_ch) if is_flapping else self._handle_bot_voice_leave(guild, vc_ch)
                 self._pending_bot_leave_tasks[guild.id] = safe_create_task(
-                    self._handle_bot_voice_leave(guild, vc_ch),
+                    handler,
                     name=f"verify_bot_leave_{guild.id}_{self.bot_index}"
                 )
             elif after.channel is not None and before.channel is not None and before.channel.id != after.channel.id:
