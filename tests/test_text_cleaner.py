@@ -118,3 +118,32 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class TestSplitAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_async_matches_sync(self):
+        from src.utils.text_cleaner import TextCleaner
+        a = await TextCleaner.split_into_chunks_async("今日はいい天気ですね", author_prefix="テスト")
+        b = TextCleaner.split_into_chunks("今日はいい天気ですね", author_prefix="テスト")
+        self.assertEqual([c.text for c in a], [c.text for c in b])
+
+    async def test_timeout_falls_back_without_morph(self):
+        import time
+        from unittest import mock
+        from src.utils import text_cleaner as tc
+        real = tc.TextCleaner.split_into_chunks
+        calls = []
+
+        def slow_first(*a, **k):
+            calls.append(tc._skip_morph.get())
+            if len(calls) == 1:
+                time.sleep(0.6)
+            return real(*a, **k)
+
+        with mock.patch.object(tc.TextCleaner, "split_into_chunks", staticmethod(slow_first)):
+            t = time.perf_counter()
+            r = await tc.TextCleaner.split_into_chunks_async("こんにちは世界", author_prefix="x", timeout_s=0.1)
+            self.assertLess(time.perf_counter() - t, 0.5)
+        self.assertTrue(r)
+        self.assertEqual(calls[1], True)  # 退避側は形態素解析スキップ
+        self.assertFalse(tc._skip_morph.get())

@@ -1438,7 +1438,7 @@ class TTSManager:
 
         # 2. チャンクの取得 (未指定なら split_into_chunks で自動分割: 各マシン×各エンジン推論性能に適応)
         if chunks is None:
-            chunks = TextCleaner.split_into_chunks(
+            chunks = await TextCleaner.split_into_chunks_async(
                 text,
                 author_prefix=author_prefix,
                 engine=provider,

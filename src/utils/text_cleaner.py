@@ -1,5 +1,10 @@
 import re
+import gc
 import time
+import asyncio
+import resource
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
 import emoji
 import logging
 import threading
@@ -74,8 +79,13 @@ _janome_tokenizer = None
 _janome_failed = False
 _janome_lock = threading.Lock()
 
+# 形態素解析を使わず正規表現のみで分割させるフラグ (split_into_chunks_async のタイムアウト退避用)
+_skip_morph: contextvars.ContextVar = contextvars.ContextVar("skip_morph", default=False)
+
 def get_sudachi_tokenizer():
     """SudachiPy 形態素解析器をスレッドセーフに遅延初期化して返却"""
+    if _skip_morph.get():
+        return None, None
     global _sudachi_tokenizer, _sudachi_failed, _sudachi_split_mode
     if _sudachi_tokenizer is not None:
         return _sudachi_tokenizer, _sudachi_split_mode
@@ -99,6 +109,8 @@ def get_sudachi_tokenizer():
 
 def get_janome_tokenizer():
     """Janome 形態素解析器をスレッドセーフに遅延初期化して返却"""
+    if _skip_morph.get():
+        return None
     global _janome_tokenizer, _janome_failed
     if _janome_tokenizer is not None:
         return _janome_tokenizer
@@ -154,6 +166,10 @@ def warmup_morphological_tokenizers():
 
     elapsed_ms = (time.perf_counter() - t_start) * 1000.0
     logger.info(f"✨ [TextCleaner] 形態素解析エンジンのホットウォーム完了 (SudachiPy / Janome, 所要時間: {elapsed_ms:.1f}ms)")
+
+_SPLIT_DIAG_THRESHOLD_MS = 500.0
+_SPLIT_TIMEOUT_S = 0.3
+_SPLIT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="text-split")
 
 @dataclass
 class TextChunk:
@@ -814,6 +830,9 @@ class TextCleaner:
         各マシン・各エンジンの実測推論性能統計 (latency_profiler) に基づき、第1チャンク上限 (max_first_chunk_chars) を自律動的決定。
         """
         t_start = time.time()
+        _cpu0 = time.thread_time()
+        _ru0 = resource.getrusage(resource.RUSAGE_SELF)
+        _gc0 = [g["collections"] for g in gc.get_stats()]
         chunks: List[TextChunk] = []
 
         # 0. 動的第1チャンク文字数上限 (max_first_chunk_chars) の自律解決 (各マシン×各エンジン特性・クラウド回線速度を反映)
@@ -947,7 +966,46 @@ class TextCleaner:
         for c in chunks:
             c.split_ms = split_ms
 
+        if split_ms >= _SPLIT_DIAG_THRESHOLD_MS:
+            TextCleaner._log_split_diagnostics(split_ms, len(text), _cpu0, _ru0, _gc0)
+
         return chunks
+
+    @staticmethod
+    def _log_split_diagnostics(split_ms: float, text_len: int, cpu0: float, ru0, gc0) -> None:
+        """分割が閾値を超えた時の原因切り分け情報 (CPU時間 vs 壁時計・ページフォールト・GC・稼働スレッド) を記録"""
+        try:
+            ru1 = resource.getrusage(resource.RUSAGE_SELF)
+            cpu_ms = (time.thread_time() - cpu0) * 1000.0
+            gc_delta = [b["collections"] - a for a, b in zip(gc0, gc.get_stats())]
+            threads = [t.name for t in threading.enumerate()]
+            logger.warning(
+                f"🔬 [SplitDiag] split={split_ms:.0f}ms cpu={cpu_ms:.0f}ms wait={max(0.0, split_ms - cpu_ms):.0f}ms "
+                f"chars={text_len} majflt+={ru1.ru_majflt - ru0.ru_majflt} minflt+={ru1.ru_minflt - ru0.ru_minflt} "
+                f"ctxsw(vol/invol)+={ru1.ru_nvcsw - ru0.ru_nvcsw}/{ru1.ru_nivcsw - ru0.ru_nivcsw} "
+                f"gc(gen0/1/2)+={gc_delta} threads={len(threads)}:{','.join(threads[:12])}"
+            )
+        except Exception as e:
+            logger.debug(f"split diagnostics failed: {e}")
+
+    @staticmethod
+    async def split_into_chunks_async(*args, timeout_s: float = _SPLIT_TIMEOUT_S, **kwargs) -> List['TextChunk']:
+        """
+        split_into_chunks を専用スレッドで実行し、イベントループを塞がない。
+        timeout_s を超えたら形態素解析を使わない正規表現のみの分割で即座に退避する (背景スレッドの結果は破棄)。
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(_SPLIT_EXECUTOR, lambda: TextCleaner.split_into_chunks(*args, **kwargs))
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+            logger.warning(f"⏱️ [TextCleaner] 文分割が {timeout_s * 1000:.0f}ms を超過したため、正規表現のみの簡易分割へ退避します。")
+            token = _skip_morph.set(True)
+            try:
+                return TextCleaner.split_into_chunks(*args, **kwargs)
+            finally:
+                _skip_morph.reset(token)
 
     @staticmethod
     def apply_head_chunk_limit(chunks: List['TextChunk'], head_chars: int) -> List['TextChunk']:

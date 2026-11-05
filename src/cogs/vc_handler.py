@@ -1210,7 +1210,7 @@ class VCHandlerCog(commands.Cog):
             except Exception:
                 pass
 
-            chunks = item.chunks or TextCleaner.split_into_chunks(
+            chunks = item.chunks or await TextCleaner.split_into_chunks_async(
                 item.text,
                 author_prefix=item.author_prefix,
                 engine=engine_name,
@@ -1481,7 +1481,7 @@ class VCHandlerCog(commands.Cog):
             pass
 
         # チャンク分割の作成 (発言者名プレフィックス + 本文チャンク: 各マシン×各エンジン推論性能に応じた動的文字数適応)
-        all_chunks = item.chunks or TextCleaner.split_into_chunks(
+        all_chunks = item.chunks or await TextCleaner.split_into_chunks_async(
             item.text,
             author_prefix=item.author_prefix,
             engine=engine_name,
