@@ -53,6 +53,7 @@ _RE_BEEP_SPLIT = re.compile(r'(<<(?:\u30d4\u30fc\u97f3|__BEEP)(?::\d+)?(?:__)?>>
 # 句読点なし多段チャンキング & 30文字ハードキャップ用の事前コンパイル定数 (PERF-3)
 _MAX_CHUNK_CHARS = 30
 _MIN_PART_CHARS = 5
+_FASTPATH_MAX_CHARS = 14  # 14文字以下の短文は形態素解析をスキップするファストパス上限 (CPU縮退時でも自力完走可能)
 _RE_SPLIT_SLANG_DELIM = re.compile(r'((?:(?<![a-zA-Z0-9])[wｗW]+(?![a-zA-Z0-9])|草+|パチパチ))[\s\u3000]*')
 _RE_SPLIT_ENDING = re.compile(r'((?:です|ます|でした|ました|ですね|ですよ|ですよね|だよね|じゃん|だし)(?:よ|ね|な)?)(?=[^\s、。！？\d])')
 
@@ -515,12 +516,14 @@ class TextCleaner:
         min_tail_chars: int = 5
     ) -> List[Tuple[str, str]]:
         """
-        読点のない長い文（閾値以上、通常18文字以上、動的短文時は10〜14文字）を、
+        読点のない長い文（閾値以上、通常18文字以上、動的短文時は15〜18文字）を、
         超高速・高精度な形態素解析（SudachiPy）を用いて接続詞・接続助詞の自然な境界で分割する。
         SudachiPy が未導入または失敗した場合は Janome / 正規表現ルールに安全フォールバック。
+        ※ 14文字以下の短文は形態素解析を完全スキップ（ファストパス）
         """
         raw_text = sentence.strip()
-        if len(raw_text) < min_chars_threshold:
+        effective_thresh = max(_FASTPATH_MAX_CHARS + 1, min_chars_threshold)
+        if len(raw_text) < effective_thresh or len(_RE_STRIP_PUNCT_SPACES.sub('', raw_text)) <= _FASTPATH_MAX_CHARS:
             return [(sentence, delim)]
 
         # 1. SudachiPy 形態素解析器の取得を試みる (最優先: Rust製超高速・最新辞書)
@@ -1166,12 +1169,18 @@ class TextCleaner:
         morph_refined: List[Tuple[str, str]] = []
         for idx, (sentence, delim) in enumerate(ending_refined):
             raw_len = len(_RE_STRIP_PUNCT_SPACES.sub('', sentence))
+            # 14文字以下の短文は形態素解析を完全バイパス (ファストパス: CPU縮退時でも声色維持・遅延ゼロ)
+            if raw_len <= _FASTPATH_MAX_CHARS:
+                morph_refined.append((sentence, delim))
+                continue
+
             cur_limit = (max_first_chunk_chars if (idx == 0 and is_first_plain_segment and max_first_chunk_chars) else max_chunk_chars)
             if cur_limit < 22:
-                m_thresh = max(8, min(18, int(cur_limit * 0.75)))
+                # 動的短縮時でも最低15文字以上 (14文字以下は形態素解析を絶対に呼ばない)
+                m_thresh = max(_FASTPATH_MAX_CHARS + 1, min(18, int(cur_limit * 0.75)))
                 if idx == 0 and is_first_plain_segment and max_first_chunk_chars and max_first_chunk_chars < 18:
-                    m_thresh = max(8, min(m_thresh, max_first_chunk_chars))
-                m_head = min(7, max(3, m_thresh // 2))
+                    m_thresh = max(_FASTPATH_MAX_CHARS + 1, min(m_thresh, max_first_chunk_chars))
+                m_head = min(7, max(4, m_thresh // 2))
                 m_tail = min(5, max(3, m_thresh // 3))
             else:
                 m_thresh = 18

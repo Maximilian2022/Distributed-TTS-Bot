@@ -114,6 +114,39 @@ class TestTextCleaner(unittest.TestCase):
         duration = time.perf_counter() - t0
         self.assertLess(duration, 0.05, f"ReDoS suspected! Took {duration}s")
 
+    def test_short_text_fastpath_skips_morphological(self):
+        # 14文字以下の短文は形態素解析エンジン（SudachiPy/Janome）を絶対に呼ばずにファストパスすること
+        from unittest.mock import patch
+        import src.utils.text_cleaner as tc
+
+        short_texts = [
+            "お疲れ様でした",     # 7文字
+            "いてらーわら",       # 6文字
+            "了解です！",         # 5文字
+            "こんにちは",         # 5文字
+            "14文字以内の短文テストです", # 13文字
+            "ちょうど十四文字の文章です", # 13文字
+        ]
+        with patch.object(tc, "get_sudachi_tokenizer", wraps=tc.get_sudachi_tokenizer) as mock_sudachi, \
+             patch.object(tc, "get_janome_tokenizer", wraps=tc.get_janome_tokenizer) as mock_janome:
+            for text in short_texts:
+                chunks = TextCleaner.split_into_chunks(text)
+                self.assertGreaterEqual(len(chunks), 1)
+            # 14文字以下の短文では形態素解析器は一度も呼ばれてはならない
+            mock_sudachi.assert_not_called()
+            mock_janome.assert_not_called()
+
+    def test_stream_planner_head_min_chars_14(self):
+        # 14文字以下の先頭パーツは plan_head_chars で短縮不要 (None) となること
+        from src.utils.stream_planner import plan_head_chars, HEAD_MIN_CHARS
+        self.assertEqual(HEAD_MIN_CHARS, 14)
+        dummy_nodes = [{"pending_ms": 1000.0, "est_ms": lambda l: l * 100.0}]
+        # 14文字以下は短縮不要 (None)
+        res_14 = plan_head_chars([14, 20], has_name=True, name_play_s=0.8, nodes=dummy_nodes, max_silence=1.5, az_margin=0.45)
+        self.assertIsNone(res_14)
+        res_7 = plan_head_chars([7], has_name=False, name_play_s=0.0, nodes=dummy_nodes, max_silence=1.5, az_margin=0.45)
+        self.assertIsNone(res_7)
+
 if __name__ == "__main__":
     unittest.main()
 

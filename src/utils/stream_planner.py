@@ -17,7 +17,7 @@ CLOUD_LATENCY_SEC = 0.27        # クラウド投機の応答 (Azure 実測 p50�
 PART_PAUSE_SEC = 0.06
 PREROLL_SAFETY_SEC = 0.25       # Adaptive Preroll (名前あり) の安全マージン
 PREROLL_MIN_WAIT_SEC = 0.15
-HEAD_MIN_CHARS = 10             # _hardcap_slice の最小スライス長 (_MIN_PART_CHARS*2)
+HEAD_MIN_CHARS = 14             # 先頭短縮の最小文字数 (14文字以下の短文は短縮不要・ストレートパス)
 
 
 @dataclass

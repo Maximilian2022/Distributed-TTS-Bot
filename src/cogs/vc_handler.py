@@ -1512,8 +1512,8 @@ class VCHandlerCog(commands.Cog):
             try:
                 voice_cfg_p = self.tts_manager._get_voice_config(item.speaker_id)
                 model_id_p = getattr(voice_cfg_p, "speaker_uuid", "") or getattr(voice_cfg_p, "voice_name", "") or str(item.speaker_id)
-                # 先頭本文パーツ長の動的決定 (先行合成済みの発話は分割を変えない: キャッシュキー一致のため)
-                if head_mode != "off" and item.chunks is None:
+                # 先頭本文パーツ長の動的決定 (14文字以下の短文は短縮不要・ストレートパス。先行合成済みの発話は分割を変えない: キャッシュキー一致のため)
+                if head_mode != "off" and item.chunks is None and len(all_chunks[head_idx].text) > 14:
                     head_text = all_chunks[head_idx].text
                     head_key = CacheManager.generate_cache_key(item.speaker_id, item.pitch, item.speed, head_text, user_id=item.user_id)
                     planned = None
