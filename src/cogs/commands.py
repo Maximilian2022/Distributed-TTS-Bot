@@ -1318,7 +1318,8 @@ class CommandsCog(commands.Cog):
         target="字幕化する対象メンバー (未指定で実行者自身 / all_members有効時は無視)",
         all_members="VC内の全メンバーを対象にするか (True: 全員, False: targetまたは実行者)",
         trans_langs="リアルタイム翻訳先言語コード (例: en, ko, zh。空欄で翻訳なし)",
-        output="字幕の出力先 (both: 聞き専＋ゲームPC, channel: 聞き専のみ, game: ゲームPCのみ)"
+        output="字幕の出力先 (both: 聞き専＋ゲームPC, channel: 聞き専のみ, game: ゲームPCのみ)",
+        channel="出力先のテキストチャンネル (未指定でVC紐付けチャンネルまたは実行チャンネル)"
     )
     @app_commands.choices(
         output=[
@@ -1334,6 +1335,7 @@ class CommandsCog(commands.Cog):
         all_members: Optional[bool] = False,
         trans_langs: Optional[str] = None,
         output: Optional[str] = "both",
+        channel: Optional[discord.TextChannel] = None,
     ) -> None:
         if not interaction.guild:
             await interaction.response.send_message("❌ このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
@@ -1412,9 +1414,12 @@ class CommandsCog(commands.Cog):
         # 出力先チャンネルの決定
         text_channel_id = None
         if output in ("both", "channel"):
-            target_vc_cog = target_bot.get_cog("VCHandlerCog") or self.vc_handler
-            state = target_vc_cog.get_guild_state(interaction.guild.id)
-            text_channel_id = state.bound_text_channel_id or interaction.channel.id
+            if channel is not None:
+                text_channel_id = channel.id
+            else:
+                target_vc_cog = target_bot.get_cog("VCHandlerCog") or self.vc_handler
+                state = target_vc_cog.get_guild_state(interaction.guild.id)
+                text_channel_id = state.bound_text_channel_id or interaction.channel.id
 
         langs = trans_langs if trans_langs is not None else getattr(self.config, "hayamimi_trans_langs", "")
         success = await stt_mgr.start_stt(
@@ -1438,7 +1443,12 @@ class CommandsCog(commands.Cog):
             if langs:
                 embed.add_field(name="🌍 リアルタイム翻訳", value=f"`{langs}`", inline=True)
 
-            out_text = "聞き専チャンネル ＋ ゲームPC" if output == "both" else ("聞き専チャンネルのみ" if output == "channel" else "ゲームPCのみ")
+            ch_mention = f"<#{text_channel_id}>" if text_channel_id else "なし"
+            out_text = (
+                f"聞き専 ({ch_mention}) ＋ ゲームPC"
+                if output == "both"
+                else (f"聞き専のみ ({ch_mention})" if output == "channel" else "ゲームPCのみ")
+            )
             embed.add_field(name="📤 出力先", value=out_text, inline=True)
 
             if output in ("both", "game"):
@@ -1494,9 +1504,15 @@ class CommandsCog(commands.Cog):
 
         if is_active and stt_mgr:
             receiver = stt_mgr.receivers.get(interaction.guild.id)
+            dispatcher = stt_mgr.dispatchers.get(interaction.guild.id)
             if receiver:
                 speakers = len(receiver._sessions)
                 embed.add_field(name="現在接続中の話者セッション", value=f"{speakers} 名", inline=True)
+                targets = "全員 (All)" if not receiver.target_user_ids else ", ".join(f"<@{u}>" for u in receiver.target_user_ids)
+                embed.add_field(name="🎯 対象話者", value=targets, inline=True)
+            if dispatcher:
+                ch_str = f"<#{dispatcher.text_channel_id}> (`{dispatcher.text_channel_id}`)" if dispatcher.text_channel_id else "ゲームPCのみ (Discord出力なし)"
+                embed.add_field(name="📤 出力先テキストCh", value=ch_str, inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

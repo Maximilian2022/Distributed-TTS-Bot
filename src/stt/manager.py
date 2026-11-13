@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from typing import Dict, Optional, Set
 import discord
@@ -10,6 +11,8 @@ from src.stt.dispatcher import SpeechDispatcher, GameClientConnection
 import src.stt.voice_receiver
 
 logger = logging.getLogger(__name__)
+
+_STT_KV_KEY = "active_stt_sessions"
 
 
 class STTManager:
@@ -54,8 +57,8 @@ class STTManager:
             logger.warning(f"Cannot start STT: Bot is not connected to VC in guild {guild.id}")
             return False
 
-        # 既存セッションがあれば停止
-        await self.stop_stt(guild.id)
+        # 既存セッションがあれば停止 (再設定開始なので永続レコードは一旦残す)
+        await self.stop_stt(guild.id, clear_persisted=False)
 
         gateway_url = self.config.hayamimi_ws_url
         if not gateway_url:
@@ -94,14 +97,29 @@ class STTManager:
         success = await receiver.start()
         if success:
             self.receivers[guild.id] = receiver
-            logger.info(f"🎙️ [STTManager] Successfully started STT for guild {guild.name} ({guild.id})")
+            ch_obj = bot_to_use.get_channel(text_channel_id) if text_channel_id else None
+            ch_info = f"#{getattr(ch_obj, 'name', 'unknown')} ({text_channel_id})" if text_channel_id else "None (GamePC only)"
+            logger.info(
+                f"🎙️ [STTManager] Successfully started STT for guild {guild.name} ({guild.id}) | "
+                f"VC: {getattr(vc.channel, 'name', 'unknown')} ({getattr(vc.channel, 'id', None)}) | "
+                f"OutputTextCh: {ch_info} | Targets: {list(target_user_ids) if target_user_ids else 'All'}"
+            )
+            await self._persist_session_state(
+                guild_id=guild.id,
+                bot_index=getattr(bot_to_use, "bot_index", 1),
+                vc_id=getattr(vc.channel, "id", None),
+                text_channel_id=text_channel_id,
+                target_user_ids=target_user_ids,
+                trans_langs=langs,
+                model=asr_model,
+            )
             return True
         else:
             await dispatcher._scheduled_flush()
             self.dispatchers.pop(guild.id, None)
             return False
 
-    async def stop_stt(self, guild_id: int) -> None:
+    async def stop_stt(self, guild_id: int, clear_persisted: bool = True) -> None:
         """指定ギルドの STT ストリーミングを停止"""
         receiver = self.receivers.pop(guild_id, None)
         if receiver:
@@ -111,7 +129,103 @@ class STTManager:
         if dispatcher:
             await dispatcher._scheduled_flush()
 
+        if clear_persisted:
+            await self._clear_persisted_session_state(guild_id)
+
         logger.info(f"🛑 [STTManager] Stopped STT for guild {guild_id}")
+
+    async def _load_persisted_sessions(self) -> Dict[str, dict]:
+        if not self.db or not hasattr(self.db, "get_system_kv"):
+            return {}
+        try:
+            raw = await self.db.get_system_kv(_STT_KV_KEY, "{}")
+            data = json.loads(raw or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.debug(f"Failed to load persisted STT sessions: {e}")
+            return {}
+
+    async def _persist_session_state(
+        self,
+        guild_id: int,
+        bot_index: int,
+        vc_id: Optional[int],
+        text_channel_id: Optional[int],
+        target_user_ids: Optional[Set[int]],
+        trans_langs: str,
+        model: str,
+    ) -> None:
+        if not self.db or not hasattr(self.db, "set_system_kv"):
+            return
+        try:
+            data = await self._load_persisted_sessions()
+            data[str(guild_id)] = {
+                "bot_index": int(bot_index or 1),
+                "vc_id": vc_id,
+                "text_channel_id": text_channel_id,
+                "target_user_ids": sorted(int(u) for u in (target_user_ids or set())),
+                "trans_langs": trans_langs or "",
+                "model": model or "reazon",
+            }
+            await self.db.set_system_kv(_STT_KV_KEY, json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"⚠️ [STTManager] Failed to persist STT session state: {e}")
+
+    async def _clear_persisted_session_state(self, guild_id: int) -> None:
+        if not self.db or not hasattr(self.db, "set_system_kv"):
+            return
+        try:
+            data = await self._load_persisted_sessions()
+            if str(guild_id) in data:
+                data.pop(str(guild_id), None)
+                await self.db.set_system_kv(_STT_KV_KEY, json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            logger.debug(f"Failed to clear persisted STT session state: {e}")
+
+    async def restore_persisted_sessions_for_bot(self, bot_client: discord.Client, bot_index: int = 1) -> None:
+        """再起動後のVC自動接続完了時に、稼働中だったSTTセッションを安全に自動復旧"""
+        data = await self._load_persisted_sessions()
+        if not data:
+            return
+
+        for gid_str, info in list(data.items()):
+            try:
+                if int(info.get("bot_index", 1)) != int(bot_index):
+                    continue
+                guild_id = int(gid_str)
+                if self.is_active(guild_id):
+                    continue
+                guild = bot_client.get_guild(guild_id)
+                if not guild or not guild.voice_client or not guild.voice_client.is_connected():
+                    continue
+                vc = guild.voice_client
+                vc_ch = getattr(vc, "channel", None)
+                human_members = [m for m in getattr(vc_ch, "members", []) if not getattr(m, "bot", False)]
+                if not human_members:
+                    logger.info(f"ℹ️ [STTManager] Skipping STT restore for guild {guild_id}: VC has no humans.")
+                    await self._clear_persisted_session_state(guild_id)
+                    continue
+
+                saved_vc_id = info.get("vc_id")
+                if saved_vc_id and vc_ch and vc_ch.id != int(saved_vc_id):
+                    logger.info(f"ℹ️ [STTManager] Skipping STT restore for guild {guild_id}: VC changed ({saved_vc_id} -> {vc_ch.id}).")
+                    await self._clear_persisted_session_state(guild_id)
+                    continue
+
+                targets = set(int(u) for u in (info.get("target_user_ids") or []))
+                ok = await self.start_stt(
+                    guild=guild,
+                    text_channel_id=info.get("text_channel_id"),
+                    target_user_ids=targets,
+                    trans_langs=info.get("trans_langs"),
+                    model=info.get("model"),
+                    voice_client=vc,
+                    bot_client=bot_client,
+                )
+                if ok:
+                    logger.info(f"♻️ [STTManager] Restored persisted STT session on Bot #{bot_index} for guild {guild.name} ({guild_id})")
+            except Exception as e:
+                logger.warning(f"⚠️ [STTManager] Error restoring STT session for {gid_str}: {e}")
 
     async def handle_game_ws(self, request: web.Request) -> web.WebSocketResponse:
         """ゲームPCクライアント向け WebSocket ハンドラ (/api/stt/stream)"""

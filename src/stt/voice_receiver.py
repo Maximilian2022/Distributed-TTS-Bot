@@ -9,6 +9,11 @@ from discord.opus import Decoder as OpusDecoder
 import nacl.secret
 
 try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:
+    AESGCM = None
+
+try:
     import davey
 except ImportError:
     davey = None
@@ -71,6 +76,10 @@ class VoiceStreamReceiver:
         self._dave_err_logged: Set[str] = set()
         self._pushed_frame_counts: Dict[int, int] = {}
         self._last_push_log_time: Dict[int, float] = {}
+        self._decoded_frame_count = 0
+        self._decode_err_count = 0
+        self._transport_err_count = 0
+        self._dave_err_count = 0
 
         self._is_running = False
         self._lock = asyncio.Lock()
@@ -88,15 +97,7 @@ class VoiceStreamReceiver:
             logger.error("❌ VoiceClient is not connected.")
             return False
 
-        # DAVE の Passthrough モードを有効化
         state = getattr(self.vc, "_connection", None)
-        if state:
-            dave = getattr(state, "dave_session", None)
-            if dave and hasattr(dave, "set_passthrough_mode"):
-                try:
-                    dave.set_passthrough_mode(True, 120)
-                except Exception as ex:
-                    logger.debug(f"DAVE passthrough setup: {ex}")
 
         # Voice WebSocket フックの登録 (SSRC -> user_id マッピング取得用)
         self._install_ws_hook()
@@ -190,11 +191,23 @@ class VoiceStreamReceiver:
                         self._user_to_name[u_id] = display_name
                         logger.info(f"🎙️ [VoiceReceiver] SSRC {ssrc} mapped to User {u_id} ({display_name}) via WS op={op}")
 
-                        # 既存セッションの表示名を即時昇格
-                        sess = self._sessions.get(ssrc)
-                        if sess:
-                            sess.user_id = u_id
-                            sess.user_name = display_name
+                        # ターゲット指定あり＆ターゲット外ユーザーと判明した場合、誤作成セッションを即時停止・破棄
+                        if self.target_user_ids and u_id not in self.target_user_ids:
+                            self._pending_pcm.pop(ssrc, None)
+                            self._connecting_ssrcs.discard(ssrc)
+                            self._decoders.pop(ssrc, None)
+                            wrong_sess = self._sessions.pop(ssrc, None)
+                            if wrong_sess:
+                                logger.info(
+                                    f"🚫 [VoiceReceiver] Closing non-target session for SSRC {ssrc} ({display_name}, uid={u_id})"
+                                )
+                                asyncio.create_task(wrong_sess.close())
+                        else:
+                            # 既存セッションの表示名・IDを即時昇格
+                            sess = self._sessions.get(ssrc)
+                            if sess:
+                                sess.user_id = u_id
+                                sess.user_name = display_name
             except Exception as ex:
                 logger.warning(f"Error in voice ws hook: {ex}")
 
@@ -206,21 +219,120 @@ class VoiceStreamReceiver:
 
         ws._hook = _hook_wrapper
 
+    def _decrypt_transport_rtp(self, data: bytes) -> Optional[bytes]:
+        """Discord Voice Transport 暗号化 (AEAD XChaCha20 / AES256-GCM / XSalsa20) を復号してペイロードを抽出"""
+        b0 = data[0]
+        cc = b0 & 0x0F
+        has_pad = bool(b0 & 0x20)
+        has_ext = bool(b0 & 0x10)
+        base_hdr = 12 + 4 * cc
+
+        if len(data) <= base_hdr:
+            return None
+
+        # 平文ヘッダ長 (非rtpsize / テストモック用)
+        if has_ext:
+            if len(data) < base_hdr + 4:
+                return None
+            ext_len_words = struct.unpack_from(">H", data, base_hdr + 2)[0]
+            header_len_plain = base_hdr + 4 + ext_len_words * 4
+        else:
+            ext_len_words = 0
+            header_len_plain = base_hdr
+
+        state = getattr(self.vc, "_connection", None)
+        mode = getattr(state, "mode", None) if state else None
+        secret_key = getattr(state, "secret_key", None) if state else None
+
+        # テストモックや暗号なし状態の場合は従来の平文オフセットにフォールバック
+        if not isinstance(mode, str) or not isinstance(secret_key, (bytes, bytearray, list, tuple)):
+            if len(data) <= header_len_plain:
+                return None
+            return data[header_len_plain:]
+
+        key_bytes = bytes(secret_key)
+        if len(key_bytes) != 32:
+            return None
+
+        try:
+            plain: bytes
+            if mode in ("aead_xchacha20_poly1305_rtpsize", "aead_aes256_gcm_rtpsize"):
+                # rtpsize モード: 拡張ヘッダの先頭4バイトまでが AAD、拡張ボディは暗号化ペイロードに含まれる
+                aad_len = base_hdr + (4 if has_ext else 0)
+                if len(data) <= aad_len + 4:
+                    return None
+                aad = data[:aad_len]
+                ciphertext = data[aad_len:-4]
+                nonce_tail = data[-4:]
+
+                if mode == "aead_xchacha20_poly1305_rtpsize":
+                    nonce = nonce_tail + (b"\x00" * 20)
+                    plain = nacl.secret.Aead(key_bytes).decrypt(ciphertext, aad, nonce)
+                else:
+                    if AESGCM is None:
+                        raise RuntimeError("cryptography AESGCM is not installed")
+                    nonce = nonce_tail + (b"\x00" * 8)
+                    plain = AESGCM(key_bytes).decrypt(nonce, ciphertext, aad)
+
+                if has_ext and ext_len_words > 0:
+                    ext_bytes = ext_len_words * 4
+                    if len(plain) <= ext_bytes:
+                        return None
+                    plain = plain[ext_bytes:]
+            elif mode == "xsalsa20_poly1305_lite":
+                if len(data) <= header_len_plain + 4:
+                    return None
+                nonce = data[-4:] + (b"\x00" * 20)
+                plain = nacl.secret.SecretBox(key_bytes).decrypt(data[header_len_plain:-4], nonce)
+            elif mode == "xsalsa20_poly1305_suffix":
+                if len(data) <= header_len_plain + 24:
+                    return None
+                nonce = data[-24:]
+                plain = nacl.secret.SecretBox(key_bytes).decrypt(data[header_len_plain:-24], nonce)
+            elif mode == "xsalsa20_poly1305":
+                if len(data) <= header_len_plain:
+                    return None
+                nonce = data[:12] + (b"\x00" * 12)
+                plain = nacl.secret.SecretBox(key_bytes).decrypt(data[header_len_plain:], nonce)
+            else:
+                if len(data) <= header_len_plain:
+                    return None
+                return data[header_len_plain:]
+
+            # RFC 3550 RTP Padding 除去
+            if has_pad and plain:
+                pad_len = plain[-1]
+                if 0 < pad_len <= len(plain):
+                    plain = plain[:-pad_len]
+
+            return plain
+        except Exception as ex:
+            self._transport_err_count += 1
+            if self._transport_err_count == 1 or self._transport_err_count % 50 == 0:
+                logger.warning(
+                    f"⚠️ [Transport] RTP decrypt error (mode={mode}, count={self._transport_err_count}): {ex}"
+                )
+            return None
+
     def _on_rtp_packet(self, data: bytes) -> None:
-        """UDP SocketReader から届いた RTP パケットを同期処理 (DAVE復号 + SSRC独立 Opus デコード)"""
+        """UDP SocketReader から届いた RTP パケットを同期処理 (Transport復号 + DAVE復号 + SSRC独立 Opus デコード)"""
         if not self._is_running or len(data) < 16:
             return
 
         self._rtp_recv_count += 1
         now = time.time()
 
-        # 5秒に1回、届いているパケット総数を確実にINFO出力
+        # 5秒に1回、届いているパケット総数と復号・デコード成否をINFO出力
         if now - self._last_stat_log_time >= 5.0:
             self._last_stat_log_time = now
+            state = getattr(self.vc, "_connection", None)
+            mode = getattr(state, "mode", None) if state else None
+            mode_str = mode if isinstance(mode, str) else "unknown"
             logger.info(
-                f"📊 [RTP Stats] Recv total {self._rtp_recv_count} UDP pkts | "
-                f"SSRC pkt counts in session: {dict(self._ssrc_pkt_counts)} | "
-                f"Target users: {list(self.target_user_ids)}"
+                f"📊 [RTP Stats] Recv {self._rtp_recv_count} UDP pkts | "
+                f"Decoded={self._decoded_frame_count} DecErr={self._decode_err_count} "
+                f"TransErr={self._transport_err_count} DaveErr={self._dave_err_count} | "
+                f"Mode={mode_str} | SSRC={dict(self._ssrc_pkt_counts)} | Targets={list(self.target_user_ids)}"
             )
 
         try:
@@ -239,25 +351,17 @@ class VoiceStreamReceiver:
             if ssrc == getattr(self.vc, "ssrc", None):
                 return
 
-            # RTP ヘッダー拡張 (Extension) のスキップ
-            has_ext = bool(b0 & 0x10)
-            if has_ext and len(data) >= 16:
-                ext_len = struct.unpack_from(">H", data, 14)[0]
-                header_len = 12 + 4 + ext_len * 4
-            else:
-                header_len = 12
-
-            if len(data) <= header_len:
-                return
-
-            payload = data[header_len:]
-
             # 2. ターゲット話者フィルタリング (SSRCが特定話者と判明している場合)
             user_id = self._ssrc_to_user.get(ssrc)
             if self.target_user_ids and user_id and user_id not in self.target_user_ids:
                 return
 
-            # 3. DAVE E2EE 復号 (Passthrough または MLS グループ鍵復号)
+            # 3. Discord Voice Transport Layer 復号
+            payload = self._decrypt_transport_rtp(data)
+            if not payload:
+                return
+
+            # 4. DAVE E2EE 復号 (Passthrough または MLS グループ鍵復号)
             state = getattr(self.vc, "_connection", None)
             dave = getattr(state, "dave_session", None) if state else None
             is_dave_active = bool(
@@ -267,37 +371,68 @@ class VoiceStreamReceiver:
 
             opus_data: Optional[bytes] = None
             if is_dave_active:
-                if len(self.target_user_ids) == 1:
+                if user_id:
+                    try:
+                        opus_data = dave.decrypt(user_id, media_type_audio, payload)
+                    except Exception as ex:
+                        self._dave_err_count += 1
+                        if self._dave_err_count == 1 or self._dave_err_count % 50 == 0:
+                            logger.warning(
+                                f"⚠️ [DAVE] Decrypt error on SSRC {ssrc} (uid={user_id}, count={self._dave_err_count}): {ex}"
+                            )
+                        return
+                elif len(self.target_user_ids) == 1:
                     target_id = next(iter(self.target_user_ids))
                     try:
-                        opus_data = dave.decrypt(target_id, media_type_audio, payload)
-                        if not user_id:
+                        decrypted = dave.decrypt(target_id, media_type_audio, payload)
+                        opus_data = decrypted
+                        # 真に DAVE 暗号化されたパケットが target_id の鍵で復号された場合のみ確定マッピング
+                        if decrypted != payload:
                             self._ssrc_to_user[ssrc] = target_id
                             user_id = target_id
                             member = self.vc.guild.get_member(target_id) if self.vc and self.vc.guild else None
                             if member:
                                 self._user_to_name[target_id] = member.display_name
                     except Exception as ex:
-                        err_key = f"dave_err_{ssrc}_{type(ex).__name__}"
-                        if err_key not in self._dave_err_logged:
-                            self._dave_err_logged.add(err_key)
-                            logger.info(f"⚠️ [DAVE] Decrypt error on SSRC {ssrc}: {ex}")
+                        self._dave_err_count += 1
+                        if self._dave_err_count == 1 or self._dave_err_count % 50 == 0:
+                            logger.info(
+                                f"⚠️ [DAVE] Decrypt error on SSRC {ssrc} (target={target_id}, count={self._dave_err_count}): {ex}"
+                            )
                         return
                 else:
-                    uid_to_try = user_id
-                    if not uid_to_try:
-                        uids = getattr(dave, "get_user_ids", lambda: [])()
-                        cand = [u for u in uids if u != getattr(self.vc, "user_id", None) and (not self.vc.guild.me or u != self.vc.guild.me.id)]
-                        uid_to_try = cand[0] if cand else (uids[0] if uids else None)
+                    uids = getattr(dave, "get_user_ids", lambda: [])()
+                    me_id = getattr(self.vc.guild.me, "id", None) if self.vc and self.vc.guild else None
+                    bot_uid = getattr(self.vc, "user_id", None)
+                    cand = [u for u in uids if u != bot_uid and u != me_id]
+                    if self.target_user_ids:
+                        # ターゲット候補を優先順にして試す
+                        cand = sorted(cand, key=lambda u: 0 if u in self.target_user_ids else 1)
 
-                    if uid_to_try:
-                        try:
-                            opus_data = dave.decrypt(uid_to_try, media_type_audio, payload)
-                        except Exception as ex:
-                            err_key = f"dave_err_{ssrc}_{type(ex).__name__}"
-                            if err_key not in self._dave_err_logged:
-                                self._dave_err_logged.add(err_key)
-                                logger.info(f"⚠️ [DAVE] Decrypt error on SSRC {ssrc}: {ex}")
+                    if cand:
+                        last_ex: Optional[Exception] = None
+                        for u in cand:
+                            try:
+                                decrypted = dave.decrypt(u, media_type_audio, payload)
+                                opus_data = decrypted
+                                if decrypted != payload:
+                                    # DAVE 復号に真に成功した話者へ確定マッピング
+                                    self._ssrc_to_user[ssrc] = u
+                                    user_id = u
+                                    member = self.vc.guild.get_member(u) if self.vc and self.vc.guild else None
+                                    if member:
+                                        self._user_to_name[u] = member.display_name
+                                    if self.target_user_ids and u not in self.target_user_ids:
+                                        return
+                                break
+                            except Exception as ex:
+                                last_ex = ex
+                        if opus_data is None:
+                            self._dave_err_count += 1
+                            if self._dave_err_count == 1 or self._dave_err_count % 50 == 0:
+                                logger.warning(
+                                    f"⚠️ [DAVE] Decrypt failed for all candidates on SSRC {ssrc} (count={self._dave_err_count}): {last_ex}"
+                                )
                             return
                     else:
                         opus_data = payload
@@ -307,7 +442,7 @@ class VoiceStreamReceiver:
             if not opus_data:
                 return
 
-            # 4. Opus デコード (SSRC ごとに完全独立したデコーダーを使用 & 破損時自己修復)
+            # 5. Opus デコード (SSRC ごとに完全独立したデコーダーを使用 & 破損時自己修復)
             decoder = self._decoders.get(ssrc)
             if not decoder:
                 decoder = OpusDecoder()
@@ -318,14 +453,17 @@ class VoiceStreamReceiver:
             except Exception as dec_err:
                 # デコーダーの予測状態が壊れた場合は即座に再生成して自己修復
                 self._decoders[ssrc] = OpusDecoder()
-                err_key = f"dec_{ssrc}"
-                if err_key not in self._dave_err_logged:
-                    self._dave_err_logged.add(err_key)
-                    logger.warning(f"❌ [VoiceReceiver] Opus decode error on SSRC {ssrc}: {dec_err} (decoder reset)")
+                self._decode_err_count += 1
+                if self._decode_err_count == 1 or self._decode_err_count % 50 == 0:
+                    logger.warning(
+                        f"❌ [VoiceReceiver] Opus decode error on SSRC {ssrc} (count={self._decode_err_count}): {dec_err} (decoder reset)"
+                    )
                 return
 
             if not pcm:
                 return
+
+            self._decoded_frame_count += 1
 
             # 音声レベル (RMS) の計算 (3840 bytes = 960 stereo samples)
             shorts = struct.unpack(f"<{len(pcm)//2}h", pcm)

@@ -1106,6 +1106,17 @@ class VCHandlerCog(commands.Cog):
         # データベースから接続セッションを削除 (この号機のみ)
         await self.db.remove_active_vc(guild.id, bot_index=self.bot_index)
 
+        # この Bot 上で稼働中の STT セッションがあればクリーンアップ
+        try:
+            from src.stt.manager import STTManager
+            stt_mgr = STTManager.get_instance()
+            if stt_mgr and stt_mgr.is_active(guild.id):
+                rec = stt_mgr.receivers.get(guild.id)
+                if rec and getattr(rec.vc, "client", None) is self.bot:
+                    await stt_mgr.stop_stt(guild.id, clear_persisted=True)
+        except Exception as stt_err:
+            logger.debug(f"[Bot #{self.bot_index}] Error stopping STT on disconnect_vc: {stt_err}")
+
         vc = guild.voice_client
         if vc is not None:
             if vc.is_playing():
@@ -1174,6 +1185,17 @@ class VCHandlerCog(commands.Cog):
                         await self.db.remove_active_vc(guild_id, bot_index=self.bot_index)
                 else:
                     await self.db.remove_active_vc(guild_id, bot_index=self.bot_index)
+
+            # 再起動前に稼働していた STT (早耳 Live) セッションがあれば VC 復元後に自動再開
+            try:
+                from src.stt.manager import STTManager
+                stt_mgr = STTManager.get_instance()
+                if not stt_mgr:
+                    primary_bot = self.bot_pool.bots.get(1, self.bot) if self.bot_pool else self.bot
+                    stt_mgr = STTManager(primary_bot, self.db, self.config)
+                await stt_mgr.restore_persisted_sessions_for_bot(self.bot, self.bot_index)
+            except Exception as stt_err:
+                logger.warning(f"[Bot #{self.bot_index}] Error restoring persisted STT sessions: {stt_err}")
         except Exception as e:
             logger.error(f"[Bot #{self.bot_index}] Error restoring active VC sessions: {e}")
 

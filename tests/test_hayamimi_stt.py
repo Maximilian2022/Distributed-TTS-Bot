@@ -195,6 +195,150 @@ class TestHayamimiSTT(unittest.IsolatedAsyncioTestCase):
         mock_session.push_audio.assert_not_called()
         self.assertNotIn(7777, receiver._ssrc_to_user)
 
+    async def test_voice_receiver_transport_aead_rtpsize_decryption(self):
+        """Discord Voice Transport 暗号化 (aead_xchacha20_poly1305_rtpsize + RTP拡張) の完全復号テスト"""
+        from src.stt.voice_receiver import VoiceStreamReceiver
+        import nacl.secret
+        import struct
+
+        secret_key = list(range(32))
+        box = nacl.secret.Aead(bytes(secret_key))
+
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.guild.id = 12345
+        mock_vc.ssrc = 9999
+
+        mock_conn = MagicMock()
+        mock_conn.dave_session = None
+        mock_conn.mode = "aead_xchacha20_poly1305_rtpsize"
+        mock_conn.secret_key = secret_key
+        mock_vc._connection = mock_conn
+
+        mock_dispatcher = MagicMock()
+        receiver = VoiceStreamReceiver(
+            voice_client=mock_vc,
+            dispatcher=mock_dispatcher,
+            gateway_url="ws://dummy/ws/stream",
+            target_user_ids={1001},
+        )
+        receiver._is_running = True
+
+        mock_decoder = MagicMock()
+        mock_decoder.decode.return_value = b"\x01\x02" * 1920
+        receiver._decoders[5627] = mock_decoder
+
+        mock_session = MagicMock()
+        mock_session.is_connected = True
+        receiver._sessions[5627] = mock_session
+
+        # RTP Header Extension あり (b0=0x90, pt=120, ext profile=0xBEDE, len=1 word)
+        header = struct.pack(">BBHIIHH", 0x90, 120, 10, 4800, 5627, 0xBEDE, 1)
+        ext_body = b"\x10\x45\x00\x00"
+        plain_opus = b"\xf8\xff\xfe\xaa\xbb"
+        nonce = bytearray(24)
+        nonce[:4] = struct.pack(">I", 77)
+        encrypted_pkt = header + box.encrypt(ext_body + plain_opus, header, bytes(nonce)).ciphertext + nonce[:4]
+
+        receiver._on_rtp_packet(encrypted_pkt)
+
+        # 拡張ヘッダが正しく除去され、生の Opus パケットだけがデコーダに渡されたか検証
+        mock_decoder.decode.assert_called_once_with(plain_opus)
+        mock_session.push_audio.assert_called_once_with(b"\x01\x02" * 1920)
+        self.assertEqual(receiver._decoded_frame_count, 1)
+
+    async def test_voice_receiver_ws_hook_closes_nontarget_session(self):
+        """WS Opcode 5 で後からターゲット外話者と判明した場合に誤セッションを即座に破棄するテスト"""
+        from src.stt.voice_receiver import VoiceStreamReceiver
+
+        mock_ws = MagicMock()
+        mock_ws._hook = AsyncMock()
+        mock_conn = MagicMock()
+        mock_conn.ws = mock_ws
+        mock_vc = MagicMock()
+        mock_vc.guild.get_member.return_value = MagicMock(display_name="OtherUser")
+        mock_vc._connection = mock_conn
+
+        receiver = VoiceStreamReceiver(
+            voice_client=mock_vc,
+            dispatcher=MagicMock(),
+            gateway_url="ws://dummy/ws/stream",
+            target_user_ids={1001},
+        )
+        receiver._install_ws_hook()
+
+        # 事前接続されてしまったターゲット外 SSRC 5654 のダミーセッション
+        wrong_sess = MagicMock()
+        wrong_sess.close = AsyncMock()
+        receiver._sessions[5654] = wrong_sess
+
+        # Opcode 5 で SSRC 5654 = user_id 2002 (ターゲット外) が通知される
+        await mock_ws._hook(None, {"op": 5, "d": {"user_id": "2002", "ssrc": 5654, "speaking": 1}})
+        await asyncio.sleep(0)
+
+        self.assertNotIn(5654, receiver._sessions)
+        wrong_sess.close.assert_awaited_once()
+
+    async def test_stt_manager_persist_and_restore(self):
+        """STTManager のセッション状態永続化と再起動後自動復元テスト"""
+        from src.stt.manager import STTManager
+        import json
+
+        kv_store = {}
+        mock_db = MagicMock()
+        mock_db.get_system_kv = AsyncMock(side_effect=lambda k, default=None: kv_store.get(k, default))
+        mock_db.set_system_kv = AsyncMock(side_effect=lambda k, v: kv_store.__setitem__(k, v))
+
+        cfg = AppConfig()
+        cfg.hayamimi_ws_url = "ws://127.0.0.1:8833/ws/stream"
+
+        mock_bot = MagicMock()
+        mock_bot.bot_index = 1
+        mock_guild = MagicMock()
+        mock_guild.id = 999
+        mock_guild.name = "TestGuild"
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.channel.id = 555
+        mock_vc.channel.name = "GeneralVC"
+        mock_vc.channel.members = [MagicMock(bot=False)]
+        mock_guild.voice_client = mock_vc
+        mock_bot.get_guild.return_value = mock_guild
+
+        mgr = STTManager(bot=mock_bot, db=mock_db, config=cfg)
+
+        async def fake_start(self_rec):
+            self_rec._is_running = True
+            return True
+
+        with patch("src.stt.voice_receiver.VoiceStreamReceiver.start", new=fake_start), \
+             patch("src.stt.voice_receiver.VoiceStreamReceiver.stop", new=AsyncMock()):
+            ok = await mgr.start_stt(
+                guild=mock_guild,
+                text_channel_id=777,
+                target_user_ids={1001},
+                trans_langs="en",
+                voice_client=mock_vc,
+                bot_client=mock_bot,
+            )
+            self.assertTrue(ok)
+            self.assertIn("active_stt_sessions", kv_store)
+            saved = json.loads(kv_store["active_stt_sessions"])
+            self.assertEqual(saved["999"]["text_channel_id"], 777)
+            self.assertEqual(saved["999"]["target_user_ids"], [1001])
+
+            # 再起動をシミュレート (メモリ上の receivers クリア)
+            mgr.receivers.clear()
+            mgr.dispatchers.clear()
+            await mgr.restore_persisted_sessions_for_bot(mock_bot, bot_index=1)
+            self.assertTrue(mgr.is_active(999))
+            self.assertEqual(mgr.dispatchers[999].text_channel_id, 777)
+
+            # /stt stop で永続化状態も削除されるか
+            await mgr.stop_stt(999, clear_persisted=True)
+            saved_after = json.loads(kv_store["active_stt_sessions"])
+            self.assertNotIn("999", saved_after)
+
 
 if __name__ == "__main__":
     unittest.main()
