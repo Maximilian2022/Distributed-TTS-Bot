@@ -1454,6 +1454,61 @@
                 </div>
               </div>
 
+              <!-- 早耳 Live (Hayamimi) STT・翻訳設定 -->
+              <div class="card" style="margin-bottom:16px;padding:20px;border-left:4px solid #a855f7;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+                  <h3 style="margin:0;font-size:15px;display:flex;align-items:center;gap:6px;">
+                    <span style="font-size:18px;">🎙️</span>
+                    <span>早耳 Live 連携 (リアルタイム音声認識・多言語翻訳 STT)</span>
+                    <span id="hayamimi-status-badge" class="badge">未設定</span>
+                  </h3>
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="testCredential('hayamimi')">疎通テスト ⚡</button>
+                </div>
+                <div style="margin-bottom:12px;">
+                  <label class="form-label" style="font-size:12px;">早耳 Gateway WebSocket URL (HAYAMIMI_WS_URL)</label>
+                  <input type="text" id="cred-hayamimi-ws-url" class="form-input" placeholder="ws://192.168.11.244:8833/ws/stream または wss://hayamimi.kit-a.net/ws/stream" style="font-family:monospace;font-size:12px;">
+                  <small style="color:var(--text-muted);font-size:11px;margin-top:4px;display:block;">
+                    💡 早耳 Live の WebSocket エンドポイント URL を指定します。Discord の 48kHz Stereo 音声をそのままストリーミング送信します。
+                  </small>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+                  <div>
+                    <label class="form-label" style="font-size:12px;">ASR 音声認識モデル (Model)</label>
+                    <select id="cred-hayamimi-model" class="form-select">
+                      <option value="reazon">reazon (ReazonSpeech Zipformer・日本語高精度・推奨)</option>
+                      <option value="haas">haas (Haas ONNX・超軽量・超高速)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="form-label" style="font-size:12px;">多言語リアルタイム翻訳先 (trans_langs)</label>
+                    <input type="text" id="cred-hayamimi-trans-langs" class="form-input" placeholder="空欄で翻訳なし (例: en や en,ko)">
+                    <small style="color:var(--text-dim);font-size:11px;">カンマ区切りの言語コード。確定発話を同時に翻訳して返却します。</small>
+                  </div>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">
+                  <div>
+                    <label class="form-label" style="font-size:12px;">翻訳用 Gemini API キー (任意)</label>
+                    <input type="password" id="cred-hayamimi-gemini-key" class="form-input" placeholder="未設定 (サーバー既定を使用)">
+                  </div>
+                  <div>
+                    <label class="form-label" style="font-size:12px;">OBS 置換辞書トークン (任意)</label>
+                    <input type="password" id="cred-hayamimi-token" class="form-input" placeholder="未設定 (辞書連携なし)">
+                  </div>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                  <div>
+                    <label class="form-label" style="font-size:12px;">Discord 連投抑制バッファ (秒)</label>
+                    <input type="number" step="0.1" min="0.3" max="3.0" id="cred-hayamimi-buffer-sec" class="form-input" value="1.0">
+                    <small style="color:var(--text-dim);font-size:11px;">連続発話を1つのメッセージにまとめて送信し、Discord 429 制限を防止（推奨: 1.0秒）</small>
+                  </div>
+                  <div>
+                    <label class="form-label" style="font-size:12px;">最大同時話者数 (人)</label>
+                    <input type="number" min="1" max="8" id="cred-hayamimi-max-speakers" class="form-input" value="8">
+                    <small style="color:var(--text-dim);font-size:11px;">同時ストリーミング上限（推奨: 最大8人、All時は遅延許容モード）</small>
+                  </div>
+                </div>
+              </div>
+
               <!-- システム基本公開設定 -->
               <div class="card" style="margin-bottom:20px;padding:20px;">
                 <h3 style="margin:0 0 12px;font-size:15px;">🌐 公開URL・管理者パスワード設定</h3>

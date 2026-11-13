@@ -1308,4 +1308,197 @@ class CommandsCog(commands.Cog):
         else:
             await interaction.followup.send(f"❌ 管理者DMへの送信に失敗しました。Botコンソールログを確認してください。", ephemeral=True)
 
+    # ========================================================
+    # 🎙️ 早耳 Live (Hayamimi) リアルタイム音声認識 (STT) ＆ 翻訳コマンド
+    # ========================================================
+    stt_group = app_commands.Group(name="stt", description="早耳 Live (Hayamimi) リアルタイム音声認識 ＆ 多言語翻訳")
+
+    @stt_group.command(name="start", description="VC音声のリアルタイム文字起こし・翻訳を開始します。")
+    @app_commands.describe(
+        target="字幕化する対象メンバー (未指定で実行者自身 / all_members有効時は無視)",
+        all_members="VC内の全メンバーを対象にするか (True: 全員, False: targetまたは実行者)",
+        trans_langs="リアルタイム翻訳先言語コード (例: en, ko, zh。空欄で翻訳なし)",
+        output="字幕の出力先 (both: 聞き専＋ゲームPC, channel: 聞き専のみ, game: ゲームPCのみ)"
+    )
+    @app_commands.choices(
+        output=[
+            app_commands.Choice(name="聞き専チャンネル ＋ ゲームPC (両方)", value="both"),
+            app_commands.Choice(name="聞き専チャンネルのみ", value="channel"),
+            app_commands.Choice(name="ゲームPCのみ (Discordチャット無投稿)", value="game"),
+        ]
+    )
+    async def stt_start(
+        self,
+        interaction: discord.Interaction,
+        target: Optional[discord.Member] = None,
+        all_members: Optional[bool] = False,
+        trans_langs: Optional[str] = None,
+        output: Optional[str] = "both",
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("❌ このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+            return
+
+        # マルチBotプール対応: 該当VCまたはテキストチャンネルに接続中のBotを検索
+        target_bot = None
+        target_guild = None
+        vc = None
+        assigned_bot_idx = 1
+
+        if self.bot_pool:
+            if isinstance(interaction.user, discord.Member) and interaction.user.voice and interaction.user.voice.channel:
+                found = self.bot_pool.find_connected_bot_in_vc(interaction.guild_id, interaction.user.voice.channel.id)
+                if found:
+                    assigned_bot_idx, target_bot = found
+            if not target_bot:
+                found = self.bot_pool.find_bot_for_text_channel(interaction.guild_id, interaction.channel_id)
+                if found:
+                    assigned_bot_idx, target_bot = found
+            if not target_bot:
+                for b_idx, b in self.bot_pool.bots.items():
+                    g = b.get_guild(interaction.guild_id)
+                    if g and g.voice_client and g.voice_client.is_connected():
+                        assigned_bot_idx = b_idx
+                        target_bot = b
+                        target_guild = g
+                        vc = g.voice_client
+                        break
+
+        if not target_bot:
+            target_bot = self.bot
+
+        if not target_guild:
+            target_guild = target_bot.get_guild(interaction.guild_id)
+        if not vc and target_guild:
+            vc = target_guild.voice_client
+
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message(
+                "❌ Bot がボイスチャンネルに接続していません。先に `/join` で接続してください。",
+                ephemeral=True
+            )
+            return
+
+        from src.stt.manager import STTManager
+        stt_mgr = STTManager.get_instance()
+        if not stt_mgr:
+            stt_mgr = STTManager(self.bot, self.db, self.config)
+
+        gateway_url = getattr(self.config, "hayamimi_ws_url", "").strip()
+        if not gateway_url:
+            await interaction.response.send_message(
+                "⚠️ **早耳 Live Gateway URL が設定されていません。**\n"
+                "WebUI の「🔑 API・外部サービス連携設定」タブから `HAYAMIMI_WS_URL` を設定してください。",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=False)
+
+        # ターゲット話者の決定
+        target_set = set()
+        target_desc = ""
+        if all_members:
+            target_set = set()  # 空集合は全員 (All)
+            target_desc = "👥 VC内の全員 (All - 最大8人)"
+        elif target:
+            target_set.add(target.id)
+            target_desc = f"{target.mention} (特定話者)"
+        else:
+            # target 未指定かつ all_members=False 時はコマンド実行者自身
+            target_set.add(interaction.user.id)
+            target_desc = f"{interaction.user.mention} (コマンド実行者)"
+
+        # 出力先チャンネルの決定
+        text_channel_id = None
+        if output in ("both", "channel"):
+            target_vc_cog = target_bot.get_cog("VCHandlerCog") or self.vc_handler
+            state = target_vc_cog.get_guild_state(interaction.guild.id)
+            text_channel_id = state.bound_text_channel_id or interaction.channel.id
+
+        langs = trans_langs if trans_langs is not None else getattr(self.config, "hayamimi_trans_langs", "")
+        success = await stt_mgr.start_stt(
+            guild=target_guild,
+            text_channel_id=text_channel_id,
+            target_user_ids=target_set,
+            trans_langs=langs,
+            voice_client=vc,
+            bot_client=target_bot,
+        )
+
+        if success:
+            embed = discord.Embed(
+                title="🎙️ 早耳 Live 音声認識 (STT) を開始しました",
+                color=0x2ecc71,
+                description="VC 内の発話をリアルタイムで文字起こしし、テキストとして出力します。"
+            )
+            embed.add_field(name="🎯 対象話者", value=target_desc, inline=True)
+            embed.add_field(name="🤖 担当Bot", value=f"Bot {assigned_bot_idx}号機", inline=True)
+            embed.add_field(name="🌐 早耳 Gateway", value=f"`{gateway_url}`", inline=True)
+            if langs:
+                embed.add_field(name="🌍 リアルタイム翻訳", value=f"`{langs}`", inline=True)
+
+            out_text = "聞き専チャンネル ＋ ゲームPC" if output == "both" else ("聞き専チャンネルのみ" if output == "channel" else "ゲームPCのみ")
+            embed.add_field(name="📤 出力先", value=out_text, inline=True)
+
+            if output in ("both", "game"):
+                embed.add_field(
+                    name="🎮 ゲームPC自動入力ツール",
+                    value="ゲーム画面へ自動貼り付け＆Enter送信を行う場合、PCで以下から `run.bat` を実行してください：\n"
+                          f"📥 [run.bat ダウンロード]({self.config.web_dashboard_url}/stt/run.bat)",
+                    inline=False
+                )
+
+            embed.set_footer(text="停止するには /stt stop を実行してください")
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(
+                "❌ 早耳 Live STT の開始に失敗しました。Gateway への接続状況やログを確認してください。",
+                ephemeral=True
+            )
+
+    @stt_group.command(name="stop", description="VC音声のリアルタイム文字起こし・翻訳を終了します。")
+    async def stt_stop(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("❌ このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+            return
+
+        from src.stt.manager import STTManager
+        stt_mgr = STTManager.get_instance()
+        if not stt_mgr or not stt_mgr.is_active(interaction.guild.id):
+            await interaction.response.send_message("ℹ️ このサーバーでは STT 音声認識は稼働していません。", ephemeral=True)
+            return
+
+        await stt_mgr.stop_stt(interaction.guild.id)
+        await interaction.response.send_message("🛑 早耳 Live 音声認識 (STT) を停止しました。")
+
+    @stt_group.command(name="status", description="リアルタイム音声認識の稼働状況を表示します。")
+    async def stt_status(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("❌ このコマンドはサーバー内でのみ使用できます。", ephemeral=True)
+            return
+
+        from src.stt.manager import STTManager
+        stt_mgr = STTManager.get_instance()
+        is_active = stt_mgr and stt_mgr.is_active(interaction.guild.id)
+
+        embed = discord.Embed(
+            title="🎙️ 早耳 Live STT 稼働ステータス",
+            color=0x3498db if is_active else 0x95a5a6
+        )
+        embed.add_field(name="状態", value="🟢 稼働中 (Active)" if is_active else "⚪ 停止中 (Idle)", inline=True)
+        embed.add_field(name="早耳 Gateway", value=f"`{getattr(self.config, 'hayamimi_ws_url', '未設定')}`", inline=True)
+        embed.add_field(name="ASR モデル", value=getattr(self.config, "hayamimi_model", "reazon"), inline=True)
+        embed.add_field(name="Discord 連投抑制バッファ", value=f"{getattr(self.config, 'hayamimi_buffer_seconds', 1.0)} 秒", inline=True)
+        embed.add_field(name="最大同時話者数", value=f"{getattr(self.config, 'hayamimi_max_speakers', 8)} 人", inline=True)
+
+        if is_active and stt_mgr:
+            receiver = stt_mgr.receivers.get(interaction.guild.id)
+            if receiver:
+                speakers = len(receiver._sessions)
+                embed.add_field(name="現在接続中の話者セッション", value=f"{speakers} 名", inline=True)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 

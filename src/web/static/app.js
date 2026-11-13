@@ -8984,6 +8984,29 @@ async function loadCredentials() {
       credErrorContact.value = (data.error_contact_user_id && data.error_contact_user_id !== "0") ? String(data.error_contact_user_id) : "";
     }
 
+    // 早耳 Live (Hayamimi) STT
+    const hayamimiBadge = document.getElementById("hayamimi-status-badge");
+    const hayamimiWsUrl = document.getElementById("cred-hayamimi-ws-url");
+    const hayamimiModel = document.getElementById("cred-hayamimi-model");
+    const hayamimiTrans = document.getElementById("cred-hayamimi-trans-langs");
+    const hayamimiGemini = document.getElementById("cred-hayamimi-gemini-key");
+    const hayamimiToken = document.getElementById("cred-hayamimi-token");
+    const hayamimiBuffer = document.getElementById("cred-hayamimi-buffer-sec");
+    const hayamimiSpeakers = document.getElementById("cred-hayamimi-max-speakers");
+
+    if (hayamimiBadge) {
+      hayamimiBadge.textContent = data.hayamimi_configured ? "🟢 設定済み" : "⚪ 未設定";
+      hayamimiBadge.style.background = data.hayamimi_configured ? "rgba(168,85,247,0.2)" : "rgba(255,255,255,0.06)";
+      hayamimiBadge.style.color = data.hayamimi_configured ? "#c084fc" : "var(--text-dim)";
+    }
+    if (hayamimiWsUrl && data.hayamimi_ws_url !== undefined) hayamimiWsUrl.value = data.hayamimi_ws_url || "";
+    if (hayamimiModel && data.hayamimi_model) hayamimiModel.value = data.hayamimi_model;
+    if (hayamimiTrans && data.hayamimi_trans_langs !== undefined) hayamimiTrans.value = data.hayamimi_trans_langs || "";
+    if (hayamimiGemini) hayamimiGemini.value = data.hayamimi_gemini_key || "";
+    if (hayamimiToken) hayamimiToken.value = data.hayamimi_token || "";
+    if (hayamimiBuffer && data.hayamimi_buffer_seconds) hayamimiBuffer.value = data.hayamimi_buffer_seconds;
+    if (hayamimiSpeakers && data.hayamimi_max_speakers) hayamimiSpeakers.value = data.hayamimi_max_speakers;
+
     // HA Secret の保持とワンライナー更新
     if (data.ha_secret) {
       window.currentHaSecret = data.ha_secret;
@@ -9145,6 +9168,23 @@ async function saveCredentials(event) {
     payload.error_contact_user_id = credErrorContactVal;
   }
 
+  // 早耳 Live (Hayamimi) 設定
+  const hWsUrl = document.getElementById("cred-hayamimi-ws-url")?.value?.trim();
+  const hModel = document.getElementById("cred-hayamimi-model")?.value?.trim();
+  const hTrans = document.getElementById("cred-hayamimi-trans-langs")?.value?.trim();
+  const hGemini = document.getElementById("cred-hayamimi-gemini-key")?.value?.trim();
+  const hToken = document.getElementById("cred-hayamimi-token")?.value?.trim();
+  const hBuffer = document.getElementById("cred-hayamimi-buffer-sec")?.value?.trim();
+  const hSpeakers = document.getElementById("cred-hayamimi-max-speakers")?.value?.trim();
+
+  if (hWsUrl !== undefined) payload.hayamimi_ws_url = hWsUrl;
+  if (hModel) payload.hayamimi_model = hModel;
+  if (hTrans !== undefined) payload.hayamimi_trans_langs = hTrans;
+  if (hGemini) payload.hayamimi_gemini_key = hGemini;
+  if (hToken) payload.hayamimi_token = hToken;
+  if (hBuffer) payload.hayamimi_buffer_seconds = hBuffer;
+  if (hSpeakers) payload.hayamimi_max_speakers = hSpeakers;
+
   try {
     const res = await fetch("/api/system/credentials", {
       method: "POST",
@@ -9167,11 +9207,15 @@ async function saveCredentials(event) {
       const k3 = document.getElementById("cred-google-key");
       const k4 = document.getElementById("cred-admin-password");
       const k5 = document.getElementById("cred-cloudflare-tunnel-token");
+      const k6 = document.getElementById("cred-hayamimi-gemini-key");
+      const k7 = document.getElementById("cred-hayamimi-token");
       if (k1) k1.value = "";
       if (k2) k2.value = "";
       if (k3) k3.value = "";
       if (k4) k4.value = "";
       if (k5) k5.value = "";
+      if (k6) k6.value = "";
+      if (k7) k7.value = "";
       loadCredentials();
     } else {
       showToast(data.error || "設定保存に失敗しました", "error");
@@ -9226,12 +9270,32 @@ async function testErrorAlert(isGuild) {
 window.testErrorAlert = testErrorAlert;
 
 async function testCredential(provider) {
-  showToast(`⚡ ${provider.toUpperCase()} のテスト音声合成を実行中...`, "success");
+  const isHayamimi = provider.toLowerCase() === "hayamimi";
+  if (isHayamimi) {
+    showToast(`⚡ 早耳 Live への接続テストを実行中...`, "success");
+  } else {
+    showToast(`⚡ ${provider.toUpperCase()} のテスト音声合成を実行中...`, "success");
+  }
+
+  const payload = { provider: provider };
+  if (isHayamimi) {
+    const wsUrl = document.getElementById("cred-hayamimi-ws-url")?.value?.trim();
+    const model = document.getElementById("cred-hayamimi-model")?.value?.trim();
+    const transLangs = document.getElementById("cred-hayamimi-trans-langs")?.value?.trim();
+    const geminiKey = document.getElementById("cred-hayamimi-gemini-key")?.value?.trim();
+    const token = document.getElementById("cred-hayamimi-token")?.value?.trim();
+    if (wsUrl) payload.ws_url = wsUrl;
+    if (model) payload.model = model;
+    if (transLangs !== undefined) payload.trans_langs = transLangs;
+    if (geminiKey) payload.gemini_key = geminiKey;
+    if (token) payload.token = token;
+  }
+
   try {
     const res = await fetch("/api/system/credentials/test", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ provider: provider })
+      body: JSON.stringify(payload)
     });
     const rawText = await res.text();
     let data = {};
@@ -9243,13 +9307,17 @@ async function testCredential(provider) {
     }
 
     if (res.ok && (data.status === "ok" || data.success)) {
-      showToast(`✅ ${provider.toUpperCase()} 疎通成功！ (遅延: ${data.latency_ms}ms, 形式: ${data.format})`, "success");
-      if (data.audio_base64) {
-        const audio = new Audio(`data:audio/${data.format};base64,${data.audio_base64}`);
-        audio.play().catch(e => console.warn("Audio play prevented:", e));
+      if (isHayamimi) {
+        showToast(`✅ ${data.message} (遅延: ${data.latency_ms}ms)`, "success");
+      } else {
+        showToast(`✅ ${provider.toUpperCase()} 疎通成功！ (遅延: ${data.latency_ms}ms, 形式: ${data.format})`, "success");
+        if (data.audio_base64) {
+          const audio = new Audio(`data:audio/${data.format};base64,${data.audio_base64}`);
+          audio.play().catch(e => console.warn("Audio play prevented:", e));
+        }
       }
     } else {
-      showToast(`❌ ${provider.toUpperCase()} テスト失敗: ${data.error || data.message || res.statusText}`, "error");
+      showToast(`❌ ${isHayamimi ? "早耳 Live" : provider.toUpperCase()} テスト失敗: ${data.error || data.message || res.statusText}`, "error");
     }
   } catch (err) {
     showToast(`通信エラー: ${err.message}`, "error");

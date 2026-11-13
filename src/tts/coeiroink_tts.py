@@ -3,7 +3,7 @@ import time
 import aiohttp
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 from src.tts.base import BaseTTSClient, TTSError, TTSConnectionError
 from src.tts.node_pool import TTSNodePool
 

@@ -558,6 +558,11 @@ class WebServer:
         self.app.router.add_get("/volunteer/volunteer_worker.py", self.handle_volunteer_file)
         self.app.router.add_get("/volunteer/ttsbot-volunteer-worker.zip", self.handle_volunteer_zip)
 
+        # 早耳 Live (Hayamimi) STT ゲーム連携ツール配信 & WebSocket API
+        self.app.router.add_get("/stt/run.bat", self.handle_stt_file)
+        self.app.router.add_get("/stt/hayamimi_game_bridge.py", self.handle_stt_file)
+        self.app.router.add_get("/api/stt/stream", self.api_stt_stream)
+
         # API (認証必要)
         self.app.router.add_get("/api/me", self.api_get_me)
         self.app.router.add_post("/api/me/voice", self.api_update_voice)
@@ -1348,6 +1353,47 @@ class WebServer:
             "Content-Disposition": 'attachment; filename="ttsbot-volunteer-worker.zip"'
         }
         return web.Response(body=buf.read(), content_type="application/zip", headers=headers)
+
+    async def handle_stt_file(self, request: web.Request) -> web.Response:
+        """早耳 Live ゲーム連携スクリプトの配信 (CWE-22 Path Injection 対策済み)"""
+        STT_SAFE_FILES = {
+            "run.bat": ("run.bat", "application/x-bat"),
+            "hayamimi_game_bridge.py": ("hayamimi_game_bridge.py", "text/x-python"),
+        }
+        raw_name = request.path.split("/")[-1]
+        file_info = STT_SAFE_FILES.get(raw_name)
+        if not file_info:
+            return web.Response(text="File not found", status=404)
+
+        filename, mime_type = file_info
+        candidate_dirs = [
+            (Path(__file__).resolve().parent.parent.parent / "tools" / "game_bridge"),
+            Path("/app/tools/game_bridge"),
+            (Path(__file__).resolve().parent / "static" / "stt"),
+        ]
+        target_path = None
+        for b_dir in candidate_dirs:
+            p = b_dir / filename
+            if p.is_file():
+                target_path = p
+                break
+
+        if not target_path:
+            return web.Response(text="File not found on server", status=404)
+
+        return web.Response(
+            body=target_path.read_bytes(),
+            content_type=mime_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+
+    async def api_stt_stream(self, request: web.Request) -> web.WebSocketResponse:
+        """早耳 Live ゲームPC連携用リアルタイム WebSocket ストリーム (出口B)"""
+        from src.stt.manager import STTManager
+        stt_mgr = STTManager.get_instance()
+        if not stt_mgr:
+            stt_mgr = STTManager(self.bot, self.db, self.config)
+        return await stt_mgr.handle_game_ws(request)
 
     def _load_or_create_master_instance_id(self) -> str:
         """
@@ -7028,7 +7074,18 @@ class WebServer:
             # Gemini AI
             "gemini_api_key": _mask(self.config.gemini_api_key),
             "gemini_api_key_configured": bool(self.config.gemini_api_key),
-            "gemini_model": self.config.gemini_model
+            "gemini_model": self.config.gemini_model,
+            # 早耳 Live (Hayamimi) STT
+            "hayamimi_ws_url": self.config.hayamimi_ws_url,
+            "hayamimi_model": self.config.hayamimi_model or "reazon",
+            "hayamimi_trans_langs": self.config.hayamimi_trans_langs,
+            "hayamimi_gemini_key": _mask(self.config.hayamimi_gemini_key),
+            "hayamimi_gemini_key_configured": bool(self.config.hayamimi_gemini_key),
+            "hayamimi_token": _mask(self.config.hayamimi_token),
+            "hayamimi_token_configured": bool(self.config.hayamimi_token),
+            "hayamimi_buffer_seconds": getattr(self.config, "hayamimi_buffer_seconds", 1.0),
+            "hayamimi_max_speakers": getattr(self.config, "hayamimi_max_speakers", 8),
+            "hayamimi_configured": bool(self.config.hayamimi_ws_url)
         })
 
     async def api_system_save_credentials(self, request: web.Request) -> web.Response:
@@ -7199,6 +7256,55 @@ class WebServer:
                     await self.db.set_credential("gemini_model", g_mod, is_secret=False)
                     self.config.gemini_model = g_mod
                     os.environ["GEMINI_MODEL"] = g_mod
+
+            # 12. 早耳 Live (Hayamimi) STT 設定
+            if "hayamimi_ws_url" in data:
+                h_url = str(data["hayamimi_ws_url"]).strip()
+                await self.db.set_credential("hayamimi_ws_url", h_url, is_secret=False)
+                self.config.hayamimi_ws_url = h_url
+                os.environ["HAYAMIMI_WS_URL"] = h_url
+
+            if "hayamimi_model" in data:
+                h_mod = str(data["hayamimi_model"]).strip() or "reazon"
+                await self.db.set_credential("hayamimi_model", h_mod, is_secret=False)
+                self.config.hayamimi_model = h_mod
+                os.environ["HAYAMIMI_MODEL"] = h_mod
+
+            if "hayamimi_trans_langs" in data:
+                h_trans = str(data["hayamimi_trans_langs"]).strip()
+                await self.db.set_credential("hayamimi_trans_langs", h_trans, is_secret=False)
+                self.config.hayamimi_trans_langs = h_trans
+                os.environ["HAYAMIMI_TRANS_LANGS"] = h_trans
+
+            if "hayamimi_gemini_key" in data and not str(data["hayamimi_gemini_key"]).startswith("•"):
+                h_gkey = str(data["hayamimi_gemini_key"]).strip()
+                await self.db.set_credential("hayamimi_gemini_key", h_gkey, is_secret=True)
+                self.config.hayamimi_gemini_key = h_gkey
+                os.environ["HAYAMIMI_GEMINI_KEY"] = h_gkey
+
+            if "hayamimi_token" in data and not str(data["hayamimi_token"]).startswith("•"):
+                h_tok = str(data["hayamimi_token"]).strip()
+                await self.db.set_credential("hayamimi_token", h_tok, is_secret=True)
+                self.config.hayamimi_token = h_tok
+                os.environ["HAYAMIMI_TOKEN"] = h_tok
+
+            if "hayamimi_buffer_seconds" in data:
+                try:
+                    h_buf = float(data["hayamimi_buffer_seconds"])
+                    h_buf = max(0.2, min(5.0, h_buf))
+                    await self.db.set_credential("hayamimi_buffer_seconds", str(h_buf), is_secret=False)
+                    self.config.hayamimi_buffer_seconds = h_buf
+                except (ValueError, TypeError):
+                    pass
+
+            if "hayamimi_max_speakers" in data:
+                try:
+                    h_spk = int(data["hayamimi_max_speakers"])
+                    h_spk = max(1, min(16, h_spk))
+                    await self.db.set_credential("hayamimi_max_speakers", str(h_spk), is_secret=False)
+                    self.config.hayamimi_max_speakers = h_spk
+                except (ValueError, TypeError):
+                    pass
 
             # ホットリロード
             if self.tts_manager:
@@ -7474,7 +7580,7 @@ class WebServer:
         })
 
     async def api_system_test_credentials(self, request: web.Request) -> web.Response:
-        """指定TTSプロバイダの即時疎通・音声合成テスト (管理者のみ)"""
+        """指定TTSプロバイダまたは早耳Liveの即時疎通テスト (管理者のみ)"""
         await self._require_admin(request)
         try:
             data = await request.json()
@@ -7483,6 +7589,78 @@ class WebServer:
 
         provider = str(data.get("provider", "azure")).strip()
         voice_name = str(data.get("voice_name", "")).strip()
+
+        # 早耳 Live (Hayamimi) WebSocket 疎通テスト
+        if provider.lower() == "hayamimi":
+            ws_url = str(data.get("ws_url") or self.config.hayamimi_ws_url).strip()
+            if not ws_url:
+                return web.json_response({
+                    "status": "error",
+                    "success": False,
+                    "provider": "hayamimi",
+                    "error": "早耳 Live Gateway URL (HAYAMIMI_WS_URL) が未設定です。"
+                }, status=400)
+
+            t_start = time.perf_counter()
+            try:
+                model = str(data.get("model") or self.config.hayamimi_model or "reazon").strip()
+                trans_langs = str(data.get("trans_langs") or self.config.hayamimi_trans_langs or "").strip()
+                gemini_key = str(data.get("gemini_key") or self.config.hayamimi_gemini_key or "").strip()
+                token = str(data.get("token") or self.config.hayamimi_token or "").strip()
+
+                params = {
+                    "sample_rate": 48000,
+                    "channels": 2,
+                    "format": "s16le",
+                    "model": model,
+                }
+                if trans_langs:
+                    params["trans_langs"] = trans_langs
+                if gemini_key:
+                    params["gemini_key"] = gemini_key
+                if token:
+                    params["token"] = token
+
+                query_str = urllib.parse.urlencode(params)
+                delimiter = "&" if "?" in ws_url else "?"
+                target_url = f"{ws_url}{delimiter}{query_str}"
+
+                timeout = aiohttp.ClientTimeout(total=5.0)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.ws_connect(target_url) as ws:
+                        ready_msg = await ws.receive_json(timeout=4.0)
+                        elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+                        if isinstance(ready_msg, dict) and ready_msg.get("type") == "ready":
+                            sess_id = ready_msg.get("session_id", "unknown")
+                            r_model = ready_msg.get("model", model)
+                            r_trans = ready_msg.get("trans_langs", [])
+                            trans_str = f", 翻訳: {','.join(r_trans)}" if r_trans else ""
+                            return web.json_response({
+                                "status": "ok",
+                                "success": True,
+                                "provider": "hayamimi",
+                                "message": f"早耳 Live 正常接続 (Session: {sess_id}, Model: {r_model}{trans_str})",
+                                "latency_ms": elapsed_ms,
+                                "format": "ws",
+                                "ready_data": ready_msg
+                            })
+                        else:
+                            return web.json_response({
+                                "status": "error",
+                                "success": False,
+                                "provider": "hayamimi",
+                                "error": f"予期しないレスポンス: {ready_msg}",
+                                "latency_ms": elapsed_ms
+                            })
+            except Exception as e:
+                elapsed_ms = round((time.perf_counter() - t_start) * 1000, 1)
+                return web.json_response({
+                    "status": "error",
+                    "success": False,
+                    "provider": "hayamimi",
+                    "error": f"早耳 Live 接続失敗: {e}",
+                    "latency_ms": elapsed_ms
+                })
 
         if not self.tts_manager:
             return web.json_response({

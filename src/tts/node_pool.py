@@ -13,7 +13,7 @@ import time
 import logging
 from urllib.parse import urlparse
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 import aiohttp
 from src.config import TTSNodeConfig
 from src.tts.base import TTSConnectionError, TTSError

@@ -150,6 +150,15 @@ class AppConfig:
     ha_secret: str = ""
     cloudflare_tunnel_token: str = ""
 
+    # 早耳 Live (Hayamimi) STT / リアルタイム音声認識・翻訳設定
+    hayamimi_ws_url: str = ""
+    hayamimi_model: str = "reazon"
+    hayamimi_trans_langs: str = ""
+    hayamimi_gemini_key: str = ""
+    hayamimi_token: str = ""
+    hayamimi_buffer_seconds: float = 1.0
+    hayamimi_max_speakers: int = 8
+
     def get_discord_tokens(self) -> List[Tuple[int, str]]:
         """有効な全Botトークンを (bot_index, token) の昇順リストで取得 (最大10台対応)"""
         tokens = []
@@ -196,6 +205,26 @@ class AppConfig:
             self.gemini_api_key = credentials["gemini_api_key"].strip()
         if credentials.get("gemini_model"):
             self.gemini_model = credentials["gemini_model"].strip()
+        if credentials.get("hayamimi_ws_url") is not None:
+            self.hayamimi_ws_url = credentials["hayamimi_ws_url"].strip()
+        if credentials.get("hayamimi_model"):
+            self.hayamimi_model = credentials["hayamimi_model"].strip()
+        if credentials.get("hayamimi_trans_langs") is not None:
+            self.hayamimi_trans_langs = credentials["hayamimi_trans_langs"].strip()
+        if credentials.get("hayamimi_gemini_key") is not None:
+            self.hayamimi_gemini_key = credentials["hayamimi_gemini_key"].strip()
+        if credentials.get("hayamimi_token") is not None:
+            self.hayamimi_token = credentials["hayamimi_token"].strip()
+        if credentials.get("hayamimi_buffer_seconds"):
+            try:
+                self.hayamimi_buffer_seconds = float(credentials["hayamimi_buffer_seconds"])
+            except ValueError:
+                pass
+        if credentials.get("hayamimi_max_speakers"):
+            try:
+                self.hayamimi_max_speakers = int(credentials["hayamimi_max_speakers"])
+            except ValueError:
+                pass
 
         # トークン辞書の更新
         for bt in bot_tokens:
@@ -385,6 +414,21 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     cfg.coeiroink_base_url = os.getenv("COEIROINK_URL", cfg.coeiroink_base_url)
     cfg.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     cfg.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+    cfg.hayamimi_ws_url = os.getenv("HAYAMIMI_WS_URL", cfg.hayamimi_ws_url).strip()
+    cfg.hayamimi_model = os.getenv("HAYAMIMI_MODEL", cfg.hayamimi_model).strip()
+    cfg.hayamimi_trans_langs = os.getenv("HAYAMIMI_TRANS_LANGS", cfg.hayamimi_trans_langs).strip()
+    cfg.hayamimi_gemini_key = os.getenv("HAYAMIMI_GEMINI_KEY", cfg.hayamimi_gemini_key).strip()
+    cfg.hayamimi_token = os.getenv("HAYAMIMI_TOKEN", cfg.hayamimi_token).strip()
+    if os.getenv("HAYAMIMI_BUFFER_SECONDS"):
+        try:
+            cfg.hayamimi_buffer_seconds = float(os.getenv("HAYAMIMI_BUFFER_SECONDS"))
+        except ValueError:
+            pass
+    if os.getenv("HAYAMIMI_MAX_SPEAKERS"):
+        try:
+            cfg.hayamimi_max_speakers = int(os.getenv("HAYAMIMI_MAX_SPEAKERS"))
+        except ValueError:
+            pass
     cfg.speculative_timeout_seconds = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", cfg.speculative_timeout_seconds))
     for _flag in ("stream_tl_speculative", "head_route_earliest", "head_dynamic_length", "chunk_singleflight"):
         setattr(cfg, _flag, normalize_rollout_mode(os.getenv(_flag.upper(), getattr(cfg, _flag))))

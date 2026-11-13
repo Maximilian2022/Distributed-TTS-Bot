@@ -3330,6 +3330,13 @@ class Database:
             "google_api_key": "GOOGLE_API_KEY",
             "worker_shared_secret": "WORKER_SHARED_SECRET",
             "error_contact_user_id": "DISCORD_OWNER_USER_ID",
+            "hayamimi_ws_url": "HAYAMIMI_WS_URL",
+            "hayamimi_model": "HAYAMIMI_MODEL",
+            "hayamimi_trans_langs": "HAYAMIMI_TRANS_LANGS",
+            "hayamimi_gemini_key": "HAYAMIMI_GEMINI_KEY",
+            "hayamimi_token": "HAYAMIMI_TOKEN",
+            "hayamimi_buffer_seconds": "HAYAMIMI_BUFFER_SECONDS",
+            "hayamimi_max_speakers": "HAYAMIMI_MAX_SPEAKERS",
         }
         loaded = {}
         for db_key, env_var in mapping.items():
@@ -3375,7 +3382,8 @@ class Database:
         secret_keys = {
             "azure_speech_key", "google_credentials_json", "google_api_key",
             "worker_shared_secret", "admin_password", "web_session_secret",
-            "gemini_api_key", "cloudflare_tunnel_token", "discord_client_secret"
+            "gemini_api_key", "cloudflare_tunnel_token", "discord_client_secret",
+            "hayamimi_gemini_key", "hayamimi_token"
         }
         try:
             async with self.get_connection() as db:

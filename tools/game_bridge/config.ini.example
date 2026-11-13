@@ -1,0 +1,16 @@
+[settings]
+# TTSBot サーバーの WebUI / API URL (例: ws://192.168.11.244:8088 または wss://tts.example.com)
+server_url = ws://192.168.11.244:8088
+
+# 対象とする Discord ユーザー ID (自分の発話のみ入力させたい場合は自分のIDを入力。空欄または0で全員対象)
+target_user_id = 0
+
+# クリップボード貼り付けから Enter キー押下までの待機時間 (ミリ秒)
+enter_delay_ms = 50
+
+# 貼り付け後に自動で Enter キーを押すかどうか (true / false)
+auto_enter = true
+
+# 一時停止フラグ (true で入力を停止)
+paused = false
+

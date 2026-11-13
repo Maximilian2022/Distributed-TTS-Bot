@@ -4,7 +4,7 @@ import aiohttp
 import asyncio
 import logging
 import urllib.parse
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 from src.tts.base import BaseTTSClient, TTSError, TTSConnectionError
 from src.tts.node_pool import TTSNodePool
 
