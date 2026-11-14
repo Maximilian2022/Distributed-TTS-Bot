@@ -25,6 +25,13 @@ from src.utils.streaming_audio import StreamingAudioSource, get_beep_pcm
 from src.utils.gemini_tutor import GeminiTutorClient
 from src.utils.avatar_manager import cache_member_info_and_avatar
 from src.utils.alert_service import alert_service, CATEGORY_BOT, SEVERITY_ERROR
+from src.stt.hayamimi_client import (
+    HayamimiTranslator,
+    extract_translation_output,
+    normalize_hayamimi_lang,
+    prepare_text_for_translation,
+    should_translate_for_japanese_tts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -509,6 +516,7 @@ class VCHandlerCog(commands.Cog):
         self.bot_pool = bot_pool
         self.text_cleaner = TextCleaner(max_length=config.max_text_length)
         self.gemini_tutor = GeminiTutorClient(api_key=config.gemini_api_key, model=config.gemini_model)
+        self.hayamimi_translator = HayamimiTranslator(config)
         self.guild_states: Dict[int, GuildVCState] = {}
 
         # 入室プリウォーム・バッチ集約用ステート (同時多人数入室ストーム対策)
@@ -2207,6 +2215,7 @@ class VCHandlerCog(commands.Cog):
 
         # NGワード検知リストの収集（本文）
         detected_ng_words: List[str] = list(self.text_cleaner.last_detected_ng_words)
+        body_has_ng_words: bool = bool(detected_ng_words)
 
         # 辞書が使用された場合、非同期で last_used_at を更新 (LRU管理用)
         if dict_words:
@@ -2227,7 +2236,97 @@ class VCHandlerCog(commands.Cog):
             logger.info(f"Skipped duplicate short phrase: '{cleaned_body}' from {message.author.display_name}")
             return
 
-        # 4. ユーザー声質設定の取得 (ギルド個別設定 & 初回他サーバー引き継ぎ & 自動選定)
+        # 4. チャンネル/ギルドの翻訳設定解決 (自動参加ペア単位オプション優先)
+        reply_enabled, translate_lang, speak_foreign_as_ja = self._resolve_channel_translation_config(
+            guild_settings, message.channel.id
+        )
+
+        # 4.5. 多言語投稿の日本語訳読み上げルート (ペア翻訳ON時 & 非日本語候補 & 非NGワード)
+        if speak_foreign_as_ja and not body_has_ng_words:
+            prepared_for_trans = prepare_text_for_translation(message.content, message.guild)
+            if should_translate_for_japanese_tts(prepared_for_trans, dict_words):
+                state.deduplicator.record_added(cleaned_body)
+                safe_create_task(
+                    self._process_foreign_message_translation_and_tts(
+                        message=message,
+                        state=state,
+                        fallback_cleaned_body=cleaned_body,
+                        prepared_text=prepared_for_trans,
+                        target_lang=translate_lang,
+                        reply_enabled=reply_enabled,
+                        guild_settings=guild_settings,
+                        dict_words=dict_words,
+                        ng_words=ng_words,
+                        detected_ng_words=detected_ng_words,
+                        max_length=max_length,
+                        read_username=read_username,
+                        t_received=t_received,
+                        discord_created=discord_created,
+                    ),
+                    name=f"foreign_tts_{message.id}"
+                )
+                return
+
+        # 5. 通常読み上げルート (0ms追加遅延で即座にキュー投入)
+        await self._enqueue_tts_message(
+            message=message,
+            state=state,
+            body_text=cleaned_body,
+            guild_settings=guild_settings,
+            dict_words=dict_words,
+            ng_words=ng_words,
+            detected_ng_words=detected_ng_words,
+            read_username=read_username,
+            t_received=t_received,
+            discord_created=discord_created,
+        )
+
+        # 6. 投稿テキスト自動翻訳表示 (TTS再生キュー投入後・完全非同期のため読み上げ遅延ゼロ)
+        if reply_enabled and not body_has_ng_words:
+            safe_create_task(
+                self._translate_and_reply_message(message, translate_lang),
+                name=f"tts_translate_{message.id}"
+            )
+
+    @staticmethod
+    def _resolve_channel_translation_config(
+        guild_settings: Dict[str, Any], channel_id: int
+    ) -> Tuple[bool, str, bool]:
+        """
+        チャンネルに適用する翻訳設定 (reply_enabled, target_lang, speak_foreign_as_ja) を解決する。
+        自動参加ペアに該当テキストチャンネルの翻訳オプションONがあればそれを最優先し、
+        なければギルド全体設定 (tts_translate_enabled) にフォールバックする。
+        """
+        pairs = guild_settings.get("auto_join_pairs") or []
+        for p in pairs:
+            if not isinstance(p, dict):
+                continue
+            try:
+                if int(p.get("text_id", 0) or 0) == int(channel_id) and bool(p.get("translate_enabled", False)):
+                    lang = normalize_hayamimi_lang(p.get("translate_lang"), default="en")
+                    return True, lang, True
+            except (ValueError, TypeError):
+                continue
+
+        guild_enabled = bool(guild_settings.get("tts_translate_enabled", 0))
+        guild_lang = normalize_hayamimi_lang(guild_settings.get("tts_translate_lang"), default="en")
+        return guild_enabled, guild_lang, False
+
+    async def _enqueue_tts_message(
+        self,
+        message: discord.Message,
+        state: GuildVCState,
+        body_text: str,
+        guild_settings: Dict[str, Any],
+        dict_words: List[Tuple[str, str]],
+        ng_words: List[str],
+        detected_ng_words: List[str],
+        read_username: bool,
+        t_received: float,
+        discord_created: float,
+        record_dedup: bool = True,
+    ) -> None:
+        """サニタイズ済み本文から QueueItem を組み立て、VC 再生キューへ投入する共通ヘルパー"""
         available_speaker_ids = list(self.config.voices.keys())
         user_settings = await self.db.get_or_create_user_settings(
             user_id=message.author.id,
@@ -2241,7 +2340,6 @@ class VCHandlerCog(commands.Cog):
         author_prefix = None
         if read_username:
             raw_display_name = message.author.display_name
-            # 個人設定で「括弧除去 (【】（）等)」がONの場合 (デフォルトON: 例「【称号】ユーザー名【属性】」→「ユーザー名」)
             if user_settings.get("strip_name_brackets", True):
                 stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
                 if stripped:
@@ -2259,7 +2357,6 @@ class VCHandlerCog(commands.Cog):
                     if w not in detected_ng_words:
                         detected_ng_words.append(w)
 
-            # 「以下略」がついた場合は取り除く
             cleaned_author = cleaned_author.replace(" 以下略", "").strip()
             if cleaned_author:
                 author_prefix = f"{cleaned_author}、"
@@ -2269,10 +2366,9 @@ class VCHandlerCog(commands.Cog):
             safe_create_task(self._add_reaction_safe(message, "🤫"), name=f"ng_react_{message.id}")
             safe_create_task(self.db.touch_ng_words(message.guild.id, detected_ng_words), name="touch_ng_words")
 
-        # 5. 再生キューに追加 (本文と名前プレフィックスをスマート分離)
         spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 2.5) or 2.5)
         item = QueueItem(
-            text=cleaned_body,
+            text=body_text,
             user_id=message.author.id,
             user_name=message.author.display_name,
             speaker_id=user_settings["speaker_id"],
@@ -2286,15 +2382,9 @@ class VCHandlerCog(commands.Cog):
             speculative_timeout=spec_timeout,
         )
 
-        state.deduplicator.record_added(cleaned_body)
+        if record_dedup:
+            state.deduplicator.record_added(body_text)
 
-        # バックグラウンド先行合成 (非同期プリフェッチ) のインテリジェント制御:
-        # 1. 現在再生中ではなくキューも空の場合:
-        #    直ちに _playback_loop -> _stream_play_item が起動して最速で第1文を合成・再生開始できるため、
-        #    プリフェッチタスクは起動しない（同一リクエストの二重並行実行によるGPUセマフォ競合・自爆遅延を完全排除）。
-        # 2. 現在他の発言が再生中またはキュー待ちの場合:
-        #    前の発言の再生時間（待ち時間）を利用し、後続のストリーミング再生で必要となる全チャンクを
-        #    文分割単位で並行先行合成してパーツキャッシュ（L1/L2）に温めておく。
         is_busy = state.is_playing or not state.queue.empty()
         if is_busy:
             self._share_chunks_for_prefetch(item)
@@ -2307,7 +2397,6 @@ class VCHandlerCog(commands.Cog):
 
         await state.queue.put(item)
 
-        # 再生ループタスクが停止していれば自己修復 (自動再起動)
         if state.play_task is None or state.play_task.done():
             logger.info(f"🔄 [Self-Healing] Playback loop for guild '{message.guild.name}' was inactive. Auto-restarting...")
             state.play_task = safe_create_task(
@@ -2315,8 +2404,129 @@ class VCHandlerCog(commands.Cog):
                 name=f"playback_loop_{message.guild.id}"
             )
 
-        log_text = f"[{author_prefix}]{cleaned_body}" if author_prefix else cleaned_body
+        log_text = f"[{author_prefix}]{body_text}" if author_prefix else body_text
         logger.debug(f"Queued message from {message.author.display_name}: '{log_text}' (Queue size: {state.queue.qsize()})")
+
+    async def _send_translation_reply(
+        self, message: discord.Message, out_lang: str, translated_str: str
+    ) -> None:
+        """翻訳結果を指定フォーマットで通知なしリプライ投稿する共通ヘルパー"""
+        try:
+            lang_badge = out_lang.upper()
+            prefix = f"🌐 `[{lang_badge}]` "
+            max_body_len = 1950 - len(prefix)
+            body = translated_str
+            if len(body) > max_body_len:
+                body = body[:max_body_len] + "…"
+            await message.reply(
+                f"{prefix}{body}",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logger.debug(f"[TTSTranslate] Failed to send reply for msg {getattr(message, 'id', '?')}: {e}")
+        except Exception as e:
+            logger.debug(f"[TTSTranslate] Unexpected reply error: {e}")
+
+    async def _process_foreign_message_translation_and_tts(
+        self,
+        message: discord.Message,
+        state: GuildVCState,
+        fallback_cleaned_body: str,
+        prepared_text: str,
+        target_lang: str,
+        reply_enabled: bool,
+        guild_settings: Dict[str, Any],
+        dict_words: List[Tuple[str, str]],
+        ng_words: List[str],
+        detected_ng_words: List[str],
+        max_length: int,
+        read_username: bool,
+        t_received: float,
+        discord_created: float,
+    ) -> None:
+        """
+        非日本語テキストを Hayamimi POST /api/translate で日本語へ翻訳し、
+        日本語読み上げテキストとして再生キュー投入＆翻訳リプライを投稿する。
+        失敗・タイムアウト時は原文ベース (fallback_cleaned_body) で読み上げを維持する。
+        """
+        speak_body = fallback_cleaned_body
+        ng_list = list(detected_ng_words)
+        try:
+            res = await self.hayamimi_translator.translate(
+                text=prepared_text,
+                target_langs=[target_lang],
+                timeout=5.0,
+            )
+            source_lang, out_lang, translated_text = extract_translation_output(
+                res, prepared_text, target_lang
+            )
+
+            if translated_text and out_lang:
+                if source_lang != "ja" and out_lang == "ja":
+                    # 多言語 -> 日本語訳を日本語として読み上げ
+                    ja_cleaned = self.text_cleaner.clean(
+                        raw_text=translated_text,
+                        guild=message.guild,
+                        dictionary_entries=dict_words,
+                        ng_words=ng_words,
+                        max_length=max_length,
+                    )
+                    if self.text_cleaner.last_detected_ng_words:
+                        for w in self.text_cleaner.last_detected_ng_words:
+                            if w not in ng_list:
+                                ng_list.append(w)
+                    if ja_cleaned:
+                        speak_body = ja_cleaned
+                if reply_enabled:
+                    safe_create_task(
+                        self._send_translation_reply(message, out_lang, translated_text),
+                        name=f"tts_translate_reply_{message.id}"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[ForeignTTSTranslate] Translation failed, using fallback text: {e}")
+
+        await self._enqueue_tts_message(
+            message=message,
+            state=state,
+            body_text=speak_body,
+            guild_settings=guild_settings,
+            dict_words=dict_words,
+            ng_words=ng_words,
+            detected_ng_words=ng_list,
+            read_username=read_username,
+            t_received=t_received,
+            discord_created=discord_created,
+            record_dedup=False,
+        )
+
+    async def _translate_and_reply_message(self, message: discord.Message, target_lang: str) -> None:
+        """
+        投稿メッセージを Hayamimi POST /api/translate で非同期翻訳し、元メッセージへ通知なしリプライを送信する。
+        音声合成・VC再生パイプラインを一切ブロックしない独立タスクとして実行される。
+        """
+        try:
+            prepared_text = prepare_text_for_translation(message.content, getattr(message, "guild", None))
+            if not prepared_text:
+                return
+
+            res = await self.hayamimi_translator.translate(
+                text=prepared_text,
+                target_langs=[target_lang],
+            )
+            _, out_lang, translated_str = extract_translation_output(res, prepared_text, target_lang)
+            if not out_lang or not translated_str:
+                return
+
+            await self._send_translation_reply(message, out_lang, translated_str)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug(f"[TTSTranslate] Unexpected translation error: {e}")
 
     def _schedule_prewarm_batch(self, guild: discord.Guild, member: discord.Member) -> None:
         """複数ユーザー同時入室時の過負荷を防ぐため、2.0秒のデバウンスバッチで事前ウォームアップをスケジュール"""
@@ -3198,4 +3408,10 @@ class VCHandlerCog(commands.Cog):
             if t and not t.done():
                 t.cancel()
         self._pending_bot_leave_tasks.clear()
+        try:
+            loop = asyncio.get_running_loop()
+            if hasattr(self, "hayamimi_translator") and self.hayamimi_translator:
+                loop.create_task(self.hayamimi_translator.close())
+        except RuntimeError:
+            pass
 

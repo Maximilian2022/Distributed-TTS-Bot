@@ -16,6 +16,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from src.utils.default_ng_words import DEFAULT_NG_WORDS
 from src.utils.security import encrypt_credential, decrypt_credential
+from src.stt.hayamimi_client import normalize_hayamimi_lang
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,31 @@ def clamp_max_silence(value: Any) -> float:
     if v != v:  # NaN
         return MAX_SILENCE_DEFAULT_SECONDS
     return round(max(MAX_SILENCE_MIN_SECONDS, min(MAX_SILENCE_MAX_SECONDS, v)), 2)
+
+
+def normalize_auto_join_pairs(raw_pairs: Any, max_limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    auto_join_pairs リストを正規化・サニタイズする (下位互換およびペア単位翻訳設定対応)。
+    """
+    valid_pairs: List[Dict[str, Any]] = []
+    if not isinstance(raw_pairs, list):
+        return valid_pairs
+    for p in raw_pairs[:max(1, min(10, int(max_limit or 10)))]:
+        if not isinstance(p, dict):
+            continue
+        try:
+            vc_id = int(p.get("vc_id", 0))
+            text_id = int(p.get("text_id", 0))
+            if vc_id > 0 and text_id > 0:
+                valid_pairs.append({
+                    "vc_id": vc_id,
+                    "text_id": text_id,
+                    "translate_enabled": bool(p.get("translate_enabled", False)),
+                    "translate_lang": normalize_hayamimi_lang(p.get("translate_lang"), default="en"),
+                })
+        except (ValueError, TypeError):
+            pass
+    return valid_pairs
 
 class Database:
     def __init__(self, db_path: str, max_connections: int = 5):
@@ -387,6 +413,8 @@ class Database:
                     announce_vc_events INTEGER DEFAULT 0,
                     speculative_timeout_seconds REAL DEFAULT 1.5,
                     ignore_prefixes TEXT DEFAULT '[";", "；"]',
+                    tts_translate_enabled INTEGER DEFAULT 0,
+                    tts_translate_lang TEXT DEFAULT 'en',
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -432,6 +460,12 @@ class Database:
                     # 値は引き継がず全ギルド既定 1.5s から開始 (旧列は段階導入フラグ off 時の従来経路で引き続き使用)
                     await db.execute("ALTER TABLE guild_settings ADD COLUMN max_silence_seconds REAL DEFAULT 1.5")
                     logger.info("Migrated guild_settings table: added max_silence_seconds column")
+                if "tts_translate_enabled" not in cols:
+                    await db.execute("ALTER TABLE guild_settings ADD COLUMN tts_translate_enabled INTEGER DEFAULT 0")
+                    logger.info("Migrated guild_settings table: added tts_translate_enabled column")
+                if "tts_translate_lang" not in cols:
+                    await db.execute("ALTER TABLE guild_settings ADD COLUMN tts_translate_lang TEXT DEFAULT 'en'")
+                    logger.info("Migrated guild_settings table: added tts_translate_lang column")
 
             # 4. 月別TTS利用量トラッキング (失敗数・フォールバック生成数も記録)
             await db.execute("""
@@ -1876,7 +1910,7 @@ class Database:
                         atxt = int(res.get("auto_join_text_channel_id", 0) or 0)
                         if avc > 0 and atxt > 0:
                             pairs = [{"vc_id": avc, "text_id": atxt}]
-                    res["auto_join_pairs"] = pairs
+                    res["auto_join_pairs"] = normalize_auto_join_pairs(pairs)
 
                     # ignore_prefixes のデコード
                     prefixes_raw = res.get("ignore_prefixes")
@@ -1897,6 +1931,8 @@ class Database:
                     res["max_silence_seconds"] = clamp_max_silence(res.get("max_silence_seconds"))
                     res["disaster_volume"] = float(res.get("disaster_volume", 1.0) if res.get("disaster_volume") is not None else 1.0)
                     res["error_contact_user_id"] = int(res.get("error_contact_user_id", 0) or 0)
+                    res["tts_translate_enabled"] = int(res.get("tts_translate_enabled", 0) or 0)
+                    res["tts_translate_lang"] = normalize_hayamimi_lang(res.get("tts_translate_lang"), default="en")
 
                     self._guild_settings_cache[guild_id] = (now, dict(res))
                     return res
@@ -1912,7 +1948,10 @@ class Database:
         def_prefixes = getattr(default_cfg, "ignore_prefixes", [";", "；"]) if default_cfg else [";", "；"]
         def_spec_timeout = float(getattr(default_cfg, "speculative_timeout_seconds", 2.5)) if default_cfg else 2.5
 
-        initial_pairs = [{"vc_id": auto_vc, "text_id": auto_text}] if auto_vc > 0 and auto_text > 0 else []
+        initial_pairs = (
+            [{"vc_id": auto_vc, "text_id": auto_text, "translate_enabled": False, "translate_lang": "en"}]
+            if auto_vc > 0 and auto_text > 0 else []
+        )
 
         new_settings = {
             "guild_id": guild_id,
@@ -1935,15 +1974,17 @@ class Database:
             "disaster_pref_filter": "",
             "disaster_alert_weather": 1,
             "disaster_volume": 1.0,
-            "error_contact_user_id": 0
+            "error_contact_user_id": 0,
+            "tts_translate_enabled": 0,
+            "tts_translate_lang": "en",
         }
 
         async with self.get_connection() as db:
             await db.execute(
                 """
                 INSERT OR IGNORE INTO guild_settings
-                (guild_id, command_prefix, max_text_length, dedup_window_seconds, dedup_max_length, auto_join_vc_id, auto_join_text_channel_id, auto_join_pairs, admin_role_id, default_speaker, read_username, announce_vc_events, speculative_timeout_seconds, ignore_prefixes, disaster_alert_enabled, disaster_min_scale, disaster_pref_filter, disaster_alert_weather, disaster_volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, 30, '', 1, 1.0)
+                (guild_id, command_prefix, max_text_length, dedup_window_seconds, dedup_max_length, auto_join_vc_id, auto_join_text_channel_id, auto_join_pairs, admin_role_id, default_speaker, read_username, announce_vc_events, speculative_timeout_seconds, ignore_prefixes, disaster_alert_enabled, disaster_min_scale, disaster_pref_filter, disaster_alert_weather, disaster_volume, tts_translate_enabled, tts_translate_lang)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, 30, '', 1, 1.0, 0, 'en')
                 """,
                 (guild_id, prefix, max_len, dedup_sec, dedup_len, auto_vc, auto_text, json.dumps(initial_pairs), 0, def_speaker, def_spec_timeout, json.dumps(list(def_prefixes)))
             )
@@ -1958,17 +1999,7 @@ class Database:
 
         # auto_join_pairs が指定された場合のバリデーション & 下位互換処理
         if "auto_join_pairs" in kwargs:
-            raw_pairs = kwargs["auto_join_pairs"]
-            valid_pairs = []
-            if isinstance(raw_pairs, list):
-                for p in raw_pairs[:10]:  # 最大10件対応 (動的Botプール上限)
-                    try:
-                        vc_id = int(p.get("vc_id", 0))
-                        text_id = int(p.get("text_id", 0))
-                        if vc_id > 0 and text_id > 0:
-                            valid_pairs.append({"vc_id": vc_id, "text_id": text_id})
-                    except (ValueError, TypeError):
-                        pass
+            valid_pairs = normalize_auto_join_pairs(kwargs["auto_join_pairs"], max_limit=10)
             current["auto_join_pairs"] = valid_pairs
             if valid_pairs:
                 current["auto_join_vc_id"] = valid_pairs[0]["vc_id"]
@@ -2004,6 +2035,12 @@ class Database:
                 current["disaster_volume"] = 1.0
             del kwargs["disaster_volume"]
 
+        if "tts_translate_enabled" in kwargs:
+            current["tts_translate_enabled"] = 1 if kwargs.pop("tts_translate_enabled") else 0
+
+        if "tts_translate_lang" in kwargs:
+            current["tts_translate_lang"] = normalize_hayamimi_lang(kwargs.pop("tts_translate_lang"), default="en")
+
         current.update(kwargs)
 
         async with self.get_connection() as db:
@@ -2015,9 +2052,10 @@ class Database:
                     auto_join_pairs, admin_role_id, default_speaker, read_username,
                     announce_vc_events, speculative_timeout_seconds, ignore_prefixes,
                     disaster_alert_enabled, disaster_min_scale, disaster_pref_filter,
-                    disaster_alert_weather, disaster_volume, error_contact_user_id, max_silence_seconds, updated_at
+                    disaster_alert_weather, disaster_volume, error_contact_user_id, max_silence_seconds,
+                    tts_translate_enabled, tts_translate_lang, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     command_prefix=excluded.command_prefix,
                     max_text_length=excluded.max_text_length,
@@ -2039,6 +2077,8 @@ class Database:
                     disaster_volume=excluded.disaster_volume,
                     error_contact_user_id=excluded.error_contact_user_id,
                     max_silence_seconds=excluded.max_silence_seconds,
+                    tts_translate_enabled=excluded.tts_translate_enabled,
+                    tts_translate_lang=excluded.tts_translate_lang,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -2062,7 +2102,9 @@ class Database:
                     1 if current.get("disaster_alert_weather", 1) else 0,
                     float(current.get("disaster_volume", 1.0) if current.get("disaster_volume") is not None else 1.0),
                     int(current.get("error_contact_user_id", 0) or 0),
-                    clamp_max_silence(current.get("max_silence_seconds"))
+                    clamp_max_silence(current.get("max_silence_seconds")),
+                    1 if current.get("tts_translate_enabled", 0) else 0,
+                    normalize_hayamimi_lang(current.get("tts_translate_lang"), default="en")
                 )
             )
             await db.commit()

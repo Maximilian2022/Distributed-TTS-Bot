@@ -34,8 +34,9 @@ from aiohttp import web
 import discord
 
 from src.config import AppConfig, save_yaml_config, reload_config, TTSNodeConfig
+from src.stt.hayamimi_client import normalize_hayamimi_lang
 from src.database import (
-    Database, clamp_max_silence, VOLUNTEER_TOKEN_PREFIX,
+    Database, clamp_max_silence, normalize_auto_join_pairs, VOLUNTEER_TOKEN_PREFIX,
     CLUSTER_WORKER_TOKEN_PREFIX, STANDBY_HA_TOKEN_PREFIX
 )
 from src.cache_manager import CacheManager
@@ -3361,7 +3362,15 @@ class WebServer:
 
         settings = await self.db.get_guild_settings(guild.id, self.config)
         raw_pairs = settings.get("auto_join_pairs", [])
-        str_pairs = [{"vc_id": str(p["vc_id"]), "text_id": str(p["text_id"])} for p in raw_pairs]
+        str_pairs = [
+            {
+                "vc_id": str(p["vc_id"]),
+                "text_id": str(p["text_id"]),
+                "translate_enabled": bool(p.get("translate_enabled", False)),
+                "translate_lang": normalize_hayamimi_lang(p.get("translate_lang"), default="en"),
+            }
+            for p in raw_pairs
+        ]
 
         # 稼働中のBot数を動的に取得 (最低1台、最大10台)
         active_bots = 1
@@ -3395,6 +3404,8 @@ class WebServer:
             "disaster_alert_weather": bool(settings.get("disaster_alert_weather", 1)),
             "disaster_volume": float(settings.get("disaster_volume", 1.0) if settings.get("disaster_volume") is not None else 1.0),
             "error_contact_user_id": str(settings.get("error_contact_user_id", "") or ""),
+            "tts_translate_enabled": bool(settings.get("tts_translate_enabled", 0)),
+            "tts_translate_lang": normalize_hayamimi_lang(settings.get("tts_translate_lang"), default="en"),
             "is_admin": perms["is_admin"],
             "has_role": perms["has_role"]
         })
@@ -3425,21 +3436,11 @@ class WebServer:
             update_fields["auto_join_text_channel_id"] = int(data["auto_join_text_channel_id"] or 0)
         if "auto_join_pairs" in data:
             raw_pairs = data["auto_join_pairs"]
-            valid_pairs = []
             max_limit = 10
             if self.bot_pool and hasattr(self.bot_pool, "get_active_bot_count"):
                 max_limit = self.bot_pool.get_active_bot_count()
             slice_limit = max(1, min(10, max_limit))
-            if isinstance(raw_pairs, list):
-                for p in raw_pairs[:slice_limit]:
-                    try:
-                        vc_id = int(p.get("vc_id", 0))
-                        text_id = int(p.get("text_id", 0))
-                        if vc_id > 0 and text_id > 0:
-                            valid_pairs.append({"vc_id": vc_id, "text_id": text_id})
-                    except (ValueError, TypeError):
-                        pass
-            update_fields["auto_join_pairs"] = valid_pairs
+            update_fields["auto_join_pairs"] = normalize_auto_join_pairs(raw_pairs, max_limit=slice_limit)
         if "default_speaker" in data and data["default_speaker"] in self.config.voices:
             update_fields["default_speaker"] = str(data["default_speaker"])
         if "read_username" in data:
@@ -3480,6 +3481,10 @@ class WebServer:
                 update_fields["error_contact_user_id"] = int(raw_cid) if raw_cid.isdigit() else 0
             except (ValueError, TypeError):
                 pass
+        if "tts_translate_enabled" in data:
+            update_fields["tts_translate_enabled"] = 1 if data["tts_translate_enabled"] else 0
+        if "tts_translate_lang" in data:
+            update_fields["tts_translate_lang"] = normalize_hayamimi_lang(data["tts_translate_lang"], default="en")
 
         # ロール設定は管理者のみ可能
         if "admin_role_id" in data:

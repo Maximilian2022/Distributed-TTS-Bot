@@ -340,5 +340,470 @@ class TestHayamimiSTT(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("999", saved_after)
 
 
+class TestHayamimiTranslation(unittest.IsolatedAsyncioTestCase):
+    def test_translate_language_constants_and_helpers(self):
+        """8言語定義・URL導出・STT複数言語解決・前処理ヘルパーの検証"""
+        from src.stt.hayamimi_client import (
+            HAYAMIMI_TRANSLATE_LANGUAGES,
+            HAYAMIMI_VALID_LANG_CODES,
+            normalize_hayamimi_lang,
+            prepare_text_for_translation,
+            resolve_hayamimi_translate_url,
+            resolve_stt_trans_langs,
+        )
+
+        expected_codes = {"en", "zh", "zh-tw", "ko", "es", "fr", "de", "pt"}
+        self.assertEqual(HAYAMIMI_VALID_LANG_CODES, expected_codes)
+        self.assertEqual(len(HAYAMIMI_TRANSLATE_LANGUAGES), 8)
+
+        self.assertEqual(normalize_hayamimi_lang("ZH-TW"), "zh-tw")
+        self.assertEqual(normalize_hayamimi_lang("invalid", default="en"), "en")
+
+        self.assertEqual(
+            resolve_hayamimi_translate_url("ws://192.0.2.10:8833/ws/stream"),
+            "http://192.0.2.10:8833/api/translate",
+        )
+        self.assertEqual(
+            resolve_hayamimi_translate_url("wss://example.com/ws/stream"),
+            "https://example.com/api/translate",
+        )
+        self.assertEqual(resolve_hayamimi_translate_url(""), "")
+
+        self.assertEqual(resolve_stt_trans_langs(None, None, "en,ko"), "en,ko")
+        self.assertEqual(resolve_stt_trans_langs("none", None, "en,ko"), "")
+        self.assertEqual(resolve_stt_trans_langs("en", None, "ja"), "en")
+        self.assertEqual(resolve_stt_trans_langs("en", "ko", ""), "en,ko")
+        self.assertEqual(resolve_stt_trans_langs("zh-tw", "zh-tw", ""), "zh-tw")
+
+        mock_guild = MagicMock()
+        mock_member = MagicMock(display_name="Taro")
+        mock_guild.get_member.return_value = mock_member
+        self.assertEqual(
+            prepare_text_for_translation("<@12345> おはよう https://example.com <:wave:999>", mock_guild),
+            "@Taro おはよう",
+        )
+        self.assertIsNone(prepare_text_for_translation("https://example.com", mock_guild))
+        self.assertIsNone(prepare_text_for_translation("123456", mock_guild))
+        self.assertIsNone(prepare_text_for_translation("👍👍", mock_guild))
+        self.assertEqual(prepare_text_for_translation("안녕하세요", mock_guild), "안녕하세요")
+
+    async def test_hayamimi_translator_http_post(self):
+        """HayamimiTranslator が /api/translate へ POST しレスポンスを処理するテスト"""
+        from src.stt.hayamimi_client import HayamimiTranslator
+
+        cfg = AppConfig()
+        cfg.hayamimi_ws_url = "ws://127.0.0.1:8833/ws/stream"
+        translator = HayamimiTranslator(cfg)
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "ok": True,
+            "source_lang": "ja",
+            "original": "こんにちは",
+            "translations": {"en": "Hello"},
+        })
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_session.post.return_value = mock_resp
+        mock_session.close = AsyncMock()
+
+        with patch.object(translator, "_get_session", new=AsyncMock(return_value=mock_session)):
+            res = await translator.translate("こんにちは", target_langs=["en"])
+            self.assertIsNotNone(res)
+            self.assertEqual(res["translations"]["en"], "Hello")
+            mock_session.post.assert_called_once()
+            called_url = mock_session.post.call_args[0][0]
+            self.assertEqual(called_url, "http://127.0.0.1:8833/api/translate")
+
+            # 例外発生時も落ちずに None を返す
+            mock_session.post.side_effect = RuntimeError("connection refused")
+            res_err = await translator.translate("こんにちは", target_langs=["en"])
+            self.assertIsNone(res_err)
+
+        await translator.close()
+
+    async def test_database_tts_translate_persistence(self):
+        """guild_settings の tts_translate_enabled / tts_translate_lang 永続化テスト"""
+        import tempfile
+        import os
+        from src.database import Database
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test_trans.db")
+            db = Database(db_path)
+            await db.init_db()
+            try:
+                default_cfg = await db.get_guild_settings(1111)
+                self.assertEqual(default_cfg["tts_translate_enabled"], 0)
+                self.assertEqual(default_cfg["tts_translate_lang"], "en")
+
+                updated = await db.update_guild_settings(
+                    1111, tts_translate_enabled=1, tts_translate_lang="zh-tw"
+                )
+                self.assertEqual(updated["tts_translate_enabled"], 1)
+                self.assertEqual(updated["tts_translate_lang"], "zh-tw")
+
+                # キャッシュ破棄してDBから再読込できることを検証
+                db.invalidate_guild_cache(1111)
+                reloaded = await db.get_guild_settings(1111)
+                self.assertEqual(reloaded["tts_translate_enabled"], 1)
+                self.assertEqual(reloaded["tts_translate_lang"], "zh-tw")
+
+                # 不正言語コード時は "en" に安全フォールバック
+                sanitized = await db.update_guild_settings(1111, tts_translate_lang="invalid_xx")
+                self.assertEqual(sanitized["tts_translate_lang"], "en")
+            finally:
+                await db.close()
+
+    async def test_vc_handler_translate_and_reply_and_ng_guard(self):
+        """VCHandlerCog の双方向翻訳リプライ表示および NGワード・URLスキップ検証"""
+        import discord
+        from src.cogs.vc_handler import VCHandlerCog
+
+        cfg = AppConfig()
+        cfg.hayamimi_ws_url = "ws://127.0.0.1:8833/ws/stream"
+        mock_bot = MagicMock()
+        mock_db = MagicMock()
+        mock_cache = MagicMock()
+        mock_tts = MagicMock()
+
+        cog = VCHandlerCog(mock_bot, cfg, mock_db, mock_cache, mock_tts)
+        try:
+            # 1. 日本語 -> 指定言語 (ko)
+            msg_ja = MagicMock(spec=discord.Message)
+            msg_ja.id = 1
+            msg_ja.content = "よろしくお願いします"
+            msg_ja.guild = MagicMock()
+            msg_ja.guild.get_member.return_value = None
+            msg_ja.reply = AsyncMock()
+
+            cog.hayamimi_translator.translate = AsyncMock(return_value={
+                "ok": True,
+                "source_lang": "ja",
+                "translations": {"ko": "잘 부탁드립니다."},
+            })
+            await cog._translate_and_reply_message(msg_ja, "ko")
+            msg_ja.reply.assert_awaited_once()
+            self.assertEqual(msg_ja.reply.call_args[0][0], "🌐 `[KO]` 잘 부탁드립니다.")
+            self.assertFalse(msg_ja.reply.call_args.kwargs["mention_author"])
+
+            # 2. 他言語 (en) -> 自動日本語 ("ja")
+            msg_en = MagicMock(spec=discord.Message)
+            msg_en.id = 2
+            msg_en.content = "Good morning!"
+            msg_en.guild = MagicMock()
+            msg_en.reply = AsyncMock()
+
+            cog.hayamimi_translator.translate = AsyncMock(return_value={
+                "ok": True,
+                "source_lang": "en",
+                "translations": {"ja": "おはようございます！"},
+            })
+            await cog._translate_and_reply_message(msg_en, "ko")
+            self.assertEqual(msg_en.reply.call_args[0][0], "🌐 `[JA]` おはようございます！")
+
+            # 3. URLのみは API 呼び出し自体をスキップ
+            msg_url = MagicMock(spec=discord.Message)
+            msg_url.id = 3
+            msg_url.content = "https://example.com/abc"
+            msg_url.guild = MagicMock()
+            msg_url.reply = AsyncMock()
+            cog.hayamimi_translator.translate.reset_mock()
+            await cog._translate_and_reply_message(msg_url, "en")
+            cog.hayamimi_translator.translate.assert_not_awaited()
+            msg_url.reply.assert_not_awaited()
+
+            # 4. on_message で NG ワード含有時は翻訳タスクを起こさず、通常時は起こす
+            state = cog.get_guild_state(100)
+            state.bound_text_channel_id = 200
+            state.is_playing = False
+            mock_vc = MagicMock()
+            mock_vc.is_connected.return_value = True
+            mock_guild = MagicMock()
+            mock_guild.id = 100
+            mock_guild.name = "TestGuild"
+            mock_guild.voice_client = mock_vc
+
+            mock_db.get_guild_settings = AsyncMock(return_value={
+                "ignore_prefixes": [";"],
+                "max_text_length": 50,
+                "read_username": 0,
+                "dedup_window_seconds": 5.0,
+                "dedup_max_length": 10,
+                "speculative_timeout_seconds": 1.5,
+                "tts_translate_enabled": 1,
+                "tts_translate_lang": "en",
+            })
+            mock_db.get_dictionary_words = AsyncMock(return_value=[])
+            mock_db.get_ng_words = AsyncMock(return_value=["badword"])
+            mock_db.touch_ng_words = AsyncMock()
+            mock_db.get_or_create_user_settings = AsyncMock(return_value={
+                "speaker_id": "nanami",
+                "pitch": "0%",
+                "speed": 1.0,
+                "volume": 0.8,
+            })
+
+            def _make_msg(content: str, mid: int) -> MagicMock:
+                m = MagicMock(spec=discord.Message)
+                m.id = mid
+                m.content = content
+                m.guild = mock_guild
+                m.channel = MagicMock(id=200)
+                m.author = MagicMock(id=555, bot=False, display_name="UserA")
+                m.created_at = None
+                m.reply = AsyncMock()
+                return m
+
+            with patch.object(cog, "_playback_loop", new=AsyncMock()), \
+                 patch.object(cog, "_translate_and_reply_message", new=AsyncMock()) as mock_trans_task, \
+                 patch("src.cogs.vc_handler.safe_create_task", side_effect=lambda coro, **kw: asyncio.create_task(coro)):
+                await cog.on_message(_make_msg("badword です", 10))
+                await asyncio.sleep(0)
+                mock_trans_task.assert_not_awaited()
+
+                await cog.on_message(_make_msg("通常のテスト発言", 11))
+                await asyncio.sleep(0)
+                mock_trans_task.assert_awaited_once()
+                self.assertEqual(mock_trans_task.call_args[0][1], "en")
+        finally:
+            await cog.hayamimi_translator.close()
+
+    async def test_commands_choices_and_translate_commands(self):
+        """CommandCog の STT 選択肢定義と /translate コマンド群の検証"""
+        import discord
+        from src.cogs.commands import (
+            CommandsCog,
+            _STT_LANG_1_CHOICES,
+            _STT_LANG_2_CHOICES,
+            _TTS_TRANSLATE_LANG_CHOICES,
+        )
+
+        self.assertEqual(len(_TTS_TRANSLATE_LANG_CHOICES), 8)
+        self.assertEqual(len(_STT_LANG_1_CHOICES), 9)
+        self.assertEqual(len(_STT_LANG_2_CHOICES), 9)
+        self.assertEqual([c.value for c in _TTS_TRANSLATE_LANG_CHOICES], ["en", "zh", "zh-tw", "ko", "es", "fr", "de", "pt"])
+
+        cfg = AppConfig()
+        mock_db = MagicMock()
+        mock_db.get_guild_settings = AsyncMock(return_value={
+            "admin_role_id": 0,
+            "tts_translate_enabled": 1,
+            "tts_translate_lang": "zh-tw",
+            "auto_join_pairs": [
+                {"vc_id": 10, "text_id": 20, "translate_enabled": True, "translate_lang": "ko"}
+            ],
+        })
+        mock_db.update_guild_settings = AsyncMock(return_value={
+            "tts_translate_enabled": 1,
+            "tts_translate_lang": "zh-tw",
+        })
+
+        cog = CommandsCog(MagicMock(), cfg, mock_db, MagicMock(), MagicMock())
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.guild_id = 123
+        interaction.user = MagicMock(spec=discord.Member)
+        interaction.user.roles = []
+        interaction.user.guild_permissions = MagicMock(administrator=True, manage_guild=True)
+        interaction.response = MagicMock()
+        interaction.response.send_message = AsyncMock()
+
+        await cog.translate_set.callback(cog, interaction, enabled=True, target_lang="zh-tw")
+        mock_db.update_guild_settings.assert_awaited_once_with(
+            123, tts_translate_enabled=1, tts_translate_lang="zh-tw"
+        )
+        interaction.response.send_message.assert_awaited_once()
+
+        interaction.response.send_message.reset_mock()
+        await cog.translate_status.callback(cog, interaction)
+        interaction.response.send_message.assert_awaited_once()
+        sent_embed = interaction.response.send_message.call_args.kwargs["embed"]
+        self.assertIn("zh-tw", str(sent_embed.fields[1].value))
+        self.assertIn("<#20>", str(sent_embed.fields[2].value))
+
+    def test_should_translate_for_japanese_tts(self):
+        """非日本語判定 (ひらがな・カタカナ・www・辞書語・2文字漢字スキップ等) の検証"""
+        from src.stt.hayamimi_client import should_translate_for_japanese_tts
+
+        self.assertFalse(should_translate_for_japanese_tts("Apexやろう"))
+        self.assertFalse(should_translate_for_japanese_tts("Hello 世界だよ"))
+        self.assertFalse(should_translate_for_japanese_tts("www"))
+        self.assertFalse(should_translate_for_japanese_tts("了解"))
+        self.assertFalse(should_translate_for_japanese_tts("開始！"))
+        self.assertFalse(should_translate_for_japanese_tts("Discord", [("discord", "ディスコード")]))
+
+        self.assertTrue(should_translate_for_japanese_tts("Hello everyone!"))
+        self.assertTrue(should_translate_for_japanese_tts("안녕하세요"))
+        self.assertTrue(should_translate_for_japanese_tts("今天天气很好"))
+
+    async def test_auto_join_pairs_translation_persistence_and_normalization(self):
+        """auto_join_pairs のペア単位 translate_enabled / translate_lang 永続化・正規化検証"""
+        import tempfile
+        import os
+        from src.database import Database, normalize_auto_join_pairs
+
+        norm = normalize_auto_join_pairs([
+            {"vc_id": "111", "text_id": "222"},
+            {"vc_id": "333", "text_id": "444", "translate_enabled": True, "translate_lang": "ZH-TW"},
+            {"vc_id": "555", "text_id": "666", "translate_enabled": True, "translate_lang": "bad"},
+        ])
+        self.assertEqual(len(norm), 3)
+        self.assertFalse(norm[0]["translate_enabled"])
+        self.assertEqual(norm[0]["translate_lang"], "en")
+        self.assertTrue(norm[1]["translate_enabled"])
+        self.assertEqual(norm[1]["translate_lang"], "zh-tw")
+        self.assertEqual(norm[2]["translate_lang"], "en")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test_pairs.db")
+            db = Database(db_path)
+            await db.init_db()
+            try:
+                await db.update_guild_settings(
+                    1000,
+                    auto_join_pairs=[
+                        {"vc_id": 101, "text_id": 201, "translate_enabled": False, "translate_lang": "en"},
+                        {"vc_id": 102, "text_id": 202, "translate_enabled": True, "translate_lang": "ko"},
+                    ],
+                )
+                db.invalidate_guild_cache(1000)
+                loaded = await db.get_guild_settings(1000)
+                pairs = loaded["auto_join_pairs"]
+                self.assertEqual(len(pairs), 2)
+                self.assertFalse(pairs[0]["translate_enabled"])
+                self.assertTrue(pairs[1]["translate_enabled"])
+                self.assertEqual(pairs[1]["translate_lang"], "ko")
+            finally:
+                await db.close()
+
+    async def test_vc_handler_pair_translation_reads_foreign_as_japanese(self):
+        """自動参加ペアの翻訳ONチャンネルで多言語→日本語訳読み上げ＆リプライ追記が動く検証"""
+        import discord
+        from src.cogs.vc_handler import VCHandlerCog
+
+        cfg = AppConfig()
+        cfg.hayamimi_ws_url = "ws://127.0.0.1:8833/ws/stream"
+        mock_bot = MagicMock()
+        mock_db = MagicMock()
+        mock_cache = MagicMock()
+        mock_tts = MagicMock()
+
+        cog = VCHandlerCog(mock_bot, cfg, mock_db, mock_cache, mock_tts)
+        try:
+            state = cog.get_guild_state(100)
+            state.bound_text_channel_id = 200
+            state.is_playing = False
+            mock_vc = MagicMock()
+            mock_vc.is_connected.return_value = True
+            mock_guild = MagicMock()
+            mock_guild.id = 100
+            mock_guild.name = "TestGuild"
+            mock_guild.voice_client = mock_vc
+            mock_guild.get_member.return_value = None
+
+            guild_cfg = {
+                "ignore_prefixes": [";"],
+                "max_text_length": 100,
+                "read_username": 0,
+                "dedup_window_seconds": 5.0,
+                "dedup_max_length": 10,
+                "speculative_timeout_seconds": 1.5,
+                "tts_translate_enabled": 0,  # サーバー全体は OFF
+                "tts_translate_lang": "en",
+                "auto_join_pairs": [
+                    {"vc_id": 150, "text_id": 200, "translate_enabled": True, "translate_lang": "ko"},
+                    {"vc_id": 151, "text_id": 201, "translate_enabled": False, "translate_lang": "en"},
+                ],
+            }
+            mock_db.get_guild_settings = AsyncMock(return_value=guild_cfg)
+            mock_db.get_dictionary_words = AsyncMock(return_value=[])
+            mock_db.get_ng_words = AsyncMock(return_value=[])
+            mock_db.get_or_create_user_settings = AsyncMock(return_value={
+                "speaker_id": "nanami",
+                "pitch": "0%",
+                "speed": 1.0,
+                "volume": 0.8,
+            })
+
+            def _make_msg(content: str, mid: int, ch_id: int = 200) -> MagicMock:
+                m = MagicMock(spec=discord.Message)
+                m.id = mid
+                m.content = content
+                m.guild = mock_guild
+                m.channel = MagicMock(id=ch_id)
+                m.author = MagicMock(id=555, bot=False, display_name="UserA")
+                m.created_at = None
+                m.reply = AsyncMock()
+                return m
+
+            def _spawn(coro, **kw):
+                return asyncio.create_task(coro)
+
+            with patch.object(cog, "_playback_loop", new=AsyncMock()), \
+                 patch("src.cogs.vc_handler.safe_create_task", side_effect=_spawn):
+
+                # 1. ペア翻訳 ON チャンネル (200) で英語投稿 -> 日本語に翻訳して読み上げ & [JA] リプライ
+                cog.hayamimi_translator.translate = AsyncMock(return_value={
+                    "ok": True,
+                    "source_lang": "en",
+                    "translations": {"ja": "こんにちは皆さん！"},
+                })
+                msg_en = _make_msg("Hello everyone!", 101, ch_id=200)
+                await cog.on_message(msg_en)
+                await asyncio.sleep(0.05)
+
+                self.assertEqual(state.queue.qsize(), 1)
+                item1 = await state.queue.get()
+                self.assertEqual(item1.text, "こんにちは皆さん！")
+                msg_en.reply.assert_awaited_once()
+                self.assertEqual(msg_en.reply.call_args[0][0], "🌐 `[JA]` こんにちは皆さん！")
+
+                # 2. ペア翻訳 ON チャンネル (200) で日本語投稿 -> 原文即時読み上げ & [KO] リプライ
+                cog.hayamimi_translator.translate = AsyncMock(return_value={
+                    "ok": True,
+                    "source_lang": "ja",
+                    "translations": {"ko": "수고하셨습니다."},
+                })
+                msg_ja = _make_msg("お疲れ様です", 102, ch_id=200)
+                await cog.on_message(msg_ja)
+                await asyncio.sleep(0.05)
+
+                self.assertEqual(state.queue.qsize(), 1)
+                item2 = await state.queue.get()
+                self.assertEqual(item2.text, "お疲れ様です")
+                msg_ja.reply.assert_awaited_once()
+                self.assertEqual(msg_ja.reply.call_args[0][0], "🌐 `[KO]` 수고하셨습니다.")
+
+                # 3. 翻訳 API 失敗時は原文ベース (TextCleaner整形後) のフォールバックで読み上げ継続
+                cog.hayamimi_translator.translate = AsyncMock(return_value=None)
+                msg_err = _make_msg("Good night!", 103, ch_id=200)
+                await cog.on_message(msg_err)
+                await asyncio.sleep(0.05)
+
+                self.assertEqual(state.queue.qsize(), 1)
+                item3 = await state.queue.get()
+                self.assertEqual(item3.text, cog.text_cleaner.clean("Good night!"))
+                msg_err.reply.assert_not_awaited()
+
+                # 4. ペア翻訳 OFF チャンネル (201) では翻訳APIを呼ばず従来読み上げのまま
+                state.bound_text_channel_id = 201
+                cog.hayamimi_translator.translate = AsyncMock()
+                msg_off = _make_msg("Good morning!", 104, ch_id=201)
+                await cog.on_message(msg_off)
+                await asyncio.sleep(0.05)
+
+                self.assertEqual(state.queue.qsize(), 1)
+                item4 = await state.queue.get()
+                self.assertEqual(item4.text, cog.text_cleaner.clean("Good morning!"))
+                cog.hayamimi_translator.translate.assert_not_awaited()
+                msg_off.reply.assert_not_awaited()
+        finally:
+            await cog.hayamimi_translator.close()
+
+
 if __name__ == "__main__":
     unittest.main()

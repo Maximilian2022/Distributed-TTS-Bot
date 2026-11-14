@@ -12,6 +12,12 @@ from src.database import Database
 from src.cache_manager import CacheManager
 from src.cogs.vc_handler import VCHandlerCog, VCConnectAborted
 from src.disaster.parser import format_scale_name
+from src.stt.hayamimi_client import (
+    HAYAMIMI_LANGUAGE_LABELS,
+    HAYAMIMI_TRANSLATE_LANGUAGES,
+    normalize_hayamimi_lang,
+    resolve_stt_trans_langs,
+)
 from src.utils.alert_service import (
     alert_service,
     CATEGORY_BOT,
@@ -23,6 +29,18 @@ from src.utils.alert_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+_STT_LANG_1_CHOICES: List[app_commands.Choice[str]] = [
+    app_commands.Choice(name="翻訳なし (OFF)", value="none"),
+    *[app_commands.Choice(name=label, value=code) for code, label in HAYAMIMI_TRANSLATE_LANGUAGES],
+]
+_STT_LANG_2_CHOICES: List[app_commands.Choice[str]] = [
+    app_commands.Choice(name="指定なし (1言語のみ)", value="none"),
+    *[app_commands.Choice(name=label, value=code) for code, label in HAYAMIMI_TRANSLATE_LANGUAGES],
+]
+_TTS_TRANSLATE_LANG_CHOICES: List[app_commands.Choice[str]] = [
+    app_commands.Choice(name=label, value=code) for code, label in HAYAMIMI_TRANSLATE_LANGUAGES
+]
 
 
 def generate_magic_login_url(
@@ -1317,11 +1335,14 @@ class CommandsCog(commands.Cog):
     @app_commands.describe(
         target="字幕化する対象メンバー (未指定で実行者自身 / all_members有効時は無視)",
         all_members="VC内の全メンバーを対象にするか (True: 全員, False: targetまたは実行者)",
-        trans_langs="リアルタイム翻訳先言語コード (例: en, ko, zh。空欄で翻訳なし)",
+        trans_langs="第1リアルタイム翻訳先言語 (未指定時はWebUI既定値を使用)",
+        trans_lang_2="第2リアルタイム翻訳先言語 (任意・2言語同時翻訳用)",
         output="字幕の出力先 (both: 聞き専＋ゲームPC, channel: 聞き専のみ, game: ゲームPCのみ)",
         channel="出力先のテキストチャンネル (未指定でVC紐付けチャンネルまたは実行チャンネル)"
     )
     @app_commands.choices(
+        trans_langs=_STT_LANG_1_CHOICES,
+        trans_lang_2=_STT_LANG_2_CHOICES,
         output=[
             app_commands.Choice(name="聞き専チャンネル ＋ ゲームPC (両方)", value="both"),
             app_commands.Choice(name="聞き専チャンネルのみ", value="channel"),
@@ -1334,6 +1355,7 @@ class CommandsCog(commands.Cog):
         target: Optional[discord.Member] = None,
         all_members: Optional[bool] = False,
         trans_langs: Optional[str] = None,
+        trans_lang_2: Optional[str] = None,
         output: Optional[str] = "both",
         channel: Optional[discord.TextChannel] = None,
     ) -> None:
@@ -1421,7 +1443,11 @@ class CommandsCog(commands.Cog):
                 state = target_vc_cog.get_guild_state(interaction.guild.id)
                 text_channel_id = state.bound_text_channel_id or interaction.channel.id
 
-        langs = trans_langs if trans_langs is not None else getattr(self.config, "hayamimi_trans_langs", "")
+        langs = resolve_stt_trans_langs(
+            trans_langs,
+            trans_lang_2,
+            getattr(self.config, "hayamimi_trans_langs", "")
+        )
         success = await stt_mgr.start_stt(
             guild=target_guild,
             text_channel_id=text_channel_id,
@@ -1510,11 +1536,103 @@ class CommandsCog(commands.Cog):
                 embed.add_field(name="現在接続中の話者セッション", value=f"{speakers} 名", inline=True)
                 targets = "全員 (All)" if not receiver.target_user_ids else ", ".join(f"<@{u}>" for u in receiver.target_user_ids)
                 embed.add_field(name="🎯 対象話者", value=targets, inline=True)
+                active_langs = getattr(receiver, "trans_langs", "") or "翻訳なし"
+                embed.add_field(name="🌍 リアルタイム翻訳", value=f"`{active_langs}`", inline=True)
             if dispatcher:
                 ch_str = f"<#{dispatcher.text_channel_id}> (`{dispatcher.text_channel_id}`)" if dispatcher.text_channel_id else "ゲームPCのみ (Discord出力なし)"
                 embed.add_field(name="📤 出力先テキストCh", value=ch_str, inline=True)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # --- 読み上げチャンネル投稿テキスト自動翻訳表示設定 (/translate) ---
+    translate_group = app_commands.Group(
+        name="translate",
+        description="読み上げチャンネルに投稿されたテキストの自動翻訳表示を設定・確認します。"
+    )
+
+    @translate_group.command(name="status", description="このサーバーの投稿テキスト自動翻訳設定を確認します。")
+    async def translate_status(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild_id:
+            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
+            return
+
+        settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
+        enabled = bool(settings.get("tts_translate_enabled", 0))
+        target_lang = normalize_hayamimi_lang(settings.get("tts_translate_lang"), default="en")
+        lang_label = HAYAMIMI_LANGUAGE_LABELS.get(target_lang, target_lang)
+
+        embed = discord.Embed(
+            title="🌐 読み上げチャンネル 自動翻訳表示設定",
+            description=(
+                "テキストの読み上げ（日本語音声）はそのままに、投稿メッセージの下へ翻訳結果をリプライ表示します。\n"
+                "外国語で投稿された場合は自動で判定し、日本語へ翻訳して表示します。"
+            ),
+            color=discord.Color.green() if enabled else discord.Color.greyple()
+        )
+        embed.add_field(name="翻訳表示機能 (サーバー全体)", value="**有効 (ON)** ✅" if enabled else "**無効 (OFF)** ❌", inline=True)
+        embed.add_field(name="日本語投稿時の翻訳先言語", value=f"`{target_lang}` — {lang_label}", inline=True)
+
+        pair_lines = []
+        for p in (settings.get("auto_join_pairs") or []):
+            if isinstance(p, dict) and p.get("translate_enabled"):
+                tid = p.get("text_id")
+                plang = normalize_hayamimi_lang(p.get("translate_lang"), default="en")
+                plabel = HAYAMIMI_LANGUAGE_LABELS.get(plang, plang)
+                pair_lines.append(f"• <#{tid}> → `{plang}` ({plabel}) ＆ 多言語は日本語訳読み上げ")
+        if pair_lines:
+            embed.add_field(
+                name="🔗 自動参加ペア別 翻訳モード有効チャンネル",
+                value="\n".join(pair_lines),
+                inline=False,
+            )
+
+        embed.set_footer(text="設定を変更するには /translate set または WebUI の自動参加ペアリング設定から変更できます")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @translate_group.command(name="set", description="読み上げチャンネル投稿テキストの自動翻訳表示を設定します（管理者専用）。")
+    @app_commands.describe(
+        enabled="自動翻訳表示を有効にするか (True: 有効, False: 無効)",
+        target_lang="日本語投稿時の翻訳先言語 (他言語の投稿は自動で日本語に翻訳されます)"
+    )
+    @app_commands.choices(target_lang=_TTS_TRANSLATE_LANG_CHOICES)
+    async def translate_set(
+        self,
+        interaction: discord.Interaction,
+        enabled: Optional[bool] = None,
+        target_lang: Optional[str] = None,
+    ) -> None:
+        if not await self._check_admin_permission(interaction):
+            return
+
+        if enabled is None and target_lang is None:
+            await interaction.response.send_message(
+                "⚠️ `enabled`（有効/無効）または `target_lang`（翻訳先言語）のいずれかを指定してください。",
+                ephemeral=True
+            )
+            return
+
+        update_kwargs: Dict[str, Any] = {}
+        if enabled is not None:
+            update_kwargs["tts_translate_enabled"] = 1 if enabled else 0
+        if target_lang is not None:
+            update_kwargs["tts_translate_lang"] = normalize_hayamimi_lang(target_lang, default="en")
+
+        updated = await self.db.update_guild_settings(interaction.guild_id, **update_kwargs)
+        cur_enabled = bool(updated.get("tts_translate_enabled", 0))
+        cur_lang = normalize_hayamimi_lang(updated.get("tts_translate_lang"), default="en")
+        lang_label = HAYAMIMI_LANGUAGE_LABELS.get(cur_lang, cur_lang)
+
+        status_str = "**有効 (ON)** ✅" if cur_enabled else "**無効 (OFF)** ❌"
+        hint = ""
+        if not cur_enabled and target_lang is not None and enabled is None:
+            hint = "\nℹ️ 現在この機能は無効 (OFF) です。動作させるには `/translate set enabled:True` を実行してください。"
+
+        await interaction.response.send_message(
+            f"✅ **自動翻訳表示設定を更新しました**\n"
+            f"• 状態: {status_str}\n"
+            f"• 日本語投稿時の翻訳先言語: `{cur_lang}` ({lang_label}){hint}",
+            ephemeral=True
+        )
 
 
 

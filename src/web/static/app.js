@@ -2370,6 +2370,17 @@ async function loadGuildChannels(guildId) {
   }
 }
 
+const AUTO_PAIR_TRANSLATE_LANGUAGES = [
+  { code: "en", label: "英語 (en)" },
+  { code: "zh", label: "中国語・簡体 (zh)" },
+  { code: "zh-tw", label: "台湾語・繁体 (zh-tw)" },
+  { code: "ko", label: "韓国語 (ko)" },
+  { code: "es", label: "スペイン語 (es)" },
+  { code: "fr", label: "フランス語 (fr)" },
+  { code: "de", label: "ドイツ語 (de)" },
+  { code: "pt", label: "ポルトガル語 (pt)" }
+];
+
 function renderAutoJoinPairs(pairs, maxPairs) {
   const container = document.getElementById("auto-join-pairs-list");
   if (!container) return;
@@ -2383,7 +2394,12 @@ function renderAutoJoinPairs(pairs, maxPairs) {
   const textChannels = currentGuildChannels.text || [];
 
   for (let i = 0; i < count; i++) {
-    const pair = (pairs && pairs[i]) ? pairs[i] : { vc_id: "0", text_id: "0" };
+    const pair = (pairs && pairs[i])
+      ? pairs[i]
+      : { vc_id: "0", text_id: "0", translate_enabled: false, translate_lang: "en" };
+    const isTransEnabled = !!pair.translate_enabled;
+    const transLangVal = pair.translate_lang || "en";
+
     const row = document.createElement("div");
     row.className = "auto-pair-row";
     row.dataset.index = i;
@@ -2398,7 +2414,7 @@ function renderAutoJoinPairs(pairs, maxPairs) {
 
     // VC選択
     const vcWrapper = document.createElement("div");
-    vcWrapper.style.cssText = "flex:1;min-width:180px;";
+    vcWrapper.style.cssText = "flex:1;min-width:170px;";
     const vcSelect = document.createElement("select");
     vcSelect.className = "form-input auto-pair-vc";
     vcSelect.dataset.index = i;
@@ -2421,7 +2437,7 @@ function renderAutoJoinPairs(pairs, maxPairs) {
 
     // Text選択
     const textWrapper = document.createElement("div");
-    textWrapper.style.cssText = "flex:1;min-width:180px;";
+    textWrapper.style.cssText = "flex:1;min-width:170px;";
     const textSelect = document.createElement("select");
     textSelect.className = "form-input auto-pair-text";
     textSelect.dataset.index = i;
@@ -2435,6 +2451,42 @@ function renderAutoJoinPairs(pairs, maxPairs) {
     textSelect.innerHTML = textHtml;
     textWrapper.appendChild(textSelect);
     row.appendChild(textWrapper);
+
+    // 翻訳オプション (ON/OFF + 翻訳先言語)
+    const transWrapper = document.createElement("div");
+    transWrapper.style.cssText = "display:flex;align-items:center;gap:6px;background:rgba(168,85,247,0.10);border:1px solid rgba(168,85,247,0.28);padding:4px 8px;border-radius:6px;";
+
+    const transLabel = document.createElement("label");
+    transLabel.style.cssText = "display:flex;align-items:center;gap:5px;cursor:pointer;font-size:12px;font-weight:600;white-space:nowrap;margin:0;";
+    transLabel.title = "ONにするとこのチャンネルの投稿に翻訳を追加し、多言語は日本語へ訳して読み上げます";
+
+    const transCheck = document.createElement("input");
+    transCheck.type = "checkbox";
+    transCheck.className = "auto-pair-translate";
+    transCheck.dataset.index = i;
+    transCheck.checked = isTransEnabled;
+    transCheck.style.cssText = "width:16px;height:16px;cursor:pointer;accent-color:#a855f7;";
+
+    const transSpan = document.createElement("span");
+    transSpan.textContent = "🌐 翻訳";
+    transLabel.appendChild(transCheck);
+    transLabel.appendChild(transSpan);
+
+    const transLangSelect = document.createElement("select");
+    transLangSelect.className = "form-input auto-pair-translate-lang";
+    transLangSelect.dataset.index = i;
+    transLangSelect.style.cssText = `font-size:12px;padding:3px 6px;min-width:130px;opacity:${isTransEnabled ? '1' : '0.55'};`;
+    transLangSelect.innerHTML = AUTO_PAIR_TRANSLATE_LANGUAGES.map(l =>
+      `<option value="${l.code}" ${l.code === transLangVal ? 'selected' : ''}>${escapeHtml(l.label)}</option>`
+    ).join("");
+
+    transCheck.onchange = () => {
+      transLangSelect.style.opacity = transCheck.checked ? "1" : "0.55";
+    };
+
+    transWrapper.appendChild(transLabel);
+    transWrapper.appendChild(transLangSelect);
+    row.appendChild(transWrapper);
 
     // クリアボタン
     const clearBtn = document.createElement("button");
@@ -2453,10 +2505,17 @@ function renderAutoJoinPairs(pairs, maxPairs) {
 function clearAutoJoinPair(index) {
   const vcSelect = document.querySelector(`.auto-pair-vc[data-index="${index}"]`);
   const textSelect = document.querySelector(`.auto-pair-text[data-index="${index}"]`);
+  const transCheck = document.querySelector(`.auto-pair-translate[data-index="${index}"]`);
+  const transLangSelect = document.querySelector(`.auto-pair-translate-lang[data-index="${index}"]`);
   if (vcSelect) vcSelect.value = "0";
   if (textSelect) textSelect.value = "0";
+  if (transCheck) transCheck.checked = false;
+  if (transLangSelect) {
+    transLangSelect.value = "en";
+    transLangSelect.style.opacity = "0.55";
+  }
   if (cachedAutoJoinPairs && cachedAutoJoinPairs[index]) {
-    cachedAutoJoinPairs[index] = { vc_id: "0", text_id: "0" };
+    cachedAutoJoinPairs[index] = { vc_id: "0", text_id: "0", translate_enabled: false, translate_lang: "en" };
   }
 }
 window.clearAutoJoinPair = clearAutoJoinPair;
@@ -2500,6 +2559,16 @@ async function loadBotConfig(guildId) {
     const announceVCCheckbox = document.getElementById("cfg-announce-vc");
     if (announceVCCheckbox) {
       announceVCCheckbox.checked = !!cfg.announce_vc_events;
+    }
+
+    // 投稿テキスト自動翻訳表示
+    const ttsTransCheckbox = document.getElementById("cfg-tts-translate-enabled");
+    if (ttsTransCheckbox) {
+      ttsTransCheckbox.checked = !!cfg.tts_translate_enabled;
+    }
+    const ttsTransLangSelect = document.getElementById("cfg-tts-translate-lang");
+    if (ttsTransLangSelect) {
+      ttsTransLangSelect.value = cfg.tts_translate_lang || "en";
     }
 
     // 最大許容沈黙 (遅い・止まったと感じるまでの秒数)
@@ -2644,6 +2713,8 @@ async function saveBotConfig(e) {
   const adminRole = document.getElementById("cfg-admin-role")?.value || "0";
   const readUsername = document.getElementById("cfg-read-username")?.checked || false;
   const announceVCEvents = document.getElementById("cfg-announce-vc")?.checked || false;
+  const ttsTranslateEnabled = document.getElementById("cfg-tts-translate-enabled")?.checked || false;
+  const ttsTranslateLang = document.getElementById("cfg-tts-translate-lang")?.value || "en";
   const maxSilence = Math.max(1.0, Math.min(2.5, parseFloat(document.getElementById("cfg-speculative-timeout")?.value || 1.5)));
 
   const disasterEnabled = document.getElementById("cfg-disaster-enabled")?.checked ?? true;
@@ -2660,10 +2731,17 @@ async function saveBotConfig(e) {
   for (let i = 0; i < countToExtract; i++) {
     const vcSelect = document.querySelector(`.auto-pair-vc[data-index="${i}"]`);
     const textSelect = document.querySelector(`.auto-pair-text[data-index="${i}"]`);
+    const transCheck = document.querySelector(`.auto-pair-translate[data-index="${i}"]`);
+    const transLangSelect = document.querySelector(`.auto-pair-translate-lang[data-index="${i}"]`);
     const vcId = vcSelect ? vcSelect.value : "0";
     const textId = textSelect ? textSelect.value : "0";
     if (vcId && vcId !== "0" && textId && textId !== "0") {
-      pairs.push({ vc_id: vcId, text_id: textId });
+      pairs.push({
+        vc_id: vcId,
+        text_id: textId,
+        translate_enabled: transCheck ? !!transCheck.checked : false,
+        translate_lang: transLangSelect ? (transLangSelect.value || "en") : "en"
+      });
     }
   }
 
@@ -2678,6 +2756,8 @@ async function saveBotConfig(e) {
     auto_join_text_channel_id: pairs.length > 0 ? pairs[0].text_id : "0",
     read_username: readUsername,
     announce_vc_events: announceVCEvents,
+    tts_translate_enabled: ttsTranslateEnabled,
+    tts_translate_lang: ttsTranslateLang,
     max_silence_seconds: maxSilence,
     disaster_alert_enabled: disasterEnabled,
     disaster_min_scale: disasterMinScale,
