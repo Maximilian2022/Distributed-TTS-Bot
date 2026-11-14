@@ -415,6 +415,7 @@ class Database:
                     ignore_prefixes TEXT DEFAULT '[";", "；"]',
                     tts_translate_enabled INTEGER DEFAULT 0,
                     tts_translate_lang TEXT DEFAULT 'en',
+                    local_tts_kanji_reading INTEGER DEFAULT 1,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -466,6 +467,9 @@ class Database:
                 if "tts_translate_lang" not in cols:
                     await db.execute("ALTER TABLE guild_settings ADD COLUMN tts_translate_lang TEXT DEFAULT 'en'")
                     logger.info("Migrated guild_settings table: added tts_translate_lang column")
+                if "local_tts_kanji_reading" not in cols:
+                    await db.execute("ALTER TABLE guild_settings ADD COLUMN local_tts_kanji_reading INTEGER DEFAULT 1")
+                    logger.info("Migrated guild_settings table: added local_tts_kanji_reading column")
 
             # 4. 月別TTS利用量トラッキング (失敗数・フォールバック生成数も記録)
             await db.execute("""
@@ -1817,8 +1821,22 @@ class Database:
                 item = await cur.fetchone()
                 return dict(item) if item else None
 
-    async def approve_ai_suggestion(self, suggestion_id: int) -> Optional[Dict[str, Any]]:
-        """AI提案を承認し、本辞書 (guild_dictionary) へ登録"""
+    async def get_ai_suggestion_by_guild_word(self, guild_id: int, word: str) -> Optional[Dict[str, Any]]:
+        """ギルドIDと単語からAI提案レコードを取得"""
+        w = (word or "").strip()
+        if not w:
+            return None
+        async with self.get_connection() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM ai_suggested_words WHERE guild_id = ? AND word = ?",
+                (guild_id, w)
+            ) as cur:
+                item = await cur.fetchone()
+                return dict(item) if item else None
+
+    async def approve_ai_suggestion(self, suggestion_id: int, reading: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """AI提案を承認し、本辞書 (guild_dictionary) へ登録 (reading指定時は読みを上書き)"""
         async with self.get_connection() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -1832,7 +1850,9 @@ class Database:
 
             guild_id = data["guild_id"]
             word = data["word"]
-            reading = data["suggested_reading"]
+            effective_reading = (reading.strip() if isinstance(reading, str) and reading.strip() else data["suggested_reading"])
+            data["suggested_reading"] = effective_reading
+            data["status"] = "approved"
 
             # 本辞書に追加・更新
             await db.execute(
@@ -1843,17 +1863,17 @@ class Database:
                     reading = excluded.reading,
                     last_used_at = CURRENT_TIMESTAMP
                 """,
-                (guild_id, word, reading)
+                (guild_id, word, effective_reading)
             )
-            # ステータスを approved に更新
+            # ステータスを approved に更新 (編集後の読みも同期)
             await db.execute(
-                "UPDATE ai_suggested_words SET status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (suggestion_id,)
+                "UPDATE ai_suggested_words SET suggested_reading = ?, status = 'approved', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (effective_reading, suggestion_id)
             )
             await db.commit()
 
         self.invalidate_guild_cache(guild_id)
-        logger.info(f"Approved AI suggestion #{suggestion_id} for guild {guild_id}: '{word}' -> '{reading}'")
+        logger.info(f"Approved AI suggestion #{suggestion_id} for guild {guild_id}: '{word}' -> '{effective_reading}'")
         return data
 
     async def reject_ai_suggestion(self, suggestion_id: int) -> bool:
@@ -1933,6 +1953,8 @@ class Database:
                     res["error_contact_user_id"] = int(res.get("error_contact_user_id", 0) or 0)
                     res["tts_translate_enabled"] = int(res.get("tts_translate_enabled", 0) or 0)
                     res["tts_translate_lang"] = normalize_hayamimi_lang(res.get("tts_translate_lang"), default="en")
+                    raw_lkr = res.get("local_tts_kanji_reading")
+                    res["local_tts_kanji_reading"] = 1 if (raw_lkr is None or int(raw_lkr) != 0) else 0
 
                     self._guild_settings_cache[guild_id] = (now, dict(res))
                     return res
@@ -1977,14 +1999,15 @@ class Database:
             "error_contact_user_id": 0,
             "tts_translate_enabled": 0,
             "tts_translate_lang": "en",
+            "local_tts_kanji_reading": 1,
         }
 
         async with self.get_connection() as db:
             await db.execute(
                 """
                 INSERT OR IGNORE INTO guild_settings
-                (guild_id, command_prefix, max_text_length, dedup_window_seconds, dedup_max_length, auto_join_vc_id, auto_join_text_channel_id, auto_join_pairs, admin_role_id, default_speaker, read_username, announce_vc_events, speculative_timeout_seconds, ignore_prefixes, disaster_alert_enabled, disaster_min_scale, disaster_pref_filter, disaster_alert_weather, disaster_volume, tts_translate_enabled, tts_translate_lang)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, 30, '', 1, 1.0, 0, 'en')
+                (guild_id, command_prefix, max_text_length, dedup_window_seconds, dedup_max_length, auto_join_vc_id, auto_join_text_channel_id, auto_join_pairs, admin_role_id, default_speaker, read_username, announce_vc_events, speculative_timeout_seconds, ignore_prefixes, disaster_alert_enabled, disaster_min_scale, disaster_pref_filter, disaster_alert_weather, disaster_volume, tts_translate_enabled, tts_translate_lang, local_tts_kanji_reading)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, 30, '', 1, 1.0, 0, 'en', 1)
                 """,
                 (guild_id, prefix, max_len, dedup_sec, dedup_len, auto_vc, auto_text, json.dumps(initial_pairs), 0, def_speaker, def_spec_timeout, json.dumps(list(def_prefixes)))
             )
@@ -2041,6 +2064,9 @@ class Database:
         if "tts_translate_lang" in kwargs:
             current["tts_translate_lang"] = normalize_hayamimi_lang(kwargs.pop("tts_translate_lang"), default="en")
 
+        if "local_tts_kanji_reading" in kwargs:
+            current["local_tts_kanji_reading"] = 1 if kwargs.pop("local_tts_kanji_reading") else 0
+
         current.update(kwargs)
 
         async with self.get_connection() as db:
@@ -2053,9 +2079,9 @@ class Database:
                     announce_vc_events, speculative_timeout_seconds, ignore_prefixes,
                     disaster_alert_enabled, disaster_min_scale, disaster_pref_filter,
                     disaster_alert_weather, disaster_volume, error_contact_user_id, max_silence_seconds,
-                    tts_translate_enabled, tts_translate_lang, updated_at
+                    tts_translate_enabled, tts_translate_lang, local_tts_kanji_reading, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     command_prefix=excluded.command_prefix,
                     max_text_length=excluded.max_text_length,
@@ -2079,6 +2105,7 @@ class Database:
                     max_silence_seconds=excluded.max_silence_seconds,
                     tts_translate_enabled=excluded.tts_translate_enabled,
                     tts_translate_lang=excluded.tts_translate_lang,
+                    local_tts_kanji_reading=excluded.local_tts_kanji_reading,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -2104,7 +2131,8 @@ class Database:
                     int(current.get("error_contact_user_id", 0) or 0),
                     clamp_max_silence(current.get("max_silence_seconds")),
                     1 if current.get("tts_translate_enabled", 0) else 0,
-                    normalize_hayamimi_lang(current.get("tts_translate_lang"), default="en")
+                    normalize_hayamimi_lang(current.get("tts_translate_lang"), default="en"),
+                    1 if current.get("local_tts_kanji_reading", 1) else 0,
                 )
             )
             await db.commit()

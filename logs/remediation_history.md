@@ -1,3 +1,72 @@
+## 2026-11-14 20:56 ローカルTTS限定 SudachiPy 漢字かな補完・共通日本語/MMOゲーム用語辞書・❌リアクションDiscordボタン承認UIの実装
+- **背景・目的**:
+  - 漢字の誤読（ローカルTTSにおける文脈依存漢字や難読語・ゲーム用語の読み間違い）、MMO・ネットゲーム特有の略語/記号混在語の誤読、およびユーザーによる `❌` リアクション誤読指摘からの登録導線を改善するため、合意済みの3本柱（＋WIKIWIKI MMO用語全集ベース初期辞書・英語略語拡充）を一括実装し本番適用する。
+- **実施内容**:
+  1. `src/utils/common_reading_dict.json` & `src/utils/text_cleaner.py`:
+     - MMO用語全集を参考に、全サーバー共通初期プリセット辞書 (`common_reading_dict.json`, **61語**: `宝珠`, `廃神`, `教えて君`, `タダゲー厨`, `Pスキル`, `3D酔い`, `DDoS攻撃`, `おk`, `完凸`, `零式`, `蛮神`, `瘴気`, `顕現`, `邂逅`, `篭もる` 等) を新設。
+     - `COMMON_ACRONYMS` に MMO/ネットゲーム英語略語 (`directx`, `wb`, `debuff`, `buff`, `mob`, `melee`, `dupe`, `thx`, `thanx`, `plz`, `ez`, `rdy`, `pk`, `pt`, `npc`, `gm`, `str`, `dex`, `vit`, `int`, `mnd`, `chr`, `ddos`, `rmt`, `rmter`, `ss`, `hq`, `dmg`, `wtb`, `wts`, `wtt`, `wiz` 等) を拡充。
+     - 単一パス境界ガード付き複合正規表現 `_COMMON_READING_REGEX` + O(1) ルックアップ (`data/custom_common_reading.json`) を実装し、`apply_dictionary()` でサーバー個別辞書 (`guild_dictionary`) 置換箇所をプレースホルダ保護して常に最優先適用。
+     - ローカルTTS専用安全かな補完 `convert_kanji_for_local_tts()` および段階診断 `preview_common_and_local_tts()` を実装（漢字なしファストパス、`<<__BEEP:N__>>`・助詞・記号・OOV未知語・数詞＋助数詞クラスタ保護）。
+  2. `src/database.py`:
+     - `guild_settings`（テーブル定義・自動 `ALTER TABLE` マイグレーション・GET/UPDATE）に `local_tts_kanji_reading INTEGER DEFAULT 1` を追加。
+     - `get_ai_suggestion_by_guild_word()` を新設し、`approve_ai_suggestion(suggestion_id, reading=None)` を編集後の読み上書き登録対応に拡張。
+  3. `src/tts/manager.py`:
+     - `resolve_cache_text()`, `_synthesize_single_chunk()`, `get_chunk_audio()`, `get_audio_path()` に `local_tts_kanji_reading` を導入。VOICEVOX / SHAREVOX / COEIROINK / OpenJTalk 等ローカルエンジン送信時のみ安全かな補完を適用し、Azure / Google / Edge 等クラウドエンジンへは原文のまま送信。キャッシュキーは ON/OFF を分離しつつ `cache_metadata.text` は元表記を保持し `purge_by_word` 互換を維持。
+  4. `src/cogs/vc_handler.py`:
+     - `QueueItem`・プリフェッチ・再生ループへ `local_tts_kanji_reading` を伝播。
+     - `_reaction_learn_cache` (`OrderedDict`, TTL 300s / 最大500件) デバウンス付き `_learn_from_reaction()` および `MisreadSuggestionApprovalView` / `MisreadSuggestionEditModal` を実装し、`❌` リアクション指摘に対し元メッセージへのリプライUIからワンクリック登録・読み修正登録・却下および `cache_manager.purge_by_word` 即時削除を実行可能化。
+  5. `src/web/server.py`, `src/web/templates/index.html`, `src/web/static/app.js`:
+     - `/api/common_dict` (`GET`, `POST`, `import_batch`, `preview`, `DELETE` パス/クエリ両対応) と `/api/config` の `local_tts_kanji_reading` 読み書きを追加。
+     - WebUI 単語辞書サブタブに「🎮 共通日本語・ゲーム用語辞書」カード、一般設定タブに「🈷️ ローカルTTS 漢字かな補完」チェックボックスを追加（新規JSは純粋DOM操作のみで `innerHTML` 不使用）。
+  6. `tests/test_kanji_and_common_dict.py`:
+     - 漢字補完の各種保護、MMO辞書/略語、サーバー辞書優先、TTSManager ローカル/クラウド分岐＆キャッシュ分離、DBマイグレーション＆上書き承認、Web API 認証/権限/CRUD、Discord ボタン/モーダル承認UIの計9テストを追加。
+- **検証・本番反映結果**:
+  - `node --check src/web/static/app.js` 構文エラーなし。
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh python3 -m unittest discover tests`) にて全 232 件の単体テストが合格（`Ran 232 tests in 12.886s OK`）。
+  - `./scripts/rolling_update.sh --build` により本番コンテナ (`ttsbot-app-1`) をローリングアップデートし、`healthy` 復帰 (`/health` 200 OK)、本番DB `guild_settings.local_tts_kanji_reading` カラム確認、`TextCleaner.preview_common_and_local_tts` 実機動作確認完了（検証用 `/tmp/mmo_terms*` も削除済み）。
+
+## 2026-11-14 19:15 多層 O(1) 英語カタカナ辞書アーキテクチャ・SudachiDict抽出静的辞書・e2kオフライン未知語推論・WebUI管理機能の実装
+- **背景・目的**:
+  - 個別語彙のハードコード拡充では新語・固有名詞への追従に限界がある一方、総当たりループ型の辞書にすると登録数増加に伴って発話遅延が悪化するため、「登録語数が増えても計算量 O(1) で遅くならない多層辞書構造」「オープン辞書からの事前静的辞書生成」「完全未知語のオフライン自動カタカナ化」「今後の追記に備えるWebUI管理口」を一括実装・本番適用する。
+- **実施内容**:
+  1. `scripts/build_english_kana_dict.py` & `src/utils/english_kana_dict.json`:
+     - `sudachidict-core` (Apache License 2.0) の `Dictionary().entries()` から `alkana` 未収録かつ純粋なカタカナ読みを持つ固有名詞・外来語・最新IT/SNS用語 **18,420 語** を抽出し、静的コンパクト JSON 辞書 (`src/utils/english_kana_dict.json`, 555KB, ロード約12ms) を生成するビルダーを実装（将来の JMdict XML / 外部 TSV・CSV・JSON マージにも対応）。
+     - 全大文字略語コードや1文字読み羅列ノイズ・`www` スラング領域の混入を自動フィルタリング。
+  2. `requirements-optional.txt` & `src/utils/text_cleaner.py`:
+     - `e2k>=0.8.1` (Public Domain / `numpy` 依存) をオプショナル依存関係へ追加し、コンテナイメージ `madpiero/ttsbot:latest` を更新。
+     - `TextCleaner` に O(1) 多層解決 (`resolve_english_word_kana` / `convert_english_to_kana` / `preview_english_kana`) を実装：
+       - **解決順序**: `カスタム共通辞書 (data/custom_english_kana.json)` → `組込定番マップ (COMMON_ACRONYMS: 89語)` → `alkana (49,216語)` → `Sudachi抽出静的辞書 (18,420語)` → `e2k LRUキャッシュ (最大10,000語)` → `e2k NGram/C2K オフライン推論 (1文あたり新規推論上限 8語ガード付き)`。
+       - `www` 等の w 連続スラングは `slang_skip` として保護し後段の `normalize_slang` (`わら`) を維持。
+       - `warmup_morphological_tokenizers()` へ辞書事前ロード＆`e2k` ホットウォームを組み込み、初回発話時のモデル初期化スパイク（~400ms）を解消。
+       - カスタム辞書のバリデーション・アトミック保存 (`os.replace`)・リロード・検索・一括インポート API を実装。
+  3. `src/web/server.py`, `src/web/templates/index.html`, `src/web/static/app.js`:
+     - `/api/english_dict` (`GET`, `POST`, `DELETE`, `import_batch`, `preview`) エンドポイントを追加（参照/プレビューは認証必須、変更・削除は `_require_admin` 権限ガード＆音声キャッシュ自動パージ付き）。
+     - WebUI「📖 単語辞書」サブタブ内に「🌐 共通英語カタカナ辞書 (高速 O(1) マップ + 未知語自動推論)」UI（各層統計バッジ、解決元診断付きリアルタイム変換テスト、1件/一括追加、全辞書横断検索＆ワンクリック上書き登録）を実装。
+  4. `tests/test_english_kana_dict.py` & `tests/test_text_cleaner.py`:
+     - 多層 O(1) ルックアップ優先度、`www` スラング保護、カスタム辞書永続化/バリデーション、`e2k` LRU キャッシュ＆8語上限ガード、`e2k` 実機推論、および `/api/english_dict` 認証・403権限・キャッシュパージの単体テストを追加。
+- **検証・本番反映結果**:
+  - `node --check src/web/static/app.js` 構文エラーなし。
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh python3 -m unittest discover tests`) にて全 223 件の単体テストが合格（`Ran 223 tests in 12.104s OK`、一時コンテナ自動破棄・残骸なしを確認）。
+  - `./scripts/rolling_update.sh --build` により最小瞬断ローリングアップデートを実施し、`HEALTHY` 復帰・`/health` HTTP 200 OK（`"status": "ok"`, `"is_ready": true`, `"guilds_count": 2`）、全 5 台 Bot 接続、既存 VC（`わっしょい` / `どっこいしょ`）自動復旧、`e2k` ホットウォーム完了ログ (`Dict=18420+0`) を確認。
+  - 本番コンテナ内ベンチマークにて `'TikTokとか'` → `'ティックトックとか'` (`0.06ms`)、`'AmazonとNetflixを見る'` → `'アマゾンとネットフリックスを見る'` (`0.09ms`)、`'草www'` → `'草わら'` (`0.05ms`)、未知語 `'PydanticとKubernetes'` → `'ピダンティックとクーベルネッテス'` (`e2k` 推論 `56.41ms` / キャッシュ後 `0.195ms`) を実機確認完了。
+
+## 2026-11-14 18:34 英単語カタカナ変換の日本語隣接境界バグ修正 (`_RE_ENGLISH_WORD`) ＆ 主要SNS/IT/ゲーム用語拡充
+- **背景・目的**:
+  - `Youtubeが突然` や `TikTokとか` のように前後にスペースなく日本語が隣接する文で、既存のカタカナ変換（`YouTube -> ユーチューブ` 等）が効かずアルファベット1文字ずつ（「わいおーゆーてぃーゆーびーいー」等）読み上げられてしまう問題の修正。
+- **調査と真因特定**:
+  1. `src/utils/text_cleaner.py` の `_RE_ENGLISH_WORD = re.compile(r'\b[a-zA-Z]{2,}\b')` において、Python 3 の `\b` はひらがな・カタカナ・漢字などの日本語文字も `\w` として扱うため、日本語が隣接すると単語境界が成立せず `convert_english_to_kana()` が素通りしていた（単体 `Youtube` は `ユーチューブ` になるが、`Youtubeが突然` は `Youtubeが突然` のまま残存することを実機確認）。
+  2. `TikTok` 等が `COMMON_ACRONYMS` および `alkana` 辞書に未収録であり、即座のカタカナ変換が行われず AI 辞書提案（WebUI承認待ち）に回っていた。
+- **実施内容**:
+  1. `src/utils/text_cleaner.py`:
+     - `_RE_ENGLISH_WORD` を `re.compile(r'(?<![a-zA-Z0-9_])[a-zA-Z]{2,}(?![a-zA-Z0-9_])')` へ変更。日本語との境界では確実に英単語としてマッチさせつつ、前段（Step 4.5）で置換される NG ワードプレースホルダ `<<__BEEP:N__>>`（アンダースコア隣接）や `mp3` / `abc123` 等の英数字混合語の部分切り出しを防止。
+     - `COMMON_ACRONYMS` へ `tiktok` (`ティックトック`), `instagram`, `github`, `chatgpt`, `openai`, `netflix`, `amazon`, `spotify`, `obs`, `vtuber`, `sns`, `api`, `bgm`, `gg`, `afk`, `brb`, `tps`, `mmo`, `pvp`, `pve`, `rta`, `ssd`, `hdd`, `os`, `vr`, `ar`, `iphone`, `ipad`, `ios`, `android`, `xbox`, `valorant`, `minecraft`, `fortnite`, `lol`, `vrchat`, `niconico`, `bilibili`, `reddit`, `wikipedia` 等の頻出SNS・IT・ゲーム略語を追加。
+  2. `tests/test_text_cleaner.py`:
+     - `TestEnglishKanaConversion` を追加し、日本語隣接変換（`Youtubeが突然` / `TikTokが突然` / `DiscordとGitHubとChatGPTをOBSで配信`）、`<<__BEEP:3__>>` 非破壊および英数字混在保護、日本語隣接時の未知英単語検知（`XYZABCが来た`）の単体テストを追加。
+- **検証・本番反映結果**:
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh python3 -m unittest discover tests`) にて全 217 件の単体テストが合格（`Ran 217 tests in 11.788s OK`、一時コンテナ自動破棄・残骸なしを確認）。
+  - `docker compose up -d --no-deps --force-recreate app` により 1 回限りの最小影響切り替えを実施し、`HEALTHY at 19s`、`/health` HTTP 200 OK（`"status": "ok"`, `"is_ready": true`, `"guilds_count": 2`）、全 5 台の Bot 接続、および `Fast Recovery` による通話中 VC（`わっしょい` / `どっこいしょ`）自動復元とエラーなしを確認。
+  - 本番コンテナ (`ttsbot-app-1`) 上での実機確認にて、`TextCleaner().clean(...)` が `Youtubeが突然 -> ユーチューブが突然`、`TikTokとか -> ティックトックとか`、`禁止語YouTubeとTikTok` (`ng_words=['禁止語']`) `-> <<__BEEP:3__>> ユーチューブとティックトック` となることを確認完了。
+
 ## 2026-11-14 07:31 自動参加チャンネル・ペアリング単位の翻訳オプション（翻訳リプライ＋多言語日本語訳読み上げ）実装
 - **背景・目的**:
   - 日本人中心の通常雑談チャンネルでの誤判定や翻訳待ち遅延を回避しつつ、指定された自動参加ペアのチャンネルに限り、翻訳リプライ追記に加えて「非日本語（英語・韓国語・中国語等）の投稿を Hayamimi 経由で日本語化して日本語音声で読み上げる」機能を実現する。

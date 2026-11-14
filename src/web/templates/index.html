@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="ja">
+
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -27,7 +28,7 @@
     window.APP_USER_DATA = serverData.user_data;
     window.VOLUNTEER_WORKER_TOKEN = serverData.worker_token || "";
     window.latestAgentVersion = serverData.agent_version || "";
-    window.switchMetricsNode = function(nodeKey) {
+    window.switchMetricsNode = function (nodeKey) {
       if (typeof window.doSwitchMetricsNode === 'function') {
         window.doSwitchMetricsNode(nodeKey);
       } else {
@@ -36,6 +37,7 @@
     };
   </script>
 </head>
+
 <body>
 
   <!-- ナビゲーションヘッダー -->
@@ -46,7 +48,9 @@
           <img src="/static/logo.png?v={{ASSET_V}}" alt="Distributed TTS" class="bot-logo-img">
         </div>
         <div class="logo-text">
-          <h1>Distributed TTS <span class="badge">Online</span> <span class="build-tag" style="font-size:10px;font-weight:500;opacity:0.65;background:rgba(255,255,255,0.1);padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:6px;" title="ビルド: {{BUILD_ID}} ({{BUILD_DATE}})">{{BUILD_ID}}</span></h1>
+          <h1>Distributed TTS <span class="badge">Online</span> <span class="build-tag"
+              style="font-size:10px;font-weight:500;opacity:0.65;background:rgba(255,255,255,0.1);padding:2px 6px;border-radius:4px;vertical-align:middle;margin-left:6px;"
+              title="ビルド: {{BUILD_ID}} ({{BUILD_DATE}})">{{BUILD_ID}}</span></h1>
         </div>
       </div>
 
@@ -319,6 +323,182 @@
                   </thead>
                   <tbody id="dict-table-body">
                     <!-- 動的にレンダリング -->
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- 共通 O(1) 英語カタカナ辞書 & 未知語自動変換 (全サーバー共通・高速ハッシュマップ) -->
+            <div class="card" id="english-dict-card" style="margin-top:16px;border:1px solid rgba(56, 189, 248, 0.25);">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+                <div>
+                  <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                    🌐 共通英語カタカナ辞書 (高速 O(1) マップ + 未知語自動推論)
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    登録語数が増えても検索計算量は常に O(1) です。優先順: <b>カスタム登録 → 組込定番 → alkana → Sudachi抽出辞書 → e2k自動推論</b>
+                  </div>
+                </div>
+                <div id="english-dict-stats" style="font-size:12px;color:var(--text-muted);display:flex;gap:8px;flex-wrap:wrap;">
+                  読み込み中...
+                </div>
+              </div>
+
+              <!-- リアルタイム変換プレビュー -->
+              <div style="background:rgba(0,0,0,0.12);border-radius:8px;padding:12px;margin-bottom:14px;">
+                <div style="font-size:13px;font-weight:600;margin-bottom:8px;">🔍 変換プレビュー＆解決元チェック</div>
+                <form onsubmit="previewEnglishDict(event)" style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <input type="text" id="english-preview-input" class="form-input" style="flex:1;min-width:220px;" placeholder="例: Youtubeが突然TikTokとKubernetesを見る">
+                  <button type="submit" class="btn btn-secondary btn-sm">変換テスト</button>
+                </form>
+                <div id="english-preview-result" style="margin-top:8px;font-size:13px;display:none;"></div>
+              </div>
+
+              <!-- カスタム追加フォーム -->
+              <form onsubmit="addEnglishDictWord(event)" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+                <input type="text" id="english-dict-word" class="form-input" style="flex:1;min-width:160px;" placeholder="英単語 (半角英字2文字以上 例: openai)" required pattern="[A-Za-z]{2,64}">
+                <input type="text" id="english-dict-reading" class="form-input" style="flex:1;min-width:160px;" placeholder="カタカナ読み (例: オープンエーアイ)" required maxlength="128">
+                <button type="submit" class="btn btn-primary btn-sm">共通辞書に追加/上書き</button>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="toggleEnglishBatchBox()">📋 一括追加</button>
+              </form>
+
+              <div id="english-dict-batch-box" style="display:none;margin-bottom:14px;padding:10px;border:1px dashed var(--border-color);border-radius:8px;">
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">
+                  1行に1件「<code>英単語:カタカナ</code>」「<code>英単語,カタカナ</code>」またはタブ区切りで入力してください（最大5000件）。
+                </div>
+                <textarea id="english-dict-batch-text" class="form-input" rows="4" style="width:100%;font-family:monospace;font-size:12px;" placeholder="github:ギットハブ&#10;spotify:スポティファイ"></textarea>
+                <div style="margin-top:8px;display:flex;justify-content:flex-end;gap:8px;">
+                  <button type="button" class="btn btn-secondary btn-sm" onclick="toggleEnglishBatchBox()">閉じる</button>
+                  <button type="button" class="btn btn-primary btn-sm" onclick="importEnglishDictBatch()">一括インポート実行</button>
+                </div>
+              </div>
+
+              <!-- 辞書検索（システム辞書含む） -->
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+                <div style="font-size:13px;font-weight:600;">
+                  共通カスタム登録一覧 (<span id="english-custom-count">0件</span>)
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                  <input type="text" id="english-dict-search" class="form-input" style="width:240px;" placeholder="システム辞書も含め検索 (2文字~)..." oninput="debouncedSearchEnglishDict()">
+                </div>
+              </div>
+
+              <div id="english-search-results-box" style="display:none;margin-bottom:12px;">
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">🔎 辞書検索結果 (最大100件 / クリックで上書きフォームへ転記)</div>
+                <div class="dict-table-container" style="max-height:200px;">
+                  <table class="table">
+                    <thead>
+                      <tr>
+                        <th style="width:35%;">英単語</th>
+                        <th style="width:35%;">読み方</th>
+                        <th style="width:15%;">登録層</th>
+                        <th style="width:15%;text-align:right;">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="english-search-table-body"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="dict-table-container" style="max-height:240px;">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th style="width:40%;">英単語</th>
+                      <th style="width:40%;">カタカナ読み</th>
+                      <th style="width:20%;text-align:right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="english-custom-table-body">
+                    <tr><td colspan="3" style="text-align:center;color:var(--text-muted);">読み込み中...</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <!-- 全サーバー共通 日本語・ゲーム用語読み辞書 (単一パス複合正規表現 + O(1) ハッシュマップ) -->
+            <div class="card" id="common-dict-card" style="margin-top:16px;border:1px solid rgba(168, 85, 247, 0.25);">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+                <div>
+                  <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                    🎮 共通日本語・ゲーム用語辞書 (全サーバー共通)
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    漢字誤読・MMO/ネットゲーム用語・英数記号混在語を全サーバーで統一補正します（各サーバーの「サーバー別単語辞書」が常に最優先されます）。
+                  </div>
+                </div>
+                <div id="common-dict-stats" style="font-size:12px;color:var(--text-muted);display:flex;gap:8px;flex-wrap:wrap;">
+                  読み込み中...
+                </div>
+              </div>
+
+              <!-- リアルタイム変換プレビュー（共通辞書 + 英語辞書 + ローカルTTS漢字補完） -->
+              <div style="background:rgba(0,0,0,0.12);border-radius:8px;padding:12px;margin-bottom:14px;">
+                <div style="font-size:13px;font-weight:600;margin-bottom:8px;">🔍 変換プレビュー（共通辞書 → 英語辞書 → ローカルTTSかな補完）</div>
+                <form id="common-preview-form" style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <input type="text" id="common-preview-input" class="form-input" style="flex:1;min-width:220px;" maxlength="500" placeholder="例: DirectXとPスキルで宝珠を取りに1月1日に行く">
+                  <button type="submit" class="btn btn-secondary btn-sm">変換テスト</button>
+                </form>
+                <div id="common-preview-result" style="margin-top:8px;font-size:13px;display:none;"></div>
+              </div>
+
+              <!-- カスタム追加/上書きフォーム -->
+              <form id="common-dict-add-form" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+                <input type="text" id="common-dict-word" class="form-input" style="flex:1;min-width:160px;" placeholder="単語・ゲーム用語 (例: 宝珠 / Pスキル / 3D酔い)" required maxlength="64">
+                <input type="text" id="common-dict-reading" class="form-input" style="flex:1;min-width:160px;" placeholder="読み方 (例: ほうじゅ / ぴーすきる)" required maxlength="128">
+                <button type="submit" class="btn btn-primary btn-sm">共通辞書に追加/上書き</button>
+                <button type="button" id="common-dict-batch-toggle-btn" class="btn btn-secondary btn-sm">📋 一括追加</button>
+              </form>
+
+              <div id="common-dict-batch-box" style="display:none;margin-bottom:14px;padding:10px;border:1px dashed var(--border-color);border-radius:8px;">
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px;">
+                  1行に1件「<code>単語:読み方</code>」「<code>単語,読み方</code>」またはタブ区切りで入力してください（最大5000件）。
+                </div>
+                <textarea id="common-dict-batch-text" class="form-input" rows="4" style="width:100%;font-family:monospace;font-size:12px;" placeholder="宝珠:ほうじゅ&#10;Pスキル:ぴーすきる"></textarea>
+                <div style="margin-top:8px;display:flex;justify-content:flex-end;gap:8px;">
+                  <button type="button" id="common-dict-batch-close-btn" class="btn btn-secondary btn-sm">閉じる</button>
+                  <button type="button" id="common-dict-batch-import-btn" class="btn btn-primary btn-sm">一括インポート実行</button>
+                </div>
+              </div>
+
+              <!-- 辞書検索（システム初期辞書含む） -->
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+                <div style="font-size:13px;font-weight:600;">
+                  共通カスタム登録一覧 (<span id="common-custom-count">0件</span>)
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                  <input type="text" id="common-dict-search" class="form-input" style="width:240px;" placeholder="システム初期辞書も含め検索 (1文字~)...">
+                </div>
+              </div>
+
+              <div id="common-search-results-box" style="display:none;margin-bottom:12px;">
+                <div style="font-size:12px;color:var(--text-muted);margin-bottom:4px;">🔎 辞書検索結果 (最大100件 / 「転記」で上書き編集可)</div>
+                <div class="dict-table-container" style="max-height:200px;">
+                  <table class="table">
+                    <thead>
+                      <tr>
+                        <th style="width:35%;">単語・用語</th>
+                        <th style="width:35%;">読み方</th>
+                        <th style="width:15%;">登録層</th>
+                        <th style="width:15%;text-align:right;">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="common-search-table-body"></tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="dict-table-container" style="max-height:240px;">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th style="width:40%;">単語・用語</th>
+                      <th style="width:40%;">読み方</th>
+                      <th style="width:20%;text-align:right;">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="common-custom-table-body">
+                    <tr><td colspan="3" style="text-align:center;color:var(--text-muted);">読み込み中...</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -661,6 +841,19 @@
                       </small>
                     </div>
                     <input type="checkbox" id="cfg-read-username" style="width:22px;height:22px;cursor:pointer;accent-color:var(--accent);">
+                  </div>
+
+                  <!-- ローカルTTS 漢字かな補完オプション (デフォルト: ON) -->
+                  <div class="form-group" style="grid-column: 1 / -1;background:rgba(56, 189, 248, 0.06);border:1px solid rgba(56, 189, 248, 0.25);border-radius:8px;padding:14px;display:flex;align-items:center;justify-content:space-between;">
+                    <div>
+                      <label for="cfg-local-tts-kanji" style="font-weight:600;font-size:14px;cursor:pointer;display:block;margin-bottom:2px;">
+                        🈷️ ローカルTTS 漢字かな補完（VOICEVOX / COEIROINK / OpenJTalk 向け）
+                      </label>
+                      <small style="color:var(--text-dim);font-size:12px;">
+                        有効にすると、ローカル合成エンジンへ送るテキストのみ文脈解析で安全なひらがな補完を行い漢字の誤読を防ぎます（クラウド音声 Azure / Google 等には原文のまま送信されます）
+                      </small>
+                    </div>
+                    <input type="checkbox" id="cfg-local-tts-kanji" checked style="width:22px;height:22px;cursor:pointer;accent-color:var(--accent);">
                   </div>
 
                   <!-- VC入退室通知読み上げオプション (デフォルト: OFF) -->
@@ -2540,7 +2733,7 @@
                 <div style="background:var(--bg-card-hover);padding:12px 14px;border-radius:8px;">
                   <div style="font-weight:700;color:var(--primary);font-family:monospace;font-size:14px;">/info</div>
                   <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
-                    Botの動作情報、搭載TTSエンジン、利用規約およびクレジット表記ルールを表示します。
+                    Botの動作情報、搭載TTSエンジン、利用規約およびクレジット表記ルールを表。
                   </div>
                 </div>
               </div>
@@ -2557,7 +2750,8 @@
     <div class="modal-card" style="max-width:720px;" onclick="event.stopPropagation()">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
         <h3 style="margin:0;font-size:17px;">📋 単語辞書のテキスト一括インポート</h3>
-        <button type="button" class="btn btn-secondary btn-sm" style="padding:2px 8px;font-size:12px;line-height:1;" onclick="closeDictBatchImportModal()">✕</button>
+        <button type="button" class="btn btn-secondary btn-sm" style="padding:2px 8px;font-size:12px;line-height:1;"
+          onclick="closeDictBatchImportModal()">✕</button>
       </div>
       <p style="font-size:13px;color:var(--text-muted);line-height:1.5;margin-bottom:14px;">
         「単語：読み方」形式のテキストを貼り付けて、まとめて辞書に追加・更新できます。<br>
@@ -2566,29 +2760,37 @@
 
       <div style="margin-bottom:14px;">
         <label class="form-label" style="font-size:12px;margin-bottom:6px;display:block;">入力テキスト (コピペ用):</label>
-        <textarea id="dict-batch-textarea" class="form-input" rows="6" style="width:100%;font-family:monospace;font-size:13px;resize:vertical;"
+        <textarea id="dict-batch-textarea" class="form-input" rows="6"
+          style="width:100%;font-family:monospace;font-size:13px;resize:vertical;"
           placeholder="m2o：えむつーおー&#10;【】ーnannanー【杖&宝珠】：なんなん&#10;【ど】henya【鎌】 —：へにゃ&#10;【ど】十文字【宝洋弓】：じゅうもんじ&#10;【ど】henya【鎌】：へにゃ&#10;【ど】oty【杖】：おつや"
           oninput="onDictBatchInputChanged()"></textarea>
       </div>
 
       <!-- 解析結果プレビュー & 重複制御 -->
       <div id="dict-batch-preview-container" style="margin-bottom:18px;display:none;">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
+        <div
+          style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px;">
           <div style="font-size:12px;font-weight:600;color:var(--text-main);display:flex;align-items:center;gap:8px;">
             <span>🔍 解析結果:</span>
-            <span class="badge" style="background:#23a55a;color:white;font-size:11px;" id="dict-batch-badge-new">新規: 0</span>
-            <span class="badge" style="background:#f39c12;color:white;font-size:11px;display:none;" id="dict-batch-badge-conflict">競合: 0</span>
-            <span class="badge" style="background:#5c6069;color:white;font-size:11px;" id="dict-batch-badge-identical">完全重複(除外): 0</span>
+            <span class="badge" style="background:#23a55a;color:white;font-size:11px;" id="dict-batch-badge-new">新規:
+              0</span>
+            <span class="badge" style="background:#f39c12;color:white;font-size:11px;display:none;"
+              id="dict-batch-badge-conflict">競合: 0</span>
+            <span class="badge" style="background:#5c6069;color:white;font-size:11px;"
+              id="dict-batch-badge-identical">完全重複(除外): 0</span>
             <span id="dict-batch-skip-info" style="font-size:11px;color:#ff9f43;display:none;"></span>
           </div>
           <!-- 競合一括切り替えボタン -->
           <div id="dict-batch-conflict-actions" style="display:none;gap:6px;">
-            <button type="button" class="btn btn-secondary btn-sm" onclick="setAllDictConflicts(true)" style="padding:2px 8px;font-size:11px;">競合を全て上書き</button>
-            <button type="button" class="btn btn-secondary btn-sm" onclick="setAllDictConflicts(false)" style="padding:2px 8px;font-size:11px;">競合を全てスキップ</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="setAllDictConflicts(true)"
+              style="padding:2px 8px;font-size:11px;">競合を全て上書き</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="setAllDictConflicts(false)"
+              style="padding:2px 8px;font-size:11px;">競合を全てスキップ</button>
           </div>
         </div>
 
-        <div style="max-height:220px;overflow-y:auto;background:rgba(0,0,0,0.3);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;">
+        <div
+          style="max-height:220px;overflow-y:auto;background:rgba(0,0,0,0.3);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;">
           <table style="width:100%;font-size:12px;border-collapse:collapse;" id="dict-batch-preview-table">
             <thead>
               <tr style="color:var(--text-muted);border-bottom:1px solid rgba(255,255,255,0.08);text-align:left;">
@@ -2606,7 +2808,8 @@
 
       <div style="display:flex;justify-content:flex-end;gap:10px;">
         <button type="button" class="btn btn-secondary btn-sm" onclick="closeDictBatchImportModal()">キャンセル</button>
-        <button type="button" id="dict-batch-submit-btn" class="btn btn-primary btn-sm" onclick="executeDictBatchImport()" disabled>
+        <button type="button" id="dict-batch-submit-btn" class="btn btn-primary btn-sm"
+          onclick="executeDictBatchImport()" disabled>
           インポートを実行 (0件)
         </button>
       </div>
@@ -2621,11 +2824,14 @@
         メンバーのサーバー表示名（ニックネーム等）を単語辞書に登録し、メンションや呼びかけが自然な発音で読み上げられるようにします。
       </p>
       <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:20px;">
-        <button type="button" class="btn btn-secondary" onclick="executeUserImport('me')" style="text-align:left;padding:14px;border:1px solid var(--border-color);border-radius:8px;">
+        <button type="button" class="btn btn-secondary" onclick="executeUserImport('me')"
+          style="text-align:left;padding:14px;border:1px solid var(--border-color);border-radius:8px;">
           <div style="font-weight:600;font-size:14px;color:var(--text-main);margin-bottom:4px;">👤 自分のみインポート</div>
-          <div style="font-size:12px;color:var(--text-dim);">あなたの現在のサーバー表示名（<span id="import-my-name-preview" style="color:var(--primary);font-weight:bold;">読み込み中</span>）を単語として追加します</div>
+          <div style="font-size:12px;color:var(--text-dim);">あなたの現在のサーバー表示名（<span id="import-my-name-preview"
+              style="color:var(--primary);font-weight:bold;">読み込み中</span>）を単語として追加します</div>
         </button>
-        <button type="button" class="btn btn-primary" onclick="executeUserImport('all')" style="text-align:left;padding:14px;border-radius:8px;">
+        <button type="button" class="btn btn-primary" onclick="executeUserImport('all')"
+          style="text-align:left;padding:14px;border-radius:8px;">
           <div style="font-weight:600;font-size:14px;margin-bottom:4px;">👥 サーバー全員をインポート</div>
           <div style="font-size:12px;color:rgba(255,255,255,0.85);">このサーバーの全参加メンバー（非Bot）の表示名を辞書に一括登録します</div>
         </button>
@@ -2643,24 +2849,32 @@
         <h3 style="margin:0;font-size:16px;display:flex;align-items:center;gap:6px;">
           📁 MYCOEIROINK モデル ZIPアップロード
         </h3>
-        <button type="button" class="btn btn-secondary btn-sm" onclick="closeMyCoeUploadModal()" style="padding:2px 8px;">✕</button>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeMyCoeUploadModal()"
+          style="padding:2px 8px;">✕</button>
       </div>
       <p style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:14px;">
         BOOTH等の外部サイトからダウンロードしたZIPファイルをアップロードして導入します。<br>
-        <span style="color:var(--text-dim);font-size:11px;">※Zip Slip対策・危険ファイル検査などの厳格な安全バリデーションを実施の上、COEIROINKエンジンに安全配置されます。</span>
+        <span style="color:var(--text-dim);font-size:11px;">※Zip
+          Slip対策・危険ファイル検査などの厳格な安全バリデーションを実施の上、COEIROINKエンジンに安全配置されます。</span>
       </p>
 
-      <div id="mycoe-target-speaker-info" style="background:rgba(236,72,153,0.1);border:1px solid rgba(236,72,153,0.3);border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:12px;display:none;">
-        対象話者: <strong id="mycoe-target-speaker-name" style="color:#ec4899;">-</strong> (UUID: <code id="mycoe-target-speaker-uuid" style="font-size:11px;">-</code>)
+      <div id="mycoe-target-speaker-info"
+        style="background:rgba(236,72,153,0.1);border:1px solid rgba(236,72,153,0.3);border-radius:6px;padding:8px 12px;margin-bottom:14px;font-size:12px;display:none;">
+        対象話者: <strong id="mycoe-target-speaker-name" style="color:#ec4899;">-</strong> (UUID: <code
+          id="mycoe-target-speaker-uuid" style="font-size:11px;">-</code>)
       </div>
 
       <!-- ドロップゾーン -->
-      <div id="mycoe-drop-zone" style="border:2px dashed rgba(255,255,255,0.2);border-radius:10px;padding:32px 20px;text-align:center;background:rgba(0,0,0,0.2);cursor:pointer;transition:border-color 0.2s, background 0.2s;" onclick="document.getElementById('mycoe-zip-input').click()" ondragover="onMyCoeDragOver(event)" ondragleave="onMyCoeDragLeave(event)" ondrop="onMyCoeDrop(event)">
+      <div id="mycoe-drop-zone"
+        style="border:2px dashed rgba(255,255,255,0.2);border-radius:10px;padding:32px 20px;text-align:center;background:rgba(0,0,0,0.2);cursor:pointer;transition:border-color 0.2s, background 0.2s;"
+        onclick="document.getElementById('mycoe-zip-input').click()" ondragover="onMyCoeDragOver(event)"
+        ondragleave="onMyCoeDragLeave(event)" ondrop="onMyCoeDrop(event)">
         <div style="font-size:36px;margin-bottom:8px;">📦</div>
         <div style="font-weight:600;font-size:14px;margin-bottom:4px;color:var(--text-main);">ZIPファイルをここにドラッグ＆ドロップ</div>
         <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px;">またはクリックしてファイルを選択 (最大 2GB)</div>
         <button type="button" class="btn btn-secondary btn-sm" style="pointer-events:none;">ファイルを選択 📂</button>
-        <input type="file" id="mycoe-zip-input" accept=".zip" style="display:none;" onchange="onMyCoeFileSelected(this.files)">
+        <input type="file" id="mycoe-zip-input" accept=".zip" style="display:none;"
+          onchange="onMyCoeFileSelected(this.files)">
       </div>
 
       <!-- アップロード進行状態 -->
@@ -2670,7 +2884,8 @@
           <span id="mycoe-upload-percent-text">0%</span>
         </div>
         <div style="width:100%;height:6px;background:rgba(255,255,255,0.1);border-radius:3px;overflow:hidden;">
-          <div id="mycoe-upload-progress-bar" style="width:0%;height:100%;background:#ec4899;transition:width 0.2s;"></div>
+          <div id="mycoe-upload-progress-bar" style="width:0%;height:100%;background:#ec4899;transition:width 0.2s;">
+          </div>
         </div>
       </div>
 
@@ -2681,43 +2896,58 @@
   </div>
 
   <!-- 🔁 ワーカーローリング処理 (更新 / 再起動) 進捗モーダル -->
-  <div id="rolling-progress-modal" class="modal-backdrop" style="display:none;" onclick="closeRollingProgressModal(event)">
-    <div class="modal-card" style="max-width:640px;width:95%;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,0.6);padding:20px;" onclick="event.stopPropagation()">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:10px;">
+  <div id="rolling-progress-modal" class="modal-backdrop" style="display:none;"
+    onclick="closeRollingProgressModal(event)">
+    <div class="modal-card"
+      style="max-width:640px;width:95%;background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;box-shadow:0 12px 36px rgba(0,0,0,0.6);padding:20px;"
+      onclick="event.stopPropagation()">
+      <div
+        style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:10px;">
         <h3 id="rolling-modal-title" style="margin:0;font-size:16px;display:flex;align-items:center;gap:8px;">
           <span>🔁</span> <span id="rolling-modal-title-text">ワーカー ローリング処理</span>
         </h3>
-        <button type="button" class="btn btn-secondary btn-sm" onclick="closeRollingProgressModal(true)" style="padding:2px 8px;font-size:12px;line-height:1;">✕</button>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="closeRollingProgressModal(true)"
+          style="padding:2px 8px;font-size:12px;line-height:1;">✕</button>
       </div>
 
       <!-- ステータス概要 & プログレスバー -->
-      <div style="margin-bottom:16px;background:rgba(0,0,0,0.25);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
+      <div
+        style="margin-bottom:16px;background:rgba(0,0,0,0.25);padding:12px;border-radius:8px;border:1px solid rgba(255,255,255,0.05);">
         <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;margin-bottom:6px;">
           <span id="rolling-status-summary" style="font-weight:600;color:var(--text-main);">準備中...</span>
-          <span id="rolling-status-ratio" style="font-family:monospace;font-size:12px;color:var(--text-muted);">0 / 0 台</span>
+          <span id="rolling-status-ratio" style="font-family:monospace;font-size:12px;color:var(--text-muted);">0 / 0
+            台</span>
         </div>
-        <div style="width:100%;height:8px;background:rgba(255,255,255,0.08);border-radius:4px;overflow:hidden;margin-bottom:6px;">
-          <div id="rolling-progress-bar" style="width:0%;height:100%;background:linear-gradient(90deg, #5865f2, #00b0f4);transition:width 0.3s ease;"></div>
+        <div
+          style="width:100%;height:8px;background:rgba(255,255,255,0.08);border-radius:4px;overflow:hidden;margin-bottom:6px;">
+          <div id="rolling-progress-bar"
+            style="width:0%;height:100%;background:linear-gradient(90deg, #5865f2, #00b0f4);transition:width 0.3s ease;">
+          </div>
         </div>
         <div id="rolling-current-detail" style="font-size:11px;color:#a8ff78;min-height:16px;"></div>
       </div>
 
       <!-- ノード別処理状況リスト -->
-      <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;">ノード別進行状況 (1台ずつドレイン・検証)</div>
-      <div id="rolling-nodes-list" style="max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;background:rgba(0,0,0,0.15);padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,0.04);">
+      <div style="font-size:12px;font-weight:600;color:var(--text-muted);margin-bottom:8px;">ノード別進行状況 (1台ずつドレイン・検証)
+      </div>
+      <div id="rolling-nodes-list"
+        style="max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;background:rgba(0,0,0,0.15);padding:8px;border-radius:6px;border:1px solid rgba(255,255,255,0.04);">
         <div style="color:var(--text-dim);font-size:11px;text-align:center;padding:8px;">ノード情報を取得中...</div>
       </div>
 
       <!-- フッター操作 -->
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.08);">
+      <div
+        style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.08);">
         <span style="font-size:11px;color:var(--text-dim);">💡 処理中も通話中VCのリクエストは稼働中の別ノードへ自動退避されます</span>
-        <button type="button" id="rolling-modal-close-btn" class="btn btn-secondary btn-sm" onclick="closeRollingProgressModal(true)" style="padding:6px 14px;">閉じる</button>
+        <button type="button" id="rolling-modal-close-btn" class="btn btn-secondary btn-sm"
+          onclick="closeRollingProgressModal(true)" style="padding:6px 14px;">閉じる</button>
       </div>
     </div>
   </div>
 
   <!-- 画面右下のビルド番号ウォーターマーク（クリックでキャッシュ無視強制再読み込み） -->
-  <div id="build-watermark" class="build-watermark" title="ビルド日時: {{BUILD_DATE}}&#10;クリックでキャッシュをバイパスして強制再読み込み" onclick="forceHardReload()">
+  <div id="build-watermark" class="build-watermark" title="ビルド日時: {{BUILD_DATE}}&#10;クリックでキャッシュをバイパスして強制再読み込み"
+    onclick="forceHardReload()">
     <span class="build-dot"></span>
     <span class="build-text">Build: <strong>{{BUILD_ID}}</strong></span>
     <span class="build-reload-icon">🔄</span>
@@ -2745,6 +2975,7 @@
       cursor: pointer;
       transition: all 0.2s ease;
     }
+
     .build-watermark:hover {
       background: rgba(30, 30, 48, 0.96);
       border-color: rgba(255, 255, 255, 0.35);
@@ -2752,6 +2983,7 @@
       transform: translateY(-1px);
       box-shadow: 0 4px 14px rgba(0, 0, 0, 0.6);
     }
+
     .build-watermark .build-dot {
       width: 6px;
       height: 6px;
@@ -2760,11 +2992,13 @@
       display: inline-block;
       box-shadow: 0 0 6px #10b981;
     }
+
     .build-watermark .build-reload-icon {
       font-size: 10px;
       opacity: 0.6;
       transition: transform 0.3s ease;
     }
+
     .build-watermark:hover .build-reload-icon {
       opacity: 1;
       transform: rotate(180deg);
@@ -2777,19 +3011,23 @@
         showToast("キャッシュをバイパスして最新バージョンを読み込みます...", "info");
       }
       setTimeout(() => {
-        const u = new URL(window.location.href);
-        u.searchParams.set("nocache", Date.now());
-        window.location.href = u.toString();
+        const u = new URL(windolocation.href);
+        u.searchParams.set("nocache", Date.
+          window.location.href = u.toString();
       }, 250);
     }
   </script>
 
   <!-- Botトークン追加・編集モーダル -->
-  <div id="bot-token-modal" class="modal-backdrop" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;">
-    <div class="modal-card card" style="max-width:480px;width:90%;background:var(--bg-card, #1a1a2e);border:1px solid rgba(255,255,255,0.15);border-radius:12px;padding:0;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
-      <div style="padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;">
+  <div id="bot-token-modal" class="modal-backdrop"
+    style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;">
+    <div class="modal-card card"
+      style="max-width:480px;width:90%;background:var(--bg-card, #1a1a2e);border:1px solid rgba(255,255,255,0.15);border-radius:12px;padding:0;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+      <div
+        style="padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between;align-items:center;">
         <h3 id="bot-modal-title" style="margin:0;font-size:16px;">Botトークンの設定</h3>
-        <button type="button" onclick="closeBotModal()" style="background:none;border:none;color:#aaa;font-size:20px;cursor:pointer;">×</button>
+        <button type="button" onclick="closeBotModal()"
+          style="background:none;border:none;color:#aaa;font-size:20px;cursor:pointer;">×</button>
       </div>
       <form onsubmit="submitBotTokenForm(event)">
         <div style="padding:20px;">
@@ -2824,7 +3062,8 @@
             <label for="bot-modal-enabled" style="font-size:13px;cursor:pointer;">保存後に即座にGatewayへ接続起動する</label>
           </div>
         </div>
-        <div style="padding:14px 20px;background:rgba(0,0,0,0.2);display:flex;justify-content:flex-end;gap:10px;border-top:1px solid rgba(255,255,255,0.08);">
+        <div
+          style="padding:14px 20px;background:rgba(0,0,0,0.2);display:flex;justify-content:flex-end;gap:10px;border-top:1px solid rgba(255,255,255,0.08);">
           <button type="button" class="btn btn-secondary btn-sm" onclick="closeBotModal()">キャンセル</button>
           <button type="submit" id="bot-modal-submit-btn" class="btn btn-primary btn-sm">保存して接続 🚀</button>
         </div>
@@ -2835,4 +3074,5 @@
   <div id="toast-container" class="toast-container"></div>
   <script src="/static/app.js?v={{ASSET_V}}"></script>
 </body>
+
 </html>

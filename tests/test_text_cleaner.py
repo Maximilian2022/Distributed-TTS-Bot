@@ -147,6 +147,55 @@ class TestTextCleaner(unittest.TestCase):
         res_7 = plan_head_chars([7], has_name=False, name_play_s=0.0, nodes=dummy_nodes, max_silence=1.5, az_margin=0.45)
         self.assertIsNone(res_7)
 
+
+class TestEnglishKanaConversion(unittest.TestCase):
+    def test_english_words_adjacent_to_japanese(self):
+        # 日本語（ひらがな・カタカナ・漢字）が前後に隣接していてもカタカナ変換されること
+        cases = [
+            ("Youtubeが突然", "ユーチューブが突然"),
+            ("youtubeとか", "ユーチューブとか"),
+            ("YouTubeを見る", "ユーチューブを見る"),
+            ("TikTokが突然", "ティックトックが突然"),
+            ("tiktokとか", "ティックトックとか"),
+            ("TikTokとYouTube", "ティックトックとユーチューブ"),
+            ("DiscordとGitHubとChatGPTをOBSで配信", "ディスコードとギットハブとチャットジーピーティーをオービーエスで配信"),
+        ]
+        for src, expected in cases:
+            converted, unknown = TextCleaner.convert_english_to_kana(src)
+            self.assertEqual(converted, expected, f"Failed for {src!r}")
+            self.assertEqual(unknown, [], f"Unexpected unknown words for {src!r}: {unknown}")
+
+    def test_beep_placeholder_and_alphanumeric_not_broken(self):
+        # NGワードの一時プレースホルダ <<__BEEP:N__>> が alkana("beep") 等で破壊されないこと
+        cleaner = TextCleaner()
+        text_with_ng = "テスト禁止語YouTubeとTikTok"
+        cleaned = cleaner.clean(
+            text_with_ng,
+            ng_words=["禁止語"],
+            max_length=100,
+        )
+        self.assertIn("ユーチューブ", cleaned)
+        self.assertIn("ティックトック", cleaned)
+        self.assertIn("<<__BEEP:3__>>", cleaned)
+        self.assertNotIn("ビープ", cleaned)
+        self.assertEqual(cleaner.last_detected_unknown_words, [])
+
+        # 英数字混在トークンのアルファベット部分だけが誤って切り出されないこと
+        converted_alnum, unknown_alnum = TextCleaner.convert_english_to_kana("mp3やabc123と123abc")
+        self.assertEqual(converted_alnum, "mp3やabc123と123abc")
+        self.assertEqual(unknown_alnum, [])
+
+    def test_unknown_english_word_adjacent_to_japanese_detected(self):
+        from unittest.mock import patch
+        import src.utils.text_cleaner as tc
+
+        # e2k オフライン推論が使えない場合は未知語として検出されること
+        with patch.object(tc, "_get_e2k_converters", return_value=(None, None)):
+            converted, unknown = TextCleaner.convert_english_to_kana("XYZABCが来た")
+            self.assertEqual(converted, "XYZABCが来た")
+            self.assertEqual(unknown, ["XYZABC"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

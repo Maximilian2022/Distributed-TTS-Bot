@@ -579,6 +579,17 @@ class WebServer:
         self.app.router.add_put("/api/dict", self.api_update_dict)
         self.app.router.add_post("/api/dict/delete_batch", self.api_delete_dict_batch)
         self.app.router.add_delete("/api/dict/{word}", self.api_delete_dict)
+        self.app.router.add_get("/api/english_dict", self.api_get_english_dict)
+        self.app.router.add_post("/api/english_dict", self.api_upsert_english_dict)
+        self.app.router.add_post("/api/english_dict/import_batch", self.api_import_english_dict_batch)
+        self.app.router.add_post("/api/english_dict/preview", self.api_preview_english_dict)
+        self.app.router.add_delete("/api/english_dict/{word}", self.api_delete_english_dict)
+        self.app.router.add_get("/api/common_dict", self.api_get_common_dict)
+        self.app.router.add_post("/api/common_dict", self.api_upsert_common_dict)
+        self.app.router.add_post("/api/common_dict/import_batch", self.api_import_common_dict_batch)
+        self.app.router.add_post("/api/common_dict/preview", self.api_preview_common_dict)
+        self.app.router.add_delete("/api/common_dict", self.api_delete_common_dict)
+        self.app.router.add_delete("/api/common_dict/{word}", self.api_delete_common_dict)
         self.app.router.add_get("/api/ng", self.api_get_ng)
         self.app.router.add_post("/api/ng", self.api_add_ng)
         self.app.router.add_post("/api/ng/delete_batch", self.api_delete_ng_batch)
@@ -3134,6 +3145,210 @@ class WebServer:
             return web.json_response({"success": True, "purged_cache_count": purged})
         return web.json_response({"error": "Word not found"}, status=404)
 
+    # --- 共通 O(1) 英語カタカナ辞書 API ---
+
+    async def api_get_english_dict(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        query = request.query.get("q", "").strip()
+        try:
+            limit = max(1, min(200, int(request.query.get("limit", "100"))))
+        except ValueError:
+            limit = 100
+        stats = TextCleaner.get_english_kana_stats()
+        custom_map = TextCleaner.get_custom_english_kana_dict()
+        search_results = TextCleaner.search_system_english_kana(query=query, limit=limit) if query else []
+        return web.json_response({
+            "stats": stats,
+            "custom_entries": [{"word": k, "reading": v} for k, v in custom_map.items()],
+            "search_results": search_results,
+        })
+
+    async def api_upsert_english_dict(self, request: web.Request) -> web.Response:
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        word = str(data.get("word", "") or "")
+        reading = str(data.get("reading", "") or "")
+        try:
+            norm_word, norm_reading = TextCleaner.upsert_custom_english_kana(word, reading)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        purged = await self.cache_manager.purge_by_word(norm_word) if self.cache_manager else 0
+        return web.json_response({
+            "success": True,
+            "word": norm_word,
+            "reading": norm_reading,
+            "purged_cache_count": purged,
+            "stats": TextCleaner.get_english_kana_stats(),
+        })
+
+    async def api_import_english_dict_batch(self, request: web.Request) -> web.Response:
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        raw_items = data.get("items") or []
+        if not isinstance(raw_items, list) or not raw_items:
+            return web.json_response({"error": "items list is required"}, status=400)
+        if len(raw_items) > 5000:
+            return web.json_response({"error": "Too many items (max 5000)"}, status=400)
+
+        pairs: List[Tuple[str, str]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return web.json_response({"error": "Each item must be an object"}, status=400)
+            pairs.append((str(item.get("word", "") or ""), str(item.get("reading", "") or "")))
+
+        try:
+            count = TextCleaner.import_custom_english_kana_batch(pairs)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+        words = [w.strip().lower() for w, _ in pairs if w.strip()]
+        purged = await self.cache_manager.purge_by_words(words) if (self.cache_manager and words) else 0
+        return web.json_response({
+            "success": True,
+            "imported_count": count,
+            "purged_cache_count": purged,
+            "stats": TextCleaner.get_english_kana_stats(),
+        })
+
+    async def api_delete_english_dict(self, request: web.Request) -> web.Response:
+        await self._require_admin(request)
+        word = request.match_info.get("word", "").strip().lower()
+        if not word:
+            return web.json_response({"error": "Word is required"}, status=400)
+        deleted = TextCleaner.delete_custom_english_kana(word)
+        if not deleted:
+            return web.json_response({"error": "Word not found"}, status=404)
+        purged = await self.cache_manager.purge_by_word(word) if self.cache_manager else 0
+        return web.json_response({
+            "success": True,
+            "word": word,
+            "purged_cache_count": purged,
+            "stats": TextCleaner.get_english_kana_stats(),
+        })
+
+    async def api_preview_english_dict(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        text = str(data.get("text", "") or "")
+        if len(text) > 500:
+            return web.json_response({"error": "Text is too long (max 500 chars)"}, status=400)
+        preview = TextCleaner.preview_english_kana(text)
+        return web.json_response(preview)
+
+    # --- 全サーバー共通 日本語・ゲーム用語読み辞書 API ---
+
+    async def api_get_common_dict(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        query = request.query.get("q", "").strip()
+        try:
+            limit = max(1, min(200, int(request.query.get("limit", "100"))))
+        except ValueError:
+            limit = 100
+        stats = TextCleaner.get_common_reading_stats()
+        custom_map = TextCleaner.get_custom_common_reading_dict()
+        search_results = TextCleaner.search_common_reading_dict(query=query, limit=limit) if query else []
+        return web.json_response({
+            "stats": stats,
+            "custom_entries": [{"word": k, "reading": v} for k, v in custom_map.items()],
+            "search_results": search_results,
+        })
+
+    async def api_upsert_common_dict(self, request: web.Request) -> web.Response:
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "JSON object required"}, status=400)
+        word = str(data.get("word", "") or "")
+        reading = str(data.get("reading", "") or "")
+        try:
+            norm_word, norm_reading = TextCleaner.upsert_custom_common_reading(word, reading)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        purged = await self.cache_manager.purge_by_word(norm_word) if self.cache_manager else 0
+        return web.json_response({
+            "success": True,
+            "word": norm_word,
+            "reading": norm_reading,
+            "purged_cache_count": purged,
+            "stats": TextCleaner.get_common_reading_stats(),
+        })
+
+    async def api_import_common_dict_batch(self, request: web.Request) -> web.Response:
+        await self._require_admin(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "JSON object required"}, status=400)
+        raw_items = data.get("items") or []
+        if not isinstance(raw_items, list) or not raw_items:
+            return web.json_response({"error": "items list is required"}, status=400)
+        if len(raw_items) > 5000:
+            return web.json_response({"error": "Too many items (max 5000)"}, status=400)
+
+        pairs: List[Tuple[str, str]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return web.json_response({"error": "Each item must be an object"}, status=400)
+            pairs.append((str(item.get("word", "") or ""), str(item.get("reading", "") or "")))
+
+        try:
+            count = TextCleaner.import_custom_common_reading_batch(pairs)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+        words = [w.strip() for w, _ in pairs if w.strip()]
+        purged = await self.cache_manager.purge_by_words(words) if (self.cache_manager and words) else 0
+        return web.json_response({
+            "success": True,
+            "imported_count": count,
+            "purged_cache_count": purged,
+            "stats": TextCleaner.get_common_reading_stats(),
+        })
+
+    async def api_delete_common_dict(self, request: web.Request) -> web.Response:
+        await self._require_admin(request)
+        word = (request.match_info.get("word") or request.query.get("word", "")).strip()
+        if not word:
+            return web.json_response({"error": "Word is required"}, status=400)
+        deleted = TextCleaner.delete_custom_common_reading(word)
+        if not deleted:
+            return web.json_response({"error": "Word not found"}, status=404)
+        purged = await self.cache_manager.purge_by_word(word) if self.cache_manager else 0
+        return web.json_response({
+            "success": True,
+            "word": word,
+            "purged_cache_count": purged,
+            "stats": TextCleaner.get_common_reading_stats(),
+        })
+
+    async def api_preview_common_dict(self, request: web.Request) -> web.Response:
+        self._require_auth(request)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "JSON object required"}, status=400)
+        text = str(data.get("text", "") or "")
+        if len(text) > 500:
+            return web.json_response({"error": "Text is too long (max 500 chars)"}, status=400)
+        preview = TextCleaner.preview_common_and_local_tts(text)
+        return web.json_response(preview)
+
     # --- NGワード API ---
 
     async def api_get_ng(self, request: web.Request) -> web.Response:
@@ -3406,6 +3621,7 @@ class WebServer:
             "error_contact_user_id": str(settings.get("error_contact_user_id", "") or ""),
             "tts_translate_enabled": bool(settings.get("tts_translate_enabled", 0)),
             "tts_translate_lang": normalize_hayamimi_lang(settings.get("tts_translate_lang"), default="en"),
+            "local_tts_kanji_reading": bool(settings.get("local_tts_kanji_reading", 1)),
             "is_admin": perms["is_admin"],
             "has_role": perms["has_role"]
         })
@@ -3485,6 +3701,8 @@ class WebServer:
             update_fields["tts_translate_enabled"] = 1 if data["tts_translate_enabled"] else 0
         if "tts_translate_lang" in data:
             update_fields["tts_translate_lang"] = normalize_hayamimi_lang(data["tts_translate_lang"], default="en")
+        if "local_tts_kanji_reading" in data:
+            update_fields["local_tts_kanji_reading"] = 1 if data["local_tts_kanji_reading"] else 0
 
         # ロール設定は管理者のみ可能
         if "admin_role_id" in data:

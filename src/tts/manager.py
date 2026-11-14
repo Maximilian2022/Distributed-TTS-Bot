@@ -260,7 +260,20 @@ class TTSManager:
     def _is_local_provider(self, provider: str) -> bool:
         """プロバイダーがローカル推論エンジン系（VOICEVOX等）かどうか判定"""
         p = str(provider).lower()
-        return p in self.cache_manager.LOCAL_PROVIDERS or p.startswith("vv_")
+        local_set = getattr(self.cache_manager, "LOCAL_PROVIDERS", None)
+        if not isinstance(local_set, (set, frozenset, list, tuple)):
+            local_set = ("voicevox", "sharevox", "coeiroink", "openjtalk")
+        return p in local_set or p.startswith("vv_")
+
+    def resolve_cache_text(self, text: str, provider: str, local_tts_kanji_reading: bool = True) -> str:
+        """
+        キャッシュキー用の実効テキストを解決する。
+        ローカルTTSかつ漢字かな補完有効時は、安全かな補完後の文字列をキー計算に用いることで、
+        設定ON/OFFのキャッシュ分離と従来の誤読キャッシュからの自動切り替えを実現する。
+        """
+        if local_tts_kanji_reading and self._is_local_provider(provider):
+            return TextCleaner.convert_kanji_for_local_tts(text)
+        return text
 
     async def initialize_voicevox(self) -> int:
         """
@@ -870,7 +883,8 @@ class TTSManager:
         speculative_deadline_fn: Optional[Callable[[], float]] = None,
         prefer_earliest_finish: bool = False,
         local_only: bool = False,
-        avoid_nodes: Optional[Set[str]] = None
+        avoid_nodes: Optional[Set[str]] = None,
+        local_tts_kanji_reading: bool = True,
     ) -> Tuple[bytes, str, str]:
         """
         単一のテキストパーツを合成。
@@ -878,6 +892,7 @@ class TTSManager:
           (再生タイムライン基準)。未指定時は従来の speculative_timeout (相対秒)
         - local_only: ローカルエンジンのみで合成し、投機・フォールバックしない (先行合成のキャッシュ温め用)
         - avoid_nodes: 同一発話内で別チャンクが割り当て済みのノード (分散ロードバランシング)
+        - local_tts_kanji_reading: ローカルTTS送信時のみ SudachiPy 漢字かな補完を適用するか
         - プライマリプロバイダーを最優先
         - Google 95% (950,000文字) 到達時は課金防止のため自動バイパス
         - 障害時は Azure ➔ Google ➔ VOICEVOX の多層セーフティネットで自動フォールバック
@@ -885,14 +900,27 @@ class TTSManager:
         voice_cfg = self._get_voice_config(speaker_id)
         primary_provider = voice_cfg.provider
 
+        # ローカルTTS専用: 初回利用時のみ遅延変換してクラウドTTS側の原文には影響させない
+        _local_text_cache: Optional[str] = None
+
+        def _get_local_text() -> str:
+            nonlocal _local_text_cache
+            if _local_text_cache is None:
+                _local_text_cache = (
+                    TextCleaner.convert_kanji_for_local_tts(text)
+                    if local_tts_kanji_reading
+                    else text
+                )
+            return _local_text_cache
+
         async def _try_voicevox(style_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("voicevox", self.voicevox_client, self.voicevox_pool, text, style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
+            return await self._try_local_engine("voicevox", self.voicevox_client, self.voicevox_pool, _get_local_text(), style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
 
         async def _try_sharevox(style_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("sharevox", self.sharevox_client, self.sharevox_pool, text, style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
+            return await self._try_local_engine("sharevox", self.sharevox_client, self.sharevox_pool, _get_local_text(), style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
 
         async def _try_coeiroink(voice_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("coeiroink", self.coeiroink_client, self.coeiroink_pool, text, voice_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
+            return await self._try_local_engine("coeiroink", self.coeiroink_client, self.coeiroink_pool, _get_local_text(), voice_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
 
         preview_text = text[:30] + ("..." if len(text) > 30 else "")
 
@@ -998,7 +1026,7 @@ class TTSManager:
             try:
                 t0 = time.time()
                 res = await self.openjtalk_client.synthesize(
-                    text=text,
+                    text=_get_local_text(),
                     voice_name=voice_name,
                     pitch=pitch,
                     speed=speed
@@ -1136,8 +1164,9 @@ class TTSManager:
             cloud_prov, cloud_param = chain[1]
 
             # 同一パーツのローカル合成を共有 (先行合成と再生側の二重発注防止)
+            local_task_text = _get_local_text()
             prim_task, inflight_entry, joined = self._acquire_local_task(
-                (prim_prov, prim_param, text, str(pitch), float(speed)),
+                (prim_prov, prim_param, local_task_text, str(pitch), float(speed)),
                 lambda: _call_provider(prim_prov, prim_param),
             )
             self._inflight_join_info[(str(speaker_id), text)] = joined
@@ -1314,7 +1343,8 @@ class TTSManager:
         speculative_deadline_fn: Optional[Callable[[], float]] = None,
         prefer_earliest_finish: bool = False,
         local_only: bool = False,
-        avoid_nodes: Optional[Set[str]] = None
+        avoid_nodes: Optional[Set[str]] = None,
+        local_tts_kanji_reading: bool = True,
     ) -> Tuple[bytes, str, str, bool]:
         """
         単一チャンク（文パーツや発言者名プレフィックス等）の音声バイト列を取得。
@@ -1325,7 +1355,8 @@ class TTSManager:
         """
         voice_cfg = self._get_voice_config(speaker_id)
         provider = voice_cfg.provider
-        cache_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, text, user_id=user_id)
+        cache_text = self.resolve_cache_text(text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+        cache_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, cache_text, user_id=user_id)
 
         # 1. キャッシュ確認
         cached_bytes = await self.cache_manager.get_bytes(cache_key, provider=provider)
@@ -1351,7 +1382,7 @@ class TTSManager:
         audio_bytes, used_provider, used_param = await self._synthesize_single_chunk(
             text, speaker_id, pitch, speed, is_longest_chunk=is_longest_chunk, speculative_timeout=speculative_timeout,
             speculative_deadline_fn=speculative_deadline_fn, prefer_earliest_finish=prefer_earliest_finish, local_only=local_only,
-            avoid_nodes=avoid_nodes
+            avoid_nodes=avoid_nodes, local_tts_kanji_reading=local_tts_kanji_reading
         )
         worker_lbl = self._get_worker_label_for_provider(used_provider)
         is_fb = (used_provider != provider)
@@ -1405,7 +1436,8 @@ class TTSManager:
         text: str,
         author_prefix: Optional[str] = None,
         chunks: Optional[List[TextChunk]] = None,
-        speculative_timeout: Optional[float] = None
+        speculative_timeout: Optional[float] = None,
+        local_tts_kanji_reading: bool = True,
     ) -> Path:
         """
         スマートパーツ分割・並列合成・ゼロ遅延WAV結合による音声ファイル取得。
@@ -1420,7 +1452,8 @@ class TTSManager:
         provider = voice_cfg.provider
 
         full_text = f"{author_prefix}{text}" if author_prefix else text
-        full_cache_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, full_text, user_id=user_id)
+        full_cache_text = self.resolve_cache_text(full_text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+        full_cache_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, full_cache_text, user_id=user_id)
 
         # 1. 全文キャッシュ確認 (超高速パス)
         cached_file = await self.cache_manager.get(full_cache_key, provider=provider)
@@ -1465,7 +1498,8 @@ class TTSManager:
                 return self.cache_manager.get_file_path(chunk_cache_key, provider=provider)
 
             audio_bytes, used_provider, used_param = await self._synthesize_single_chunk(
-                single_chunk.text, speaker_id, pitch, speed, is_longest_chunk=True, speculative_timeout=speculative_timeout
+                single_chunk.text, speaker_id, pitch, speed, is_longest_chunk=True, speculative_timeout=speculative_timeout,
+                local_tts_kanji_reading=local_tts_kanji_reading
             )
             worker_lbl = self._get_worker_label_for_provider(used_provider)
             is_fb_single = (used_provider != provider)
@@ -1509,7 +1543,8 @@ class TTSManager:
         missed_indices: List[int] = []
 
         async def _check_chunk(i: int, ch: TextChunk):
-            k = CacheManager.generate_cache_key(speaker_id, pitch, speed, ch.text, user_id=user_id)
+            ch_cache_text = self.resolve_cache_text(ch.text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+            k = CacheManager.generate_cache_key(speaker_id, pitch, speed, ch_cache_text, user_id=user_id)
             b = await self.cache_manager.get_bytes(k, provider=provider)
             return i, ch, b
 
@@ -1543,7 +1578,8 @@ class TTSManager:
                     pitch,
                     speed,
                     is_longest_chunk=(i == longest_idx),
-                    speculative_timeout=speculative_timeout
+                    speculative_timeout=speculative_timeout,
+                    local_tts_kanji_reading=local_tts_kanji_reading
                 )
                 for i in missed_indices
             ]
@@ -1569,7 +1605,8 @@ class TTSManager:
                         is_chunk=True
                     ), name=f"save_chunk_cache_{i}")
                 else:
-                    c_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, chunks[i].text, user_id=user_id)
+                    ch_cache_text = self.resolve_cache_text(chunks[i].text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+                    c_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, ch_cache_text, user_id=user_id)
                     safe_create_task(self.cache_manager.save(
                         c_key,
                         audio_bytes,

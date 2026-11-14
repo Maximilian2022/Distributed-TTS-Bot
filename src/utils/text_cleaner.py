@@ -1,15 +1,19 @@
 import re
 import gc
+import os
+import json
 import time
 import asyncio
 import resource
 import contextvars
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import emoji
 import logging
 import threading
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 import discord
 from src.utils.streaming_audio import calc_beep_duration
 from src.utils.latency_profiler import latency_profiler
@@ -22,16 +26,253 @@ _sudachi_failed = False
 _sudachi_split_mode = None
 _sudachi_lock = threading.Lock()
 
+# O(1) 英語→カタカナ辞書 & e2k 未知語オフライン変換用シングルトン/LRUキャッシュ
+_SYSTEM_ENGLISH_KANA_DICT_PATH = Path(__file__).resolve().parent / "english_kana_dict.json"
+_ENGLISH_DICT_LOCK = threading.RLock()
+_SYSTEM_ENGLISH_KANA_DICT: Dict[str, str] = {}
+_SYSTEM_ENGLISH_KANA_META: Dict[str, Any] = {}
+_CUSTOM_ENGLISH_KANA_DICT: Dict[str, str] = {}
+_ENGLISH_DICTS_LOADED = False
+
+# 全サーバー共通 日本語・ゲーム用語読み辞書 (単一パス複合正規表現 + O(1) ルックアップ)
+_SYSTEM_COMMON_READING_DICT_PATH = Path(__file__).resolve().parent / "common_reading_dict.json"
+_COMMON_READING_LOCK = threading.RLock()
+_SYSTEM_COMMON_READING_DICT: Dict[str, str] = {}
+_SYSTEM_COMMON_READING_META: Dict[str, Any] = {}
+_CUSTOM_COMMON_READING_DICT: Dict[str, str] = {}
+_COMMON_READING_MERGED_LOWER: Dict[str, str] = {}
+_COMMON_READING_REGEX: Optional[re.Pattern] = None
+_COMMON_READING_LOADED = False
+
+_RE_ASCII_ALPHA = re.compile(r'[a-zA-Z]')
+_RE_HAS_ASCII_ALNUM = re.compile(r'[a-zA-Z0-9]')
+
+_ALKANA_MODULE: Any = None
+_ALKANA_CHECKED = False
+
+_E2K_NGRAM: Any = None
+_E2K_C2K: Any = None
+_E2K_FAILED = False
+_E2K_LOCK = threading.Lock()
+_E2K_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_E2K_CACHE_MAX_SIZE = 10000
+_E2K_MAX_INFER_PER_TEXT = 8
+
+_RE_VALID_ENGLISH_WORD_KEY = re.compile(r'^[a-zA-Z]{2,64}$')
+_RE_CTRL_CHARS = re.compile(r'[\x00-\x1f\x7f]')
+
+
+def _get_custom_english_kana_dict_path() -> Path:
+    override = os.getenv("TTSBOT_CUSTOM_ENGLISH_DICT_PATH", "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent.parent.parent / "data" / "custom_english_kana.json"
+
+
+def _load_english_kana_json(path: Path) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    if not path.exists():
+        return {}, {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"⚠️ [EnglishDict] 辞書JSONの読み込みに失敗しました ({path}): {e}")
+        return {}, {}
+    if not isinstance(raw, dict):
+        return {}, {}
+
+    meta = raw.get("_meta") if isinstance(raw.get("_meta"), dict) else {}
+    entries_raw = raw.get("entries") if isinstance(raw.get("entries"), dict) else raw
+    parsed: Dict[str, str] = {}
+    for k, v in entries_raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        if k.startswith("_"):
+            continue
+        lk = k.strip().lower()
+        rv = v.strip()
+        if _RE_VALID_ENGLISH_WORD_KEY.match(lk) and rv and set(lk) != {"w"}:
+            parsed[lk] = rv
+    return parsed, meta
+
+
+def ensure_english_kana_dicts_loaded(force: bool = False) -> None:
+    """システム英語カタカナ辞書とカスタム英語カタカナ辞書をメモリへロードする (O(1)参照用)"""
+    global _SYSTEM_ENGLISH_KANA_DICT, _SYSTEM_ENGLISH_KANA_META, _CUSTOM_ENGLISH_KANA_DICT, _ENGLISH_DICTS_LOADED
+    if _ENGLISH_DICTS_LOADED and not force:
+        return
+    with _ENGLISH_DICT_LOCK:
+        if _ENGLISH_DICTS_LOADED and not force:
+            return
+        sys_dict, sys_meta = _load_english_kana_json(_SYSTEM_ENGLISH_KANA_DICT_PATH)
+        cust_dict, _ = _load_english_kana_json(_get_custom_english_kana_dict_path())
+        _SYSTEM_ENGLISH_KANA_DICT = sys_dict
+        _SYSTEM_ENGLISH_KANA_META = sys_meta
+        _CUSTOM_ENGLISH_KANA_DICT = cust_dict
+        _ENGLISH_DICTS_LOADED = True
+        if force:
+            with _E2K_LOCK:
+                _E2K_CACHE.clear()
+
+
+def _get_custom_common_reading_dict_path() -> Path:
+    override = os.getenv("TTSBOT_CUSTOM_COMMON_DICT_PATH", "").strip()
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent.parent.parent / "data" / "custom_common_reading.json"
+
+
+def _load_common_reading_json(path: Path) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    if not path.exists():
+        return {}, {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"⚠️ [CommonDict] 辞書JSONの読み込みに失敗しました ({path}): {e}")
+        return {}, {}
+    if not isinstance(raw, dict):
+        return {}, {}
+
+    meta = raw.get("_meta") if isinstance(raw.get("_meta"), dict) else {}
+    entries_raw = raw.get("entries") if isinstance(raw.get("entries"), dict) else raw
+    parsed: Dict[str, str] = {}
+    for k, v in entries_raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        if k.startswith("_"):
+            continue
+        kw = _RE_CTRL_CHARS.sub("", k).strip()
+        rv = _RE_CTRL_CHARS.sub("", v).strip()
+        if 1 <= len(kw) <= 64 and 1 <= len(rv) <= 128:
+            parsed[kw] = rv
+    return parsed, meta
+
+
+def _rebuild_common_reading_matcher_locked() -> None:
+    """システム辞書とカスタム辞書を統合し、最長一致＋境界ガード付き単一正規表現を構築"""
+    global _COMMON_READING_MERGED_LOWER, _COMMON_READING_REGEX
+
+    merged: Dict[str, str] = dict(_SYSTEM_COMMON_READING_DICT)
+    # カスタム登録がシステム初期値を上書き（大文字小文字が異なる同ASCII語もカスタム側優先）
+    lower_to_canonical: Dict[str, str] = {k.lower(): k for k in merged}
+    for ck, cv in _CUSTOM_COMMON_READING_DICT.items():
+        lk = ck.lower()
+        old_key = lower_to_canonical.get(lk)
+        if old_key and old_key != ck:
+            merged.pop(old_key, None)
+        merged[ck] = cv
+        lower_to_canonical[lk] = ck
+
+    if not merged:
+        _COMMON_READING_MERGED_LOWER = {}
+        _COMMON_READING_REGEX = None
+        return
+
+    sorted_keys = sorted(merged.keys(), key=len, reverse=True)
+    parts: List[str] = []
+    lookup_lower: Dict[str, str] = {}
+
+    for kw in sorted_keys:
+        reading = merged[kw]
+        lookup_lower[kw.lower()] = reading
+        esc = re.escape(kw)
+        if _RE_KANJI_ONLY.match(kw):
+            pat_part = rf'(?<![\u4e00-\u9faf]){esc}(?![\u4e00-\u9faf])'
+        elif _RE_ALNUM_ONLY.match(kw):
+            pat_part = rf'(?<![a-zA-Z0-9])(?i:{esc})(?![a-zA-Z0-9])'
+        elif _RE_HAS_ASCII_ALNUM.search(kw):
+            prefix = r'(?<![a-zA-Z0-9])' if _RE_HAS_ASCII_ALNUM.match(kw[0]) else ''
+            suffix = r'(?![a-zA-Z0-9])' if _RE_HAS_ASCII_ALNUM.match(kw[-1]) else ''
+            body = f'(?i:{esc})' if _RE_ASCII_ALPHA.search(kw) else esc
+            pat_part = f'{prefix}{body}{suffix}'
+        else:
+            pat_part = esc
+        parts.append(pat_part)
+
+    _COMMON_READING_MERGED_LOWER = lookup_lower
+    _COMMON_READING_REGEX = re.compile("|".join(parts))
+
+
+def ensure_common_reading_dicts_loaded(force: bool = False) -> None:
+    """全サーバー共通の日本語・ゲーム用語読み辞書をロードして事前コンパイルする"""
+    global _SYSTEM_COMMON_READING_DICT, _SYSTEM_COMMON_READING_META, _CUSTOM_COMMON_READING_DICT, _COMMON_READING_LOADED
+    if _COMMON_READING_LOADED and not force:
+        return
+    with _COMMON_READING_LOCK:
+        if _COMMON_READING_LOADED and not force:
+            return
+        sys_dict, sys_meta = _load_common_reading_json(_SYSTEM_COMMON_READING_DICT_PATH)
+        cust_dict, _ = _load_common_reading_json(_get_custom_common_reading_dict_path())
+        _SYSTEM_COMMON_READING_DICT = sys_dict
+        _SYSTEM_COMMON_READING_META = sys_meta
+        _CUSTOM_COMMON_READING_DICT = cust_dict
+        _rebuild_common_reading_matcher_locked()
+        _COMMON_READING_LOADED = True
+
+
+def _get_alkana():
+    """alkana モジュールを1回だけ解決してキャッシュする"""
+    global _ALKANA_MODULE, _ALKANA_CHECKED
+    if _ALKANA_CHECKED:
+        return _ALKANA_MODULE
+    try:
+        import alkana
+        _ALKANA_MODULE = alkana
+    except ImportError:
+        _ALKANA_MODULE = None
+    _ALKANA_CHECKED = True
+    return _ALKANA_MODULE
+
+
+def _get_e2k_converters():
+    """e2k (Public Domain) の NGram / C2K モデルをスレッドセーフに遅延/事前初期化する"""
+    global _E2K_NGRAM, _E2K_C2K, _E2K_FAILED
+    if _E2K_NGRAM is not None and _E2K_C2K is not None:
+        return _E2K_NGRAM, _E2K_C2K
+    if _E2K_FAILED:
+        return None, None
+    with _E2K_LOCK:
+        if _E2K_NGRAM is not None and _E2K_C2K is not None:
+            return _E2K_NGRAM, _E2K_C2K
+        if _E2K_FAILED:
+            return None, None
+        try:
+            from e2k import C2K, NGram
+            _E2K_NGRAM = NGram()
+            _E2K_C2K = C2K()
+            logger.info("✨ [TextCleaner] オフライン未知英単語変換エンジン e2k (NGram/C2K) をロードしました。")
+        except Exception as e:
+            _E2K_FAILED = True
+            logger.debug(f"e2k converter unavailable, skipping offline fallback: {e}")
+            return None, None
+    return _E2K_NGRAM, _E2K_C2K
+
 # 高速化: 辞書置換および文分割用の正規表現キャッシュ & 事前コンパイル定数 (PERF-1, PERF-2)
 _DICT_REGEX_CACHE: Dict[Tuple[str, str], re.Pattern] = {}
 _SPLIT_CONJ_REGEX_CACHE: Dict[int, re.Pattern] = {}
-_RE_ENGLISH_WORD = re.compile(r'\b[a-zA-Z]{2,}\b')
+_RE_ENGLISH_WORD = re.compile(r'(?<![a-zA-Z0-9_])[a-zA-Z]{2,}(?![a-zA-Z0-9_])')
 _RE_SPLIT_PUNCT = re.compile(r'([。！？]+[）\)\]」』】]*[\s]*)')
 _RE_SPLIT_COMMA = re.compile(r'(、+)')
 _RE_STRIP_PUNCT_SPACES = re.compile(r'[、。！？\s]')
 _RE_KANJI_ONLY = re.compile(r'^[\u4e00-\u9faf]+$')
 _RE_ALNUM_ONLY = re.compile(r'^[a-zA-Z0-9]+$')
 _RE_HAS_READABLE = re.compile(r'[a-zA-Z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]')
+_RE_CONTAINS_KANJI = re.compile(r'[\u4e00-\u9faf\u3400-\u4dbf々ヶ]')
+_RE_HAS_DIGITS = re.compile(r'[0-9０-９]')
+_RE_KANJI_NUM_ONLY = re.compile(r'^[一二三四五六七八九十百千万億兆〇]+$')
+_RE_VALID_KATAKANA_READING = re.compile(r'^[\u30a1-\u30f6ー]+$')
+_RE_GDICT_PLACEHOLDER = re.compile(r'\x00GDICT_(\d+)\x00')
+
+
+def _build_kata_to_hira_trans() -> Dict[int, str]:
+    table: Dict[int, str] = {}
+    for cp in range(0x30A1, 0x30F5):  # ァ(30A1)..ヴ(30F4) -> ぁ(3041)..ゔ(3094)
+        table[cp] = chr(cp - 0x60)
+    table[0x30F5] = "か"  # ヵ
+    table[0x30F6] = "け"  # ヶ
+    return str.maketrans(table)
+
+
+_KATA_TO_HIRA_TRANS = _build_kata_to_hira_trans()
 
 # テキスト前処理・スラング正規化用の事前コンパイル定数 (PERF)
 _RE_DEMOJI_COLON = re.compile(r':([a-zA-Z0-9_\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf]+):')
@@ -158,7 +399,19 @@ def warmup_morphological_tokenizers():
         except Exception as e:
             logger.debug(f"Janome warm-up tokenize error: {e}")
 
-    # 3. TextCleaner の文章分割パイプライン全体のホットウォーム
+    # 3. O(1) 英語カタカナ辞書・共通日本語辞書・alkana・e2k 未知語変換エンジンの事前ウォームアップ
+    try:
+        ensure_english_kana_dicts_loaded()
+        ensure_common_reading_dicts_loaded()
+        _get_alkana()
+        ngram_fn, c2k_fn = _get_e2k_converters()
+        if ngram_fn is not None and c2k_fn is not None:
+            _ = c2k_fn("english")
+            _ = ngram_fn("api")
+    except Exception as e:
+        logger.debug(f"English/e2k/CommonDict warm-up skipped: {e}")
+
+    # 4. TextCleaner の文章分割パイプライン全体のホットウォーム
     try:
         for sample in warm_samples:
             _ = TextCleaner.split_into_chunks(sample, author_prefix="テストユーザー")
@@ -166,7 +419,10 @@ def warmup_morphological_tokenizers():
         logger.debug(f"TextCleaner warm-up error: {e}")
 
     elapsed_ms = (time.perf_counter() - t_start) * 1000.0
-    logger.info(f"✨ [TextCleaner] 形態素解析エンジンのホットウォーム完了 (SudachiPy / Janome, 所要時間: {elapsed_ms:.1f}ms)")
+    logger.info(
+        f"✨ [TextCleaner] 形態素解析・英語辞書ホットウォーム完了 "
+        f"(SudachiPy/Janome/Dict={len(_SYSTEM_ENGLISH_KANA_DICT)}+{len(_CUSTOM_ENGLISH_KANA_DICT)}, 所要時間: {elapsed_ms:.1f}ms)"
+    )
 
 _SPLIT_DIAG_THRESHOLD_MS = 500.0
 _SPLIT_TIMEOUT_S = 0.3
@@ -298,9 +554,8 @@ class TextCleaner:
         else:
             self.last_detected_ng_words = []
 
-        # 5. 単語辞書置換 (最長一致 & 誤爆防止ガード)
-        if dictionary_entries:
-            text = self.apply_dictionary(text, dictionary_entries)
+        # 5. 単語辞書置換 (サーバー個別辞書優先 + 全サーバー共通日本語/ゲーム用語辞書)
+        text = self.apply_dictionary(text, dictionary_entries)
 
         # 6. alkana による英単語即時カタカナ変換 & 未知語検知
         text, detected_unknown = self.convert_english_to_kana(text)
@@ -387,42 +642,71 @@ class TextCleaner:
         return text, detected
 
     @classmethod
-    def apply_dictionary(cls, text: str, dictionary_entries: Optional[List[Tuple[str, str]]]) -> str:
+    def apply_dictionary(cls, text: str, dictionary_entries: Optional[List[Tuple[str, str]]] = None) -> str:
         """
-        単語辞書置換 (最長一致: Longest-Match First & 誤爆防止境界ガード)
-        単語長の長いものから優先適用し、漢字や英数字が長い熟語の一部として
-        部分誤爆（例: 「表」が「表現」や「発表」にマッチする現象）するのを防止。
+        単語辞書置換 (サーバー個別辞書優先 -> 全サーバー共通日本語/ゲーム用語辞書)
+        最長一致 (Longest-Match First) & 誤爆防止境界ガード付き。
+        サーバー辞書で確定した置換箇所は一時プレースホルダで保護し、共通辞書による二重置換・上書きを防止する。
         """
-        if not dictionary_entries:
+        ensure_common_reading_dicts_loaded()
+        if not dictionary_entries and _COMMON_READING_REGEX is None:
             return text
 
-        # 単語長の降順でソート（最長一致）
-        sorted_entries = sorted(dictionary_entries, key=lambda x: len(x[0]), reverse=True)
+        protected_replacements: List[str] = []
 
-        for word, reading in sorted_entries:
-            w = word.strip()
-            if not w or w not in text:
-                continue
+        if dictionary_entries:
+            # 単語長の降順でソート（最長一致）
+            sorted_entries = sorted(dictionary_entries, key=lambda x: len(x[0]), reverse=True)
 
-            # 1. 漢字のみで構成された単語（例: 「表」）: 前後に漢字がない場合のみ置換
-            if _RE_KANJI_ONLY.match(w):
-                cache_key = ("kanji", w)
-                pat = _DICT_REGEX_CACHE.get(cache_key)
-                if pat is None:
-                    pat = re.compile(rf'(?<![\u4e00-\u9faf]){re.escape(w)}(?![\u4e00-\u9faf])')
-                    _DICT_REGEX_CACHE[cache_key] = pat
-                text = pat.sub(reading, text)
-            # 2. 英数字のみで構成された単語（例: 「in」）: 前後に英数字がない場合のみ置換
-            elif _RE_ALNUM_ONLY.match(w):
-                cache_key = ("alnum", w.lower())
-                pat = _DICT_REGEX_CACHE.get(cache_key)
-                if pat is None:
-                    pat = re.compile(rf'(?<![a-zA-Z0-9]){re.escape(w)}(?![a-zA-Z0-9])', re.IGNORECASE)
-                    _DICT_REGEX_CACHE[cache_key] = pat
-                text = pat.sub(reading, text)
-            # 3. ひらがな・カタカナ・記号・混在語
-            else:
-                text = text.replace(w, reading)
+            def _protect_guild_reading(reading_val: str) -> str:
+                if _COMMON_READING_REGEX is None:
+                    return reading_val
+                idx = len(protected_replacements)
+                protected_replacements.append(reading_val)
+                return f"\x00GDICT_{idx}\x00"
+
+            for word, reading in sorted_entries:
+                w = word.strip()
+                if not w or w not in text:
+                    continue
+
+                token_val = _protect_guild_reading(reading)
+                # 1. 漢字のみで構成された単語（例: 「表」）: 前後に漢字がない場合のみ置換
+                if _RE_KANJI_ONLY.match(w):
+                    cache_key = ("kanji", w)
+                    pat = _DICT_REGEX_CACHE.get(cache_key)
+                    if pat is None:
+                        pat = re.compile(rf'(?<![\u4e00-\u9faf]){re.escape(w)}(?![\u4e00-\u9faf])')
+                        _DICT_REGEX_CACHE[cache_key] = pat
+                    text = pat.sub(lambda _m, tv=token_val: tv, text)
+                # 2. 英数字のみで構成された単語（例: 「in」）: 前後に英数字がない場合のみ置換
+                elif _RE_ALNUM_ONLY.match(w):
+                    cache_key = ("alnum", w.lower())
+                    pat = _DICT_REGEX_CACHE.get(cache_key)
+                    if pat is None:
+                        pat = re.compile(rf'(?<![a-zA-Z0-9]){re.escape(w)}(?![a-zA-Z0-9])', re.IGNORECASE)
+                        _DICT_REGEX_CACHE[cache_key] = pat
+                    text = pat.sub(lambda _m, tv=token_val: tv, text)
+                # 3. ひらがな・カタカナ・記号・混在語
+                else:
+                    text = text.replace(w, token_val)
+
+        # 全サーバー共通日本語/ゲーム用語辞書 (単一パス複合正規表現 + O(1) ルックアップ)
+        with _COMMON_READING_LOCK:
+            common_regex = _COMMON_READING_REGEX
+            common_lookup = _COMMON_READING_MERGED_LOWER
+
+        if common_regex is not None and text:
+            text = common_regex.sub(
+                lambda m: common_lookup.get(m.group(0).lower(), m.group(0)),
+                text
+            )
+
+        if protected_replacements:
+            text = _RE_GDICT_PLACEHOLDER.sub(
+                lambda m: protected_replacements[int(m.group(1))],
+                text
+            )
 
         return text
 
@@ -435,59 +719,620 @@ class TextCleaner:
         "ok": "オーケー",
         "ng": "エヌジー",
         "fps": "エフピーエス",
+        "tps": "ティーピーエス",
         "rpg": "アールピージー",
+        "mmo": "エムエムオー",
+        "pvp": "ピーブイピー",
+        "pve": "ピーブイイー",
+        "rta": "アールティーエー",
         "bot": "ボット",
         "ai": "エーアイ",
         "ui": "ユーアイ",
+        "api": "エーピーアイ",
         "web": "ウェブ",
+        "sns": "エスエヌエス",
         "cpu": "シーピーユー",
         "gpu": "ジーピーユー",
         "ram": "ラム",
         "rom": "ロム",
+        "ssd": "エスエスディー",
+        "hdd": "エイチディーディー",
+        "os": "オーエス",
+        "vr": "ブイアール",
+        "ar": "エーアール",
+        "bgm": "ビージーエム",
+        "gg": "ジージー",
+        "afk": "エーエフケー",
+        "brb": "ビーアールビー",
         "ps": "プレイステーション",
         "switch": "スイッチ",
+        "xbox": "エックスボックス",
         "steam": "スチーム",
         "discord": "ディスコード",
         "twitter": "ツイッター",
         "youtube": "ユーチューブ",
         "twitch": "ツイッチ",
+        "tiktok": "ティックトック",
+        "instagram": "インスタグラム",
+        "niconico": "ニコニコ",
+        "bilibili": "ビリビリ",
+        "vtuber": "ブイチューバー",
+        "github": "ギットハブ",
+        "chatgpt": "チャットジーピーティー",
+        "openai": "オープンエーアイ",
+        "netflix": "ネットフリックス",
+        "amazon": "アマゾン",
+        "spotify": "スポティファイ",
+        "obs": "オービーエス",
+        "iphone": "アイフォン",
+        "ipad": "アイパッド",
+        "ios": "アイオーエス",
+        "android": "アンドロイド",
+        "valorant": "ヴァロラント",
+        "minecraft": "マインクラフト",
+        "fortnite": "フォートナイト",
+        "lol": "ロル",
+        "vrchat": "ブイアールチャット",
+        "reddit": "レディット",
+        "wikipedia": "ウィキペディア",
+        "alt": "オルト",
+        "ctrl": "コントロール",
+        "esc": "エスケープ",
+        "tab": "タブ",
+        "shift": "シフト",
+        "atm": "エーティーエム",
+        "vpn": "ブイピーエヌ",
+        "dns": "ディーエヌエス",
+        "http": "エイチティーティーピー",
+        "https": "エイチティーティーピーエス",
+        "html": "エイチティーエムエル",
+        "css": "シーエスエス",
+        "json": "ジェイソン",
+        "yaml": "ヤムル",
+        "sql": "エスキューエル",
+        "ssh": "エスエスエイチ",
+        "usb": "ユーエスビー",
+        "hdmi": "エイチディーエムアイ",
+        "lan": "ラン",
+        "wan": "ワン",
+        "wifi": "ワイファイ",
+        "docker": "ドッカー",
+        "linux": "リナックス",
+        "windows": "ウィンドウズ",
+        "pokemon": "ポケモン",
+        # MMO / ネットゲーム / チャット略語 (WIKIWIKI MMO用語全集 & 実測誤読対策)
+        "directx": "ダイレクトエックス",
+        "wb": "ダブリュービー",
+        "debuff": "デバフ",
+        "buff": "バフ",
+        "mob": "モブ",
+        "melee": "メレー",
+        "dupe": "デュープ",
+        "thx": "サンクス",
+        "thanx": "サンクス",
+        "plz": "プリーズ",
+        "ez": "イージー",
+        "rdy": "レディ",
+        "cya": "シーヤー",
+        "cul": "シーユーエル",
+        "hehe": "ヘヘ",
+        "gj": "ジージェー",
+        "omg": "オーエムジー",
+        "omw": "オーエムダブリュー",
+        "lfg": "エルエフジー",
+        "ld": "エルディー",
+        "asap": "エーエスエーピー",
+        "afaik": "エーエフエーアイケー",
+        "btw": "ビーティーダブリュー",
+        "pk": "ピーケー",
+        "pkk": "ピーケーケー",
+        "fpk": "エフピーケー",
+        "pt": "ピーティー",
+        "npc": "エヌピーシー",
+        "gm": "ジーエム",
+        "hp": "エイチピー",
+        "mp": "エムピー",
+        "str": "エスティーアール",
+        "dex": "デックス",
+        "vit": "ビット",
+        "int": "イント",
+        "mnd": "エムエヌディー",
+        "chr": "シーエイチアール",
+        "ddos": "ディードス",
+        "rmt": "アールエムティー",
+        "rmter": "アールエムター",
+        "ss": "エスエス",
+        "hq": "エイチキュー",
+        "dmg": "ディーエムジー",
+        "wtb": "ダブリューティービー",
+        "wts": "ダブリューティーエス",
+        "wtt": "ダブリューティーティー",
+        "wiz": "ウィズ",
+        "np": "エヌピー",
+        "dk": "ディーケー",
+        "dyk": "ディーワイケー",
+        "dyt": "ディーワイティー",
+        "ack": "エーシーケー",
+        "bibi": "バイバイ",
+        "fsaa": "エフエスエーエー",
+        "morpg": "エムオーアールピージー",
+        "mmorpg": "エムエムオーアールピージー",
+        "rvr": "アールブイアール",
+        "kos": "ケーオーエス",
+        "ks": "ケーエス",
+        "pol": "ピーオーエル",
+        "poof": "プーフ",
+        "twink": "トゥインク",
+        "evac": "イバック",
+        "kwel": "クール",
     }
+
+    @classmethod
+    def resolve_english_word_kana(
+        cls,
+        raw_w: str,
+        *,
+        allow_e2k: bool = True,
+        e2k_budget: Optional[List[int]] = None,
+    ) -> Tuple[Optional[str], str]:
+        """
+        英単語1語を多層 O(1) 辞書 + オフライン未知語変換 (e2k + LRU) で解決する。
+        Returns: (カタカナ読み or None, 解決元 tier)
+        tier: 'slang_skip' | 'custom' | 'builtin' | 'alkana' | 'system' | 'e2k_cache' | 'e2k' | 'unknown'
+        """
+        lower_w = raw_w.lower()
+
+        # 'www' など w の連続ネットスラングは後段 normalize_slang のためそのまま通す
+        if set(lower_w) == {"w"}:
+            return None, "slang_skip"
+
+        ensure_english_kana_dicts_loaded()
+
+        # 1. カスタム共通辞書 (WebUI・管理者設定、最優先 O(1))
+        custom_hit = _CUSTOM_ENGLISH_KANA_DICT.get(lower_w)
+        if custom_hit:
+            return custom_hit, "custom"
+
+        # 2. 組込定番略語・固有名詞マップ (O(1))
+        builtin_hit = cls.COMMON_ACRONYMS.get(lower_w)
+        if builtin_hit:
+            return builtin_hit, "builtin"
+
+        # 3. alkana 一般英単語辞書 (49,216語, O(1))
+        alkana_mod = _get_alkana()
+        if alkana_mod is not None:
+            kana = alkana_mod.get_kana(lower_w)
+            if kana:
+                return kana, "alkana"
+
+        # 4. 事前構築済みシステム辞書 JSON (SudachiDict抽出等, O(1))
+        system_hit = _SYSTEM_ENGLISH_KANA_DICT.get(lower_w)
+        if system_hit:
+            return system_hit, "system"
+
+        # 5. e2k LRU キャッシュ (O(1))
+        with _E2K_LOCK:
+            cached = _E2K_CACHE.get(lower_w)
+            if cached:
+                _E2K_CACHE.move_to_end(lower_w)
+                return cached, "e2k_cache"
+
+        # 6. e2k オフライン RNN 未知語即時変換 (Public Domain)
+        if allow_e2k and (e2k_budget is None or e2k_budget[0] > 0):
+            ngram_fn, c2k_fn = _get_e2k_converters()
+            if ngram_fn is not None and c2k_fn is not None:
+                try:
+                    with _E2K_LOCK:
+                        # ロック再取得時のダブルチェック
+                        cached2 = _E2K_CACHE.get(lower_w)
+                        if cached2:
+                            _E2K_CACHE.move_to_end(lower_w)
+                            return cached2, "e2k_cache"
+                        inferred = c2k_fn(lower_w) if ngram_fn(lower_w) else ngram_fn.as_is(lower_w)
+                        if inferred and isinstance(inferred, str) and inferred.strip():
+                            inferred = inferred.strip()
+                            _E2K_CACHE[lower_w] = inferred
+                            if len(_E2K_CACHE) > _E2K_CACHE_MAX_SIZE:
+                                _E2K_CACHE.popitem(last=False)
+                            if e2k_budget is not None:
+                                e2k_budget[0] -= 1
+                            return inferred, "e2k"
+                except Exception as e:
+                    logger.debug(f"e2k inference skipped for {raw_w!r}: {e}")
+
+        return None, "unknown"
 
     @classmethod
     def convert_english_to_kana(cls, text: str) -> Tuple[str, List[str]]:
         """
-        英単語を alkana および事前略語マップを用いて即座にカタカナ化する。
-        alkanaに未登録の未知の英字単語（造語・固有名詞等）を検出してリストとして返す。
+        英単語を多層 O(1) 辞書 (カスタム/組込/alkana/Sudachi抽出) および
+        オフライン未知語推論 (e2k + LRUキャッシュ) を用いて即座にカタカナ化する。
+        変換できなかった未登録の英字単語のみを unknown_words として返却する。
         """
         unknown_words: List[str] = []
-
-        try:
-            import alkana
-        except ImportError:
-            alkana = None
+        e2k_budget = [_E2K_MAX_INFER_PER_TEXT]
 
         def _replace_word(m: re.Match) -> str:
             raw_w = m.group(0)
-            lower_w = raw_w.lower()
-
-            # 1. 事前略語マップ
-            if lower_w in cls.COMMON_ACRONYMS:
-                return cls.COMMON_ACRONYMS[lower_w]
-
-            # 2. alkana による英単語即時変換
-            if alkana is not None:
-                kana = alkana.get_kana(lower_w)
-                if kana:
-                    return kana
-
-            # 3. 未知語（2文字以上の未知英単語を抽出）
-            if len(raw_w) >= 2 and raw_w not in unknown_words:
+            kana, tier = cls.resolve_english_word_kana(raw_w, allow_e2k=True, e2k_budget=e2k_budget)
+            if kana:
+                return kana
+            if tier == "unknown" and len(raw_w) >= 2 and raw_w not in unknown_words:
                 unknown_words.append(raw_w)
             return raw_w
 
         # 英単語境界にマッチ（英字2文字以上・事前コンパイル定数を使用）
         converted_text = _RE_ENGLISH_WORD.sub(_replace_word, text)
         return converted_text, unknown_words
+
+    @classmethod
+    def preview_english_kana(cls, text: str) -> Dict[str, Any]:
+        """テキスト内の英単語ごとの変換結果と解決元 tier を診断付きで返す (WebUIテスト用)"""
+        tokens: List[Dict[str, str]] = []
+        e2k_budget = [_E2K_MAX_INFER_PER_TEXT]
+
+        def _replace_word(m: re.Match) -> str:
+            raw_w = m.group(0)
+            kana, tier = cls.resolve_english_word_kana(raw_w, allow_e2k=True, e2k_budget=e2k_budget)
+            out = kana if kana else raw_w
+            tokens.append({"word": raw_w, "kana": out, "tier": tier})
+            return out
+
+        converted = _RE_ENGLISH_WORD.sub(_replace_word, text or "")
+        return {
+            "original": text or "",
+            "converted": converted,
+            "tokens": tokens,
+        }
+
+    # --- グローバル O(1) 英語カタカナ辞書の管理・永続化 API ---
+
+    @classmethod
+    def reload_english_kana_dict(cls) -> Dict[str, Any]:
+        """ディスク上の英語カタカナ辞書を再ロードし、O(1)統計情報を返す"""
+        ensure_english_kana_dicts_loaded(force=True)
+        return cls.get_english_kana_stats()
+
+    @classmethod
+    def get_english_kana_stats(cls) -> Dict[str, Any]:
+        ensure_english_kana_dicts_loaded()
+        alkana_mod = _get_alkana()
+        alkana_count = 0
+        if alkana_mod is not None:
+            data_mod = getattr(alkana_mod, "data", None)
+            data_dict = getattr(data_mod, "data", None)
+            if isinstance(data_dict, dict):
+                alkana_count = len(data_dict)
+        ngram_fn, c2k_fn = _get_e2k_converters() if not _E2K_FAILED else (None, None)
+        with _ENGLISH_DICT_LOCK:
+            custom_count = len(_CUSTOM_ENGLISH_KANA_DICT)
+            system_count = len(_SYSTEM_ENGLISH_KANA_DICT)
+            meta = dict(_SYSTEM_ENGLISH_KANA_META)
+        with _E2K_LOCK:
+            e2k_cache_count = len(_E2K_CACHE)
+        return {
+            "custom_count": custom_count,
+            "builtin_count": len(cls.COMMON_ACRONYMS),
+            "alkana_count": alkana_count,
+            "system_count": system_count,
+            "e2k_available": (ngram_fn is not None and c2k_fn is not None),
+            "e2k_cache_count": e2k_cache_count,
+            "system_meta": meta,
+        }
+
+    @classmethod
+    def get_custom_english_kana_dict(cls) -> Dict[str, str]:
+        ensure_english_kana_dicts_loaded()
+        with _ENGLISH_DICT_LOCK:
+            return dict(sorted(_CUSTOM_ENGLISH_KANA_DICT.items()))
+
+    @classmethod
+    def search_system_english_kana(cls, query: str = "", limit: int = 100) -> List[Dict[str, str]]:
+        """システム/組込/カスタム辞書から条件一致するエントリを検索 (WebUIプレビュー用)"""
+        ensure_english_kana_dicts_loaded()
+        q = query.strip().lower()
+        results: List[Dict[str, str]] = []
+        seen = set()
+
+        def _collect(mapping: Dict[str, str], source_name: str):
+            for k in sorted(mapping.keys()):
+                if len(results) >= limit:
+                    return
+                if k in seen:
+                    continue
+                v = mapping[k]
+                if not q or (q in k) or (q in v.lower()):
+                    seen.add(k)
+                    results.append({"word": k, "reading": v, "source": source_name})
+
+        with _ENGLISH_DICT_LOCK:
+            _collect(_CUSTOM_ENGLISH_KANA_DICT, "custom")
+            _collect(cls.COMMON_ACRONYMS, "builtin")
+            _collect(_SYSTEM_ENGLISH_KANA_DICT, "system")
+        return results
+
+    @staticmethod
+    def validate_english_kana_entry(word: str, reading: str) -> Tuple[str, str]:
+        w = _RE_CTRL_CHARS.sub("", (word or "")).strip().lower()
+        r = _RE_CTRL_CHARS.sub("", (reading or "")).strip()
+        if not _RE_VALID_ENGLISH_WORD_KEY.match(w) or set(w) == {"w"}:
+            raise ValueError("英単語は2〜64文字の半角英字 (a-z) で指定してください（www等は不可）。")
+        if not r or len(r) > 128:
+            raise ValueError("読み方は1〜128文字で入力してください。")
+        return w, r
+
+    @classmethod
+    def _save_custom_english_kana_locked(cls, mapping: Dict[str, str]) -> None:
+        path = _get_custom_english_kana_dict_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "_meta": {"count": len(mapping)},
+            "entries": dict(sorted(mapping.items())),
+        }
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    @classmethod
+    def upsert_custom_english_kana(cls, word: str, reading: str) -> Tuple[str, str]:
+        global _CUSTOM_ENGLISH_KANA_DICT
+        w, r = cls.validate_english_kana_entry(word, reading)
+        ensure_english_kana_dicts_loaded()
+        with _ENGLISH_DICT_LOCK:
+            new_map = dict(_CUSTOM_ENGLISH_KANA_DICT)
+            new_map[w] = r
+            cls._save_custom_english_kana_locked(new_map)
+            _CUSTOM_ENGLISH_KANA_DICT = new_map
+        with _E2K_LOCK:
+            _E2K_CACHE.pop(w, None)
+        return w, r
+
+    @classmethod
+    def import_custom_english_kana_batch(cls, items: List[Tuple[str, str]]) -> int:
+        global _CUSTOM_ENGLISH_KANA_DICT
+        ensure_english_kana_dicts_loaded()
+        validated: List[Tuple[str, str]] = []
+        for raw_w, raw_r in items:
+            validated.append(cls.validate_english_kana_entry(raw_w, raw_r))
+        if not validated:
+            return 0
+        with _ENGLISH_DICT_LOCK:
+            new_map = dict(_CUSTOM_ENGLISH_KANA_DICT)
+            for w, r in validated:
+                new_map[w] = r
+            cls._save_custom_english_kana_locked(new_map)
+            _CUSTOM_ENGLISH_KANA_DICT = new_map
+        with _E2K_LOCK:
+            for w, _ in validated:
+                _E2K_CACHE.pop(w, None)
+        return len(validated)
+
+    @classmethod
+    def delete_custom_english_kana(cls, word: str) -> bool:
+        global _CUSTOM_ENGLISH_KANA_DICT
+        w = (word or "").strip().lower()
+        if not w:
+            return False
+        ensure_english_kana_dicts_loaded()
+        with _ENGLISH_DICT_LOCK:
+            if w not in _CUSTOM_ENGLISH_KANA_DICT:
+                return False
+            new_map = dict(_CUSTOM_ENGLISH_KANA_DICT)
+            del new_map[w]
+            cls._save_custom_english_kana_locked(new_map)
+            _CUSTOM_ENGLISH_KANA_DICT = new_map
+        return True
+
+    # --- 全サーバー共通 日本語・ゲーム用語読み辞書の管理・永続化 API ---
+
+    @classmethod
+    def reload_common_reading_dict(cls) -> Dict[str, Any]:
+        """ディスク上の共通日本語・ゲーム用語辞書を再ロードする"""
+        ensure_common_reading_dicts_loaded(force=True)
+        return cls.get_common_reading_stats()
+
+    @classmethod
+    def get_common_reading_stats(cls) -> Dict[str, Any]:
+        ensure_common_reading_dicts_loaded()
+        with _COMMON_READING_LOCK:
+            return {
+                "custom_count": len(_CUSTOM_COMMON_READING_DICT),
+                "system_count": len(_SYSTEM_COMMON_READING_DICT),
+                "merged_count": len(_COMMON_READING_MERGED_LOWER),
+                "system_meta": dict(_SYSTEM_COMMON_READING_META),
+            }
+
+    @classmethod
+    def get_custom_common_reading_dict(cls) -> Dict[str, str]:
+        ensure_common_reading_dicts_loaded()
+        with _COMMON_READING_LOCK:
+            return dict(sorted(_CUSTOM_COMMON_READING_DICT.items()))
+
+    @classmethod
+    def search_common_reading_dict(cls, query: str = "", limit: int = 100) -> List[Dict[str, str]]:
+        """共通日本語・ゲーム用語辞書 (カスタム・システム初期辞書) を検索"""
+        ensure_common_reading_dicts_loaded()
+        q = _RE_CTRL_CHARS.sub("", (query or "")).strip().lower()
+        results: List[Dict[str, str]] = []
+        seen_lower = set()
+
+        def _collect(mapping: Dict[str, str], source_name: str):
+            for k in sorted(mapping.keys()):
+                if len(results) >= limit:
+                    return
+                lk = k.lower()
+                if lk in seen_lower:
+                    continue
+                v = mapping[k]
+                if not q or (q in lk) or (q in v.lower()):
+                    seen_lower.add(lk)
+                    results.append({"word": k, "reading": v, "source": source_name})
+
+        with _COMMON_READING_LOCK:
+            _collect(_CUSTOM_COMMON_READING_DICT, "custom")
+            _collect(_SYSTEM_COMMON_READING_DICT, "system")
+        return results
+
+    @staticmethod
+    def validate_common_reading_entry(word: str, reading: str) -> Tuple[str, str]:
+        w = _RE_CTRL_CHARS.sub("", (word or "")).strip()
+        r = _RE_CTRL_CHARS.sub("", (reading or "")).strip()
+        if not w or len(w) > 64:
+            raise ValueError("単語は1〜64文字で入力してください。")
+        if "\x00" in w or "\x00" in r:
+            raise ValueError("不正な制御文字が含まれています。")
+        if not r or len(r) > 128:
+            raise ValueError("読み方は1〜128文字で入力してください。")
+        return w, r
+
+    @classmethod
+    def _save_custom_common_reading_locked(cls, mapping: Dict[str, str]) -> None:
+        path = _get_custom_common_reading_dict_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "_meta": {"count": len(mapping)},
+            "entries": dict(sorted(mapping.items())),
+        }
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+
+    @classmethod
+    def upsert_custom_common_reading(cls, word: str, reading: str) -> Tuple[str, str]:
+        global _CUSTOM_COMMON_READING_DICT
+        w, r = cls.validate_common_reading_entry(word, reading)
+        ensure_common_reading_dicts_loaded()
+        with _COMMON_READING_LOCK:
+            new_map = dict(_CUSTOM_COMMON_READING_DICT)
+            new_map[w] = r
+            cls._save_custom_common_reading_locked(new_map)
+            _CUSTOM_COMMON_READING_DICT = new_map
+            _rebuild_common_reading_matcher_locked()
+        return w, r
+
+    @classmethod
+    def import_custom_common_reading_batch(cls, items: List[Tuple[str, str]]) -> int:
+        global _CUSTOM_COMMON_READING_DICT
+        ensure_common_reading_dicts_loaded()
+        validated: List[Tuple[str, str]] = []
+        for raw_w, raw_r in items:
+            validated.append(cls.validate_common_reading_entry(raw_w, raw_r))
+        if not validated:
+            return 0
+        with _COMMON_READING_LOCK:
+            new_map = dict(_CUSTOM_COMMON_READING_DICT)
+            for w, r in validated:
+                new_map[w] = r
+            cls._save_custom_common_reading_locked(new_map)
+            _CUSTOM_COMMON_READING_DICT = new_map
+            _rebuild_common_reading_matcher_locked()
+        return len(validated)
+
+    @classmethod
+    def delete_custom_common_reading(cls, word: str) -> bool:
+        global _CUSTOM_COMMON_READING_DICT
+        w = _RE_CTRL_CHARS.sub("", (word or "")).strip()
+        if not w:
+            return False
+        ensure_common_reading_dicts_loaded()
+        with _COMMON_READING_LOCK:
+            if w not in _CUSTOM_COMMON_READING_DICT:
+                return False
+            new_map = dict(_CUSTOM_COMMON_READING_DICT)
+            del new_map[w]
+            cls._save_custom_common_reading_locked(new_map)
+            _CUSTOM_COMMON_READING_DICT = new_map
+            _rebuild_common_reading_matcher_locked()
+        return True
+
+    # --- ローカルTTS限定 SudachiPy 安全漢字かな補完 ---
+
+    @classmethod
+    def convert_kanji_for_local_tts(cls, text: str) -> str:
+        """
+        ローカルTTS (VOICEVOX / SHAREVOX / COEIROINK / OpenJTalk) 向けの安全かな補完。
+        - クラウドTTS向け原文は変更せず、ローカル合成直前に漢字を含む一般トークンのみをひらがな化する。
+        - 助詞（は/へ/を）、数詞＋助数詞、カタカナ/ひらがな、記号、OOV未知語、<<__BEEP:N__>> は元表記を厳格保護する。
+        - 漢字を1文字も含まないテキストは 0.001ms 以下のファストパスで即返却する。
+        """
+        if not text or not _RE_CONTAINS_KANJI.search(text):
+            return text
+
+        tokenizer, split_mode = get_sudachi_tokenizer()
+        if tokenizer is None or split_mode is None:
+            return text
+
+        segments = _RE_BEEP_SPLIT.split(text)
+        out_segments: List[str] = []
+
+        for seg in segments:
+            if not seg:
+                continue
+            if _RE_BEEP_TAG.fullmatch(seg) or not _RE_CONTAINS_KANJI.search(seg):
+                out_segments.append(seg)
+                continue
+
+            try:
+                tokens = tokenizer.tokenize(seg, split_mode)
+            except Exception as e:
+                logger.debug(f"convert_kanji_for_local_tts skipped due to tokenize error: {e}")
+                out_segments.append(seg)
+                continue
+
+            seg_parts: List[str] = []
+            prev_in_numeral_cluster = False
+
+            for tok in tokens:
+                surface = tok.surface()
+                pos = tok.part_of_speech()
+                pos0 = pos[0] if len(pos) > 0 else ""
+                pos1 = pos[1] if len(pos) > 1 else ""
+                pos2 = pos[2] if len(pos) > 2 else ""
+
+                is_numeral = (
+                    (pos1 == "数詞")
+                    or bool(_RE_HAS_DIGITS.search(surface))
+                    or bool(_RE_KANJI_NUM_ONLY.match(surface))
+                )
+                is_counter = (pos0 == "接尾辞") or (pos1 == "助数詞") or (pos2 == "助数詞可能")
+                in_numeral_context = prev_in_numeral_cluster and is_counter
+
+                should_convert = (
+                    not tok.is_oov()
+                    and bool(_RE_CONTAINS_KANJI.search(surface))
+                    and pos0 not in ("助詞", "補助記号", "記号", "空白")
+                    and not is_numeral
+                    and not in_numeral_context
+                )
+
+                if should_convert:
+                    reading = tok.reading_form()
+                    if reading and _RE_VALID_KATAKANA_READING.match(reading):
+                        seg_parts.append(reading.translate(_KATA_TO_HIRA_TRANS))
+                    else:
+                        seg_parts.append(surface)
+                else:
+                    seg_parts.append(surface)
+
+                prev_in_numeral_cluster = is_numeral or in_numeral_context
+
+            out_segments.append("".join(seg_parts))
+
+        return "".join(out_segments)
+
+    @classmethod
+    def preview_common_and_local_tts(cls, text: str) -> Dict[str, Any]:
+        """共通辞書＋英語辞書＋ローカルTTS漢字かな補完の段階別プレビュー (WebUIテスト用)"""
+        src = text or ""
+        after_dict = cls.apply_dictionary(src, None)
+        after_english, _ = cls.convert_english_to_kana(after_dict)
+        after_local_tts = cls.convert_kanji_for_local_tts(after_english)
+        return {
+            "original": src,
+            "after_common_dict": after_dict,
+            "after_english_and_dict": after_english,
+            "local_tts_kanji_converted": after_local_tts,
+        }
 
     @staticmethod
     def normalize_slang(text: str) -> str:

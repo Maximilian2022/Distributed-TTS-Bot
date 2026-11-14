@@ -17,6 +17,7 @@ document.addEventListener("DOMContentLoaded", () => {
   updateVolunteerOneliner();
   initDynamicRedirectUri();
   initAppLoginUsername();
+  if (typeof initCommonDictListeners === "function") initCommonDictListeners();
 
   // ログイン済みの場合にデータを初期ロード
   if (window.APP_IS_LOGGED_IN) {
@@ -122,8 +123,10 @@ function triggerTabDataLoad(activeSubOrTab) {
       if (chk) chk.checked = false;
     }
   }
-  if (activeSubOrTab === "dict") {
+  if (activeSubOrTab === "words" || activeSubOrTab === "dict") {
     if (currentGuildId) loadDictionary(currentGuildId);
+    if (typeof loadEnglishDict === "function") loadEnglishDict();
+    if (typeof loadCommonDict === "function") loadCommonDict();
   }
   if (activeSubOrTab === "ng") {
     if (currentGuildId) loadNgWords(currentGuildId);
@@ -316,6 +319,8 @@ async function switchGuild(guildId) {
   if (typeof selectedDictWords !== "undefined") selectedDictWords.clear();
   if (typeof selectedNgWords !== "undefined") selectedNgWords.clear();
   loadDictionary(currentGuildId);
+  if (typeof loadEnglishDict === "function") loadEnglishDict();
+  if (typeof loadCommonDict === "function") loadCommonDict();
   loadNgWords(currentGuildId);
   loadUserProfile(currentGuildId);
   loadSyncSourceGuilds();
@@ -1814,7 +1819,608 @@ async function deleteDictWord(encodedWord) {
   }
 }
 
-// --- 単語辞書テキスト一括インポート ---
+// --- 共通 O(1) 英語カタカナ辞書管理 ---
+
+let englishDictSearchTimer = null;
+
+function _englishTierLabel(tier) {
+  const labels = {
+    custom: "カスタム(最優先)",
+    builtin: "組込定番",
+    alkana: "alkana辞書",
+    system: "Sudachi抽出",
+    e2k_cache: "e2kキャッシュ",
+    e2k: "e2k自動推論",
+    slang_skip: "スラング保護",
+    unknown: "未変換"
+  };
+  return labels[tier] || tier || "-";
+}
+
+async function loadEnglishDict(searchQuery = "") {
+  const tbody = document.getElementById("english-custom-table-body");
+  const statsEl = document.getElementById("english-dict-stats");
+  const countEl = document.getElementById("english-custom-count");
+  if (!tbody && !statsEl) return;
+
+  try {
+    const qs = searchQuery ? `?q=${encodeURIComponent(searchQuery)}&limit=100` : "";
+    const res = await fetch(`/api/english_dict${qs}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const s = data.stats || {};
+
+    if (statsEl) {
+      const e2kBadge = s.e2k_available
+        ? `<span class="badge" style="background:#23a55a;color:#fff;">e2k有効 (cache:${Number(s.e2k_cache_count || 0)})</span>`
+        : `<span class="badge" style="background:#6b7280;color:#fff;">e2k無効</span>`;
+      statsEl.innerHTML =
+        `<span class="badge">カスタム:${Number(s.custom_count || 0)}</span>` +
+        `<span class="badge">組込:${Number(s.builtin_count || 0)}</span>` +
+        `<span class="badge">alkana:${Number(s.alkana_count || 0)}</span>` +
+        `<span class="badge">Sudachi:${Number(s.system_count || 0)}</span>` +
+        e2kBadge;
+    }
+
+    const customEntries = data.custom_entries || [];
+    if (countEl) countEl.textContent = `${customEntries.length}件`;
+    if (tbody) {
+      if (customEntries.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="3" style="text-align:center;color:var(--text-muted);font-size:12px;">共通カスタム辞書への追加登録はまだありません（上のフォームから追加できます）</td></tr>`;
+      } else {
+        tbody.innerHTML = customEntries.map(item => `
+          <tr>
+            <td style="font-weight:600;">${escapeHtml(item.word)}</td>
+            <td>${escapeHtml(item.reading)}</td>
+            <td style="text-align:right;white-space:nowrap;">
+              <button type="button" class="btn btn-secondary btn-sm" data-word="${escapeHtml(item.word)}" data-reading="${escapeHtml(item.reading)}" onclick="prefillEnglishDictForm(this.dataset.word, this.dataset.reading)">編集</button>
+              <button type="button" class="btn btn-danger btn-sm" data-word="${escapeHtml(item.word)}" onclick="deleteEnglishDictWord(this.dataset.word)">削除</button>
+            </td>
+          </tr>
+        `).join("");
+      }
+    }
+
+    const searchBox = document.getElementById("english-search-results-box");
+    const searchBody = document.getElementById("english-search-table-body");
+    if (searchBox && searchBody) {
+      const results = data.search_results || [];
+      if (searchQuery) {
+        searchBox.style.display = "block";
+        if (results.length === 0) {
+          searchBody.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--text-muted);font-size:12px;">該当する登録単語はありません（「${escapeHtml(searchQuery)}」も発話時は自動推論されます）</td></tr>`;
+        } else {
+          searchBody.innerHTML = results.map(item => `
+            <tr>
+              <td style="font-weight:600;">${escapeHtml(item.word)}</td>
+              <td>${escapeHtml(item.reading)}</td>
+              <td><span style="font-size:11px;color:var(--text-muted);">${escapeHtml(_englishTierLabel(item.source))}</span></td>
+              <td style="text-align:right;">
+                <button type="button" class="btn btn-secondary btn-sm" data-word="${escapeHtml(item.word)}" data-reading="${escapeHtml(item.reading)}" onclick="prefillEnglishDictForm(this.dataset.word, this.dataset.reading)">上書き</button>
+              </td>
+            </tr>
+          `).join("");
+        }
+      } else {
+        searchBox.style.display = "none";
+        searchBody.innerHTML = "";
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load english dict:", err);
+  }
+}
+
+function debouncedSearchEnglishDict() {
+  if (englishDictSearchTimer) clearTimeout(englishDictSearchTimer);
+  englishDictSearchTimer = setTimeout(() => {
+    const inp = document.getElementById("english-dict-search");
+    const q = inp ? inp.value.trim() : "";
+    loadEnglishDict(q.length >= 2 ? q : "");
+  }, 220);
+}
+
+function prefillEnglishDictForm(word, reading) {
+  const wEl = document.getElementById("english-dict-word");
+  const rEl = document.getElementById("english-dict-reading");
+  if (wEl) wEl.value = word || "";
+  if (rEl) {
+    rEl.value = reading || "";
+    rEl.focus();
+  }
+}
+
+function toggleEnglishBatchBox() {
+  const box = document.getElementById("english-dict-batch-box");
+  if (!box) return;
+  box.style.display = box.style.display === "none" ? "block" : "none";
+}
+
+async function addEnglishDictWord(e) {
+  e.preventDefault();
+  const wEl = document.getElementById("english-dict-word");
+  const rEl = document.getElementById("english-dict-reading");
+  const word = wEl ? wEl.value.trim() : "";
+  const reading = rEl ? rEl.value.trim() : "";
+  if (!word || !reading) {
+    showToast("英単語とカタカナ読みを入力してください", "error");
+    return;
+  }
+  try {
+    const res = await fetch("/api/english_dict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word, reading })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`共通英語辞書に「${data.word} → ${data.reading}」を登録しました`, "success");
+      if (wEl) wEl.value = "";
+      if (rEl) rEl.value = "";
+      const qInp = document.getElementById("english-dict-search");
+      await loadEnglishDict(qInp && qInp.value.trim().length >= 2 ? qInp.value.trim() : "");
+    } else {
+      showToast(data.error || "登録に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("通信エラーが発生しました", "error");
+  }
+}
+
+async function importEnglishDictBatch() {
+  const ta = document.getElementById("english-dict-batch-text");
+  const raw = ta ? ta.value : "";
+  const lines = raw.split(/\r?\n/);
+  const items = [];
+  for (const line of lines) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    const m = s.match(/^([^\s:：\t,]+)\s*[:：\t,]+\s*(.+)$/);
+    if (m && m[1].trim() && m[2].trim()) {
+      items.push({ word: m[1].trim(), reading: m[2].trim() });
+    }
+  }
+  if (items.length === 0) {
+    showToast("有効な「英単語:カタカナ」行が見つかりません", "error");
+    return;
+  }
+  try {
+    const res = await fetch("/api/english_dict/import_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`${data.imported_count}件の英単語を共通辞書へ一括登録しました`, "success");
+      if (ta) ta.value = "";
+      toggleEnglishBatchBox();
+      await loadEnglishDict();
+    } else {
+      showToast(data.error || "一括登録に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("通信エラーが発生しました", "error");
+  }
+}
+
+async function deleteEnglishDictWord(word) {
+  if (!word || !confirm(`共通辞書から「${word}」を削除しますか？`)) return;
+  try {
+    const res = await fetch(`/api/english_dict/${encodeURIComponent(word)}`, { method: "DELETE" });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`「${word}」を削除しました`, "success");
+      await loadEnglishDict();
+    } else {
+      showToast(data.error || "削除に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("削除中にエラーが発生しました", "error");
+  }
+}
+
+async function previewEnglishDict(e) {
+  e.preventDefault();
+  const inp = document.getElementById("english-preview-input");
+  const resBox = document.getElementById("english-preview-result");
+  const text = inp ? inp.value.trim() : "";
+  if (!text || !resBox) return;
+
+  try {
+    const res = await fetch("/api/english_dict/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.error || "プレビューに失敗しました", "error");
+      return;
+    }
+    const chips = (data.tokens || []).map(t => `
+      <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);margin:2px 4px 2px 0;font-size:12px;">
+        <b>${escapeHtml(t.word)}</b> → <span style="color:var(--primary);font-weight:600;">${escapeHtml(t.kana)}</span>
+        <span style="color:var(--text-muted);font-size:11px;">[${escapeHtml(_englishTierLabel(t.tier))}]</span>
+        ${t.tier !== "slang_skip" ? `<button type="button" class="btn btn-secondary btn-sm" style="padding:1px 6px;font-size:10px;" data-word="${escapeHtml(t.word)}" data-reading="${escapeHtml(t.kana)}" onclick="prefillEnglishDictForm(this.dataset.word, this.dataset.reading)">修正</button>` : ""}
+      </span>
+    `).join("");
+
+    resBox.style.display = "block";
+    resBox.innerHTML = `
+      <div style="margin-bottom:6px;">変換結果: <b style="color:#23a55a;">${escapeHtml(data.converted || "")}</b></div>
+      <div style="display:flex;flex-wrap:wrap;">${chips || '<span style="color:var(--text-muted);font-size:12px;">英単語が検出されませんでした</span>'}</div>
+    `;
+  } catch (err) {
+    showToast("通信エラーが発生しました", "error");
+  }
+}
+
+// --- 全サーバー共通 日本語・ゲーム用語辞書 ---
+
+let _commonSearchTimer = null;
+
+function initCommonDictListeners() {
+  const previewForm = document.getElementById("common-preview-form");
+  if (previewForm && !previewForm.dataset.bound) {
+    previewForm.dataset.bound = "1";
+    previewForm.addEventListener("submit", previewCommonDict);
+  }
+
+  const addForm = document.getElementById("common-dict-add-form");
+  if (addForm && !addForm.dataset.bound) {
+    addForm.dataset.bound = "1";
+    addForm.addEventListener("submit", addCommonDictWord);
+  }
+
+  const batchToggleBtn = document.getElementById("common-dict-batch-toggle-btn");
+  if (batchToggleBtn && !batchToggleBtn.dataset.bound) {
+    batchToggleBtn.dataset.bound = "1";
+    batchToggleBtn.addEventListener("click", toggleCommonBatchBox);
+  }
+
+  const batchCloseBtn = document.getElementById("common-dict-batch-close-btn");
+  if (batchCloseBtn && !batchCloseBtn.dataset.bound) {
+    batchCloseBtn.dataset.bound = "1";
+    batchCloseBtn.addEventListener("click", toggleCommonBatchBox);
+  }
+
+  const batchImportBtn = document.getElementById("common-dict-batch-import-btn");
+  if (batchImportBtn && !batchImportBtn.dataset.bound) {
+    batchImportBtn.dataset.bound = "1";
+    batchImportBtn.addEventListener("click", importCommonDictBatch);
+  }
+
+  const searchInp = document.getElementById("common-dict-search");
+  if (searchInp && !searchInp.dataset.bound) {
+    searchInp.dataset.bound = "1";
+    searchInp.addEventListener("input", debouncedSearchCommonDict);
+  }
+}
+
+function toggleCommonBatchBox() {
+  const box = document.getElementById("common-dict-batch-box");
+  if (!box) return;
+  box.style.display = box.style.display === "none" ? "block" : "none";
+}
+
+function _commonSourceLabel(src) {
+  if (src === "custom") return "カスタム(共通)";
+  if (src === "system") return "初期プリセット";
+  return String(src || "");
+}
+
+function prefillCommonDictForm(word, reading) {
+  const wInp = document.getElementById("common-dict-word");
+  const rInp = document.getElementById("common-dict-reading");
+  if (wInp) wInp.value = String(word || "");
+  if (rInp) {
+    rInp.value = String(reading || "");
+    rInp.focus();
+  }
+}
+
+function _createTextBadge(label, text) {
+  const span = document.createElement("span");
+  span.style.padding = "2px 8px";
+  span.style.borderRadius = "6px";
+  span.style.background = "rgba(255,255,255,0.06)";
+  span.style.border = "1px solid rgba(255,255,255,0.1)";
+  span.textContent = `${label}: ${text}`;
+  return span;
+}
+
+function _createEmptyTableRow(colSpan, text) {
+  const tr = document.createElement("tr");
+  const td = document.createElement("td");
+  td.colSpan = colSpan;
+  td.style.textAlign = "center";
+  td.style.color = "var(--text-muted)";
+  td.textContent = text;
+  tr.appendChild(td);
+  return tr;
+}
+
+async function loadCommonDict(searchQuery = "") {
+  const customBody = document.getElementById("common-custom-table-body");
+  const statsBox = document.getElementById("common-dict-stats");
+  const countBadge = document.getElementById("common-custom-count");
+  const searchBox = document.getElementById("common-search-results-box");
+  const searchBody = document.getElementById("common-search-table-body");
+  if (!customBody) return;
+
+  try {
+    const url = searchQuery
+      ? `/api/common_dict?q=${encodeURIComponent(searchQuery)}&limit=100`
+      : "/api/common_dict";
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const data = await res.json();
+
+    if (statsBox && data.stats) {
+      const s = data.stats;
+      statsBox.replaceChildren(
+        _createTextBadge("初期プリセット", `${Number(s.system_count || 0).toLocaleString()}語`),
+        _createTextBadge("カスタム", `${Number(s.custom_count || 0)}件`),
+        _createTextBadge("合計有効", `${Number(s.merged_count || 0).toLocaleString()}語`)
+      );
+    }
+
+    const entries = data.custom_entries || [];
+    if (countBadge) countBadge.textContent = `${entries.length}件`;
+
+    if (entries.length === 0) {
+      customBody.replaceChildren(_createEmptyTableRow(3, "カスタム登録は0件です"));
+    } else {
+      const rows = entries.map((item) => {
+        const tr = document.createElement("tr");
+
+        const tdWord = document.createElement("td");
+        tdWord.style.fontWeight = "600";
+        tdWord.textContent = item.word;
+
+        const tdReading = document.createElement("td");
+        tdReading.textContent = item.reading;
+
+        const tdAction = document.createElement("td");
+        tdAction.style.textAlign = "right";
+        tdAction.style.whiteSpace = "nowrap";
+
+        const editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.className = "btn btn-secondary btn-sm";
+        editBtn.style.marginRight = "6px";
+        editBtn.textContent = "編集";
+        editBtn.addEventListener("click", () => prefillCommonDictForm(item.word, item.reading));
+
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "btn btn-danger btn-sm";
+        delBtn.textContent = "削除";
+        delBtn.addEventListener("click", () => {
+          if (delBtn.dataset.confirming !== "1") {
+            delBtn.dataset.confirming = "1";
+            delBtn.textContent = "確定?";
+            setTimeout(() => {
+              if (delBtn.isConnected && delBtn.dataset.confirming === "1") {
+                delBtn.dataset.confirming = "";
+                delBtn.textContent = "削除";
+              }
+            }, 3000);
+            return;
+          }
+          deleteCommonDictWord(item.word);
+        });
+
+        tdAction.appendChild(editBtn);
+        tdAction.appendChild(delBtn);
+        tr.appendChild(tdWord);
+        tr.appendChild(tdReading);
+        tr.appendChild(tdAction);
+        return tr;
+      });
+      customBody.replaceChildren(...rows);
+    }
+
+    if (searchBox && searchBody) {
+      if (searchQuery) {
+        searchBox.style.display = "block";
+        const sres = data.search_results || [];
+        if (sres.length === 0) {
+          searchBody.replaceChildren(_createEmptyTableRow(4, "一致する項目はありません"));
+        } else {
+          const srows = sres.map((item) => {
+            const tr = document.createElement("tr");
+
+            const tdWord = document.createElement("td");
+            tdWord.style.fontWeight = "600";
+            tdWord.textContent = item.word;
+
+            const tdReading = document.createElement("td");
+            tdReading.textContent = item.reading;
+
+            const tdSrc = document.createElement("td");
+            const srcBadge = document.createElement("span");
+            srcBadge.style.fontSize = "11px";
+            srcBadge.style.color = "var(--text-muted)";
+            srcBadge.textContent = _commonSourceLabel(item.source);
+            tdSrc.appendChild(srcBadge);
+
+            const tdAct = document.createElement("td");
+            tdAct.style.textAlign = "right";
+            const copyBtn = document.createElement("button");
+            copyBtn.type = "button";
+            copyBtn.className = "btn btn-secondary btn-sm";
+            copyBtn.textContent = "転記";
+            copyBtn.addEventListener("click", () => prefillCommonDictForm(item.word, item.reading));
+            tdAct.appendChild(copyBtn);
+
+            tr.appendChild(tdWord);
+            tr.appendChild(tdReading);
+            tr.appendChild(tdSrc);
+            tr.appendChild(tdAct);
+            return tr;
+          });
+          searchBody.replaceChildren(...srows);
+        }
+      } else {
+        searchBox.style.display = "none";
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load common dict:", err);
+  }
+}
+
+function debouncedSearchCommonDict() {
+  if (_commonSearchTimer) clearTimeout(_commonSearchTimer);
+  _commonSearchTimer = setTimeout(() => {
+    const inp = document.getElementById("common-dict-search");
+    const q = inp ? inp.value.trim() : "";
+    loadCommonDict(q.length >= 1 ? q : "");
+  }, 250);
+}
+
+async function addCommonDictWord(e) {
+  e.preventDefault();
+  const wInp = document.getElementById("common-dict-word");
+  const rInp = document.getElementById("common-dict-reading");
+  const word = wInp ? wInp.value.trim() : "";
+  const reading = rInp ? rInp.value.trim() : "";
+  if (!word || !reading) return;
+
+  try {
+    const res = await fetch("/api/common_dict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word, reading })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`「${data.word} → ${data.reading}」を共通辞書に登録しました`, "success");
+      if (wInp) wInp.value = "";
+      if (rInp) rInp.value = "";
+      const qInp = document.getElementById("common-dict-search");
+      await loadCommonDict(qInp && qInp.value.trim().length >= 1 ? qInp.value.trim() : "");
+    } else {
+      showToast(data.error || "登録に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("登録中に通信エラーが発生しました", "error");
+  }
+}
+
+async function importCommonDictBatch() {
+  const ta = document.getElementById("common-dict-batch-text");
+  const raw = ta ? ta.value.trim() : "";
+  if (!raw) return;
+
+  const items = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    const m = s.match(/^([^\t,：:]+?)\s*[:：\t,]+\s*(.+)$/);
+    if (m && m[1].trim() && m[2].trim()) {
+      items.push({ word: m[1].trim(), reading: m[2].trim() });
+    }
+  }
+  if (items.length === 0) {
+    showToast("有効な「単語:読み方」行が見つかりません", "error");
+    return;
+  }
+  try {
+    const res = await fetch("/api/common_dict/import_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`${data.imported_count}件の用語を共通辞書へ一括登録しました`, "success");
+      if (ta) ta.value = "";
+      toggleCommonBatchBox();
+      await loadCommonDict();
+    } else {
+      showToast(data.error || "一括登録に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("通信エラーが発生しました", "error");
+  }
+}
+
+async function deleteCommonDictWord(word) {
+  if (!word) return;
+  try {
+    const res = await fetch(`/api/common_dict?word=${encodeURIComponent(word)}`, { method: "DELETE" });
+    const data = await res.json();
+    if (res.ok) {
+      showToast(`「${word}」を削除しました`, "success");
+      const qInp = document.getElementById("common-dict-search");
+      await loadCommonDict(qInp && qInp.value.trim().length >= 1 ? qInp.value.trim() : "");
+    } else {
+      showToast(data.error || "削除に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("削除中にエラーが発生しました", "error");
+  }
+}
+
+async function previewCommonDict(e) {
+  e.preventDefault();
+  const inp = document.getElementById("common-preview-input");
+  const resBox = document.getElementById("common-preview-result");
+  const text = inp ? inp.value.trim() : "";
+  if (!text || !resBox) return;
+
+  try {
+    const res = await fetch("/api/common_dict/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.error || "プレビューに失敗しました", "error");
+      return;
+    }
+
+    const row1 = document.createElement("div");
+    row1.style.marginBottom = "4px";
+    const lbl1 = document.createElement("span");
+    lbl1.style.color = "var(--text-muted)";
+    lbl1.textContent = "1. 共通辞書適用: ";
+    const val1 = document.createElement("b");
+    val1.textContent = data.after_common_dict || "";
+    row1.appendChild(lbl1);
+    row1.appendChild(val1);
+
+    const row2 = document.createElement("div");
+    row2.style.marginBottom = "4px";
+    const lbl2 = document.createElement("span");
+    lbl2.style.color = "var(--text-muted)";
+    lbl2.textContent = "2. +英語辞書 (クラウド向け): ";
+    const val2 = document.createElement("b");
+    val2.style.color = "#38bdf8";
+    val2.textContent = data.after_english_and_dict || "";
+    row2.appendChild(lbl2);
+    row2.appendChild(val2);
+
+    const row3 = document.createElement("div");
+    const lbl3 = document.createElement("span");
+    lbl3.style.color = "var(--text-muted)";
+    lbl3.textContent = "3. +ローカルTTSかな補完 (VOICEVOX等向け): ";
+    const val3 = document.createElement("b");
+    val3.style.color = "#23a55a";
+    val3.textContent = data.local_tts_kanji_converted || "";
+    row3.appendChild(lbl3);
+    row3.appendChild(val3);
+
+    resBox.style.display = "block";
+    resBox.replaceChildren(row1, row2, row3);
+  } catch (err) {
+    showToast("通信エラーが発生しました", "error");
+  }
+}
 
 function parseBatchDictText(rawText) {
   if (!rawText) return { validItems: [], skippedLines: [] };
@@ -2555,6 +3161,12 @@ async function loadBotConfig(guildId) {
       readUserCheckbox.checked = !!cfg.read_username;
     }
 
+    // ローカルTTS 漢字かな補完
+    const localKanjiCheckbox = document.getElementById("cfg-local-tts-kanji");
+    if (localKanjiCheckbox) {
+      localKanjiCheckbox.checked = cfg.local_tts_kanji_reading !== undefined ? !!cfg.local_tts_kanji_reading : true;
+    }
+
     // VC入退室通知読み上げ
     const announceVCCheckbox = document.getElementById("cfg-announce-vc");
     if (announceVCCheckbox) {
@@ -2755,6 +3367,7 @@ async function saveBotConfig(e) {
     auto_join_vc_id: pairs.length > 0 ? pairs[0].vc_id : "0",
     auto_join_text_channel_id: pairs.length > 0 ? pairs[0].text_id : "0",
     read_username: readUsername,
+    local_tts_kanji_reading: document.getElementById("cfg-local-tts-kanji")?.checked ?? true,
     announce_vc_events: announceVCEvents,
     tts_translate_enabled: ttsTranslateEnabled,
     tts_translate_lang: ttsTranslateLang,

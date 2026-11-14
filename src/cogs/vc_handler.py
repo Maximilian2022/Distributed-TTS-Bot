@@ -272,6 +272,7 @@ class QueueItem:
     queued_at: float = 0.0
     synth_task: Optional[asyncio.Task] = None
     speculative_timeout: Optional[float] = None
+    local_tts_kanji_reading: bool = True
     # 先行合成と再生側で共有する分割結果 (キャッシュキー一致のため。永続化対象外)
     chunks: Optional[List[Any]] = None
 
@@ -530,6 +531,7 @@ class VCHandlerCog(commands.Cog):
         self._nick_reconcile_task: Optional[asyncio.Task] = None
         self._auto_join_reconcile_task: Optional[asyncio.Task] = None
         self._pending_bot_leave_tasks: Dict[int, asyncio.Task] = {}
+        self._reaction_learn_cache: "collections.OrderedDict[int, float]" = collections.OrderedDict()
         _install_voice_diag_filter()
         # 遅延インシデント発生時のワーカーノード状態スナップショット取得元を登録 (1号機のみで十分)
         if bot_index == 1:
@@ -1273,7 +1275,8 @@ class VCHandlerCog(commands.Cog):
                         user_id=item.user_id,
                         is_longest_chunk=is_long,
                         speculative_timeout=speculative_timeout,
-                        local_only=local_only
+                        local_only=local_only,
+                        local_tts_kanji_reading=item.local_tts_kanji_reading,
                     )
                 except Exception as e:
                     logger.debug(f"Prefetch chunk failed for '{ch.text[:15]}...': {e}")
@@ -1299,7 +1302,8 @@ class VCHandlerCog(commands.Cog):
             pitch=item.pitch,
             speed=item.speed,
             text=item.text,
-            author_prefix=item.author_prefix
+            author_prefix=item.author_prefix,
+            local_tts_kanji_reading=item.local_tts_kanji_reading,
         )
         t_end = time.time()
         meta = getattr(self.tts_manager, "last_synthesis_meta", {}) or {}
@@ -1388,7 +1392,8 @@ class VCHandlerCog(commands.Cog):
                             pitch=item.pitch,
                             speed=item.speed,
                             text=item.text,
-                            author_prefix=item.author_prefix
+                            author_prefix=item.author_prefix,
+                            local_tts_kanji_reading=item.local_tts_kanji_reading,
                         )
                         t_synth_end = time.time()
                         meta = getattr(self.tts_manager, "last_synthesis_meta", {}) or {}
@@ -1545,7 +1550,16 @@ class VCHandlerCog(commands.Cog):
                 # 先頭本文パーツ長の動的決定 (14文字以下の短文は短縮不要・ストレートパス。先行合成済みの発話は分割を変えない: キャッシュキー一致のため)
                 if head_mode != "off" and item.chunks is None and len(all_chunks[head_idx].text) > 14:
                     head_text = all_chunks[head_idx].text
-                    head_key = CacheManager.generate_cache_key(item.speaker_id, item.pitch, item.speed, head_text, user_id=item.user_id)
+                    eff_head_text = (
+                        self.tts_manager.resolve_cache_text(
+                            head_text,
+                            engine_name,
+                            local_tts_kanji_reading=item.local_tts_kanji_reading,
+                        )
+                        if hasattr(self.tts_manager, "resolve_cache_text")
+                        else head_text
+                    )
+                    head_key = CacheManager.generate_cache_key(item.speaker_id, item.pitch, item.speed, eff_head_text, user_id=item.user_id)
                     planned = None
                     if await self.tts_manager.cache_manager.get(head_key, provider=engine_name) is None:
                         body_lens = [len(c.text) for c in all_chunks[head_idx:] if not c.is_beep and not c.is_name_prefix and c.text.strip()]
@@ -1682,7 +1696,8 @@ class VCHandlerCog(commands.Cog):
                 speculative_timeout=chunk_spec_timeout,
                 speculative_deadline_fn=deadline_fn,
                 prefer_earliest_finish=is_head,
-                avoid_nodes=chunk_avoid
+                avoid_nodes=chunk_avoid,
+                local_tts_kanji_reading=item.local_tts_kanji_reading,
             )
             t_e = time.time()
             c_meta = (
@@ -2367,6 +2382,7 @@ class VCHandlerCog(commands.Cog):
             safe_create_task(self.db.touch_ng_words(message.guild.id, detected_ng_words), name="touch_ng_words")
 
         spec_timeout = float(guild_settings.get("speculative_timeout_seconds", 2.5) or 2.5)
+        local_tts_kanji_reading = bool(guild_settings.get("local_tts_kanji_reading", 1))
         item = QueueItem(
             text=body_text,
             user_id=message.author.id,
@@ -2380,6 +2396,7 @@ class VCHandlerCog(commands.Cog):
             received_at=t_received,
             queued_at=time.time(),
             speculative_timeout=spec_timeout,
+            local_tts_kanji_reading=local_tts_kanji_reading,
         )
 
         if record_dedup:
@@ -3373,28 +3390,77 @@ class VCHandlerCog(commands.Cog):
             logger.debug(f"[GeminiTutor] on_raw_reaction_add error: {e}")
 
     async def _learn_from_reaction(self, guild_id: int, message: discord.Message) -> None:
-        """リアクション指摘メッセージから難読語・固有名詞を特定し、AI提案テーブルへ格納"""
+        """リアクション指摘メッセージから難読語・固有名詞を特定し、AI提案登録＋Discord承認UIを返信"""
+        now = time.monotonic()
+        last_ts = self._reaction_learn_cache.get(message.id)
+        if last_ts is not None and (now - last_ts) < 300.0:
+            return
+        self._reaction_learn_cache[message.id] = now
+        self._reaction_learn_cache.move_to_end(message.id)
+        while len(self._reaction_learn_cache) > 500:
+            self._reaction_learn_cache.popitem(last=False)
+
         try:
             results = await self.gemini_tutor.analyze_misread_text(message.content)
+            if not results:
+                return
+
+            entries: List[Dict[str, Any]] = []
+            seen_words: Set[str] = set()
             learned_count = 0
+
             for item in results:
+                word = str(item.get("word", "") or "").strip()
+                reading = str(item.get("reading", "") or "").strip()
+                reason = str(item.get("reason", "") or "リアクション指摘からの推論").strip()
+                if not word or not reading or word in seen_words:
+                    continue
+                seen_words.add(word)
+
                 added = await self.db.add_ai_suggestion(
                     guild_id=guild_id,
-                    word=item["word"],
-                    suggested_reading=item["reading"],
-                    reason=item.get("reason", "リアクション指摘からの推論"),
+                    word=word,
+                    suggested_reading=reading,
+                    reason=reason,
                     source="reaction"
                 )
                 if added:
                     learned_count += 1
 
+                row = await self.db.get_ai_suggestion_by_guild_word(guild_id, word)
+                if row and row.get("status") == "pending":
+                    entries.append({
+                        "id": row.get("id"),
+                        "word": str(row.get("word", word)),
+                        "reading": str(row.get("suggested_reading", reading)),
+                        "reason": str(row.get("reason") or reason),
+                        "status": "pending",
+                    })
+
             if learned_count > 0:
                 logger.info(f"💡 [GeminiTutor] Extracted {learned_count} misread suggestions from reaction on msg {message.id}")
-                # 学習完了のフィードバックとして 💡 を付与
-                try:
-                    await message.add_reaction("💡")
-                except Exception:
-                    pass
+
+            if not entries:
+                return
+
+            # 学習完了のフィードバックとして 💡 を付与
+            try:
+                await message.add_reaction("💡")
+            except Exception:
+                pass
+
+            # Discord 上で即登録・修正登録・却下できるインタラクティブUIをリプライ送信
+            try:
+                view = MisreadSuggestionApprovalView(self, guild_id=guild_id, entries=entries)
+                reply_msg = await message.reply(
+                    embed=view.build_embed(),
+                    view=view,
+                    mention_author=False,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                view.message = reply_msg
+            except Exception as ui_err:
+                logger.debug(f"[GeminiTutor] Failed to send misread approval UI: {ui_err}")
         except Exception as e:
             logger.debug(f"[GeminiTutor] _learn_from_reaction error: {e}")
 
@@ -3414,4 +3480,304 @@ class VCHandlerCog(commands.Cog):
                 loop.create_task(self.hayamimi_translator.close())
         except RuntimeError:
             pass
+
+
+class MisreadSuggestionEditModal(discord.ui.Modal, title="読み方を編集して辞書登録"):
+    """❌ リアクション誤読提案のカタカナ読みを修正して登録するためのモーダル"""
+
+    def __init__(
+        self,
+        cog: "VCHandlerCog",
+        guild_id: int,
+        entry: Dict[str, Any],
+        approval_view: "MisreadSuggestionApprovalView",
+    ):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.entry = entry
+        self.approval_view = approval_view
+
+        word_label = str(entry.get("word", ""))[:24]
+        default_reading = str(entry.get("reading", ""))[:128]
+        self.reading_input = discord.ui.TextInput(
+            label=f"「{word_label}」の読み方",
+            placeholder="カタカナまたはひらがなで入力（例: クリア）",
+            default=default_reading,
+            min_length=1,
+            max_length=128,
+            required=True,
+        )
+        self.add_item(self.reading_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        new_reading = re.sub(r"[\x00-\x1f\x7f]", "", str(self.reading_input.value or "")).strip()
+        if not new_reading or len(new_reading) > 128:
+            await interaction.followup.send("読み方は1〜128文字で入力してください。", ephemeral=True)
+            return
+
+        word = str(self.entry.get("word", "") or "").strip()
+        if not word:
+            await interaction.followup.send("対象の単語が取得できませんでした。", ephemeral=True)
+            return
+
+        suggestion_id = self.entry.get("id")
+        try:
+            if suggestion_id is not None:
+                approved = await self.cog.db.approve_ai_suggestion(int(suggestion_id), reading=new_reading)
+                if not approved:
+                    await self.cog.db.add_dict_word(self.guild_id, word, new_reading)
+            else:
+                await self.cog.db.add_dict_word(self.guild_id, word, new_reading)
+
+            purged = await self.cog.cache_manager.purge_by_word(word) if self.cog.cache_manager else 0
+            self.entry["reading"] = new_reading
+            self.entry["status"] = "approved"
+            await self.approval_view.refresh_message(
+                note=f"✏️ `{word}` → `{new_reading}` を登録し、音声キャッシュ {purged}件を削除しました。"
+            )
+            await interaction.followup.send(
+                f"✅ `{word}` → `{new_reading}` をサーバー辞書に登録しました（キャッシュ削除: {purged}件）。",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"MisreadSuggestionEditModal submit error: {e}")
+            await interaction.followup.send("辞書登録中にエラーが発生しました。", ephemeral=True)
+
+
+class MisreadSuggestionApprovalView(discord.ui.View):
+    """❌ リアクション誤読提案をDiscord上でワンクリック承認・修正登録・却下するView"""
+
+    def __init__(self, cog: "VCHandlerCog", guild_id: int, entries: List[Dict[str, Any]]):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.entries = entries
+        self.message: Optional[discord.Message] = None
+        self.last_note: str = ""
+        self._rebuild_components()
+
+    def _pending_entries(self) -> List[Tuple[int, Dict[str, Any]]]:
+        return [(idx, e) for idx, e in enumerate(self.entries) if e.get("status") == "pending"]
+
+    def _rebuild_components(self) -> None:
+        self.clear_items()
+        pending = self._pending_entries()
+        if not pending:
+            return
+
+        if len(pending) == 1:
+            idx, _entry = pending[0]
+            btn_approve = discord.ui.Button(
+                label="✅ 辞書登録",
+                style=discord.ButtonStyle.success,
+                custom_id=f"misread_approve_{idx}",
+            )
+            btn_approve.callback = self._on_approve_all
+            self.add_item(btn_approve)
+
+            btn_edit = discord.ui.Button(
+                label="✏️ 修正して登録",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"misread_edit_{idx}",
+            )
+            btn_edit.callback = self._make_single_edit_callback(idx)
+            self.add_item(btn_edit)
+
+            btn_reject = discord.ui.Button(
+                label="🗑️ 却下して閉じる",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"misread_reject_{idx}",
+            )
+            btn_reject.callback = self._on_reject_all
+            self.add_item(btn_reject)
+        else:
+            options = []
+            for idx, entry in pending[:25]:
+                word = str(entry.get("word", ""))[:40]
+                reading = str(entry.get("reading", ""))[:40]
+                options.append(
+                    discord.SelectOption(
+                        label=f"{word} → {reading}"[:100],
+                        description=str(entry.get("reason", ""))[:100] or "読み方を修正して登録",
+                        value=str(idx),
+                    )
+                )
+            select = discord.ui.Select(
+                placeholder="✏️ 読みを修正して登録する単語を選択...",
+                options=options,
+                min_values=1,
+                max_values=1,
+                custom_id="misread_select_edit",
+            )
+            select.callback = self._on_select_edit
+            self.add_item(select)
+
+            btn_approve_all = discord.ui.Button(
+                label="✅ すべて登録",
+                style=discord.ButtonStyle.success,
+                custom_id="misread_approve_all",
+            )
+            btn_approve_all.callback = self._on_approve_all
+            self.add_item(btn_approve_all)
+
+            btn_reject_all = discord.ui.Button(
+                label="🗑️ すべて却下・閉じる",
+                style=discord.ButtonStyle.secondary,
+                custom_id="misread_reject_all",
+            )
+            btn_reject_all.callback = self._on_reject_all
+            self.add_item(btn_reject_all)
+
+    def build_embed(self) -> discord.Embed:
+        pending = self._pending_entries()
+        if pending:
+            title = "💡 誤読候補の辞書登録提案"
+            color = discord.Color.gold()
+        elif any(e.get("status") == "approved" for e in self.entries):
+            title = "✅ 辞書登録を完了しました"
+            color = discord.Color.green()
+        else:
+            title = "🗑️ 誤読提案を却下しました"
+            color = discord.Color.dark_grey()
+
+        lines: List[str] = []
+        for entry in self.entries:
+            status = entry.get("status", "pending")
+            mark = "✅" if status == "approved" else ("🗑️" if status == "rejected" else "🟡")
+            word = entry.get("word", "")
+            reading = entry.get("reading", "")
+            reason = entry.get("reason", "")
+            reason_suffix = f" ({reason})" if reason else ""
+            lines.append(f"{mark} `{word}` → `{reading}`{reason_suffix}")
+
+        desc = "\n".join(lines)
+        if self.last_note:
+            desc = f"{desc}\n\n{self.last_note}"
+
+        embed = discord.Embed(title=title, description=desc[:4000], color=color)
+        if pending:
+            embed.set_footer(text="ボタンから即座にサーバー辞書へ登録＆音声キャッシュを削除できます（10分間有効）")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or interaction.guild_id != self.guild_id:
+            await interaction.response.send_message("このサーバー内でのみ操作できます。", ephemeral=True)
+            return False
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("サーバーメンバーのみ操作できます。", ephemeral=True)
+            return False
+        return True
+
+    async def refresh_message(self, note: str = "") -> None:
+        if note:
+            self.last_note = note
+        self._rebuild_components()
+        if not self._pending_entries():
+            self.stop()
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            except Exception as e:
+                logger.debug(f"Failed to update misread approval message: {e}")
+
+    def _make_single_edit_callback(self, idx: int):
+        async def _callback(interaction: discord.Interaction) -> None:
+            if idx < 0 or idx >= len(self.entries) or self.entries[idx].get("status") != "pending":
+                await interaction.response.send_message("この候補はすでに処理済みです。", ephemeral=True)
+                return
+            modal = MisreadSuggestionEditModal(
+                cog=self.cog,
+                guild_id=self.guild_id,
+                entry=self.entries[idx],
+                approval_view=self,
+            )
+            await interaction.response.send_modal(modal)
+
+        return _callback
+
+    async def _on_select_edit(self, interaction: discord.Interaction) -> None:
+        values = (interaction.data or {}).get("values") or []
+        if not values:
+            await interaction.response.send_message("候補が選択されませんでした。", ephemeral=True)
+            return
+        try:
+            idx = int(values[0])
+        except (TypeError, ValueError):
+            await interaction.response.send_message("無効な選択です。", ephemeral=True)
+            return
+        if idx < 0 or idx >= len(self.entries) or self.entries[idx].get("status") != "pending":
+            await interaction.response.send_message("この候補はすでに処理済みです。", ephemeral=True)
+            return
+        modal = MisreadSuggestionEditModal(
+            cog=self.cog,
+            guild_id=self.guild_id,
+            entry=self.entries[idx],
+            approval_view=self,
+        )
+        await interaction.response.send_modal(modal)
+
+    async def _on_approve_all(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        pending = self._pending_entries()
+        if not pending:
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+            return
+
+        total_purged = 0
+        registered_words: List[str] = []
+        for _idx, entry in pending:
+            word = str(entry.get("word", "") or "").strip()
+            reading = str(entry.get("reading", "") or "").strip()
+            if not word or not reading:
+                continue
+            suggestion_id = entry.get("id")
+            if suggestion_id is not None:
+                approved = await self.cog.db.approve_ai_suggestion(int(suggestion_id))
+                if not approved:
+                    await self.cog.db.add_dict_word(self.guild_id, word, reading)
+            else:
+                await self.cog.db.add_dict_word(self.guild_id, word, reading)
+
+            if self.cog.cache_manager:
+                total_purged += await self.cog.cache_manager.purge_by_word(word)
+            entry["status"] = "approved"
+            registered_words.append(word)
+
+        self.last_note = (
+            f"✅ {len(registered_words)}件を辞書登録し、音声キャッシュ {total_purged}件を削除しました"
+            f" (操作: {interaction.user.display_name})。"
+        )
+        self._rebuild_components()
+        self.stop()
+        await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
+    async def _on_reject_all(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        pending = self._pending_entries()
+        if not pending:
+            await interaction.edit_original_response(embed=self.build_embed(), view=self)
+            return
+
+        for _idx, entry in pending:
+            suggestion_id = entry.get("id")
+            if suggestion_id is not None:
+                await self.cog.db.reject_ai_suggestion(int(suggestion_id))
+            entry["status"] = "rejected"
+
+        self.last_note = f"🗑️ 却下しました (操作: {interaction.user.display_name})。"
+        self._rebuild_components()
+        self.stop()
+        await interaction.edit_original_response(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
 
