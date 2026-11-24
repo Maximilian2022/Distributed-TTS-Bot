@@ -447,6 +447,17 @@ class LocalEngineResourceManager:
             logger.error(f"Failed to restart container '{container_name}': {e}")
             return False
 
+    @staticmethod
+    def _resolve_guild_vc_channel(guild: Any, vc: Any) -> Any:
+        """Gateway再接続後の古い vc.channel 参照を避け、常に最新の Guild キャッシュからチャンネルを取得"""
+        ch = getattr(vc, "channel", None)
+        ch_id = getattr(ch, "id", None)
+        if ch_id is not None and hasattr(guild, "get_channel"):
+            live_ch = guild.get_channel(ch_id)
+            if live_ch is not None and hasattr(live_ch, "members"):
+                return live_ch
+        return ch
+
     def is_any_human_in_vc(self) -> bool:
         """プール内の全Botが接続しているいずれかのVCに人間メンバー（not bot）が存在するか"""
         bots = self._get_all_bots()
@@ -456,7 +467,8 @@ class LocalEngineResourceManager:
             for guild in b.guilds:
                 vc = guild.voice_client
                 if vc and vc.is_connected() and vc.channel:
-                    for m in vc.channel.members:
+                    live_ch = self._resolve_guild_vc_channel(guild, vc)
+                    for m in getattr(live_ch, "members", []):
                         if not m.bot:
                             return True
         return False
@@ -923,7 +935,8 @@ class LocalEngineResourceManager:
             for guild in b.guilds:
                 vc = guild.voice_client
                 if vc and vc.is_connected() and vc.channel:
-                    for m in vc.channel.members:
+                    live_ch = self._resolve_guild_vc_channel(guild, vc)
+                    for m in getattr(live_ch, "members", []):
                         if not m.bot:
                             active_members.append((guild.id, m.id))
 
@@ -1215,7 +1228,8 @@ class LocalEngineResourceManager:
             for guild in b.guilds:
                 vc = guild.voice_client
                 if vc and vc.is_connected() and vc.channel:
-                    members = [m.id for m in vc.channel.members if not m.bot]
+                    live_ch = self._resolve_guild_vc_channel(guild, vc)
+                    members = [m.id for m in getattr(live_ch, "members", []) if not m.bot]
                     if members:
                         active_vc_members[guild.id] = members
 

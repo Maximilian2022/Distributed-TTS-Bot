@@ -725,6 +725,45 @@ class VCHandlerCog(commands.Cog):
             return 0
         return sum(1 for m in getattr(channel, "members", []) if not m.bot)
 
+    def _resolve_live_channel(
+        self,
+        guild: Optional[discord.Guild],
+        channel: Optional[discord.abc.GuildChannel],
+        vc: Optional[discord.VoiceClient] = None,
+    ) -> Optional[discord.abc.GuildChannel]:
+        """
+        Gateway セッション無効化・再確立後に古い Guild / VoiceChannel インスタンスが
+        VoiceClient.channel 等に残存してメンバー一覧が凍結されるのを防ぐため、
+        常に現在の Bot キャッシュから最新のチャンネルインスタンスを引き直して自己修復する。
+        """
+        if channel is None:
+            return None
+        ch_id = getattr(channel, "id", None)
+        live_guild = guild
+        if getattr(self, "bot", None) is not None and guild is not None and hasattr(self.bot, "get_guild"):
+            fetched_guild = self.bot.get_guild(guild.id)
+            if fetched_guild is not None:
+                live_guild = fetched_guild
+
+        live_ch = None
+        if live_guild is not None and ch_id is not None and hasattr(live_guild, "get_channel"):
+            cand = live_guild.get_channel(ch_id)
+            if cand is not None and hasattr(cand, "members"):
+                live_ch = cand
+
+        resolved = live_ch if live_ch is not None else channel
+        if (
+            vc is not None
+            and resolved is not None
+            and getattr(vc, "channel", None) is not resolved
+            and getattr(getattr(vc, "channel", None), "id", None) == getattr(resolved, "id", None)
+        ):
+            try:
+                vc.channel = resolved
+            except Exception:
+                pass
+        return resolved
+
     def _select_primary_bot_in_vc(
         self, all_bots: List[Tuple[int, commands.Bot]], guild_id: int
     ) -> Tuple[int, commands.Bot]:
@@ -819,18 +858,52 @@ class VCHandlerCog(commands.Cog):
                 now = time.time()
                 for guild in list(self.bot.guilds):
                     vc = guild.voice_client
-                    if vc is None or vc.channel is None:
+                    me = getattr(guild, "me", None) or (
+                        guild.get_member(self.bot.user.id)
+                        if getattr(self, "bot", None) and getattr(self.bot, "user", None) and hasattr(guild, "get_member")
+                        else None
+                    )
+                    ghost_ch = (
+                        getattr(getattr(me, "voice", None), "channel", None)
+                        if (vc is None or getattr(vc, "channel", None) is None)
+                        else None
+                    )
+                    if (vc is None or vc.channel is None) and ghost_ch is None:
                         continue
+
                     state = self.get_guild_state(guild.id)
+
+                    if vc is None or vc.channel is None:
+                        # VoiceClient が消失しているのに Discord 側では VC 滞在中のゴースト状態
+                        live_ghost_ch = self._resolve_live_channel(guild, ghost_ch)
+                        ghost_ch_id = getattr(live_ghost_ch, "id", None)
+                        if self.bot_pool and ghost_ch_id is not None and self.bot_pool.is_vc_connecting(guild.id, ghost_ch_id):
+                            continue
+                        if self._count_humans(live_ghost_ch) > 0:
+                            state.empty_since = 0.0
+                            continue
+                        if state.empty_since == 0.0:
+                            state.empty_since = now
+                            continue
+                        if now - state.empty_since >= self.AUTO_LEAVE_GRACE_SECONDS:
+                            logger.warning(
+                                f"🧹 [Bot #{self.bot_index}] Auto-leave watchdog: ghost VC '{getattr(live_ghost_ch, 'name', ghost_ch_id)}' "
+                                f"in '{guild.name}' has had no human members for {now - state.empty_since:.0f}s. Disconnecting..."
+                            )
+                            state.empty_since = 0.0
+                            await self.disconnect_vc(guild)
+                        continue
+
+                    live_vc_ch = self._resolve_live_channel(guild, vc.channel, vc=vc)
 
                     # 重複Bot自動調停 (Deduplication Reconcile)
                     if self.bot_pool:
-                        all_bots = self.bot_pool.find_all_bots_in_vc(guild.id, vc.channel.id)
+                        all_bots = self.bot_pool.find_all_bots_in_vc(guild.id, live_vc_ch.id)
                         if len(all_bots) > 1:
                             primary_idx, primary_bot = self._select_primary_bot_in_vc(all_bots, guild.id)
                             if self.bot_index != primary_idx:
                                 logger.warning(
-                                    f"🚨 [Deduplication Reconcile] Multiple bots detected in VC '{vc.channel.name}' "
+                                    f"🚨 [Deduplication Reconcile] Multiple bots detected in VC '{live_vc_ch.name}' "
                                     f"(Active: {[b[0] for b in all_bots]}). "
                                     f"Bot #{self.bot_index} yielding to primary Bot #{primary_idx}. Auto-disconnecting..."
                                 )
@@ -847,7 +920,7 @@ class VCHandlerCog(commands.Cog):
                                 await self.disconnect_vc(guild)
                                 continue
 
-                    if self._count_humans(vc.channel) > 0:
+                    if self._count_humans(live_vc_ch) > 0:
                         state.empty_since = 0.0
                         continue
                     if state.empty_since == 0.0:
@@ -855,7 +928,7 @@ class VCHandlerCog(commands.Cog):
                         continue
                     if now - state.empty_since >= self.AUTO_LEAVE_GRACE_SECONDS:
                         logger.warning(
-                            f"🧹 [Bot #{self.bot_index}] Auto-leave watchdog: VC '{vc.channel.name}' in '{guild.name}' "
+                            f"🧹 [Bot #{self.bot_index}] Auto-leave watchdog: VC '{live_vc_ch.name}' in '{guild.name}' "
                             f"has had no human members for {now - state.empty_since:.0f}s. Disconnecting..."
                         )
                         state.empty_since = 0.0
@@ -879,6 +952,7 @@ class VCHandlerCog(commands.Cog):
 
         vc_lock = self.bot_pool.get_vc_lock(guild_id, channel.id) if self.bot_pool else asyncio.Lock()
         async with vc_lock:
+            channel = self._resolve_live_channel(channel.guild, channel) or channel
             vc = channel.guild.voice_client
 
             # すでに接続中の場合
@@ -894,6 +968,13 @@ class VCHandlerCog(commands.Cog):
                             pass
                         vc = None
                 else:
+                    self._resolve_live_channel(channel.guild, channel, vc=vc)
+                    if self._count_humans(channel) == 0:
+                        logger.info(
+                            f"[Bot #{self.bot_index}] VC '{channel.name}' has no human members on reuse check. Disconnecting..."
+                        )
+                        await self.disconnect_vc(channel.guild)
+                        raise VCConnectAborted(f"connect to '{channel.name}' aborted (empty channel)")
                     return vc
 
             # 新規または再接続が必要な場合 (リトライループ付き)
@@ -929,6 +1010,8 @@ class VCHandlerCog(commands.Cog):
                     last_err = None
                     start_epoch = state.connect_epoch
                     for attempt in range(1, max_retries + 1):
+                        # Gateway 再確立を跨いだリトライでも常に最新の Guild / VoiceChannel を参照する
+                        channel = self._resolve_live_channel(channel.guild, channel) or channel
                         # 試行前ガード: VCが無人化した場合は後追い接続しない (人間がいる場合は接続継続)
                         if self._count_humans(channel) == 0:
                             logger.info(
@@ -996,6 +1079,8 @@ class VCHandlerCog(commands.Cog):
                     if self.bot_pool:
                         self.bot_pool.release_vc_reservation(guild_id, channel.id, self.bot_index)
 
+                # ハンドシェイク中にも Gateway 再接続が起き得るため最新チャンネルへ更新・修復して判定
+                channel = self._resolve_live_channel(channel.guild, channel, vc=vc) or channel
                 # 接続完了後ガード: VCが無人化した場合は退出（人間がいる場合は絶対に切断しない）
                 if self._count_humans(channel) == 0:
                     logger.info(
@@ -1139,6 +1224,19 @@ class VCHandlerCog(commands.Cog):
             except Exception as e:
                 logger.warning(f"[Bot #{self.bot_index}] Exception while disconnecting VC in '{guild.name}': {e}")
             logger.info(f"[Bot #{self.bot_index}] Disconnected from VC in '{guild.name}'")
+        else:
+            # VoiceClient が未保持のまま Discord Gateway 上のボイスステートだけ残っているゴースト状態の切断
+            me = getattr(guild, "me", None) or (
+                guild.get_member(self.bot.user.id)
+                if getattr(self, "bot", None) and getattr(self.bot, "user", None) and hasattr(guild, "get_member")
+                else None
+            )
+            if getattr(getattr(me, "voice", None), "channel", None) is not None and hasattr(guild, "change_voice_state"):
+                try:
+                    await guild.change_voice_state(channel=None)
+                    logger.info(f"[Bot #{self.bot_index}] Cleared ghost voice state in '{guild.name}'")
+                except Exception as e:
+                    logger.warning(f"[Bot #{self.bot_index}] Exception while clearing ghost VC in '{guild.name}': {e}")
         # ニックネームを TTS #X にリセット (確実な即時反映)
         try:
             await self.sync_nickname(guild)
@@ -2202,6 +2300,13 @@ class VCHandlerCog(commands.Cog):
 
         # 2. ギルド設定および辞書データの取得
         guild_settings = await self.db.get_guild_settings(message.guild.id, self.config)
+        if guild_settings.get("require_vc_membership", 0) and not self._is_author_in_vc(message, vc):
+            logger.debug(
+                f"Ignored message from non-VC member {message.author.display_name} "
+                f"(guild={message.guild.id}, vc={getattr(vc.channel, 'id', None)})"
+            )
+            return
+
         ignore_prefixes = guild_settings.get("ignore_prefixes")
         if ignore_prefixes is None:
             ignore_prefixes = getattr(self.config, "ignore_prefixes", [";", "；"])
@@ -2302,6 +2407,26 @@ class VCHandlerCog(commands.Cog):
                 self._translate_and_reply_message(message, translate_lang),
                 name=f"tts_translate_{message.id}"
             )
+
+    @staticmethod
+    def _is_author_in_vc(message: discord.Message, vc: discord.VoiceClient) -> bool:
+        """メッセージ送信者が現在Bot接続中のVCに参加しているか判定する。"""
+        vc_channel = getattr(vc, "channel", None)
+        vc_channel_id = getattr(vc_channel, "id", None)
+        if vc_channel_id is None:
+            return False
+
+        author = getattr(message, "author", None)
+        if author is None:
+            return False
+
+        voice_state = getattr(author, "voice", None)
+        if voice_state is None and getattr(message, "guild", None) is not None and not isinstance(author, discord.Member):
+            member = message.guild.get_member(getattr(author, "id", None))
+            voice_state = getattr(member, "voice", None) if member is not None else None
+
+        author_channel = getattr(voice_state, "channel", None) if voice_state is not None else None
+        return author_channel is not None and getattr(author_channel, "id", None) == vc_channel_id
 
     @staticmethod
     def _resolve_channel_translation_config(
@@ -3148,17 +3273,18 @@ class VCHandlerCog(commands.Cog):
         vc: Optional[discord.VoiceClient] = guild.voice_client
 
         if vc and vc.channel:
+            live_vc_ch = self._resolve_live_channel(guild, vc.channel, vc=vc) or vc.channel
             # Bot以外の非Botメンバー数をカウント
-            human_members = [m for m in vc.channel.members if not m.bot]
+            human_members = [m for m in live_vc_ch.members if not m.bot]
             if len(human_members) == 0:
-                logger.info(f"No human members left in VC '{vc.channel.name}' of '{guild.name}'. Auto-disconnecting...")
+                logger.info(f"No human members left in VC '{live_vc_ch.name}' of '{guild.name}'. Auto-disconnecting...")
                 if self.bot_pool:
-                    self.bot_pool.clear_vc_manual_disconnect(guild.id, vc.channel.id)
+                    self.bot_pool.clear_vc_manual_disconnect(guild.id, live_vc_ch.id)
                 await self.disconnect_vc(guild)
                 return
 
             # ユーザーがBotと同じVCに入室した瞬間なら先行プリウォーム＆名前事前キャッシュをバッチ実行 (2.0秒デバウンス)
-            if after.channel and after.channel.id == vc.channel.id and (before.channel is None or before.channel.id != after.channel.id):
+            if after.channel and after.channel.id == live_vc_ch.id and (before.channel is None or before.channel.id != after.channel.id):
                 self._schedule_prewarm_batch(guild, member)
                 # VC入室アナウンス (announce_vc_events == 1 の場合のみ)
                 safe_create_task(
@@ -3167,12 +3293,30 @@ class VCHandlerCog(commands.Cog):
                 )
 
             # ユーザーがBotと同じVCから退出した瞬間（かつまだ人間が残っている）
-            elif before.channel and before.channel.id == vc.channel.id and (after.channel is None or after.channel.id != vc.channel.id):
+            elif before.channel and before.channel.id == live_vc_ch.id and (after.channel is None or after.channel.id != live_vc_ch.id):
                 # VC退出アナウンス (announce_vc_events == 1 の場合のみ)
                 safe_create_task(
                     self._enqueue_vc_event_announcement(guild, member, "leave"),
                     name=f"vc_announce_leave_{member.id}_{int(time.time()*1000)}"
                 )
+        else:
+            # VoiceClient が未保持のまま Gateway ボイスステートだけ残っているゴースト接続時の無人退出
+            me = getattr(guild, "me", None) or (
+                guild.get_member(self.bot.user.id)
+                if getattr(self, "bot", None) and getattr(self.bot, "user", None) and hasattr(guild, "get_member")
+                else None
+            )
+            ghost_ch = getattr(getattr(me, "voice", None), "channel", None)
+            if ghost_ch is not None:
+                live_ghost_ch = self._resolve_live_channel(guild, ghost_ch) or ghost_ch
+                ghost_id = getattr(live_ghost_ch, "id", None)
+                is_connecting = bool(self.bot_pool and ghost_id is not None and self.bot_pool.is_vc_connecting(guild.id, ghost_id))
+                if not is_connecting and self._count_humans(live_ghost_ch) == 0:
+                    logger.info(f"No human members left in ghost VC '{live_ghost_ch.name}' of '{guild.name}'. Auto-disconnecting...")
+                    if self.bot_pool and ghost_id is not None:
+                        self.bot_pool.clear_vc_manual_disconnect(guild.id, ghost_id)
+                    await self.disconnect_vc(guild)
+                    return
 
         # 人間がVCから退出した際、もしそのVCの人間が0人になっていれば手動切断フラグをリセット (通話セッション終了)
         if before.channel and (after.channel is None or before.channel.id != after.channel.id):
@@ -3281,6 +3425,13 @@ class VCHandlerCog(commands.Cog):
         # 起動時ニックネーム整合性チェック (全ギルド走査・未接続Botの取り残し修復)
         for guild in list(self.bot.guilds):
             self.schedule_nickname_sync(guild)
+
+        # 無人VC Watchdog を起動時にも確実に開始 (connect_vc 未経由のゴーストVC残留も監視)
+        if self._auto_leave_task is None or self._auto_leave_task.done():
+            self._auto_leave_task = safe_create_task(
+                self._auto_leave_watchdog_loop(),
+                name=f"auto_leave_watchdog_bot{self.bot_index}"
+            )
 
         # ニックネーム定期整合性修復ループを起動 (未起動時のみ)
         if self._nick_reconcile_task is None or self._nick_reconcile_task.done():

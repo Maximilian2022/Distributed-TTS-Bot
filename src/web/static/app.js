@@ -3173,6 +3173,12 @@ async function loadBotConfig(guildId) {
       announceVCCheckbox.checked = !!cfg.announce_vc_events;
     }
 
+    // VCに参加していない人の読み上げを行わない
+    const requireVcCheckbox = document.getElementById("cfg-require-vc-membership");
+    if (requireVcCheckbox) {
+      requireVcCheckbox.checked = !!cfg.require_vc_membership;
+    }
+
     // 投稿テキスト自動翻訳表示
     const ttsTransCheckbox = document.getElementById("cfg-tts-translate-enabled");
     if (ttsTransCheckbox) {
@@ -3369,6 +3375,7 @@ async function saveBotConfig(e) {
     read_username: readUsername,
     local_tts_kanji_reading: document.getElementById("cfg-local-tts-kanji")?.checked ?? true,
     announce_vc_events: announceVCEvents,
+    require_vc_membership: document.getElementById("cfg-require-vc-membership")?.checked ?? false,
     tts_translate_enabled: ttsTranslateEnabled,
     tts_translate_lang: ttsTranslateLang,
     max_silence_seconds: maxSilence,

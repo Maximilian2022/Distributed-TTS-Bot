@@ -1,3 +1,38 @@
+## 2026-11-25 06:26 Gateway再接続跨ぎの古いVoiceChannel参照による無人VCソロ居残り・ゴースト滞在の恒久修正
+- **背景・原因**:
+  - `2026-11-25 00:32:52` の `AutoJoinReconcile` VC接続リトライ中に Discord Gateway セッション無効化 (`session has been invalidated`) と `READY` 再受信が重なった際、先行タスクが掴んでいた旧 `Guild` / `VoiceChannel` インスタンス（当時の在室者 1名が凍結された孤立キャッシュ）が `vc.channel` に格納されたまま接続完了し、後続の `on_voice_state_update` や `_auto_leave_watchdog_loop` が `vc.channel.members` の凍結メンバーを見続けて 5時間以上無人退出できなかった事象の恒久対策。
+- **実施内容**:
+  1. `src/cogs/vc_handler.py`:
+     - `_resolve_live_channel()` ヘルパーを新設し、常に `self.bot.get_guild(guild.id).get_channel(ch_id)` から最新のチャンネルインスタンスを取得するとともに、`vc.channel` が旧インスタンスを指していた場合は最新インスタンスへその場で自動修復するよう実装。
+     - `connect_vc()`（ロック直後・既存接続再利用分岐・リトライ各試行前・ハンドシェイク完了後）、`on_voice_state_update()`、および `_auto_leave_watchdog_loop()` のすべてで最新チャンネル参照を通すよう統一（再利用分岐で0人だった場合の即時切断ガードも追加）。
+     - `guild.voice_client` が `None` なのに `guild.me.voice.channel` だけ残存するゴーストVC滞在についても、`on_voice_state_update` / `_auto_leave_watchdog_loop` で無人検知し、`disconnect_vc()` で `guild.change_voice_state(channel=None)` により確実に切断するよう強化。また `on_ready()` でも `_auto_leave_watchdog_loop` を起動するよう変更。
+  2. `src/resource_manager.py`:
+     - `LocalEngineResourceManager` に `_resolve_guild_vc_channel()` を追加し、`is_any_human_in_vc()`・`sync_active_vc_models_to_worker()`・定期アイドル監視で古い `vc.channel.members` による無人判定漏れ（ローカルエンジンのスリープ阻害）を防止。
+  3. `tests/test_vc_stale_channel_guard.py`:
+     - 旧 `vc.channel` の自動修復、`on_voice_state_update` 即時退出、Watchdog 猶予後退出、ゴーストVC検知・`change_voice_state(channel=None)` 切断、`LocalEngineResourceManager.is_any_human_in_vc()` の計 5 件の再現単体テストを追加。
+- **検証・状態**:
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh`): 新規テスト 5 件合格 (`Ran 5 tests in 0.097s`, OK)、全単体テスト 242 件合格 (`Ran 242 tests in 18.756s`, OK)、一時コンテナ・一時データ完全破棄確認済み。
+  - 本番反映実施: `docker compose up -d --no-deps --force-recreate app` により切り替え完了。`/health` HTTP 200 OK (`status="ok"`, `is_ready=true`, `guilds_count=2`)、Bot #1〜#5 全号機での `Auto-leave watchdog started` 起動、および稼働中 VC (`えぺAPEエペ` / Bot #2) の自動再接続 (`Voice connection complete.`) とエラーなしを実機確認完了。
+
+## 2026-11-18 19:29 サーバー固有ボット設定に「VCに参加していない人の読み上げは行わない」オプション (`require_vc_membership`) を実装（デフォルト OFF）
+- **背景・目的**:
+  - サーバーごとの WebUI 設定「⚙️ ボット設定 (サーバー固有)」にて、現在読み上げ中の VC に参加していないユーザー（別 VC 参加中を含む）のテキストメッセージを読み上げ対象外にできるオプション（デフォルト OFF）を追加する。
+- **実施内容**:
+  1. `src/database.py`:
+     - `guild_settings` テーブル定義、起動時自動 `ALTER TABLE` マイグレーション、`get_guild_settings()`（既存・新規デフォルト `0`）、`update_guild_settings()`（`INSERT ... ON CONFLICT DO UPDATE`）へ `require_vc_membership INTEGER DEFAULT 0` を追加。
+  2. `src/web/server.py`:
+     - `GET /api/config` (`api_get_config`) のレスポンスおよび `POST /api/config` (`api_update_config`) の更新項目に `require_vc_membership`（boolean 正規化）を追加。
+  3. `src/web/templates/index.html` & `src/web/static/app.js`:
+     - 「⚙️ ボット設定 (サーバー固有)」内の `cfg-announce-vc` の直後にチェックボックス `cfg-require-vc-membership`（🔇 VCに参加していない人の読み上げは行わない（デフォルト: OFF））を追加し、`loadBotConfig()` / `saveBotConfig()` へ読み込み・保存連携を実装。
+  4. `src/cogs/vc_handler.py`:
+     - 純粋判定ヘルパー `_is_author_in_vc()` を実装し、`on_message()` で `guild_settings.get("require_vc_membership", 0)` が有効な場合は読み上げ中 VC (`vc.channel.id`) に参加していない送信者のメッセージを辞書クエリ・TTS 生成前に早期スキップ（`author` が `discord.Member` でない場合は `guild.get_member()` でフォールバック判定）。
+  5. `tests/test_require_vc_membership.py`:
+     - DB スキーマ/マイグレーション（デフォルト OFF 検証）、Web API `/api/config` GET/POST、`VCHandlerCog.on_message` の OFF/ON（未参加・別VC除外・同一VC読み上げ・`discord.User` フォールバック）を検証する単体テスト 5 件を追加。
+- **検証・状態**:
+  - `node --check src/web/static/app.js`: 構文エラーなし。
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh python3 -m unittest discover tests`): 全 237 件合格 (`Ran 237 tests in 17.110s`, OK)、`tests/test_require_vc_membership.py` 単体 5 件合格 (`Ran 5 tests in 0.716s`, OK)、一時コンテナ自動破棄確認済み。
+  - 本番反映実施: `./scripts/rolling_update.sh` はコードマウント変更のみでは既存コンテナが再作成されないため、`docker compose up -d --no-deps --force-recreate app` で 1回限りの安全切り替えを実施。17秒で Ready、`Up 40 seconds (healthy)`、`/health` 200 OK (`status="ok"`, `is_ready=true`, `guilds_count=2`)、WebUI HTML への `cfg-require-vc-membership` 配信、および本番 DB (`data/bot.db`) の `guild_settings.require_vc_membership` カラム追加と既存2ギルドの初期値 `0` (OFF) を実機確認完了。
+
 ## 2026-11-14 20:56 ローカルTTS限定 SudachiPy 漢字かな補完・共通日本語/MMOゲーム用語辞書・❌リアクションDiscordボタン承認UIの実装
 - **背景・目的**:
   - 漢字の誤読（ローカルTTSにおける文脈依存漢字や難読語・ゲーム用語の読み間違い）、MMO・ネットゲーム特有の略語/記号混在語の誤読、およびユーザーによる `❌` リアクション誤読指摘からの登録導線を改善するため、合意済みの3本柱（＋WIKIWIKI MMO用語全集ベース初期辞書・英語略語拡充）を一括実装し本番適用する。

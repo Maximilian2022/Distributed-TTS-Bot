@@ -3622,6 +3622,7 @@ class WebServer:
             "tts_translate_enabled": bool(settings.get("tts_translate_enabled", 0)),
             "tts_translate_lang": normalize_hayamimi_lang(settings.get("tts_translate_lang"), default="en"),
             "local_tts_kanji_reading": bool(settings.get("local_tts_kanji_reading", 1)),
+            "require_vc_membership": bool(settings.get("require_vc_membership", 0)),
             "is_admin": perms["is_admin"],
             "has_role": perms["has_role"]
         })
@@ -3703,6 +3704,8 @@ class WebServer:
             update_fields["tts_translate_lang"] = normalize_hayamimi_lang(data["tts_translate_lang"], default="en")
         if "local_tts_kanji_reading" in data:
             update_fields["local_tts_kanji_reading"] = 1 if data["local_tts_kanji_reading"] else 0
+        if "require_vc_membership" in data:
+            update_fields["require_vc_membership"] = 1 if data["require_vc_membership"] else 0
 
         # ロール設定は管理者のみ可能
         if "admin_role_id" in data:

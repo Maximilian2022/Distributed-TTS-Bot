@@ -416,6 +416,7 @@ class Database:
                     tts_translate_enabled INTEGER DEFAULT 0,
                     tts_translate_lang TEXT DEFAULT 'en',
                     local_tts_kanji_reading INTEGER DEFAULT 1,
+                    require_vc_membership INTEGER DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -470,6 +471,9 @@ class Database:
                 if "local_tts_kanji_reading" not in cols:
                     await db.execute("ALTER TABLE guild_settings ADD COLUMN local_tts_kanji_reading INTEGER DEFAULT 1")
                     logger.info("Migrated guild_settings table: added local_tts_kanji_reading column")
+                if "require_vc_membership" not in cols:
+                    await db.execute("ALTER TABLE guild_settings ADD COLUMN require_vc_membership INTEGER DEFAULT 0")
+                    logger.info("Migrated guild_settings table: added require_vc_membership column")
 
             # 4. 月別TTS利用量トラッキング (失敗数・フォールバック生成数も記録)
             await db.execute("""
@@ -1955,6 +1959,8 @@ class Database:
                     res["tts_translate_lang"] = normalize_hayamimi_lang(res.get("tts_translate_lang"), default="en")
                     raw_lkr = res.get("local_tts_kanji_reading")
                     res["local_tts_kanji_reading"] = 1 if (raw_lkr is None or int(raw_lkr) != 0) else 0
+                    raw_rvc = res.get("require_vc_membership")
+                    res["require_vc_membership"] = 1 if (raw_rvc is not None and int(raw_rvc) != 0) else 0
 
                     self._guild_settings_cache[guild_id] = (now, dict(res))
                     return res
@@ -2000,14 +2006,15 @@ class Database:
             "tts_translate_enabled": 0,
             "tts_translate_lang": "en",
             "local_tts_kanji_reading": 1,
+            "require_vc_membership": 0,
         }
 
         async with self.get_connection() as db:
             await db.execute(
                 """
                 INSERT OR IGNORE INTO guild_settings
-                (guild_id, command_prefix, max_text_length, dedup_window_seconds, dedup_max_length, auto_join_vc_id, auto_join_text_channel_id, auto_join_pairs, admin_role_id, default_speaker, read_username, announce_vc_events, speculative_timeout_seconds, ignore_prefixes, disaster_alert_enabled, disaster_min_scale, disaster_pref_filter, disaster_alert_weather, disaster_volume, tts_translate_enabled, tts_translate_lang, local_tts_kanji_reading)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, 30, '', 1, 1.0, 0, 'en', 1)
+                (guild_id, command_prefix, max_text_length, dedup_window_seconds, dedup_max_length, auto_join_vc_id, auto_join_text_channel_id, auto_join_pairs, admin_role_id, default_speaker, read_username, announce_vc_events, speculative_timeout_seconds, ignore_prefixes, disaster_alert_enabled, disaster_min_scale, disaster_pref_filter, disaster_alert_weather, disaster_volume, tts_translate_enabled, tts_translate_lang, local_tts_kanji_reading, require_vc_membership)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, 30, '', 1, 1.0, 0, 'en', 1, 0)
                 """,
                 (guild_id, prefix, max_len, dedup_sec, dedup_len, auto_vc, auto_text, json.dumps(initial_pairs), 0, def_speaker, def_spec_timeout, json.dumps(list(def_prefixes)))
             )
@@ -2067,6 +2074,9 @@ class Database:
         if "local_tts_kanji_reading" in kwargs:
             current["local_tts_kanji_reading"] = 1 if kwargs.pop("local_tts_kanji_reading") else 0
 
+        if "require_vc_membership" in kwargs:
+            current["require_vc_membership"] = 1 if kwargs.pop("require_vc_membership") else 0
+
         current.update(kwargs)
 
         async with self.get_connection() as db:
@@ -2079,9 +2089,9 @@ class Database:
                     announce_vc_events, speculative_timeout_seconds, ignore_prefixes,
                     disaster_alert_enabled, disaster_min_scale, disaster_pref_filter,
                     disaster_alert_weather, disaster_volume, error_contact_user_id, max_silence_seconds,
-                    tts_translate_enabled, tts_translate_lang, local_tts_kanji_reading, updated_at
+                    tts_translate_enabled, tts_translate_lang, local_tts_kanji_reading, require_vc_membership, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     command_prefix=excluded.command_prefix,
                     max_text_length=excluded.max_text_length,
@@ -2106,6 +2116,7 @@ class Database:
                     tts_translate_enabled=excluded.tts_translate_enabled,
                     tts_translate_lang=excluded.tts_translate_lang,
                     local_tts_kanji_reading=excluded.local_tts_kanji_reading,
+                    require_vc_membership=excluded.require_vc_membership,
                     updated_at=CURRENT_TIMESTAMP
                 """,
                 (
@@ -2133,6 +2144,7 @@ class Database:
                     1 if current.get("tts_translate_enabled", 0) else 0,
                     normalize_hayamimi_lang(current.get("tts_translate_lang"), default="en"),
                     1 if current.get("local_tts_kanji_reading", 1) else 0,
+                    1 if current.get("require_vc_membership", 0) else 0,
                 )
             )
             await db.commit()
