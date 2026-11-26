@@ -1,3 +1,18 @@
+## 2026-11-26 16:27 Dependabot PR #23 (`janome>=0.5.2`)・PR #24 (`azure-cognitiveservices-speech>=1.53.1`) の互換性検証とマージ・ローカル同期
+- **背景・目的**:
+  - Dependabot から作成された依存パッケージ最小バージョン要件引き上げの Pull Request 2件（PR #23, PR #24）について、本番 Python `3.14` 環境との互換性を検証のうえ `main` ブランチへ取り込む。
+- **確認・実施内容**:
+  1. 使い捨てコンテナ (`docker run --rm madpiero/ttsbot:latest`) 上での事前互換性検証:
+     - `janome`: 現行イメージにすでに `0.5.2` が導入済みで問題なし。
+     - `azure-cognitiveservices-speech==1.53.1`: Linux x86_64 wheel の導入、`import azure.cognitiveservices.speech as speechsdk`、およびネイティブ C++ バインディング初期化 (`SpeechConfig`) が正常通過することを確認。
+  2. GitHub PR マージおよびブランチ整理:
+     - PR #24 (`build(deps):(deps): update azure-cognitiveservices-speech requirement from >=1.53.0 to >=1.53.1`) を `main` へマージし、リモートブランチを削除。
+     - PR #23 (`build(deps):(deps): update janome requirement from >=0.5.0 to >=0.5.2`) を続けて `main` へマージし、リモートブランチを削除。
+  3. ローカルリポジトリ同期:
+     - `/root/ttsbot` にて `git pull --ff-only origin main` (`1a76f94..7a4ddb7`) を実行し、`requirements.txt` の更新を反映。
+- **検証・状態**:
+  - 軽微なパッチ要件引き上げであり緊急の脆弱性対応ではないため、合意に基づき稼働中の本番コンテナ (`ttsbot-app-1`) の即時再起動は実施せず無停止を維持（次回以降のビルド・更新時に自動反映）。
+
 ## 2026-11-25 21:56 Worker Agent 一時ヘルパーコンテナ (`tts-compose-helper-*`) 残留防止・自動ガベージコレクションの実装 (`v3.15.1`)
 - **背景・原因**:
   - `docker` CLI を内包しないコンテナ環境（主に Windows Docker Desktop 上の Worker Agent）において、`src/web/static/agent.py` の `DockerAPI.run_compose_via_helper()` が以下の理由で `tts-compose-helper-<timestamp>` コンテナを残留させていた：
