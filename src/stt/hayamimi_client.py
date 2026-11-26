@@ -425,25 +425,42 @@ class HayamimiSession:
             pass
 
     async def _send_loop(self) -> None:
-        """PCM バイナリフレームを順次送信"""
+        """PCM バイナリフレームを順次送信 (キュー滞留時は最大4フレームまでマイクロバッチ結合送出)"""
         sent_bytes = 0
         sent_chunks = 0
         last_log_time = time.time()
         try:
             while not self._closed and self._ws and not self._ws.closed:
-                chunk = await self._send_queue.get()
-                if self._ws and not self._ws.closed:
-                    await self._ws.send_bytes(chunk)
-                    sent_bytes += len(chunk)
-                    sent_chunks += 1
-                    now = time.time()
-                    if now - last_log_time >= 5.0 and sent_chunks > 0:
-                        last_log_time = now
-                        logger.debug(
-                            f"📡 [Hayamimi Send] {self.user_name} ({self.user_id}): "
-                            f"{sent_chunks} chunks ({sent_bytes / 1024:.1f} KB) sent to session {self.session_id}"
-                        )
-                self._send_queue.task_done()
+                first_chunk = await self._send_queue.get()
+                drained_count = 1
+                payload: bytes
+                if not self._send_queue.empty():
+                    buf = bytearray(first_chunk)
+                    for _ in range(3):
+                        try:
+                            buf.extend(self._send_queue.get_nowait())
+                            drained_count += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    payload = bytes(buf)
+                else:
+                    payload = first_chunk
+
+                try:
+                    if self._ws and not self._ws.closed:
+                        await self._ws.send_bytes(payload)
+                        sent_bytes += len(payload)
+                        sent_chunks += drained_count
+                        now = time.time()
+                        if now - last_log_time >= 5.0 and sent_chunks > 0:
+                            last_log_time = now
+                            logger.debug(
+                                f"📡 [Hayamimi Send] {self.user_name} ({self.user_id}): "
+                                f"{sent_chunks} chunks ({sent_bytes / 1024:.1f} KB) sent to session {self.session_id}"
+                            )
+                finally:
+                    for _ in range(drained_count):
+                        self._send_queue.task_done()
         except asyncio.CancelledError:
             pass
         except Exception as e:

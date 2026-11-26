@@ -60,6 +60,22 @@ class DiscordAuth:
         self.pending_app_logins: Dict[str, Dict[str, Any]] = {}
         self.ip_rate_limits: Dict[str, List[float]] = {}
         self.user_app_login_cooldowns: Dict[int, float] = {}
+        # 管理者パスワード変更時の旧 uid=0 セッション失効管理
+        self.admin_pwd_version: str = ""
+        self.require_admin_pwd_version: bool = False
+
+    def set_admin_password_fingerprint(self, password: str, require_match: bool = False) -> str:
+        """管理者パスワードの指紋を更新し、必要に応じて旧パスワード発行済みセッションを即時失効させる"""
+        clean_pw = (password or "").strip()
+        if clean_pw:
+            self.admin_pwd_version = hmac.new(
+                self.session_secret, f"admin_pw:{clean_pw}".encode("utf-8"), hashlib.sha256
+            ).hexdigest()[:16]
+        else:
+            self.admin_pwd_version = ""
+        if require_match:
+            self.require_admin_pwd_version = True
+        return self.admin_pwd_version
 
     def is_configured(self) -> bool:
         return bool(self.client_id and self.client_secret and self.redirect_uri)
@@ -87,8 +103,9 @@ class DiscordAuth:
             "redirect_uri": self.redirect_uri
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        timeout = aiohttp.ClientTimeout(total=10.0, connect=4.0)
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(f"{DISCORD_API_ENDPOINT}/oauth2/token", data=data, headers=headers) as resp:
                 if resp.status == 200:
                     token_data = await resp.json()
@@ -101,7 +118,8 @@ class DiscordAuth:
     async def fetch_user_info(self, access_token: str) -> Optional[Dict[str, Any]]:
         """アクセストークンからDiscordユーザー情報を取得"""
         headers = {"Authorization": f"Bearer {access_token}"}
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=10.0, connect=4.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(f"{DISCORD_API_ENDPOINT}/users/@me", headers=headers) as resp:
                 if resp.status == 200:
                     return await resp.json()
@@ -140,14 +158,17 @@ class DiscordAuth:
 
     def create_session_token(self, user_data: Dict[str, Any], max_age: int = 86400 * 30, is_admin: bool = False) -> str:
         """HMAC署名付きセッショントークンを生成 (デフォルト30日間有効)"""
+        uid = int(user_data.get("id") or user_data.get("user_id", 0))
         payload = {
-            "user_id": int(user_data.get("id") or user_data.get("user_id", 0)),
+            "user_id": uid,
             "username": user_data.get("username", "Admin"),
             "global_name": user_data.get("global_name") or user_data.get("username", "Admin"),
             "avatar": user_data.get("avatar", ""),
             "is_admin": bool(is_admin or user_data.get("is_admin", False)),
             "exp": int(time.time()) + max_age
         }
+        if uid == 0 and self.admin_pwd_version:
+            payload["pv"] = self.admin_pwd_version
         raw_json = json.dumps(payload, separators=(',', ':'))
         b64_payload = base64.urlsafe_b64encode(raw_json.encode()).decode()
         signature = hmac.new(self.session_secret, b64_payload.encode(), hashlib.sha256).hexdigest()
@@ -189,6 +210,16 @@ class DiscordAuth:
                 logger.debug("Session token has expired.")
                 return None
 
+            # 管理者パスワードログイン (user_id==0) について、パスワード変更後は旧世代トークンを拒否
+            if int(payload.get("user_id", 0)) == 0 and self.admin_pwd_version:
+                tok_pv = payload.get("pv", "")
+                if self.require_admin_pwd_version and not hmac.compare_digest(str(tok_pv), self.admin_pwd_version):
+                    logger.info("Rejected stale admin password session after password rotation.")
+                    return None
+                if tok_pv and not hmac.compare_digest(str(tok_pv), self.admin_pwd_version):
+                    logger.info("Rejected mismatched admin password session fingerprint.")
+                    return None
+
             return payload
         except Exception as e:
             logger.warning(f"Error decoding session token: {e}")
@@ -217,7 +248,8 @@ class DiscordAuth:
         exp_ts = time.time() + expires_in
         clean_user_id = int(user_id)
         clean_username = re.sub(r"[^a-zA-Z0-9_\-]", "", str(username))[:32] or f"User_{clean_user_id}"
-        clean_path = str(target_path) if str(target_path).startswith("/") else "/"
+        raw_tp = str(target_path or "/")
+        clean_path = raw_tp if (raw_tp.startswith("/") and not raw_tp.startswith("//") and not raw_tp.startswith("/\\")) else "/"
 
         user_data = {
             "id": clean_user_id,

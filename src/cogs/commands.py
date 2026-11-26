@@ -214,9 +214,11 @@ class VoiceSelectView(discord.ui.View):
         self.user_id = user_id
         self.guild_id = guild_id
 
-        # ドロップダウンオプションの作成 (Discord API 上限25件のハードガード)
+        # ドロップダウンオプションの作成 (Discord API 上限25件のハードガード & 非表示/内部フォールバック用Edge音声除外)
         options = []
         for voice_id, voice in config.voices.items():
+            if getattr(voice, "hidden", False) or getattr(voice, "provider", "") == "edge":
+                continue
             options.append(
                 discord.SelectOption(
                     label=f"{voice.name} ({voice.gender})",
@@ -314,20 +316,20 @@ class CommandsCog(commands.Cog):
         self.bot_pool = bot_pool
         self.disaster_service = disaster_service
 
-    async def _check_admin_permission(self, interaction: discord.Interaction) -> bool:
-        """ギルド管理者または管理者ロール保持者であるかを判定。権限なし時はephemeralエラーを返答"""
-        if not interaction.guild_id or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
-            return False
+    async def _require_system_admin_perm(self, interaction: discord.Interaction) -> bool:
+        """システム最高管理者 (DISCORD_OWNER_USER_ID / ADMIN_USER_IDS / Bot Application Owner) のみ許可"""
+        uid = interaction.user.id
+        admin_ids = getattr(self.config, "admin_user_ids", []) or []
+        env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+        is_app_owner = await self.bot.is_owner(interaction.user)
+        if is_app_owner or uid in admin_ids or (env_owner_id > 0 and uid == env_owner_id):
+            return True
+        await interaction.response.send_message("❌ このコマンドはBotシステム最高管理者のみ実行できます。", ephemeral=True)
+        return False
 
-        settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
-        admin_role_id = int(settings.get("admin_role_id", 0) or 0)
-        has_admin_role = any(r.id == admin_role_id for r in getattr(interaction.user, "roles", [])) if admin_role_id > 0 else False
-        is_admin = interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or has_admin_role
-        if not is_admin:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限（または管理者ロール）が必要です。", ephemeral=True)
-            return False
-        return True
+    async def _check_admin_permission(self, interaction: discord.Interaction) -> bool:
+        """ギルド管理操作の統一権限チェック (_require_guild_manage_perm へ委譲)"""
+        return await self._require_guild_manage_perm(interaction)
 
     # --- VC制御コマンド ---
 
@@ -343,6 +345,23 @@ class CommandsCog(commands.Cog):
 
         voice_channel = interaction.user.voice.channel
         text_channel = interaction.channel
+
+        # 同一テキストチャンネルが既に同一ギルド内の別VCのBotに紐付けられていないか事前チェック (二重読み上げ・二重翻訳防止)
+        if self.bot_pool and hasattr(self.bot_pool, "bots"):
+            for b_idx, b_inst in self.bot_pool.bots.items():
+                b_cog = b_inst.get_cog("VCHandlerCog")
+                b_guild = b_inst.get_guild(interaction.guild_id)
+                if not b_cog or not b_guild or not b_guild.voice_client or not b_guild.voice_client.is_connected():
+                    continue
+                cur_vc = getattr(b_guild.voice_client, "channel", None)
+                st = b_cog.guild_states.get(interaction.guild_id) if hasattr(b_cog, "guild_states") else None
+                if cur_vc and cur_vc.id != voice_channel.id and st and st.bound_text_channel_id == text_channel.id:
+                    await interaction.response.send_message(
+                        f"⚠️ このテキストチャンネル (<#{text_channel.id}>) は既に別のボイスチャンネル (**{cur_vc.name}** / Bot {b_idx}号機) の読み上げに使用されています。\n"
+                        f"二重読み上げを防ぐため、**{voice_channel.name}** 専用の別テキストチャンネルから `/join` を実行してください。",
+                        ephemeral=True,
+                    )
+                    return
 
         await interaction.response.defer(ephemeral=False)
         try:
@@ -387,7 +406,7 @@ class CommandsCog(commands.Cog):
                 ),
                 color=discord.Color.green()
             )
-            view = WebDashboardButtonView(self.bot, label="Webダッシュボードにログイン")
+            view = WebDashboardButtonView(assigned_bot or self.bot, label="Webダッシュボードにログイン")
             await interaction.followup.send(embed=embed, view=view)
         except VCConnectAborted as e:
             logger.info(f"Join VC aborted: {e}")
@@ -685,7 +704,7 @@ class CommandsCog(commands.Cog):
         await ctx.reply(f"🔊 読み上げ音量を **{percent}%** に設定しました！")
 
     async def _require_guild_manage_perm(self, interaction: discord.Interaction) -> bool:
-        """サーバー管理者・オーナー・指定管理ロール・システム最高管理者のいずれかであるか検証"""
+        """サーバー管理者・サーバー管理権限・オーナー・指定管理ロール・システム最高管理者のいずれかであるか検証"""
         if not interaction.guild_id or not interaction.guild:
             await interaction.response.send_message("❌ このコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
             return False
@@ -696,14 +715,93 @@ class CommandsCog(commands.Cog):
             return True
         member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(uid)
         if member:
-            if member.guild_permissions.administrator:
+            if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
                 return True
             g_settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
             admin_role_id = int(g_settings.get("admin_role_id", 0) or 0)
             if admin_role_id > 0 and any(r.id == admin_role_id for r in member.roles):
                 return True
-        await interaction.response.send_message("❌ この操作にはサーバー管理者権限または管理ロールが必要です。", ephemeral=True)
+        await interaction.response.send_message("❌ この操作にはサーバー管理権限または指定された管理ロールが必要です。", ephemeral=True)
         return False
+
+    # --- ユーザー個人専用単語辞書コマンド (/userdict) ---
+
+    userdict_group = app_commands.Group(name="userdict", description="あなた個人の専用単語辞書（自分の発言・名前のみ最優先適用）を管理します。")
+
+    @userdict_group.command(name="add", description="あなた個人の専用辞書に単語と読み方を登録・上書きします。")
+    @app_commands.describe(word="登録する単語 (最大50文字)", reading="読み方 (最大100文字)")
+    async def userdict_add(self, interaction: discord.Interaction, word: str, reading: str):
+        w = word.strip()
+        r = reading.strip()
+        if not w or not r:
+            await interaction.response.send_message("❌ 単語と読み方を正しく入力してください。", ephemeral=True)
+            return
+        if len(w) > 50 or len(r) > 100:
+            await interaction.response.send_message("❌ 単語は50文字以内、読み方は100文字以内で指定してください。", ephemeral=True)
+            return
+        existing = await self.db.get_user_dictionary_words(interaction.user.id)
+        if len(existing) >= 200 and not any(ew == w for ew, _ in existing):
+            await interaction.response.send_message("❌ 個人辞書の登録上限（200件）に達しています。不要な単語を削除してください。", ephemeral=True)
+            return
+
+        await self.db.add_user_dictionary_word(interaction.user.id, w, r)
+        purged = await self.cache_manager.purge_by_word(w) if self.cache_manager else 0
+        embed = discord.Embed(
+            title="👤 マイ個人辞書に登録しました",
+            description="他のメンバーの発言には影響せず、**あなたが発言したときだけ**最優先で読み替えられます。",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="単語", value=w, inline=True)
+        embed.add_field(name="読み方", value=r, inline=True)
+        if purged > 0:
+            embed.set_footer(text=f"関連音声キャッシュ {purged} 件を最新化しました。")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @userdict_group.command(name="delete", description="あなた個人の専用辞書から単語を削除します。")
+    @app_commands.describe(word="削除する単語")
+    async def userdict_delete(self, interaction: discord.Interaction, word: str):
+        w = word.strip()
+        if not w:
+            await interaction.response.send_message("❌ 削除する単語を指定してください。", ephemeral=True)
+            return
+        deleted = await self.db.delete_user_dictionary_word(interaction.user.id, w)
+        if not deleted:
+            await interaction.response.send_message(f"⚠️ **「{w}」** はあなたの個人辞書に登録されていません。", ephemeral=True)
+            return
+        purged = await self.cache_manager.purge_by_word(w) if self.cache_manager else 0
+        await interaction.response.send_message(
+            f"🗑️ マイ個人辞書から **「{w}」** を削除しました。" + (f"（キャッシュ {purged} 件整理）" if purged else ""),
+            ephemeral=True,
+        )
+
+    @userdict_delete.autocomplete("word")
+    async def userdict_delete_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        entries = await self.db.get_user_dictionary_words(interaction.user.id)
+        q = (current or "").lower()
+        matches = [(w, r) for w, r in entries if not q or q in w.lower() or q in r.lower()]
+        return [app_commands.Choice(name=f"{w} ({r})"[:100], value=w[:100]) for w, r in matches[:25]]
+
+    @userdict_group.command(name="list", description="あなた個人の専用辞書に登録されている単語一覧を表示します。")
+    async def userdict_list(self, interaction: discord.Interaction):
+        entries = await self.db.get_user_dictionary_words(interaction.user.id)
+        if not entries:
+            view = WebDashboardButtonView(self.bot, label="Webダッシュボードで個人辞書を編集")
+            await interaction.response.send_message(
+                "👤 あなたの個人辞書にはまだ単語が登録されていません。\n`/userdict add` または Webダッシュボードから登録できます。",
+                view=view,
+                ephemeral=True,
+            )
+            return
+        lines = [f"• **{w}** → {r}" for w, r in entries[:30]]
+        embed = discord.Embed(
+            title=f"👤 マイ個人辞書一覧 ({len(entries)}件)",
+            description="\n".join(lines),
+            color=discord.Color.teal(),
+        )
+        if len(entries) > 30:
+            embed.set_footer(text=f"他 {len(entries) - 30} 件（Webダッシュボードで全件確認・編集可能）")
+        view = WebDashboardButtonView(self.bot, label="Webダッシュボードで個人辞書を編集")
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     # --- 単語辞書コマンド (/dict) ---
 
@@ -808,6 +906,57 @@ class CommandsCog(commands.Cog):
 
         view = WebDashboardButtonView(self.bot)
         await interaction.response.send_message(embed=embed, view=view)
+
+    @app_commands.command(name="help", description="全スラッシュコマンド一覧と便利な使い方を表示します。")
+    async def help_cmd(self, interaction: discord.Interaction):
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
+        embed = discord.Embed(
+            title="📖 Distributed-TTS-Bot コマンド & 使い方ガイド",
+            description=(
+                "超低遅延読み上げ (TTS) ＆ 早耳 Live リアルタイム音声認識・翻訳 (STT) 対応 Bot です。\n"
+                f"🌐 **[Webダッシュボード]({dashboard_url})** では全話者の試聴・辞書管理・詳細設定が行えます。"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="🔊 VC・再生制御",
+            value=(
+                "• `/join` — 参加中のVCへBotを呼び出し、このチャンネルを読み上げます\n"
+                "• `/leave` — VCからBotを退出させます\n"
+                "• `/skip` — 現在再生中・準備中の読み上げを即座にスキップします"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🎙️ 声質・辞書・モデレーション",
+            value=(
+                "• `/voice` — 声色（話者）・速度・ピッチを変更します\n"
+                "• `/userdict add|delete|list` — **あなた個人の専用単語辞書**を管理します\n"
+                "• `/dict add|delete|list` — サーバー共有の単語辞書（変更は管理者/指定ロール）\n"
+                "• `/ng add|delete|list|preset` — NGワードのピー音置換設定（変更は管理者/指定ロール）\n"
+                "• `/ignore list|add|delete|set|reset` — 読み上げスキップ開始文字（既定 `;`）の設定\n"
+                "• 💡 発言に **❌ リアクション** を付けると AI が誤読箇所を推論しワンクリック登録を提案します"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🌍 リアルタイム音声認識 (STT) & 多言語翻訳",
+            value=(
+                "• `/stt start|stop|status` — VC音声のリアルタイム文字起こし・翻訳・ゲームPC連携\n"
+                "• `/translate status|set` — 投稿チャットの双方向自動翻訳リプライ設定"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🚨 防災速報・クレジット情報",
+            value=(
+                "• `/disaster status|test|set` — 緊急地震速報・津波・気象警報の割り込み速報設定\n"
+                "• `/info` — 搭載エンジン一覧・キャラクター利用規約・クレジット表記"
+            ),
+            inline=False,
+        )
+        view = WebDashboardButtonView(self.bot, label="Webダッシュボードを開く")
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     # --- NGワードコマンド (/ng) ---
 
@@ -984,6 +1133,57 @@ class CommandsCog(commands.Cog):
         view = WebDashboardButtonView(self.bot)
         await interaction.response.send_message(embed=embed, view=view)
 
+    @app_commands.command(name="help", description="全スラッシュコマンド一覧と便利な使い方を表示します。")
+    async def help_cmd(self, interaction: discord.Interaction):
+        dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
+        embed = discord.Embed(
+            title="📖 Distributed-TTS-Bot コマンド & 使い方ガイド",
+            description=(
+                "超低遅延読み上げ (TTS) ＆ 早耳 Live リアルタイム音声認識・翻訳 (STT) 対応 Bot です。\n"
+                f"🌐 **[Webダッシュボード]({dashboard_url})** では全話者の試聴・辞書管理・詳細設定が行えます。"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="🔊 VC・再生制御",
+            value=(
+                "• `/join` — 参加中のVCへBotを呼び出し、このチャンネルを読み上げます\n"
+                "• `/leave` — VCからBotを退出させます\n"
+                "• `/skip` — 現在再生中・準備中の読み上げを即座にスキップします"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🎙️ 声質・辞書・モデレーション",
+            value=(
+                "• `/voice` — 声色（話者）・速度・ピッチを変更します\n"
+                "• `/userdict add|delete|list` — **あなた個人の専用単語辞書**を管理します\n"
+                "• `/dict add|delete|list` — サーバー共有の単語辞書（変更は管理者/指定ロール）\n"
+                "• `/ng add|delete|list|preset` — NGワードのピー音置換設定（変更は管理者/指定ロール）\n"
+                "• `/ignore list|add|delete|set|reset` — 読み上げスキップ開始文字（既定 `;`）の設定\n"
+                "• 💡 発言に **❌ リアクション** を付けると AI が誤読箇所を推論しワンクリック登録を提案します"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🌍 リアルタイム音声認識 (STT) & 多言語翻訳",
+            value=(
+                "• `/stt start|stop|status` — VC音声のリアルタイム文字起こし・翻訳・ゲームPC連携\n"
+                "• `/translate status|set` — 投稿チャットの双方向自動翻訳リプライ設定"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🚨 防災速報・クレジット情報",
+            value=(
+                "• `/disaster status|test|set` — 緊急地震速報・津波・気象警報の割り込み速報設定\n"
+                "• `/info` — 搭載エンジン一覧・キャラクター利用規約・クレジット表記"
+            ),
+            inline=False,
+        )
+        view = WebDashboardButtonView(self.bot, label="Webダッシュボードを開く")
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
     # --- 防災速報コマンドグループ ---
     disaster_group = app_commands.Group(name="disaster", description="防災速報（地震・津波・気象警報）の設定・テスト")
 
@@ -1024,12 +1224,7 @@ class CommandsCog(commands.Cog):
         app_commands.Choice(name="気象警報テスト (大雨・洪水)", value="weather")
     ])
     async def disaster_test(self, interaction: discord.Interaction, alert_type: str = "earthquake"):
-        if not interaction.guild:
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
-            return
-
-        if not interaction.user.guild_permissions.manage_guild and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限が必要です。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
 
         if not self.disaster_service:
@@ -1056,12 +1251,7 @@ class CommandsCog(commands.Cog):
         weather_alert: Optional[bool] = None,
         volume: Optional[app_commands.Range[int, 0, 200]] = None
     ):
-        if not interaction.guild:
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
-            return
-
-        if not interaction.user.guild_permissions.manage_guild and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限が必要です。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
 
         update_kwargs = {}
@@ -1086,27 +1276,41 @@ class CommandsCog(commands.Cog):
         await self.db.update_guild_settings(interaction.guild_id, **update_kwargs)
         await interaction.response.send_message("✅ 防災速報の設定を更新しました！ `/disaster status` で確認できます。", ephemeral=True)
 
-    @app_commands.command(name="reload", description="ボットの設定ファイル (config.yaml) および環境変数をホットリロードします（管理者専用）。")
+    @app_commands.command(name="reload", description="【システム最高管理者専用】設定ファイル (config.yaml / .env) を安全にホットリロードします。")
     async def reload_cmd(self, interaction: discord.Interaction):
-        if not interaction.guild:
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
-            return
-
-        if not interaction.user.guild_permissions.administrator and not interaction.user.guild_permissions.manage_guild:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理者権限が必要です。", ephemeral=True)
+        if not await self._require_system_admin_perm(interaction):
             return
 
         await interaction.response.defer(ephemeral=True)
         try:
             reload_config(self.config)
+            if self.db:
+                try:
+                    creds = await self.db.get_all_credentials()
+                    bots = await self.db.get_bot_tokens()
+                    self.config.apply_db_credentials(creds, bots)
+                except Exception as ce:
+                    logger.warning(f"Failed to reapply DB credentials on /reload: {ce}")
+                if hasattr(self.db, "invalidate_guild_cache"):
+                    self.db.invalidate_guild_cache()
+                if hasattr(self.db, "invalidate_user_cache"):
+                    self.db.invalidate_user_cache()
+            tts_mgr = getattr(self.bot, "tts_manager", None) or getattr(self.vc_handler, "tts_manager", None)
+            if tts_mgr:
+                if hasattr(tts_mgr, "load_cached_voices"):
+                    tts_mgr.load_cached_voices()
+                if hasattr(tts_mgr, "reload_cloud_credentials"):
+                    tts_mgr.reload_cloud_credentials(
+                        azure_key=self.config.azure_speech_key,
+                        azure_region=self.config.azure_speech_region,
+                        google_json=self.config.google_credentials_json,
+                        google_api_key=self.config.google_api_key,
+                    )
+                if hasattr(tts_mgr, "reload_nodes"):
+                    tts_mgr.reload_nodes()
 
-            if hasattr(self.db, "invalidate_guild_cache"):
-                self.db.invalidate_guild_cache()
-            if hasattr(self.db, "invalidate_user_cache"):
-                self.db.invalidate_user_cache()
-
-            logger.info(f"Configuration reloaded by {interaction.user} (ID: {interaction.user.id}) in guild {interaction.guild_id}")
-            await interaction.followup.send("✅ 設定（config.yaml / .env）をホットリロードしました！", ephemeral=True)
+            logger.info(f"Configuration safely reloaded by system admin {interaction.user} (ID: {interaction.user.id})")
+            await interaction.followup.send("✅ 設定（config.yaml / .env / DB認証情報 / ローカル話者）を安全にホットリロードしました！", ephemeral=True)
         except Exception as e:
             logger.error(f"Failed to reload config via Discord command: {e}")
             await interaction.followup.send(f"❌ 設定のリロードに失敗しました: {e}", ephemeral=True)
@@ -1151,17 +1355,9 @@ class CommandsCog(commands.Cog):
     @ignore_group.command(name="add", description="読み上げを除外する開始文字・記号を追加します（管理者専用）。")
     @app_commands.describe(prefix="除外する開始文字（例: ; や // など）")
     async def ignore_add(self, interaction: discord.Interaction, prefix: str):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
-
         settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
-        admin_role_id = int(settings.get("admin_role_id", 0) or 0)
-        has_admin_role = any(r.id == admin_role_id for r in getattr(interaction.user, "roles", [])) if admin_role_id > 0 else False
-        is_admin = interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or has_admin_role
-        if not is_admin:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限（または管理者ロール）が必要です。", ephemeral=True)
-            return
 
         p = prefix.strip()
         if not p:
@@ -1191,17 +1387,9 @@ class CommandsCog(commands.Cog):
     @ignore_group.command(name="delete", description="読み上げを除外する開始文字・記号を削除します（管理者専用）。")
     @app_commands.describe(prefix="削除する開始文字")
     async def ignore_delete(self, interaction: discord.Interaction, prefix: str):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
-
         settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
-        admin_role_id = int(settings.get("admin_role_id", 0) or 0)
-        has_admin_role = any(r.id == admin_role_id for r in getattr(interaction.user, "roles", [])) if admin_role_id > 0 else False
-        is_admin = interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or has_admin_role
-        if not is_admin:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限（または管理者ロール）が必要です。", ephemeral=True)
-            return
 
         p = prefix.strip()
         current_prefixes = list(settings.get("ignore_prefixes", [";", "；"]))
@@ -1224,16 +1412,7 @@ class CommandsCog(commands.Cog):
     @ignore_group.command(name="set", description="読み上げを除外するプレフィックスを一括設定します（管理者専用）。")
     @app_commands.describe(prefixes="カンマや空白で区切って複数指定（例: ; , ； , //）。空にする場合は「none」")
     async def ignore_set(self, interaction: discord.Interaction, prefixes: str):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
-            return
-
-        settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
-        admin_role_id = int(settings.get("admin_role_id", 0) or 0)
-        has_admin_role = any(r.id == admin_role_id for r in getattr(interaction.user, "roles", [])) if admin_role_id > 0 else False
-        is_admin = interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or has_admin_role
-        if not is_admin:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限（または管理者ロール）が必要です。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
 
         raw = prefixes.strip()
@@ -1257,16 +1436,7 @@ class CommandsCog(commands.Cog):
 
     @ignore_group.command(name="reset", description="読み上げ除外プレフィックスを初期設定（; と ；）にリセットします（管理者専用）。")
     async def ignore_reset(self, interaction: discord.Interaction):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ サーバー内で実行してください。", ephemeral=True)
-            return
-
-        settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
-        admin_role_id = int(settings.get("admin_role_id", 0) or 0)
-        has_admin_role = any(r.id == admin_role_id for r in getattr(interaction.user, "roles", [])) if admin_role_id > 0 else False
-        is_admin = interaction.user.guild_permissions.administrator or interaction.user.guild_permissions.manage_guild or has_admin_role
-        if not is_admin:
-            await interaction.response.send_message("❌ このコマンドを実行するにはサーバー管理権限（または管理者ロール）が必要です。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
 
         default_prefixes = [";", "；"]
@@ -1289,11 +1459,7 @@ class CommandsCog(commands.Cog):
         app_commands.Choice(name="⚡ Workerエンジンのエラー", value="worker_engine"),
     ])
     async def alert_test(self, interaction: discord.Interaction, target: str):
-        is_owner = await self.bot.is_owner(interaction.user)
-        is_admin_perm = interaction.user.guild_permissions.administrator if interaction.guild else False
-        owner_id = getattr(self.config, "discord_owner_user_id", 0) or int(os.getenv("ADMIN_USER_ID", "0") or 0)
-        if not (is_owner or is_admin_perm or (owner_id > 0 and interaction.user.id == owner_id)):
-            await interaction.response.send_message("❌ このコマンドはBot管理者またはサーバー管理者のみ実行できます。", ephemeral=True)
+        if not await self._require_system_admin_perm(interaction):
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -1481,6 +1647,7 @@ class CommandsCog(commands.Cog):
             trans_langs=langs,
             voice_client=vc,
             bot_client=target_bot,
+            bot_index=assigned_bot_idx,
         )
 
         if success:
@@ -1519,6 +1686,22 @@ class CommandsCog(commands.Cog):
                 ephemeral=True
             )
 
+    def _resolve_stt_bot_index(self, interaction: discord.Interaction) -> Optional[int]:
+        """コマンド実行者の参加VCまたはテキストチャンネルに紐付くBot号機番号を特定"""
+        if not self.bot_pool or not interaction.guild:
+            return None
+        if isinstance(interaction.user, discord.Member) and interaction.user.voice and interaction.user.voice.channel:
+            found = self.bot_pool.find_connected_bot_in_vc(interaction.guild.id, interaction.user.voice.channel.id)
+            if found:
+                return found[0]
+        if hasattr(self.bot_pool, "bots"):
+            for b_idx, b_inst in self.bot_pool.bots.items():
+                b_cog = b_inst.get_cog("VCHandlerCog")
+                st = b_cog.guild_states.get(interaction.guild.id) if (b_cog and hasattr(b_cog, "guild_states")) else None
+                if st and st.bound_text_channel_id == interaction.channel_id:
+                    return b_idx
+        return None
+
     @stt_group.command(name="stop", description="VC音声のリアルタイム文字起こし・翻訳を終了します。")
     async def stt_stop(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
@@ -1527,11 +1710,12 @@ class CommandsCog(commands.Cog):
 
         from src.stt.manager import STTManager
         stt_mgr = STTManager.get_instance()
-        if not stt_mgr or not stt_mgr.is_active(interaction.guild.id):
-            await interaction.response.send_message("ℹ️ このサーバーでは STT 音声認識は稼働していません。", ephemeral=True)
+        target_bot_idx = self._resolve_stt_bot_index(interaction)
+        if not stt_mgr or not stt_mgr.is_active(interaction.guild.id, bot_index=target_bot_idx):
+            await interaction.response.send_message("ℹ️ 対象のボイスチャンネルでは STT 音声認識は稼働していません。", ephemeral=True)
             return
 
-        await stt_mgr.stop_stt(interaction.guild.id)
+        await stt_mgr.stop_stt(interaction.guild.id, bot_index=target_bot_idx)
         await interaction.response.send_message("🛑 早耳 Live 音声認識 (STT) を停止しました。")
 
     @stt_group.command(name="status", description="リアルタイム音声認識の稼働状況を表示します。")
@@ -1542,7 +1726,8 @@ class CommandsCog(commands.Cog):
 
         from src.stt.manager import STTManager
         stt_mgr = STTManager.get_instance()
-        is_active = stt_mgr and stt_mgr.is_active(interaction.guild.id)
+        target_bot_idx = self._resolve_stt_bot_index(interaction)
+        is_active = bool(stt_mgr and stt_mgr.is_active(interaction.guild.id, bot_index=target_bot_idx))
 
         embed = discord.Embed(
             title="🎙️ 早耳 Live STT 稼働ステータス",
@@ -1555,8 +1740,7 @@ class CommandsCog(commands.Cog):
         embed.add_field(name="最大同時話者数", value=f"{getattr(self.config, 'hayamimi_max_speakers', 8)} 人", inline=True)
 
         if is_active and stt_mgr:
-            receiver = stt_mgr.receivers.get(interaction.guild.id)
-            dispatcher = stt_mgr.dispatchers.get(interaction.guild.id)
+            receiver, dispatcher = stt_mgr.get_session_pair(interaction.guild.id, bot_index=target_bot_idx)
             if receiver:
                 speakers = len(receiver._sessions)
                 embed.add_field(name="現在接続中の話者セッション", value=f"{speakers} 名", inline=True)
@@ -1627,7 +1811,7 @@ class CommandsCog(commands.Cog):
         enabled: Optional[bool] = None,
         target_lang: Optional[str] = None,
     ) -> None:
-        if not await self._check_admin_permission(interaction):
+        if not await self._require_guild_manage_perm(interaction):
             return
 
         if enabled is None and target_lang is None:

@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 LOG_DIR_BASE = os.getenv("WORKER_LOG_DIR", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs", "workers")))
 MAX_LOG_LINES_PER_FILE = 3000   # 1ファイルあたりの最大保持行数 (bot.log と完全同一の3,000行)
 KEEP_LINES_ON_ROTATE = 100      # ローテーション時に最新ログに残す直近行数 (100行)
+_CTRL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 
 class WorkerLogCollector:
@@ -85,13 +86,12 @@ class WorkerLogCollector:
         if not self._known_workers:
             return {}
 
+        items_snapshot = list(self._known_workers.items())
         results = {}
-        tasks = []
-        for node_id, ip in list(self._known_workers.items()):
-            tasks.append(self.collect_single_worker(node_id, ip, tail=tail))
+        tasks = [self.collect_single_worker(node_id, ip, tail=tail) for node_id, ip in items_snapshot]
 
         collected = await asyncio.gather(*tasks, return_exceptions=True)
-        for (node_id, ip), res in zip(self._known_workers.items(), collected):
+        for (node_id, ip), res in zip(items_snapshot, collected):
             if isinstance(res, Exception):
                 logger.debug(f"Log collect failed for {node_id} ({ip}): {res}")
                 results[node_id] = False
@@ -128,6 +128,10 @@ class WorkerLogCollector:
             if own_session and not session.closed:
                 await session.close()
 
+        return await asyncio.to_thread(self._persist_worker_logs_sync, node_id, target_ip, data)
+
+    def _persist_worker_logs_sync(self, node_id: str, target_ip: str, data: Dict[str, Any]) -> bool:
+        """取得済みワーカーログのディレクトリ検証・マージ書き出しをワーカースレッドで実行"""
         # 出力ディレクトリ安全検証: logs/workers/<safe_node_name>/ (CWE-22)
         safe_node_name = sanitize_filename(node_id)
         if not safe_node_name:
@@ -194,9 +198,8 @@ class WorkerLogCollector:
             merged = list(existing_lines)
             existing_set = set(existing_lines[-200:]) if len(existing_lines) >= 200 else set(existing_lines)
             
-            _ctrl_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
             for line in lines:
-                s_line = _ctrl_re.sub('', line).rstrip("\r\n")
+                s_line = _CTRL_CHAR_RE.sub('', line).rstrip("\r\n")
                 if s_line and s_line not in existing_set:
                     merged.append(s_line)
                     existing_set.add(s_line)
@@ -275,9 +278,8 @@ class WorkerLogCollector:
             }
 
         try:
-            _ctrl_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
             with open(log_file_path, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = [_ctrl_re.sub('', l).rstrip("\r\n") for l in f.readlines()]
+                all_lines = [_CTRL_CHAR_RE.sub('', l).rstrip("\r\n") for l in f.readlines()]
             recent = [l for l in (all_lines[-tail:] if tail > 0 else all_lines) if l.strip()]
             return {
                 "success": True,

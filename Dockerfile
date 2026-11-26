@@ -51,13 +51,14 @@ COPY --from=builder /install /usr/local
 WORKDIR /app
 
 # ディレクトリ作成
-RUN mkdir -p /app/cache /app/cache_voicevox /app/coeiroink_models /app/data /app/logs /app/src /app/openjtalk_voices /app/scripts /app/worker
+RUN mkdir -p /app/cache /app/cache_voicevox /app/coeiroink_models /app/data /app/logs /app/src /app/openjtalk_voices /app/scripts /app/worker /app/tools
 
 # アプリケーションコードおよび音声データのコピー
 COPY config.yaml .
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY worker/ ./worker/
+COPY tools/ ./tools/
 COPY openjtalk_voices/ ./openjtalk_voices/
 
 # ボットの起動

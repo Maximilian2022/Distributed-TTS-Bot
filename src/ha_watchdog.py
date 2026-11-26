@@ -296,6 +296,15 @@ import platform
 class HAWatchdog:
     """Master-Slave HA 監視・同期・調停マネージャー (複数台カスケード Priority 制御対応)"""
 
+    ALLOWED_STATE_FILES = frozenset({
+        "custom_common_reading.json",
+        "custom_english_kana.json",
+        "tier_routing.json",
+        "cluster_workers.json",
+        "voices_cache.json",
+        "mycoeiroink_cache.json",
+    })
+
     def __init__(self):
         self.master_url = os.getenv("TTSBOT_MASTER_URL", "").strip().rstrip("/")
         if not self.master_url:
@@ -359,6 +368,8 @@ class HAWatchdog:
         self.fail_count = 0
         self.last_sync_time = 0.0
         self.last_db_hash: Optional[str] = None
+        self.last_state_files_etag: Optional[str] = None
+        self.last_remote_state_files_hash: Optional[str] = None
         self.code_hash_file = self.db_path.parent / "ha_code_hash.txt"
         self.code_update_time_file = self.db_path.parent / "ha_code_update_time.txt"
         self.current_code_hash: Optional[str] = self._load_code_hash()
@@ -797,6 +808,12 @@ class HAWatchdog:
                             logger.info("📦 [HA Watchdog] Force cache sync signal received from Master! Triggering instant cache sync...")
                             self.sync_frequent_cache_snapshot()
 
+                        # data/*.json 運用状態ファイル (共通辞書・Tierルーティング・話者キャッシュ等) の差分同期
+                        remote_sf_hash = data.get("state_files_hash")
+                        if remote_sf_hash and remote_sf_hash != self.last_remote_state_files_hash:
+                            if self.sync_state_files_snapshot():
+                                self.last_remote_state_files_hash = remote_sf_hash
+
                         return data.get("is_active", True)
                     elif resp.status == 410:
                         self._handle_revocation()
@@ -1011,6 +1028,81 @@ class HAWatchdog:
                 if base_url == self.direct_master_url and self.is_direct_verified:
                     logger.info("Direct LAN sync failed, will attempt WAN fallback.")
                     self.is_direct_verified = False
+
+        return False
+
+    def sync_state_files_snapshot(self) -> bool:
+        """Master の /api/ha/state_files_snapshot から data/*.json 運用状態ファイルをアトミック同期"""
+        if not self.master_url or not self.ha_secret:
+            return False
+
+        primary_url = self.direct_master_url if (self.is_direct_verified and self.direct_master_url) else self.master_url
+        candidate_urls = [primary_url]
+        if primary_url != self.master_url:
+            candidate_urls.append(self.master_url)
+
+        headers = self._get_common_headers()
+        if self.last_state_files_etag:
+            headers["If-None-Match"] = f'"{self.last_state_files_etag}"'
+
+        data_dir = self.db_path.parent
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+        for base_url in candidate_urls:
+            sync_url = f"{base_url}/api/ha/state_files_snapshot"
+            req = urllib.request.Request(sync_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                    if resp.status == 304:
+                        return True
+                    if resp.status == 410:
+                        self._handle_revocation()
+                        return False
+                    if resp.status != 200:
+                        continue
+
+                    compressed = resp.read()
+                    raw_bytes = gzip.decompress(compressed)
+                    payload = json.loads(raw_bytes.decode("utf-8"))
+                    files_map = payload.get("files") if isinstance(payload, dict) else None
+                    if not isinstance(files_map, dict):
+                        continue
+
+                    updated_count = 0
+                    for fname, content in files_map.items():
+                        if fname not in self.ALLOWED_STATE_FILES or not isinstance(content, str):
+                            continue
+                        try:
+                            json.loads(content)
+                        except Exception:
+                            continue
+                        dest = data_dir / fname
+                        if dest.is_file():
+                            try:
+                                if dest.read_text(encoding="utf-8") == content:
+                                    continue
+                            except Exception:
+                                pass
+                        tmp_f = data_dir / f".{fname}.ha_tmp"
+                        tmp_f.write_text(content, encoding="utf-8")
+                        tmp_f.replace(dest)
+                        updated_count += 1
+
+                    etag = (resp.headers.get("ETag") or resp.headers.get("X-State-Files-Hash") or "").strip('"')
+                    if etag:
+                        self.last_state_files_etag = etag
+                    if updated_count > 0:
+                        logger.info(f"✨ [HA Watchdog] Synchronized {updated_count} state JSON file(s) from Master ({base_url}).")
+                    return True
+            except urllib.error.HTTPError as e:
+                if e.code == 304:
+                    return True
+                if e.code == 410:
+                    self._handle_revocation()
+                    return False
+                logger.debug(f"State files sync HTTP {e.code} via {base_url}: {e.reason}")
+            except Exception as e:
+                logger.debug(f"State files sync failed via {base_url}: {e}")
 
         return False
 
@@ -1343,9 +1435,10 @@ class HAWatchdog:
         # 起動時に LAN 直通を判定 (LAN で繋がれば LAN、無理なら WAN)
         self.probe_master_route_at_startup()
 
-        # 初回起動時に即座に初回DBプルを試行
-        logger.info("Initiating first DB snapshot synchronization from Master...")
+        # 初回起動時に即座に初回DBプル＆運用状態JSONプルを試行
+        logger.info("Initiating first DB & state files snapshot synchronization from Master...")
         self.sync_db_snapshot()
+        self.sync_state_files_snapshot()
 
         while self.running:
             try:

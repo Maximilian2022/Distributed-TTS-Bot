@@ -1,3 +1,30 @@
+## 2026-11-27 06:46 第2回PJ全体再監査に基づく全28項目（S2-1〜S2-7・B2-1〜B2-8・P2-1〜P2-5・M2-1〜M2-8）一括改修およびユーザー個人辞書 (`/userdict`)・`/help` 新規実装・本番反映
+- **背景・目的**:
+  - 第1回監査反映後の再監査で特定された全28項目（セキュリティ7件・機能不具合8件・高速化5件・欠落補完8件）について、超低遅延読み上げ・リアルタイムSTT・マルチノード分散GPU協調・HA無停止運用の要件を満たす形で一括改修を実施。
+  - ユーザー合意に基づき、①全28項目（P0/P1/P2すべて）の一括対応、②モデル導入状況・プロファイラ統計・キャッシュ容量サマリはギルド管理者にも閲覧許可しつつ、他サーバーの発言本文や `.wav` 音声を含むキャッシュ一覧/試聴/削除/スキャン・モデル更新・レイテンシリセット/インシデント生履歴はシステム最高管理者 (`_require_admin`) のみに厳格制限、③`/help` コマンドおよびユーザー個人専用辞書（`/userdict` ＋ WebUI「マイ個人辞書」＋ 発話者最優先辞書適用）を新規実装。
+- **実施内容**:
+  1. **Webセキュリティ・2階層認可・XSS排除・セッション強化 (`src/web/auth.py`, `src/web/server.py`, `src/web/templates/index.html`, `src/web/static/app.js`)**:
+     - **S2-1**: `_is_valid_worker_or_setup_token` 共通検証ヘルパーを導入し、WAN ミドルウェアと `/api/worker/heartbeat`・`manifest`・`models/list|manifest|file|download` 全ハンドラで DB 実在照合を統一（偽造 `cwtok_` バイパス遮断＆正規 `cwtok_` Heartbeat 許可）。`models/download` の `tar` サブプロセス `finally` 確実終了も実装。
+     - **S2-3**: `app.js` に `safeEncodeAttrUri()`（`!'()*` を含む完全エスケープ）と `safeExternalUrl()`（`http:`/`https:` 限定）を導入し、NGワード・単語辞書のシングルクォート属性脱出 XSS を根絶。新規個人辞書 UI (`loadUserDict`) は `createElement` + `textContent` のみで構築。
+     - **S2-4**: `/api/cache/files|audio|file|delete_batch|scan`・`/api/system/models/update`・`/api/mycoeiroink/sync`・`/api/system/latency/reset|incidents` を `_require_admin` 限定に変更し、WebUI 表示制御も連動。
+     - **S2-5 & S2-6**: `api_ha_broadcast_update` のプライベートIP無認証許可を廃止、WAN 管理許可リストへ `/api/worker/kick`・`/api/worker/broadcast_update` を追加、Cookie 認証時は `/api/worker/*` にも WAN CSRF 検証を適用。Discord App Login 要求で `is_user_in_bot_guilds` 検証を必須化、Hayamimi 疎通テストで DNS 解決後 IP の SSRF 検証を追加、OAuth 通信タイムアウト (`10s`) と `//` リダイレクト防止を追加。
+     - **S2-7 & M2-7 & B2-2**: `_get_client_ip` による WAN レート制限バケット分離、`_is_https_request` による LAN HTTP / WAN HTTPS 自動 `Secure` Cookie 制御、`Content-Security-Policy` ヘッダ付与、管理者パスワード変更時の指紋バージョン (`pv`) 照合による旧 `uid=0` セッション即時失効（および変更者本人への新 Cookie 即時再発行）、クレデンシャル保存時の `AttributeError` 修正を実装。
+  2. **ユーザー個人辞書 (`/userdict`)・`/help`・設定リロード保護・コマンド権限統一 (`src/database.py`, `src/config.py`, `src/cogs/commands.py`)**:
+     - **M2-3 & M2-8 (個人辞書・`/help`)**: SQLite `user_dictionary` テーブル＋インメモリキャッシュ＋CRUD API、WebAPI `/api/me/dict` (`GET`/`POST`/`DELETE`)、WebUI「マイ個人辞書」カード、Discord `/userdict (add|delete|list)` グループ（1人最大200件、登録・削除時キャッシュ自動パージ）、および権限連動ガイド `/help` スラッシュコマンドを新設。
+     - **S2-2 & B2-6**: `AppConfig.reload()` で動的ローカル話者（COEIROINK/VOICEVOX/SHAREVOX 等）および非空シークレットを保持可能にし、`api_reload_config` と `/reload`（システム最高管理者限定化）の両方で DB 暗号化クレデンシャルと話者一覧を再適用。`load_config()` で `hidden` フラグを読み込み、`VoiceSelectView` で `hidden` / `edge` ボイスを除外。
+     - **M2-5 & M2-6**: `commands.py` の権限判定をシステム最高管理者とギルド管理者の2系統に整理し、`/join` で同一テキストチャンネルへの複数号機重複バインドを防止。`Database.maintenance()` に失効トークン・孤児キュー掃除および複合インデックスを追加。
+  3. **マルチBot・分散Worker・TTS/STT不具合修正と高速化 (`src/main.py`, `src/bot_pool.py`, `src/resource_manager.py`, `src/cogs/vc_handler.py`, `src/tts/*`, `src/stt/*`, `src/utils/*`, `src/cache_prewarm.py`, `config.yaml`)**:
+     - **B2-1 & B2-3 & B2-7**: サブBot起動時にも `WebDashboardButtonView` を登録、`ResourceManager.stop_idle_monitor()` 実装、`shutdown_all()` での `STTManager.stop_all()` 安全フラッシュ停止、`enabled` / `not is_ws` フィルタと HTTP セッション再利用を追加。`node_pool.py` で空き GPU 稼働中の下位 CPU コンテナ不要起動を抑止し、`wake_up_nodes` 1台起動即復帰・`try_remote_start` の `success==True` 検証を導入。`WSWorkerNode.supports_model` でモデルディレクトリ名と UUID の相互照合を実装。
+     - **B2-4 & B2-5 & M2-4 & P2-5 (STT)**: `STTManager` を `(guild_id, bot_index)` ペア管理に対応させ同一ギルド複数VCでの独立稼働を実現（永続化キーの後方互換も維持）。`SpeechDispatcher` の翻訳保持を言語別辞書 (`translations: Dict[str, str]`) に拡張して2言語同時翻訳上書き消失を解消し、`AllowedMentions.none()` を付与。`VoiceStreamReceiver` に WS フック自動再装着・`self_deaf=False` 自動解除・SSRC マップ上限掃除・RMS 計算軽量化、`HayamimiSession` にマイクロバッチ送信を導入。
+     - **P2-1〜P2-4 & M2-2**: キャッシュヒット統計をライトビハインド集約バッファ（Read-your-writes 自動フラッシュ付き）化して SQLite コミット頻度を大幅削減。`split_into_chunks_async` での `local_text` 一括事前計算、第0チャンク最優先起動＆先行合成セマフォ制限、`SafeAsyncQueue(maxsize=50)` 保護、個人辞書のサーバー辞書最優先マージ、`WorkerLogCollector` の `asyncio.to_thread` 非同期化、`_CTX_WORKER_LABELS` (`ContextVar`) による並列合成ラベル分離、`cloud_task` 敗北時キャンセル、`GoogleTTSClient` gRPC チャネル `close()`、`config.yaml` の `az_margin_seconds: 0.68` & `chunk_singleflight: "on"` 同期を実施。
+  4. **HA運用状態ファイル同期・パッケージング・ドキュメント・単体テスト (`src/ha_watchdog.py`, `Dockerfile`, `src/web/static/docker-compose.slave.yml`, `src/web/static/setup-standby.sh`, `.env.example`, `README*.md`, `MANUAL.md`, `tests/test_reaudit_fixes_and_userdict.py`)**:
+     - **M2-1 & B2-8**: Master `/api/ha/state_files_snapshot`（ETag 304・gzip圧縮）と `HAWatchdog.sync_state_files_snapshot()` により `data/*.json` 状態ファイルを Standby 側へ自動アトミック同期。`Dockerfile` へ `COPY tools/ ./tools/` を追加し、Standby セットアップスクリプト・Compose テンプレート・`.env.example`・日英 README・MANUAL を最新仕様へ更新。
+     - **単体テスト**: セキュリティ境界・2階層権限・パスワード変更時旧セッション失効・個人辞書 CRUD/優先順位・HA 状態同期・ライトビハインド統計・GPU起動抑止・STT 2言語/マルチVC分離等を網羅する新規テストスイートを追加。
+- **検証・本番反映結果**:
+  - `node --check src/web/static/app.js`、`bash -n src/web/static/setup-standby.sh`、`python3 -m py_compile` 構文チェック全件合格。
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh python3 -m unittest discover -s tests -p "test_*.py"`): **全 268 件合格** (`Ran 268 tests in 17.948s`, OK)、一時コンテナ・一時データの完全自動破棄（ゼロフットプリント）を確認済み。
+  - 本番反映実施: `./scripts/rolling_update.sh --build` により裏で最新イメージをビルド完了後、`.ha_updating` 保護下で **1.4秒** の最小瞬断切り替えを実施。`ttsbot-app-1` `healthy` 復帰、`/health` HTTP 200 OK (`status="ok"`, `is_ready=true`, `guilds_count=2`, `workers.count=12`)、Cloudflare Tunnel 無切断維持、Bot #1〜#5 全号機接続および Worker Pre-warm・ピン留めモデル昇格完了（エラーログ 0 件）を実機確認完了。
+
 ## 2026-11-26 22:51 PJ全体再監査に基づく全29項目（セキュリティS-1〜S-8・不具合B-1〜B-10・不整合I-1〜I-6・高速化P-1〜P-5）の一括改修と本番反映
 - **背景・目的**:
   - PJ全体の再監査で検出された全29項目について、プロジェクト本来の目的（20msフレーム無音切れ目なしの超低遅延Discord読み上げ・早耳LiveリアルタイムSTT・マルチノード分散GPU協調・本番無停止HA運用）を守りつつ一括改修・検証・本番反映を実施。

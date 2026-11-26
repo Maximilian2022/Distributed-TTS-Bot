@@ -329,6 +329,19 @@ class TTSNode:
             async with aiohttp.ClientSession(timeout=client_to) as temp_session:
                 async with temp_session.post(agent_url, json={"engine": engine}, headers=agent_auth_headers()) as resp:
                     if resp.status == 200:
+                        body_ok = True
+                        try:
+                            data = await resp.json(content_type=None)
+                            if isinstance(data, dict) and data.get("success") is False:
+                                body_ok = False
+                                logger.warning(
+                                    f"⚠️ [On-Demand Start] Worker ({target_ip}) reported failure for '{engine}': "
+                                    f"{data.get('error') or data}"
+                                )
+                        except Exception:
+                            pass
+                        if not body_ok:
+                            return False
                         logger.info(f"✨ [On-Demand Start] Successfully woke engine '{engine}' on worker ({target_ip})")
                         self.is_healthy = True
                         self.engine_running = True
@@ -340,7 +353,7 @@ class TTSNode:
                         err_text = await resp.text()
                         logger.warning(f"⚠️ [On-Demand Start] Worker ({target_ip}) returned HTTP {resp.status} for '{engine}': {err_text}")
         except Exception as e:
-            logger.warning(f"Could not remote-start engine on worker {self.id} ({self.url}): {e}")
+            logger.warning(f"Could not remote-start engine on worker {self.id} ({self.url}): {type(e).__name__}: {e}")
         return False
 
     @property
@@ -857,42 +870,66 @@ class TTSNodePool:
 
     async def wake_up_nodes(self, wait_healthy: bool = True, timeout: float = 35.0) -> bool:
         """
-        スリープ中の外部Workerノード（GPU最優先）に対してオンデマンド遠隔起動を一括送出し、
-        いずれかのノードがヘルスチェックOK（is_available）になるまで待機する (バッチ事前生成・コールドスタート用)。
+        スリープ中の外部Workerノード（GPU最優先）に対してオンデマンド遠隔起動を送出し、
+        いずれか1台のノードがヘルスチェックOK（is_available）になった瞬間に即座に復帰する。
+        GPU候補が存在する場合は下位CPUノードを同時起動せず、GPUが一定時間内に起動しない場合のみCPUへ段階展開する。
         """
         if any(n.is_available for n in self.nodes):
             return True
 
-        candidates = [n for n in self.nodes if n.enabled and not n.draining and n.is_agent_reachable]
+        candidates = [
+            n for n in self.nodes
+            if n.enabled
+            and not n.draining
+            and not getattr(n, "is_ws", False)
+            and str(n.url).startswith("http")
+            and n.is_agent_reachable
+        ]
         if not candidates:
             return False
 
-        # GPUノードを最優先、次にCPUノード
         candidates.sort(key=lambda n: (0 if n.has_gpu else 1, n.priority))
+        gpu_candidates = [n for n in candidates if n.has_gpu][:2]
+        cpu_candidates = [n for n in candidates if not n.has_gpu][:2]
 
-        # 上位候補（GPUノードおよびCPUノード）にリモート起動を並行送信
-        tasks = []
-        for n in candidates[:3]:
-            tasks.append(n.try_remote_start(timeout=timeout))
+        primary_batch = gpu_candidates if gpu_candidates else cpu_candidates
+        secondary_batch = cpu_candidates if gpu_candidates else []
 
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            logger.info(f"⚡ [NodePool] Wake-up broadcast for '{self.engine_name}' returned: {results}")
+        now_ts = time.time()
+        launched_tasks: List[asyncio.Task] = []
+        for n in primary_batch:
+            if now_ts - getattr(n, "last_start_attempt", 0.0) > 8.0:
+                n.last_start_attempt = now_ts
+                launched_tasks.append(asyncio.create_task(n.try_remote_start(timeout=timeout)))
 
         if not wait_healthy:
             return any(n.is_available for n in self.nodes)
 
-        # いずれかのノードが利用可能になるまでポーリング待機 (最大 timeout 秒)
         start_t = time.time()
+        secondary_launched = False
         while time.time() - start_t < timeout:
             if any(n.is_available for n in self.nodes):
-                logger.info(f"✨ [NodePool] At least one node for '{self.engine_name}' is fully ready (took {time.time() - start_t:.2f}s)")
+                logger.info(f"✨ [NodePool] At least one node for '{self.engine_name}' is ready (took {time.time() - start_t:.2f}s)")
                 return True
-            await asyncio.sleep(0.5)
+            # GPU候補のみで12秒経過または全失敗した場合、予備CPU候補も追加起動
+            elapsed = time.time() - start_t
+            if secondary_batch and not secondary_launched and (
+                elapsed >= min(12.0, timeout * 0.5)
+                or (launched_tasks and all(t.done() for t in launched_tasks))
+            ):
+                secondary_launched = True
+                cur_ts = time.time()
+                for n in secondary_batch:
+                    if cur_ts - getattr(n, "last_start_attempt", 0.0) > 8.0:
+                        n.last_start_attempt = cur_ts
+                        launched_tasks.append(asyncio.create_task(n.try_remote_start(timeout=max(10.0, timeout - elapsed))))
+            if launched_tasks and all(t.done() for t in launched_tasks) and (not secondary_batch or secondary_launched):
+                break
+            await asyncio.sleep(0.25)
 
         ready = any(n.is_available for n in self.nodes)
         if not ready:
-            logger.warning(f"⚠️ [NodePool] Wake-up for '{self.engine_name}' timed out after {timeout:.1f}s.")
+            logger.warning(f"⚠️ [NodePool] Wake-up for '{self.engine_name}' did not bring any node online within {timeout:.1f}s.")
         return ready
 
     def _order_available_nodes(
@@ -1054,10 +1091,37 @@ class TTSNodePool:
         current_order = get_tier_routing_order(eng_key)
 
         # 1. オンデマンド遠隔起動のトリガー判定
-        # 現在設定されている Tier 優先順位の上位 Tier に属し、かつ Agent が生存しているノードが停止中の場合のみ起動をトリガー
+        # 既に上位GPUノードが稼働中で空きスロットがある場合は、停止中の下位CPUノードへ無駄な遠隔起動を送らない
+        target_gid_check = str(guild_id).strip() if guild_id is not None else None
+        has_idle_gpu_node = any(
+            n.is_available
+            and n.has_gpu
+            and not n.semaphore.locked()
+            and n.supports_model(self.engine_name, model_name)
+            and (not getattr(n, "exclusive_guild_id", None) or (target_gid_check and target_gid_check == str(n.exclusive_guild_id)))
+            for n in self.nodes
+        )
+        has_any_available_node = any(
+            n.is_available
+            and n.supports_model(self.engine_name, model_name)
+            and (not getattr(n, "exclusive_guild_id", None) or (target_gid_check and target_gid_check == str(n.exclusive_guild_id)))
+            for n in self.nodes
+        )
+
         candidates_to_start = []
         for n in self.nodes:
-            if n.enabled and not getattr(n, "is_ws", False) and not n.is_available and not n.draining and n.is_agent_reachable:
+            if (
+                n.enabled
+                and not getattr(n, "is_ws", False)
+                and str(n.url).startswith("http")
+                and not n.is_available
+                and not n.draining
+                and n.is_agent_reachable
+                and n.supports_model(self.engine_name, model_name)
+            ):
+                # 既に稼働中ノード（特に空きGPU）がある場合、下位CPUノードは起こさない
+                if not n.has_gpu and (has_idle_gpu_node or has_any_available_node):
+                    continue
                 candidates_to_start.append(n)
 
         if candidates_to_start:
@@ -1070,8 +1134,11 @@ class TTSNodePool:
                     return 99
 
             candidates_to_start.sort(key=lambda n: (get_node_tier_rank(n), n.priority))
-            for n in candidates_to_start:
-                if now_ts - getattr(n, "last_start_attempt", 0.0) > 10.0:
+            # GPU候補が起動待ちにいる場合はまずGPU候補のみ起動する
+            gpu_start_cands = [n for n in candidates_to_start if n.has_gpu]
+            effective_start_cands = gpu_start_cands if gpu_start_cands else candidates_to_start[:1]
+            for n in effective_start_cands:
+                if now_ts - getattr(n, "last_start_attempt", 0.0) > 15.0:
                     n.last_start_attempt = now_ts
                     asyncio.create_task(n.try_remote_start())
 

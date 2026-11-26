@@ -22,6 +22,7 @@ import discord
 logger = logging.getLogger(__name__)
 
 FRAME_SIZE = 3840  # 48kHz, 16bit, Stereo の 20ms 分のバイト数 (48000 * 2 * 2 * 0.02)
+_SILENCE_FRAME: bytes = b"\x00" * FRAME_SIZE
 
 
 def generate_beep_pcm(duration_sec: float = 0.4, freq: float = 1000.0, sample_rate: int = 48000, volume: float = 0.25) -> bytes:
@@ -601,7 +602,7 @@ class StreamingAudioSource(discord.AudioSource):
             # まだ終了していないがバッファが空 (後続パーツの生成待ち = アンダーラン)
             # 接続を切断させないよう、無音フレームを安全送出して待機
             self._underrun_frames += 1
-            return b'\x00' * FRAME_SIZE
+            return _SILENCE_FRAME
 
     @property
     def underrun_frames(self) -> int:

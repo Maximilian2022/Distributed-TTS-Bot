@@ -177,6 +177,10 @@ class WSWorkerNode(TTSNode):
             if m == req or m == uuid_part:
                 return True
 
+        # COEIROINK ディレクトリ名 <-> UUID 相互マッピング照合もサポート
+        if eng == "coeiroink" and self._match_coeiroink_model_identifier(model_name, models):
+            return True
+
         return False
 
     def to_dict(self) -> Dict[str, Any]:

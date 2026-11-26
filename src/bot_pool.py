@@ -142,8 +142,6 @@ class BotPoolManager:
                 self._connecting_vcs.pop(key, None)
         return None
 
-        return None
-
     def get_pool_user_ids(self) -> Dict[int, int]:
         """自プールの全Botの Discord User ID -> bot_index のマップを取得"""
         mapping = {}

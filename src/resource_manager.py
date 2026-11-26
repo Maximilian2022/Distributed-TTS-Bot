@@ -182,6 +182,7 @@ class LocalEngineResourceManager:
 
         # スタンバイ待機フラグ (Standby中はエンジン停止および外部Worker Reconcileをガード)
         self._is_standby: bool = False
+        self._http_session: Optional[aiohttp.ClientSession] = None
 
         if self.is_docker_available:
             logger.info("Docker socket detected. Smart local resource management is ENABLED.")
@@ -242,6 +243,30 @@ class LocalEngineResourceManager:
         connector = aiohttp.UnixConnector(path=self.socket_path)
         timeout = aiohttp.ClientTimeout(total=20)
         return aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+    def _get_http_session(self) -> aiohttp.ClientSession:
+        """Worker Agent / エンジン通信用の共有 HTTP ClientSession (Keep-Alive 再利用)"""
+        if self._http_session is None or self._http_session.closed:
+            connector = aiohttp.TCPConnector(limit=16, keepalive_timeout=45.0)
+            self._http_session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=15.0, connect=4.0),
+            )
+        return self._http_session
+
+    @staticmethod
+    def _is_controllable_http_worker(node: Any) -> bool:
+        """外部 HTTP Worker ノードとして有効かつ Agent 制御対象か判定 (無効・ドレイン・WSノードを除外)"""
+        return bool(
+            node
+            and getattr(node, "enabled", True)
+            and not getattr(node, "draining", False)
+            and not getattr(node, "is_ws", False)
+            and getattr(node, "is_external", False)
+            and getattr(node, "url", "")
+            and str(node.url).startswith("http")
+            and getattr(node, "is_agent_reachable", True)
+        )
 
     async def get_container_status(self, provider: str) -> Optional[str]:
         """コンテナの状態 ('running', 'exited', 'created', etc.) を取得"""
@@ -500,7 +525,7 @@ class LocalEngineResourceManager:
         for pool in (self.tts_manager.voicevox_pool, self.tts_manager.sharevox_pool, self.tts_manager.coeiroink_pool):
             if pool:
                 for n in pool.nodes:
-                    if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
+                    if self._is_controllable_http_worker(n):
                         try:
                             p = urlparse(n.url)
                             if p.hostname and p.hostname not in ("localhost", "127.0.0.1", LOCAL_HOST_IP):
@@ -512,14 +537,14 @@ class LocalEngineResourceManager:
             return
 
         logger.info(f"🛑 [{reason}] Broadcasting stop all engines to external workers: {external_ips}")
+        session = self._get_http_session()
+        req_timeout = aiohttp.ClientTimeout(total=4.0, connect=2.5)
         async def _stop_worker(ip: str):
             try:
                 url = f"http://{ip}:50030/engine/stop"
-                timeout = aiohttp.ClientTimeout(total=4.0)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(url, json={"engine": "all"}, headers=agent_auth_headers()) as resp:
-                        if resp.status == 200:
-                            logger.info(f"✨ [Worker Stop] Successfully stopped engines on worker ({ip})")
+                async with session.post(url, json={"engine": "all"}, headers=agent_auth_headers(), timeout=req_timeout) as resp:
+                    if resp.status == 200:
+                        logger.info(f"✨ [Worker Stop] Successfully stopped engines on worker ({ip})")
             except Exception as e:
                 logger.debug(f"Failed to stop engines on worker ({ip}): {e}")
 
@@ -724,14 +749,19 @@ class LocalEngineResourceManager:
         for prov in needed_providers:
             pool = getattr(self.tts_manager, f"{prov}_pool", None)
             if pool:
+                has_active_gpu = any(n.is_available and n.has_gpu for n in pool.nodes)
                 for n in pool.nodes:
-                    if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
-                        try:
-                            p = urlparse(n.url)
-                            if p.hostname and p.hostname not in ("localhost", "127.0.0.1"):
-                                worker_targets.append((p.hostname, prov, n))
-                        except Exception:
-                            pass
+                    if not self._is_controllable_http_worker(n):
+                        continue
+                    # 既に上位GPUワーカーが稼働中の場合、停止中のCPUフォールバックワーカーまで無理に起こさない
+                    if has_active_gpu and not n.has_gpu and not n.is_available:
+                        continue
+                    try:
+                        p = urlparse(n.url)
+                        if p.hostname and p.hostname not in ("localhost", "127.0.0.1"):
+                            worker_targets.append((p.hostname, prov, n))
+                    except Exception:
+                        pass
 
         if not worker_targets:
             return
@@ -759,21 +789,37 @@ class LocalEngineResourceManager:
                 sem = self._prewarm_semaphore
             async with sem:
                 # 1. 外部ワーカーのコンテナ先行起動 (POST /engine/start)
-                try:
-                    url = f"http://{ip}:50030/engine/start"
-                    timeout = aiohttp.ClientTimeout(total=10.0)
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.post(url, json={"engine": prov}, headers=agent_auth_headers()) as resp:
+                engine_ready = bool(node.is_available)
+                if not engine_ready:
+                    try:
+                        url = f"http://{ip}:50030/engine/start"
+                        session = self._get_http_session()
+                        req_timeout = aiohttp.ClientTimeout(total=12.0, connect=3.0)
+                        async with session.post(url, json={"engine": prov}, headers=agent_auth_headers(), timeout=req_timeout) as resp:
                             if resp.status == 200:
-                                logger.info(f"✨ [Worker Pre-warm] Remote engine '{prov}' ready on worker ({ip})")
-                                # ノード状態を即時アクティブに更新し、UIおよびルーティングへ即時反映
-                                node.engine_running = True
-                                node.is_healthy = True
-                                node.specs["engine_running"] = True
-                                node.specs["engine_healthy"] = True
-                                node.unhealthy_until = 0.0
-                except Exception as e:
-                    logger.warning(f"⚠️ [Worker Pre-warm] Failed to start engine '{prov}' on worker ({ip}): {e}")
+                                body_ok = True
+                                try:
+                                    res_json = await resp.json(content_type=None)
+                                    if isinstance(res_json, dict) and res_json.get("success") is False:
+                                        body_ok = False
+                                        logger.warning(
+                                            f"⚠️ [Worker Pre-warm] Worker ({ip}) declined engine '{prov}' start: {res_json.get('error') or res_json}"
+                                        )
+                                except Exception:
+                                    pass
+                                if body_ok:
+                                    logger.info(f"✨ [Worker Pre-warm] Remote engine '{prov}' ready on worker ({ip})")
+                                    node.engine_running = True
+                                    node.is_healthy = True
+                                    node.specs["engine_running"] = True
+                                    node.specs["engine_healthy"] = True
+                                    node.unhealthy_until = 0.0
+                                    engine_ready = True
+                    except Exception as e:
+                        logger.warning(f"⚠️ [Worker Pre-warm] Failed to start engine '{prov}' on worker ({ip}): {type(e).__name__}: {e}")
+
+                if not engine_ready:
+                    return
 
                 # 2. モデル事前ロード (エンジンURLへ直接リクエスト)
                 for vcfg in needed_voice_configs:
@@ -820,7 +866,7 @@ class LocalEngineResourceManager:
         nodes = self.tts_manager.coeiroink_pool.nodes
         worker_ips = set()
         for n in nodes:
-            if n.is_external and n.url and getattr(n, "is_agent_reachable", True):
+            if self._is_controllable_http_worker(n):
                 try:
                     p = urlparse(n.url)
                     if p.hostname and p.hostname not in ("localhost", "127.0.0.1"):
@@ -980,7 +1026,7 @@ class LocalEngineResourceManager:
             if not pool:
                 continue
             for n in pool.nodes:
-                if n.is_external and n.url and worker_ip in n.url:
+                if self._is_controllable_http_worker(n) and worker_ip in n.url:
                     safe_create_task(
                         self.warmup_speaker_model_on_node(n, vcfg),
                         name=f"sync_warmup_{worker_ip}_{vcfg.id}"
@@ -998,7 +1044,7 @@ class LocalEngineResourceManager:
             return
 
         pool = self.tts_manager.coeiroink_pool
-        ext_nodes = [n for n in pool.nodes if n.is_external and n.is_available and n.url]
+        ext_nodes = [n for n in pool.nodes if self._is_controllable_http_worker(n) and n.is_available]
         if not ext_nodes:
             return
 
@@ -1007,6 +1053,10 @@ class LocalEngineResourceManager:
             return
 
         now = time.time()
+        if len(self._ram_reconcile_cooldown) > 256:
+            self._ram_reconcile_cooldown = {
+                k: v for k, v in self._ram_reconcile_cooldown.items() if (now - v) < 600.0
+            }
         for node in ext_nodes:
             p = urlparse(node.url)
             ip = p.hostname
@@ -1199,6 +1249,24 @@ class LocalEngineResourceManager:
         if self._idle_task is None or self._idle_task.done():
             self._idle_task = safe_create_task(self._idle_monitor_loop(), name="idle_monitor_loop")
         self.start_metrics_collector()
+
+    async def stop_idle_monitor(self) -> None:
+        """アイドル状態監視・メトリクス収集タスクおよび共有 HTTP セッションを安全に停止"""
+        for task_attr in ("_idle_task", "_metrics_task"):
+            t = getattr(self, task_attr, None)
+            if t and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            setattr(self, task_attr, None)
+        if self._http_session and not self._http_session.closed:
+            try:
+                await self._http_session.close()
+            except Exception:
+                pass
+        self._http_session = None
 
     async def _idle_monitor_loop(self) -> None:
         """60秒おきにVC接続状況および各エンジンの最終使用時刻をチェック"""

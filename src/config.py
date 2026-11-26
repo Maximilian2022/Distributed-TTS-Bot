@@ -241,7 +241,35 @@ class AppConfig:
                     self.discord_token = ""
 
     def reload(self, config_path: str = "config.yaml") -> None:
-        """YAMLファイルおよび.envから最新の設定をロードして現在のインスタンスに反映"""
+        """YAMLファイルおよび.envから最新の設定をロードし、既存の動的ローカル話者・セッション鍵・DB認証情報を保全して反映"""
+        # 起動後に動的登録・DB注入された値を退避
+        prev_dynamic_voices = {
+            k: v for k, v in self.voices.items()
+            if getattr(v, "provider", "") in ("voicevox", "sharevox", "coeiroink")
+        }
+        preserved_secrets = {
+            "web_session_secret": self.web_session_secret,
+            "worker_shared_secret": self.worker_shared_secret,
+            "worker_shared_secret_previous": self.worker_shared_secret_previous,
+            "ha_secret": self.ha_secret,
+            "admin_password": self.admin_password,
+            "azure_speech_key": self.azure_speech_key,
+            "azure_speech_region": self.azure_speech_region,
+            "google_api_key": self.google_api_key,
+            "google_credentials_json": self.google_credentials_json,
+            "gemini_api_key": self.gemini_api_key,
+            "hayamimi_ws_url": self.hayamimi_ws_url,
+            "hayamimi_model": self.hayamimi_model,
+            "hayamimi_trans_langs": self.hayamimi_trans_langs,
+            "hayamimi_gemini_key": self.hayamimi_gemini_key,
+            "hayamimi_token": self.hayamimi_token,
+            "cloudflare_tunnel_token": self.cloudflare_tunnel_token,
+            "discord_client_id": self.discord_client_id,
+            "discord_client_secret": self.discord_client_secret,
+        }
+        preserved_tokens_map = dict(self.discord_tokens_map)
+        preserved_discord_token = self.discord_token
+
         env_path = Path(".env")
         if env_path.exists():
             try:
@@ -259,6 +287,27 @@ class AppConfig:
         new_cfg = load_config(config_path)
         for attr, value in new_cfg.__dict__.items():
             setattr(self, attr, value)
+
+        # 静的定義に無い動的ローカル話者を復元
+        for vk, vv in prev_dynamic_voices.items():
+            if vk not in self.voices:
+                self.voices[vk] = vv
+
+        # 環境変数未指定でランダム再生成または空に戻った秘密鍵・DBクレデンシャルを復元
+        if not os.getenv("WEB_SESSION_SECRET") and not os.getenv("SESSION_SECRET") and preserved_secrets["web_session_secret"]:
+            self.web_session_secret = preserved_secrets["web_session_secret"]
+        if not os.getenv("WORKER_SHARED_SECRET") and preserved_secrets["worker_shared_secret"]:
+            self.worker_shared_secret = preserved_secrets["worker_shared_secret"]
+        for key_name, old_val in preserved_secrets.items():
+            if key_name in ("web_session_secret", "worker_shared_secret"):
+                continue
+            if not getattr(self, key_name, "") and old_val:
+                setattr(self, key_name, old_val)
+        for idx, tok in preserved_tokens_map.items():
+            if idx not in self.discord_tokens_map and tok:
+                self.discord_tokens_map[idx] = tok
+        if not self.discord_token and preserved_discord_token:
+            self.discord_token = preserved_discord_token
 
 ROLLOUT_MODES = ("off", "shadow", "on")
 
@@ -394,7 +443,8 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
                 provider=provider,
                 voice_name=v_data.get("voice_name", ""),
                 fallback_provider=fallback_provider,
-                fallback_voice=v_data.get("fallback_voice", "")
+                fallback_voice=v_data.get("fallback_voice", ""),
+                hidden=bool(v_data.get("hidden", False)),
             )
 
     # 環境変数からの上書き (1〜10号機Botトークン)

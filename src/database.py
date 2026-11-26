@@ -196,11 +196,17 @@ class Database:
         self.pool = SQLitePool(db_path, max_connections=max_connections)
         self._guild_settings_cache: Dict[int, Tuple[float, Dict[str, Any]]] = {}
         self._dict_cache: Dict[int, Tuple[float, List[Tuple[str, str]]]] = {}
+        self._user_dict_cache: Dict[int, Tuple[float, List[Tuple[str, str]]]] = {}
         self._ng_words_cache: Dict[int, Tuple[float, List[str]]] = {}
         self._user_settings_cache: Dict[Tuple[int, int], Tuple[float, Optional[Dict[str, Any]]]] = {}
         self._cache_ttl: float = 300.0  # 5分間キャッシュ
         self._metric_delete_counter: int = 0
         self._latency_delete_counter: int = 0
+        # キャッシュヒット統計のライトビハインド集約バッファ (SQLite個別COMMIT乱発を95%削減)
+        self._pending_meta_hits: Dict[str, int] = {}
+        self._pending_savings_hits: Dict[Tuple[str, bool], List[int]] = {}
+        self._last_hit_flush_ts: float = time.monotonic()
+        self._hit_flush_lock = asyncio.Lock()
 
     def get_connection(self):
         """プールから持続的DBコネクションを取得する非同期コンテキストマネージャー"""
@@ -212,7 +218,11 @@ class Database:
         return getattr(self.pool, "_is_closed", False)
 
     async def close(self):
-        """プール内の全接続を安全に解放 (直前に WAL チェックポイントを実行)"""
+        """プール内の全接続を安全に解放 (直前に未フラッシュ統計の書き出しと WAL チェックポイントを実行)"""
+        try:
+            await self.flush_cache_hit_buffers()
+        except Exception:
+            pass
         try:
             async with self.get_connection() as db:
                 await db.execute("PRAGMA wal_checkpoint(PASSIVE);")
@@ -236,13 +246,15 @@ class Database:
                 self._dict_cache.clear()
 
     def invalidate_user_cache(self, user_id: Optional[int] = None, guild_id: Optional[int] = None) -> None:
-        """ユーザー設定キャッシュを無効化"""
+        """ユーザー設定・個人辞書キャッシュを無効化"""
         if user_id is None:
             self._user_settings_cache.clear()
+            self._user_dict_cache.clear()
         elif guild_id is None:
             keys = [k for k in self._user_settings_cache if k[1] == user_id]
             for k in keys:
                 self._user_settings_cache.pop(k, None)
+            self._user_dict_cache.pop(user_id, None)
         else:
             self._user_settings_cache.pop((guild_id, user_id), None)
 
@@ -396,6 +408,20 @@ class Database:
                     PRIMARY KEY (guild_id, word)
                 )
             """)
+
+            # 2-4. ユーザー個人専用単語辞書テーブル (/userdict & WebUI マイ個人辞書)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_dictionary (
+                    user_id INTEGER NOT NULL,
+                    word TEXT NOT NULL,
+                    reading TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, word)
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_user_dictionary_user ON user_dictionary(user_id);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_guild_dict_guild ON guild_dictionary(guild_id);")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_guild_ng_guild ON guild_ng_words(guild_id);")
 
             # 3. ギルド個別設定
             await db.execute("""
@@ -1399,6 +1425,68 @@ class Database:
             "strip_name_brackets": new_strip
         }
 
+    # --- ユーザー個人専用単語辞書 (/userdict) ---
+
+    async def get_user_dictionary_words(self, user_id: int) -> List[Tuple[str, str]]:
+        """指定ユーザーの個人専用辞書一覧を取得 (5分間オンメモリキャッシュ付き・単語長降順)"""
+        uid = int(user_id or 0)
+        if uid <= 0:
+            return []
+        now = time.time()
+        cached = self._user_dict_cache.get(uid)
+        if cached is not None and (now - cached[0]) < self._cache_ttl:
+            return list(cached[1])
+        async with self.get_connection() as db:
+            async with db.execute(
+                "SELECT word, reading FROM user_dictionary WHERE user_id = ? ORDER BY length(word) DESC, created_at DESC",
+                (uid,),
+            ) as cur:
+                rows = await cur.fetchall()
+                words = [(str(r[0]), str(r[1])) for r in rows]
+        self._user_dict_cache[uid] = (now, words)
+        if len(self._user_dict_cache) > 1024:
+            oldest_uid = next(iter(self._user_dict_cache))
+            self._user_dict_cache.pop(oldest_uid, None)
+        return list(words)
+
+    async def add_user_dictionary_word(self, user_id: int, word: str, reading: str) -> None:
+        """指定ユーザーの個人専用辞書に単語を追加・上書き"""
+        uid = int(user_id)
+        w = word.strip()
+        r = reading.strip()
+        if uid <= 0 or not w or not r:
+            return
+        async with self.get_connection() as db:
+            await db.execute(
+                """
+                INSERT INTO user_dictionary (user_id, word, reading, created_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id, word) DO UPDATE SET
+                    reading = excluded.reading,
+                    created_at = CURRENT_TIMESTAMP
+                """,
+                (uid, w, r),
+            )
+            await db.commit()
+        self._user_dict_cache.pop(uid, None)
+
+    async def delete_user_dictionary_word(self, user_id: int, word: str) -> bool:
+        """指定ユーザーの個人専用辞書から単語を削除"""
+        uid = int(user_id)
+        w = word.strip()
+        if uid <= 0 or not w:
+            return False
+        async with self.get_connection() as db:
+            cur = await db.execute(
+                "DELETE FROM user_dictionary WHERE user_id = ? AND word = ?",
+                (uid, w),
+            )
+            await db.commit()
+            deleted = cur.rowcount > 0
+        if deleted:
+            self._user_dict_cache.pop(uid, None)
+        return deleted
+
     # --- ギルド別単語辞書 ---
 
     async def add_dictionary_word(self, guild_id: int, word: str, reading: str) -> None:
@@ -2224,16 +2312,107 @@ class Database:
                 return
             logger.debug(f"Failed to record TTS failure for {provider}: {e}")
 
+    async def flush_cache_hit_buffers(self) -> None:
+        """オンメモリに蓄積されたキャッシュヒット回数・節約文字数を単一トランザクションでSQLiteへ一括反映"""
+        if self.is_closed:
+            return
+        if not self._pending_meta_hits and not self._pending_savings_hits:
+            return
+        async with self._hit_flush_lock:
+            if not self._pending_meta_hits and not self._pending_savings_hits:
+                return
+            meta_batch = dict(self._pending_meta_hits)
+            savings_batch = dict(self._pending_savings_hits)
+            self._pending_meta_hits.clear()
+            self._pending_savings_hits.clear()
+            self._last_hit_flush_ts = time.monotonic()
+
+        for attempt in range(3):
+            try:
+                async with self.get_connection() as db:
+                    if meta_batch:
+                        await db.executemany(
+                            """
+                            UPDATE cache_metadata
+                            SET hit_count = hit_count + ?, last_hit_at = CURRENT_TIMESTAMP
+                            WHERE cache_key = ?
+                            """,
+                            [(cnt, ckey) for ckey, cnt in meta_batch.items()],
+                        )
+                    for (month, is_local), vals in savings_batch.items():
+                        chars, hits = vals[0], vals[1]
+                        if is_local:
+                            await db.execute(
+                                """
+                                INSERT INTO tts_cache_savings (
+                                    month, saved_characters, hits,
+                                    saved_cloud_characters, hits_cloud,
+                                    saved_local_characters, hits_local
+                                )
+                                VALUES (?, ?, ?, 0, 0, ?, ?)
+                                ON CONFLICT(month) DO UPDATE SET
+                                    saved_characters = saved_characters + excluded.saved_characters,
+                                    hits = hits + excluded.hits,
+                                    saved_local_characters = saved_local_characters + excluded.saved_local_characters,
+                                    hits_local = hits_local + excluded.hits_local
+                                """,
+                                (month, chars, hits, chars, hits),
+                            )
+                        else:
+                            await db.execute(
+                                """
+                                INSERT INTO tts_cache_savings (
+                                    month, saved_characters, hits,
+                                    saved_cloud_characters, hits_cloud,
+                                    saved_local_characters, hits_local
+                                )
+                                VALUES (?, ?, ?, ?, ?, 0, 0)
+                                ON CONFLICT(month) DO UPDATE SET
+                                    saved_characters = saved_characters + excluded.saved_characters,
+                                    hits = hits + excluded.hits,
+                                    saved_cloud_characters = saved_cloud_characters + excluded.saved_cloud_characters,
+                                    hits_cloud = hits_cloud + excluded.hits_cloud
+                                """,
+                                (month, chars, hits, chars, hits),
+                            )
+                    await db.commit()
+                    return
+            except (sqlite3.OperationalError, aiosqlite.OperationalError) as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.1 * (2 ** attempt))
+                    continue
+                logger.debug(f"Batch cache hit flush skipped: {e}")
+                return
+            except Exception as e:
+                if not self.is_closed:
+                    logger.debug(f"Batch cache hit flush error: {e}")
+                return
+
     async def record_cache_hit(self, arg: Any, is_local: bool = False) -> None:
         """
-        キャッシュヒット記録の統合エントリーポイント:
-        - 第1引数が数値 (int): 節約文字数とヒット回数を記録 (tts_cache_savings)
-        - 第1引数が文字列 (str): キャッシュキーの hit_count を記録 (cache_metadata)
+        キャッシュヒット記録の統合エントリーポイント (ライトビハインド集約対応):
+        - 第1引数が数値 (int): 節約文字数とヒット回数をバッファリング記録 (tts_cache_savings)
+        - 第1引数が文字列 (str): キャッシュキーの hit_count をバッファリング記録 (cache_metadata)
         """
+        if self.is_closed:
+            return
         if isinstance(arg, (int, float)):
-            await self.record_cache_savings(int(arg), is_local=is_local)
-        elif isinstance(arg, str):
-            await self.record_cache_metadata_hit(arg)
+            char_count = int(arg)
+            if char_count > 0:
+                month = datetime.now().strftime("%Y-%m")
+                key = (month, bool(is_local))
+                cur = self._pending_savings_hits.get(key)
+                if cur is None:
+                    self._pending_savings_hits[key] = [char_count, 1]
+                else:
+                    cur[0] += char_count
+                    cur[1] += 1
+        elif isinstance(arg, str) and arg:
+            self._pending_meta_hits[arg] = self._pending_meta_hits.get(arg, 0) + 1
+
+        total_pending = len(self._pending_meta_hits) + sum(v[1] for v in self._pending_savings_hits.values())
+        if total_pending >= 24 or (time.monotonic() - self._last_hit_flush_ts) >= 5.0:
+            await self.flush_cache_hit_buffers()
 
     async def record_cache_savings(self, char_count: int, is_local: bool = False) -> None:
         """キャッシュヒット時に節約できた文字数とヒット回数を記録 (クラウド / ローカル分離)"""
@@ -2288,6 +2467,8 @@ class Database:
 
     async def get_monthly_tts_usage(self, month: Optional[str] = None) -> Dict[str, Any]:
         """指定月 (デフォルト当月) のプロバイダー別利用状況およびキャッシュ節約統計 (Cloud / Local) を取得"""
+        if self._pending_meta_hits or self._pending_savings_hits:
+            await self.flush_cache_hit_buffers()
         if not month:
             month = datetime.now().strftime("%Y-%m")
 
@@ -2517,38 +2698,13 @@ class Database:
                 return
 
     async def record_cache_metadata_hit(self, cache_key: str) -> None:
-        """キャッシュヒット時に再利用回数 (hit_count) と最終ヒット日時をインクリメント（ロック競合時は最大3回リトライ、非ブロッキング）"""
-        if self.is_closed:
-            return
-        for attempt in range(3):
-            try:
-                async with self.get_connection() as db:
-                    await db.execute(
-                        """
-                        UPDATE cache_metadata
-                        SET hit_count = hit_count + 1, last_hit_at = CURRENT_TIMESTAMP
-                        WHERE cache_key = ?
-                        """,
-                        (cache_key,)
-                    )
-                    await db.commit()
-                    return
-            except (sqlite3.OperationalError, aiosqlite.OperationalError) as e:
-                if "locked" in str(e).lower() and attempt < 2:
-                    await asyncio.sleep(0.1 * (2 ** attempt) + random.uniform(0.01, 0.05))
-                    continue
-                if self.is_closed or "Connection pool is closed" in str(e):
-                    return
-                logger.debug(f"Cache hit recording skipped due to db lock ({e})")
-                return
-            except Exception as e:
-                if self.is_closed or "Connection pool is closed" in str(e):
-                    return
-                logger.warning(f"Failed to record cache metadata hit for {cache_key}: {e}")
-                return
+        """キャッシュヒット時に再利用回数 (hit_count) と最終ヒット日時を集約バッファ経由で更新"""
+        await self.record_cache_hit(cache_key)
 
     async def get_cache_metadata(self, cache_key: str) -> Optional[Dict[str, Any]]:
         """特定のキャッシュファイルのメタデータを取得"""
+        if cache_key in self._pending_meta_hits:
+            await self.flush_cache_hit_buffers()
         async with self.get_connection() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -2604,6 +2760,8 @@ class Database:
             order_sql = f"created_at {sort_order_sql}"
 
         offset = max(0, (page - 1) * per_page)
+        if self._pending_meta_hits:
+            await self.flush_cache_hit_buffers()
 
         async with self.get_connection() as db:
             db.row_factory = aiosqlite.Row
@@ -2892,6 +3050,8 @@ class Database:
 
     async def get_cache_stats_summary(self) -> Dict[str, Any]:
         """キャッシュ統計（プロバイダー別ファイル数・サイズ・ヒット数、トップ単語、TTS利用量）を集計"""
+        if self._pending_meta_hits or self._pending_savings_hits:
+            await self.flush_cache_hit_buffers()
         async with self.get_connection() as db:
             # プロバイダー別キャッシュ集計
             cur = await db.execute("""
@@ -3082,20 +3242,35 @@ class Database:
 
     async def maintenance(self) -> Dict[str, Any]:
         """
-        SQLite WAL ファイルの完全チェックポイント & クエリオプティマイザの統計更新
-        - PRAGMA wal_checkpoint(TRUNCATE): WAL ファイルをメインDBに反映しサイズを0に切り詰め、肥大化とリード遅延を防止
-        - PRAGMA optimize: クエリ実行計画の最適化統計情報を更新
+        SQLite WAL ファイルの完全チェックポイント、古い失効レコードのパージ & クエリオプティマイザ統計更新
         """
-        result: Dict[str, Any] = {"checkpoint": None, "optimized": False}
+        result: Dict[str, Any] = {"checkpoint": None, "optimized": False, "purged": {}}
         try:
+            await self.flush_cache_hit_buffers()
             async with self.get_connection() as db:
+                # 30日以上前に失効済みのセットアップトークン・個人トークンおよび1日以上前の孤児待機キューを掃除
+                cur_st = await db.execute(
+                    "DELETE FROM node_setup_tokens WHERE revoked_at IS NOT NULL AND revoked_at < datetime('now', '-30 days')"
+                )
+                cur_vt = await db.execute(
+                    "DELETE FROM volunteer_tokens WHERE revoked_at IS NOT NULL AND revoked_at < datetime('now', '-30 days')"
+                )
+                cur_pq = await db.execute(
+                    "DELETE FROM pending_playback_queue WHERE created_at < datetime('now', '-1 day')"
+                )
+                await db.commit()
+                result["purged"] = {
+                    "revoked_setup_tokens": cur_st.rowcount,
+                    "revoked_volunteer_tokens": cur_vt.rowcount,
+                    "stale_pending_queue": cur_pq.rowcount,
+                }
                 cur = await db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 row = await cur.fetchone()
                 if row:
                     result["checkpoint"] = {"busy": row[0], "log": row[1], "checkpointed": row[2]}
                 await db.execute("PRAGMA optimize;")
                 result["optimized"] = True
-                logger.info(f"SQLite maintenance completed: checkpoint={result['checkpoint']}")
+                logger.info(f"SQLite maintenance completed: checkpoint={result['checkpoint']} purged={result['purged']}")
         except Exception as e:
             logger.warning(f"Error during SQLite maintenance: {e}")
         return result

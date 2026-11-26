@@ -257,7 +257,46 @@
             <!-- サブタブ1: 単語辞書 -->
             <div id="subtab-dict" class="sub-tab-pane active">
               <div class="section-title">📖 単語辞書管理</div>
-              <div class="section-desc">読み間違えやすい単語や略語、ネットスラングの読み方をサーバーごとに設定します。辞書変更時はキャッシュが自動最新化されます。</div>
+              <div class="section-desc">あなた専用の「マイ個人辞書」、サーバー共有の「単語辞書」、および全サーバー共通辞書を設定できます。優先順: <b>マイ個人辞書 ➔ サーバー単語辞書 ➔ 共通ゲーム用語辞書 ➔ 英語カタカナ辞書</b></div>
+
+            <!-- 👤 マイ個人辞書セクション (ログイン中のDiscordユーザー本人のみ最優先適用) -->
+            <div class="card" id="user-dict-card" style="border: 1px solid rgba(46, 204, 113, 0.35); background: linear-gradient(135deg, rgba(46, 204, 113, 0.06) 0%, rgba(88, 101, 242, 0.03) 100%); margin-bottom: 16px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px;">
+                <div>
+                  <h3 style="font-size:15px;margin:0;display:flex;align-items:center;gap:8px;">
+                    👤 マイ個人辞書 (あなた自身の発言・名前に最優先適用)
+                    <span id="user-dict-count" class="badge" style="background:#23a55a;color:white;font-size:11px;">0件</span>
+                  </h3>
+                  <div style="font-size:12px;color:var(--text-muted);margin-top:4px;">
+                    他の人の読み上げには影響せず、あなたが発言したときだけ最優先で適用される専用辞書です（Discordの <code>/userdict</code> とも同期されます）。
+                  </div>
+                </div>
+              </div>
+              <div id="user-dict-password-notice" style="display:none;font-size:12px;color:#f0b232;padding:6px 0;">
+                ※ 管理者パスワードログイン中はDiscordユーザーIDが紐付いていないため、個人辞書を利用するにはDiscordアカウントでログインしてください。
+              </div>
+              <div id="user-dict-body">
+                <form id="user-dict-add-form" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">
+                  <input type="text" id="user-dict-word" class="form-input" style="flex:1;min-width:160px;" placeholder="自分の単語・愛称 (例: 自キャラ名)" maxlength="50" required>
+                  <input type="text" id="user-dict-reading" class="form-input" style="flex:1;min-width:160px;" placeholder="読み方 (例: じきゃらめい)" maxlength="100" required>
+                  <button type="submit" class="btn btn-primary btn-sm">個人辞書に登録</button>
+                </form>
+                <div class="dict-table-container" style="max-height:220px;">
+                  <table class="table">
+                    <thead>
+                      <tr>
+                        <th style="width:40%;">単語</th>
+                        <th style="width:40%;">読み方</th>
+                        <th style="width:20%;text-align:right;">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="user-dict-table-body">
+                      <tr><td colspan="3" style="text-align:center;color:var(--text-muted);font-size:12px;">読み込み中...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
 
             <!-- AI学習・提案候補セクション -->
             <div class="card" id="ai-dict-card" style="border: 1px solid rgba(88, 101, 242, 0.3); background: linear-gradient(135deg, rgba(88, 101, 242, 0.05) 0%, rgba(35, 165, 90, 0.03) 100%);">
@@ -1810,7 +1849,7 @@
                     <button class="btn btn-secondary btn-sm" onclick="fetchSystemMetrics()" style="padding:4px 8px;font-size:11px;" title="最新の計測値を更新">
                       🔄 更新
                     </button>
-                    <button class="btn btn-secondary btn-sm" onclick="resetLatencyMetrics()" style="padding:4px 8px;font-size:11px;color:#f39c12;border-color:rgba(243,156,18,0.4);" title="アイドル時の残存値をクリアして新セッションを開始">
+                    <button id="btn-reset-latency" class="btn btn-secondary btn-sm" onclick="resetLatencyMetrics()" style="padding:4px 8px;font-size:11px;color:#f39c12;border-color:rgba(243,156,18,0.4);" title="アイドル時の残存値をクリアして新セッションを開始">
                       🗑️ リセット
                     </button>
                     <span id="latency-last-updated" style="font-size:11px;color:var(--text-dim, #72767d);">

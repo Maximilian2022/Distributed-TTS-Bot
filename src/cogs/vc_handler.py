@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import inspect
 import re
 import sys
 import json
@@ -35,8 +36,10 @@ from src.stt.hayamimi_client import (
 
 logger = logging.getLogger(__name__)
 
-# Bot #N の voice WebSocket が最後に閉じられた際の詳細 (guild_id -> 情報)。VoiceDiag ログと切断検証で参照する
-_LAST_VOICE_CLOSE: Dict[int, Dict[str, Any]] = {}
+# Bot #N の voice WebSocket が最後に閉じられた際の詳細 ((bot_user_id_or_0, guild_id) 及び guild_id -> 情報)
+_LAST_VOICE_CLOSE: Dict[Any, Dict[str, Any]] = {}
+# 全号機共有の ❌ リアクション誤読学習デバウンスキャッシュ (複数Bot重複発火防止)
+_SHARED_REACTION_LEARN_CACHE: "collections.OrderedDict[int, float]" = collections.OrderedDict()
 
 
 class _VoiceCloseDiagFilter(logging.Filter):
@@ -70,10 +73,14 @@ class _VoiceCloseDiagFilter(logging.Filter):
                 if vclient is not None and hasattr(vclient, "guild"):
                     guild_id = vclient.guild.id
                     channel_id = getattr(getattr(vclient, "channel", None), "id", None)
+                    bot_uid = getattr(getattr(getattr(vclient, "client", None), "user", None), "id", 0) or 0
                     break
                 frame = frame.f_back
             if guild_id is not None and code is not None:
-                _LAST_VOICE_CLOSE[guild_id] = {"code": code, "reason": reason, "at": time.time(), "msg": msg}
+                close_info = {"code": code, "reason": reason, "at": time.time(), "msg": msg}
+                _LAST_VOICE_CLOSE[guild_id] = close_info
+                if 'bot_uid' in locals() and bot_uid:
+                    _LAST_VOICE_CLOSE[(bot_uid, guild_id)] = close_info
             logger.info(
                 f"🔬 [VoiceDiag] voice WebSocket closed: close_code={code} reason={reason!r} "
                 f"guild={guild_id} channel={channel_id} exc={type(exc).__name__ if exc else None} msg='{msg}'"
@@ -442,7 +449,8 @@ class GuildVCState:
     def __init__(self, guild_id: int):
         self.guild_id = guild_id
         self.bound_text_channel_id: Optional[int] = None
-        self.queue: SafeAsyncQueue = SafeAsyncQueue()
+        self.queue: SafeAsyncQueue = SafeAsyncQueue(maxsize=50)
+        self.prefetch_sem: asyncio.Semaphore = asyncio.Semaphore(2)
         self.is_playing: bool = False
         self.current_item: Optional[QueueItem] = None
         self.play_task: Optional[asyncio.Task] = None
@@ -476,6 +484,19 @@ class GuildVCState:
     def push_front(self, item: QueueItem) -> None:
         """キューの最前列にアイテムを優先挿入 (O(1))"""
         self.queue.push_front(item)
+
+    async def enqueue_bounded(self, item: QueueItem) -> None:
+        """キュー上限(50件)超過時は最古の未再生アイテムを破棄してメモリ・GPU滞留を防止"""
+        if self.queue.maxsize > 0 and self.queue.qsize() >= self.queue.maxsize:
+            try:
+                dropped = self.queue.get_nowait()
+                if dropped and getattr(dropped, "synth_task", None) and not dropped.synth_task.done():
+                    dropped.synth_task.cancel()
+                self.queue.task_done()
+                logger.warning(f"⚠️ [Queue Cap] Guild {self.guild_id} TTS queue reached max ({self.queue.maxsize}); dropped oldest item.")
+            except Exception:
+                pass
+        await self.queue.put(item)
 
     def clear(self) -> None:
         """キューと状態のクリア"""
@@ -538,14 +559,61 @@ class VCHandlerCog(commands.Cog):
         self._nick_reconcile_task: Optional[asyncio.Task] = None
         self._auto_join_reconcile_task: Optional[asyncio.Task] = None
         self._pending_bot_leave_tasks: Dict[int, asyncio.Task] = {}
-        self._reaction_learn_cache: "collections.OrderedDict[int, float]" = collections.OrderedDict()
+        self._reaction_learn_cache: "collections.OrderedDict[int, float]" = _SHARED_REACTION_LEARN_CACHE
+        self._author_name_clean_cache: "collections.OrderedDict[Tuple[Any, ...], Tuple[float, str, List[str]]]" = collections.OrderedDict()
         _install_voice_diag_filter()
         # 遅延インシデント発生時のワーカーノード状態スナップショット取得元を登録 (1号機のみで十分)
         if bot_index == 1:
             latency_tracker.set_node_snapshot_provider(self._snapshot_worker_nodes)
 
+    @staticmethod
+    def _merge_user_and_guild_dicts(
+        user_words: Optional[List[Tuple[str, str]]],
+        guild_words: Optional[List[Tuple[str, str]]],
+    ) -> List[Tuple[str, str]]:
+        """発話者の個人辞書を最優先にしつつサーバー辞書と結合する"""
+        if not user_words:
+            return list(guild_words or [])
+        if not guild_words:
+            return list(user_words)
+        merged: List[Tuple[str, str]] = []
+        seen_keys: Set[Tuple[str, str]] = set()
+        for w, r in list(user_words) + list(guild_words):
+            if not w:
+                continue
+            ws = w.strip()
+            if not ws:
+                continue
+            k = ("ci", ws.lower()) if ws.isascii() and ws.isalnum() else ("cs", ws)
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            merged.append((ws, r))
+        return merged
+
+    async def _get_user_dict_words_safe(self, user_id: int) -> List[Tuple[str, str]]:
+        """個人辞書エントリを取得（単体テストの MagicMock DB でも安全に空リストへフォールバック）"""
+        fn = getattr(self.db, "get_user_dictionary_words", None)
+        if not callable(fn):
+            return []
+        res = fn(user_id)
+        if inspect.isawaitable(res):
+            out = await res
+            return list(out) if isinstance(out, (list, tuple)) else []
+        return []
+
+    def _is_designated_guild_cache_bot(self, guild_id: int) -> bool:
+        """複数Botが同一ギルドにいる際、アバター・メンバーキャッシュ更新を代表1台のみに限定"""
+        if not self.bot_pool or not hasattr(self.bot_pool, "bots"):
+            return self.bot_index == 1
+        for idx in sorted(self.bot_pool.bots.keys()):
+            b = self.bot_pool.bots[idx]
+            if b and b.get_guild(guild_id) is not None:
+                return idx == self.bot_index
+        return self.bot_index == 1
+
     def cog_unload(self) -> None:
-        """Cogアンロード・Bot停止時に全バックグラウンドタスクを確実にキャンセル"""
+        """Cogアンロード・Bot停止時に全バックグラウンドタスクとクライアントを確実に解放"""
         for task in (self._auto_leave_task, self._nick_reconcile_task, self._auto_join_reconcile_task):
             if task and not task.done():
                 task.cancel()
@@ -560,6 +628,12 @@ class VCHandlerCog(commands.Cog):
         for st in list(self.guild_states.values()):
             if st.play_task and not st.play_task.done():
                 st.play_task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+            if hasattr(self, "hayamimi_translator") and self.hayamimi_translator:
+                loop.create_task(self.hayamimi_translator.close())
+        except RuntimeError:
+            pass
 
     # --- 動的サーバーネーム（ニックネーム）同期ロジック ---
 
@@ -1083,7 +1157,15 @@ class VCHandlerCog(commands.Cog):
                                 except Exception:
                                     pass
 
-                            vc = await channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
+                            use_self_deaf = True
+                            try:
+                                from src.stt.manager import STTManager
+                                stt_mgr_chk = STTManager.get_instance()
+                                if stt_mgr_chk and stt_mgr_chk.is_active(guild_id, bot_index=self.bot_index):
+                                    use_self_deaf = False
+                            except Exception:
+                                pass
+                            vc = await channel.connect(timeout=20.0, reconnect=True, self_deaf=use_self_deaf)
                             _ensure_dave_session_ready(vc)
                             break
                         except VCConnectAborted:
@@ -1212,7 +1294,7 @@ class VCHandlerCog(commands.Cog):
                             self._prefetch_audio(item),
                             name=f"prefetch_{item.user_id}_{int(time.time()*1000)}"
                         )
-                        await state.queue.put(item)
+                        await state.enqueue_bounded(item)
                         restored_count += 1
                     except Exception as e:
                         logger.warning(f"Failed to parse restored queue item: {e}")
@@ -1238,10 +1320,10 @@ class VCHandlerCog(commands.Cog):
         try:
             from src.stt.manager import STTManager
             stt_mgr = STTManager.get_instance()
-            if stt_mgr and stt_mgr.is_active(guild.id):
-                rec = stt_mgr.receivers.get(guild.id)
-                if rec and getattr(rec.vc, "client", None) is self.bot:
-                    await stt_mgr.stop_stt(guild.id, clear_persisted=True)
+            if stt_mgr and stt_mgr.is_active(guild.id, bot_index=self.bot_index):
+                rec, _ = stt_mgr.get_session_pair(guild.id, bot_index=self.bot_index)
+                if rec and getattr(rec.vc, "client", None) in (self.bot, None):
+                    await stt_mgr.stop_stt(guild.id, clear_persisted=True, bot_index=self.bot_index)
         except Exception as stt_err:
             logger.debug(f"[Bot #{self.bot_index}] Error stopping STT on disconnect_vc: {stt_err}")
 
@@ -1352,7 +1434,8 @@ class VCHandlerCog(commands.Cog):
                 item.text,
                 author_prefix=item.author_prefix,
                 engine=voice_cfg.provider if voice_cfg else None,
-                speaker_id=item.speaker_id
+                speaker_id=item.speaker_id,
+                precompute_local_kanji=item.local_tts_kanji_reading,
             ) or None
         except Exception as e:
             logger.debug(f"Failed to pre-split chunks for prefetch: {e}")
@@ -1363,6 +1446,14 @@ class VCHandlerCog(commands.Cog):
         必要となる全チャンクを先行してバックグラウンド合成し、パーツキャッシュ（L1/L2）を温める。
         これにより、自分の再生順が回ってきた瞬間に 0ms キャッシュヒットで即座に音が鳴る。
         """
+        sem = self.get_guild_state(item.guild_id).prefetch_sem if item.guild_id else None
+        if sem is not None:
+            async with sem:
+                await self._prefetch_chunks_impl(item, speculative_timeout=speculative_timeout)
+        else:
+            await self._prefetch_chunks_impl(item, speculative_timeout=speculative_timeout)
+
+    async def _prefetch_chunks_impl(self, item: QueueItem, speculative_timeout: Optional[float] = None):
         try:
             engine_name = None
             try:
@@ -1377,7 +1468,8 @@ class VCHandlerCog(commands.Cog):
                 item.text,
                 author_prefix=item.author_prefix,
                 engine=engine_name,
-                speaker_id=item.speaker_id
+                speaker_id=item.speaker_id,
+                precompute_local_kanji=item.local_tts_kanji_reading,
             )
             if not chunks:
                 return
@@ -1409,6 +1501,7 @@ class VCHandlerCog(commands.Cog):
                         local_only=local_only,
                         local_tts_kanji_reading=item.local_tts_kanji_reading,
                         guild_id=item.guild_id,
+                        pre_resolved_local_text=getattr(ch, "local_text", None),
                     )
                 except Exception as e:
                     logger.debug(f"Prefetch chunk failed for '{ch.text[:15]}...': {e}")
@@ -1447,8 +1540,8 @@ class VCHandlerCog(commands.Cog):
         try:
             if hasattr(self.bot, "prewarm_service") and self.bot.prewarm_service:
                 self.bot.prewarm_service.record_user_speech()
-            elif self.bot_pool and hasattr(self.bot_pool, "main_bot"):
-                main_bot = getattr(self.bot_pool, "main_bot", None)
+            elif self.bot_pool and hasattr(self.bot_pool, "get_main_bot"):
+                main_bot = self.bot_pool.get_main_bot()
                 if main_bot and hasattr(main_bot, "prewarm_service") and main_bot.prewarm_service:
                     main_bot.prewarm_service.record_user_speech()
         except Exception:
@@ -1459,8 +1552,8 @@ class VCHandlerCog(commands.Cog):
         try:
             if hasattr(self.bot, "prewarm_service") and self.bot.prewarm_service:
                 self.bot.prewarm_service.notify_user_speech_done()
-            elif self.bot_pool and hasattr(self.bot_pool, "main_bot"):
-                main_bot = getattr(self.bot_pool, "main_bot", None)
+            elif self.bot_pool and hasattr(self.bot_pool, "get_main_bot"):
+                main_bot = self.bot_pool.get_main_bot()
                 if main_bot and hasattr(main_bot, "prewarm_service") and main_bot.prewarm_service:
                     main_bot.prewarm_service.notify_user_speech_done()
         except Exception:
@@ -1659,7 +1752,8 @@ class VCHandlerCog(commands.Cog):
             item.text,
             author_prefix=item.author_prefix,
             engine=engine_name,
-            speaker_id=item.speaker_id
+            speaker_id=item.speaker_id,
+            precompute_local_kanji=item.local_tts_kanji_reading,
         )
         if not all_chunks:
             return False
@@ -1843,6 +1937,7 @@ class VCHandlerCog(commands.Cog):
                 local_tts_kanji_reading=item.local_tts_kanji_reading,
                 depletion_deadline_fn=depletion_fn,
                 guild_id=guild.id,
+                pre_resolved_local_text=getattr(ch, "local_text", None),
             )
             t_e = time.time()
             c_meta = (
@@ -1868,17 +1963,15 @@ class VCHandlerCog(commands.Cog):
         all_created_tasks: List[asyncio.Task] = []
 
         try:
-            # 名前なしで先頭が本文の場合、先頭パーツを最初に起動して完了予測最短ノードを確実に確保する
-            head_first_task: Optional[asyncio.Task] = None
-            if route_mode == "on" and head_idx == 0:
-                head_first_task = asyncio.create_task(_synth_chunk(
-                    first_chunk,
-                    first_is_longest,
-                    chunk_idx=0,
-                    est_headroom_sec=0.0,
-                    avoid_nodes=turn_avoid_nodes
-                ))
-                all_created_tasks.append(head_first_task)
+            # 第0チャンクを必ず最初にスケジュールし、後続チャンクが先にワーカーセマフォを奪う逆転現象を根絶
+            c0_task = asyncio.create_task(_synth_chunk(
+                first_chunk,
+                first_is_longest,
+                chunk_idx=0,
+                est_headroom_sec=0.0,
+                avoid_nodes=turn_avoid_nodes
+            ))
+            all_created_tasks.append(c0_task)
 
             if len(all_chunks) > 1:
                 cum_headroom_sec = _estimate_chunk_play_sec(first_chunk)
@@ -1895,17 +1988,8 @@ class VCHandlerCog(commands.Cog):
                     all_created_tasks.append(t)
                     cum_headroom_sec += _estimate_chunk_play_sec(ch)
 
-            # 第1チャンクの取得
-            if head_first_task is not None:
-                c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await head_first_task
-            else:
-                c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await _synth_chunk(
-                    first_chunk,
-                    first_is_longest,
-                    chunk_idx=0,
-                    est_headroom_sec=0.0,
-                    avoid_nodes=turn_avoid_nodes
-                )
+            # 第0チャンクの完了待機
+            c0_ch, c0_bytes, c0_prov, c0_worker, c0_cached, c0_synth_start, c0_synth_end, c0_fb, c0_failed_provs = await c0_task
 
             if abort_ev.is_set():
                 return True
@@ -2392,13 +2476,15 @@ class VCHandlerCog(commands.Cog):
             return
 
         max_length = guild_settings.get("max_text_length", self.config.max_text_length)
-        dict_words, ng_words = await asyncio.gather(
+        guild_dict_words, user_dict_words, ng_words = await asyncio.gather(
             self.db.get_dictionary_words(message.guild.id),
-            self.db.get_ng_words(message.guild.id)
+            self._get_user_dict_words_safe(message.author.id),
+            self.db.get_ng_words(message.guild.id),
         )
+        dict_words = self._merge_user_and_guild_dicts(user_dict_words, guild_dict_words)
         read_username = bool(guild_settings.get("read_username", 0))
 
-        # 本文のサニタイズ (NGワードはピー音プレースホルダー <<BEEP>> に置換)
+        # 本文のサニタイズ (NGワードはピー音プレースホルダー <<BEEP>> に置換、個人辞書->サーバー辞書->共通辞書順で適用)
         cleaned_body = self.text_cleaner.clean(
             raw_text=message.content,
             guild=message.guild,
@@ -2414,9 +2500,14 @@ class VCHandlerCog(commands.Cog):
         detected_ng_words: List[str] = list(self.text_cleaner.last_detected_ng_words)
         body_has_ng_words: bool = bool(detected_ng_words)
 
-        # 辞書が使用された場合、非同期で last_used_at を更新 (LRU管理用)
-        if dict_words:
-            used_words = [w for w, _ in dict_words if w in message.content]
+        # サーバー辞書が使用された場合、非同期で last_used_at を更新 (LRU管理用・O(1)マッチ回収)
+        if guild_dict_words and self.text_cleaner.last_matched_dict_words:
+            guild_words_lower = {w.lower(): w for w, _ in guild_dict_words if w}
+            used_words = [
+                guild_words_lower[m.lower()]
+                for m in self.text_cleaner.last_matched_dict_words
+                if m and m.lower() in guild_words_lower
+            ]
             if used_words:
                 safe_create_task(self.db.touch_dictionary_words(message.guild.id, used_words), name="touch_dictionary_words")
 
@@ -2553,28 +2644,50 @@ class VCHandlerCog(commands.Cog):
             guild_id=message.guild.id
         )
 
-        # サーバーネーム読み上げがONの場合は、発言者表示名をサニタイズして独立プレフィックスパーツとして保持
+        # サーバーネーム読み上げがONの場合は、発言者表示名をサニタイズして独立プレフィックスパーツとして保持 (短期LRUキャッシュで高速化)
         author_prefix = None
         if read_username:
             raw_display_name = message.author.display_name
-            if user_settings.get("strip_name_brackets", True):
-                stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
-                if stripped:
-                    raw_display_name = stripped
-
-            cleaned_author = self.text_cleaner.clean(
-                raw_text=raw_display_name,
-                guild=message.guild,
-                dictionary_entries=dict_words,
-                ng_words=ng_words,
-                max_length=20
+            strip_br = bool(user_settings.get("strip_name_brackets", True))
+            name_cache_key = (
+                message.guild.id,
+                message.author.id,
+                raw_display_name,
+                strip_br,
+                len(dict_words),
+                len(ng_words),
             )
-            if self.text_cleaner.last_detected_ng_words:
-                for w in self.text_cleaner.last_detected_ng_words:
+            now_mono = time.monotonic()
+            cached_name_entry = self._author_name_clean_cache.get(name_cache_key)
+            if cached_name_entry is not None and (now_mono - cached_name_entry[0]) < 60.0:
+                self._author_name_clean_cache.move_to_end(name_cache_key)
+                cleaned_author, cached_author_ng = cached_name_entry[1], cached_name_entry[2]
+                for w in cached_author_ng:
+                    if w not in detected_ng_words:
+                        detected_ng_words.append(w)
+            else:
+                if strip_br:
+                    stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
+                    if stripped:
+                        raw_display_name = stripped
+
+                cleaned_author = self.text_cleaner.clean(
+                    raw_text=raw_display_name,
+                    guild=message.guild,
+                    dictionary_entries=dict_words,
+                    ng_words=ng_words,
+                    max_length=20
+                )
+                author_ng = list(self.text_cleaner.last_detected_ng_words)
+                for w in author_ng:
                     if w not in detected_ng_words:
                         detected_ng_words.append(w)
 
-            cleaned_author = cleaned_author.replace(" 以下略", "").strip()
+                cleaned_author = cleaned_author.replace(" 以下略", "").strip()
+                self._author_name_clean_cache[name_cache_key] = (now_mono, cleaned_author, author_ng)
+                while len(self._author_name_clean_cache) > 256:
+                    self._author_name_clean_cache.popitem(last=False)
+
             if cleaned_author:
                 author_prefix = f"{cleaned_author}、"
 
@@ -2615,7 +2728,7 @@ class VCHandlerCog(commands.Cog):
         else:
             item.synth_task = None
 
-        await state.queue.put(item)
+        await state.enqueue_bounded(item)
 
         if state.play_task is None or state.play_task.done():
             logger.info(f"🔄 [Self-Healing] Playback loop for guild '{message.guild.name}' was inactive. Auto-restarting...")
@@ -2824,11 +2937,13 @@ class VCHandlerCog(commands.Cog):
                     stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
                     if stripped:
                         raw_display_name = stripped
-                dict_words, ng_words, guild_settings = await asyncio.gather(
+                guild_dict_words, user_dict_words, ng_words, guild_settings = await asyncio.gather(
                     self.db.get_dictionary_words(guild.id),
+                    self._get_user_dict_words_safe(member.id),
                     self.db.get_ng_words(guild.id),
                     self.db.get_guild_settings(guild.id, self.config),
                 )
+                dict_words = self._merge_user_and_guild_dicts(user_dict_words, guild_dict_words)
                 cleaned_author = self.text_cleaner.clean(
                     raw_text=raw_display_name,
                     guild=guild,
@@ -2899,8 +3014,12 @@ class VCHandlerCog(commands.Cog):
 
             state = self.get_guild_state(guild.id)
 
-            # 単語辞書を取得して名前に適用
-            dict_words = await self.db.get_dictionary_words(guild.id)
+            # 個人辞書＋サーバー単語辞書を取得して名前に適用
+            guild_dict_words, user_dict_words = await asyncio.gather(
+                self.db.get_dictionary_words(guild.id),
+                self._get_user_dict_words_safe(member.id),
+            )
+            dict_words = self._merge_user_and_guild_dicts(user_dict_words, guild_dict_words)
             cleaned_name = self.text_cleaner.clean(
                 raw_text=member.display_name,
                 guild=guild,
@@ -2938,12 +3057,12 @@ class VCHandlerCog(commands.Cog):
 
             # キュー待機が生じる場合のみバックグラウンド先行合成
             if state.is_playing or not state.queue.empty():
-                self._share_chunks_for_prefetch(item)
+                await self._share_chunks_for_prefetch(item)
                 item.synth_task = safe_create_task(
                     self._prefetch_chunks(item, speculative_timeout=spec_timeout),
                     name=f"prefetch_vc_event_{item.user_id}_{int(t_now*1000)}"
                 )
-            await state.queue.put(item)
+            await state.enqueue_bounded(item)
 
             if state.play_task is None or state.play_task.done():
                 state.play_task = safe_create_task(
@@ -2987,7 +3106,8 @@ class VCHandlerCog(commands.Cog):
         """切断時の状態を1行で記録 (原因調査用)"""
         try:
             vc = guild.voice_client
-            close = _LAST_VOICE_CLOSE.get(guild.id)
+            bot_uid = getattr(getattr(self.bot, "user", None), "id", 0) or 0
+            close = _LAST_VOICE_CLOSE.get((bot_uid, guild.id)) or _LAST_VOICE_CLOSE.get(guild.id)
             close_txt = (
                 f"code={close['code']} reason={close['reason']!r} {now - close['at']:.1f}s ago" if close else "unknown"
             )
@@ -3353,11 +3473,12 @@ class VCHandlerCog(commands.Cog):
         if member.bot:
             return
 
-        # メンバー情報＆アバターキャッシュを非同期で更新 (当該ギルドのみ・Discord API消費ゼロ)
-        safe_create_task(
-            cache_member_info_and_avatar(self.db, member, guild_id=guild.id, is_in_guild=True),
-            name=f"cache_avatar_vs_{member.id}"
-        )
+        # メンバー情報＆アバターキャッシュを非同期で更新 (複数Bot重複排除のため代表1台のみ実行)
+        if self._is_designated_guild_cache_bot(guild.id):
+            safe_create_task(
+                cache_member_info_and_avatar(self.db, member, guild_id=guild.id, is_in_guild=True),
+                name=f"cache_avatar_vs_{member.id}"
+            )
 
         # 1. 自動退出判定: Botが参加中のVCから人間が0人になったら退出
         vc: Optional[discord.VoiceClient] = guild.voice_client
@@ -3704,23 +3825,6 @@ class VCHandlerCog(commands.Cog):
                 logger.debug(f"[GeminiTutor] Failed to send misread approval UI: {ui_err}")
         except Exception as e:
             logger.debug(f"[GeminiTutor] _learn_from_reaction error: {e}")
-
-    def cog_unload(self) -> None:
-        """Cogアンロード時のバックグラウンドタスク完全キャンセル"""
-        if self._auto_join_reconcile_task and not self._auto_join_reconcile_task.done():
-            self._auto_join_reconcile_task.cancel()
-        if self._nick_reconcile_task and not self._nick_reconcile_task.done():
-            self._nick_reconcile_task.cancel()
-        for t in self._pending_bot_leave_tasks.values():
-            if t and not t.done():
-                t.cancel()
-        self._pending_bot_leave_tasks.clear()
-        try:
-            loop = asyncio.get_running_loop()
-            if hasattr(self, "hayamimi_translator") and self.hayamimi_translator:
-                loop.create_task(self.hayamimi_translator.close())
-        except RuntimeError:
-            pass
 
 
 class MisreadSuggestionEditModal(discord.ui.Modal, title="読み方を編集して辞書登録"):

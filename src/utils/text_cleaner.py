@@ -486,6 +486,7 @@ class TextChunk:
     is_beep: bool = False
     beep_duration_sec: float = 0.4
     is_followed_by_beep: bool = False
+    local_text: Optional[str] = None
 
 class TextCleaner:
     def __init__(self, max_length: int = 50):
@@ -499,6 +500,7 @@ class TextCleaner:
         self._space_pattern = re.compile(r'\s+')
         self.last_detected_unknown_words: List[str] = []
         self.last_detected_ng_words: List[str] = []
+        self.last_matched_dict_words: List[str] = []
 
     def should_ignore(self, message: discord.Message, ignore_prefixes: Optional[List[str]] = None) -> bool:
         """無視すべきメッセージ（Botの発言、コマンド行、除外プレフィックス等）かを判定"""
@@ -603,8 +605,10 @@ class TextCleaner:
         else:
             self.last_detected_ng_words = []
 
-        # 5. 単語辞書置換 (サーバー個別辞書優先 + 全サーバー共通日本語/ゲーム用語辞書)
-        text = self.apply_dictionary(text, dictionary_entries)
+        # 5. 単語辞書置換 (個人辞書・サーバー個別辞書優先 + 全サーバー共通日本語/ゲーム用語辞書)
+        matched_dict: List[str] = []
+        text = self.apply_dictionary(text, dictionary_entries, matched_words_out=matched_dict)
+        self.last_matched_dict_words = matched_dict
 
         # 6. alkana による英単語即時カタカナ変換 & 未知語検知
         text, detected_unknown = self.convert_english_to_kana(text)
@@ -660,6 +664,9 @@ class TextCleaner:
         detected: List[str] = []
         sorted_words = sorted([w.strip() for w in ng_words if w.strip()], key=len, reverse=True)
 
+        if len(_DICT_REGEX_CACHE) > 512:
+            _DICT_REGEX_CACHE.clear()
+
         for w in sorted_words:
             if not w or w not in text:
                 continue
@@ -697,9 +704,14 @@ class TextCleaner:
         return text, detected
 
     @classmethod
-    def apply_dictionary(cls, text: str, dictionary_entries: Optional[List[Tuple[str, str]]] = None) -> str:
+    def apply_dictionary(
+        cls,
+        text: str,
+        dictionary_entries: Optional[List[Tuple[str, str]]] = None,
+        matched_words_out: Optional[List[str]] = None,
+    ) -> str:
         """
-        単語辞書置換 (サーバー個別辞書優先 -> 全サーバー共通日本語/ゲーム用語辞書)
+        単語辞書置換 (個人辞書・サーバー個別辞書優先 -> 全サーバー共通日本語/ゲーム用語辞書)
         最長一致 (Longest-Match First) & 誤爆防止境界ガード付き。
         サーバー辞書で確定した置換箇所は一時プレースホルダで保護し、共通辞書による二重置換・上書きを防止する。
         """
@@ -708,6 +720,7 @@ class TextCleaner:
             return text
 
         protected_replacements: List[str] = []
+        seen_matched: set = set()
 
         if dictionary_entries:
             guild_regex, guild_exact, guild_lower = _get_compiled_guild_dict_matcher(dictionary_entries)
@@ -717,6 +730,9 @@ class TextCleaner:
                     reading_val = guild_exact.get(matched)
                     if reading_val is None:
                         reading_val = guild_lower.get(matched.lower(), matched)
+                    if matched_words_out is not None and matched not in seen_matched:
+                        seen_matched.add(matched)
+                        matched_words_out.append(matched)
                     if _COMMON_READING_REGEX is None:
                         return reading_val
                     idx = len(protected_replacements)
@@ -951,35 +967,35 @@ class TextCleaner:
         if system_hit:
             return system_hit, "system"
 
-        # 5. e2k LRU キャッシュ (O(1))
-        with _E2K_LOCK:
-            cached = _E2K_CACHE.get(lower_w)
-            if cached:
-                _E2K_CACHE.move_to_end(lower_w)
-                return cached, "e2k_cache"
-
-        # 6. e2k オフライン RNN 未知語即時変換 (Public Domain)
-        if allow_e2k and (e2k_budget is None or e2k_budget[0] > 0):
+        # 5 & 6. e2k LRU キャッシュ (O(1)) およびオフライン RNN 未知語即時変換 (Public Domain)
+        if allow_e2k:
             ngram_fn, c2k_fn = _get_e2k_converters()
             if ngram_fn is not None and c2k_fn is not None:
-                try:
-                    with _E2K_LOCK:
-                        # ロック再取得時のダブルチェック
-                        cached2 = _E2K_CACHE.get(lower_w)
-                        if cached2:
-                            _E2K_CACHE.move_to_end(lower_w)
-                            return cached2, "e2k_cache"
-                        inferred = c2k_fn(lower_w) if ngram_fn(lower_w) else ngram_fn.as_is(lower_w)
-                        if inferred and isinstance(inferred, str) and inferred.strip():
-                            inferred = inferred.strip()
-                            _E2K_CACHE[lower_w] = inferred
-                            if len(_E2K_CACHE) > _E2K_CACHE_MAX_SIZE:
-                                _E2K_CACHE.popitem(last=False)
-                            if e2k_budget is not None:
-                                e2k_budget[0] -= 1
-                            return inferred, "e2k"
-                except Exception as e:
-                    logger.debug(f"e2k inference skipped for {raw_w!r}: {e}")
+                with _E2K_LOCK:
+                    cached = _E2K_CACHE.get(lower_w)
+                    if cached:
+                        _E2K_CACHE.move_to_end(lower_w)
+                        return cached, "e2k_cache"
+
+                if e2k_budget is None or e2k_budget[0] > 0:
+                    try:
+                        with _E2K_LOCK:
+                            # ロック再取得時のダブルチェック
+                            cached2 = _E2K_CACHE.get(lower_w)
+                            if cached2:
+                                _E2K_CACHE.move_to_end(lower_w)
+                                return cached2, "e2k_cache"
+                            inferred = c2k_fn(lower_w) if ngram_fn(lower_w) else ngram_fn.as_is(lower_w)
+                            if inferred and isinstance(inferred, str) and inferred.strip():
+                                inferred = inferred.strip()
+                                _E2K_CACHE[lower_w] = inferred
+                                if len(_E2K_CACHE) > _E2K_CACHE_MAX_SIZE:
+                                    _E2K_CACHE.popitem(last=False)
+                                if e2k_budget is not None:
+                                    e2k_budget[0] -= 1
+                                return inferred, "e2k"
+                    except Exception as e:
+                        logger.debug(f"e2k inference skipped for {raw_w!r}: {e}")
 
         return None, "unknown"
 
@@ -1712,6 +1728,7 @@ class TextCleaner:
         max_first_chunk_chars: Optional[int] = None,
         max_chunk_chars: Optional[int] = None,
         head_chunk_chars: Optional[int] = None,
+        precompute_local_kanji: bool = False,
     ) -> List['TextChunk']:
         """
         テキストを発言者名プレフィックスおよび多段文境界（句点・読点・スペース・スラング・終助詞・形態素・動的ハードキャップ）で超低遅延パーツ分割する。
@@ -1850,6 +1867,11 @@ class TextCleaner:
 
         if head_chunk_chars:
             chunks = TextCleaner.apply_head_chunk_limit(chunks, head_chunk_chars)
+
+        if precompute_local_kanji and not is_cloud_engine:
+            for c in chunks:
+                if not c.is_beep and c.text:
+                    c.local_text = TextCleaner.convert_kanji_for_local_tts(c.text)
 
         split_ms = round((time.time() - t_start) * 1000, 2)
         for c in chunks:

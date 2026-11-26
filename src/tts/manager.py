@@ -4,6 +4,7 @@ import io
 import json
 import wave
 import asyncio
+import contextvars
 import logging
 import aiohttp
 from pathlib import Path
@@ -27,6 +28,11 @@ from .node_pool import TTSNodePool, scan_local_coeiroink_models
 from src.resource_manager import HighLoadFallbackException, SynthesisTimeoutException
 
 logger = logging.getLogger(__name__)
+
+# 並列チャンク合成時のタスク間ワーカーラベル競合を防ぐタスクローカル辞書
+_CTX_WORKER_LABELS: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
+    "tts_worker_labels", default=None
+)
 
 
 class _InflightLocal:
@@ -567,7 +573,10 @@ class TTSManager:
         )
 
     def _get_worker_label_for_provider(self, provider: str) -> str:
-        """プロバイダーごとの直近処理ワーカー名を取得"""
+        """プロバイダーごとの直近処理ワーカー名を取得 (並列タスクローカル値を最優先)"""
+        ctx_map = _CTX_WORKER_LABELS.get()
+        if ctx_map and provider in ctx_map and ctx_map[provider]:
+            return ctx_map[provider]
         client_map = {
             "voicevox": self.voicevox_client,
             "sharevox": self.sharevox_client,
@@ -1135,6 +1144,11 @@ class TTSManager:
                 res = None
             if res is not None:
                 provider_synth_ms_map[prov] = elapsed_p_ms
+                client_obj = getattr(self, f"{prov}_client", None)
+                if client_obj is not None:
+                    cur_ctx = dict(_CTX_WORKER_LABELS.get() or {})
+                    cur_ctx[prov] = getattr(client_obj, "last_worker_label", prov)
+                    _CTX_WORKER_LABELS.set(cur_ctx)
             return res
 
         def _mark_prov_failed(prov: str) -> None:
@@ -1214,6 +1228,7 @@ class TTSManager:
             )
             self._inflight_join_info[(str(speaker_id), text)] = joined
             t_prim_start = time.time()
+            cloud_task: Optional[asyncio.Task] = None
 
             def _prim_result() -> Optional[bytes]:
                 try:
@@ -1372,9 +1387,13 @@ class TTSManager:
                     _mark_prov_failed(prim_prov)
                     chain = chain[1:]
             finally:
+                if cloud_task is not None and not cloud_task.done():
+                    cloud_task.cancel()
                 if inflight_entry is not None:
                     # 呼び出し元の取り消し (再生中断等) では最後の待ち手のみローカル合成を取り消す
-                    self._release_local_task(inflight_entry, cancel_if_last=not prim_task.done() and asyncio.current_task().cancelling() > 0)
+                    cur_t = asyncio.current_task()
+                    is_cancelling = bool(cur_t and hasattr(cur_t, "cancelling") and cur_t.cancelling() > 0)
+                    self._release_local_task(inflight_entry, cancel_if_last=not prim_task.done() and is_cancelling)
 
         for step_idx, (prov, voice_param) in enumerate(chain):
             if step_idx > 0:
@@ -1424,6 +1443,7 @@ class TTSManager:
         local_tts_kanji_reading: bool = True,
         depletion_deadline_fn: Optional[Callable[[], float]] = None,
         guild_id: Optional[Any] = None,
+        pre_resolved_local_text: Optional[str] = None,
     ) -> Tuple[bytes, str, str, bool]:
         """
         単一チャンク（文パーツや発言者名プレフィックス等）の音声バイト列を取得。
@@ -1432,10 +1452,14 @@ class TTSManager:
         3. キャッシュ保存 & DB記録
         戻り値: (audio_bytes, provider, worker_label, is_cached)
         """
+        _CTX_WORKER_LABELS.set({})
         voice_cfg = self._get_voice_config(speaker_id)
         provider = voice_cfg.provider
         is_local = self._is_local_provider(provider)
-        cache_text = self.resolve_cache_text(text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+        if pre_resolved_local_text and is_local and local_tts_kanji_reading:
+            cache_text = pre_resolved_local_text
+        else:
+            cache_text = self.resolve_cache_text(text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
         cache_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, cache_text, user_id=user_id)
 
         # 1. キャッシュ確認
@@ -1634,7 +1658,8 @@ class TTSManager:
             if getattr(ch, "is_beep", False):
                 beep_wav = self._build_beep_wav_24k_mono(getattr(ch, "beep_duration_sec", 0.4))
                 return i, ch, beep_wav, True
-            ch_cache_text = self.resolve_cache_text(ch.text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+            pre_loc = getattr(ch, "local_text", None) if (is_local and local_tts_kanji_reading) else None
+            ch_cache_text = pre_loc or self.resolve_cache_text(ch.text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
             resolved_chunk_texts[i] = ch_cache_text
             k = CacheManager.generate_cache_key(speaker_id, pitch, speed, ch_cache_text, user_id=user_id)
             b = await self.cache_manager.get_bytes(k, provider=provider)

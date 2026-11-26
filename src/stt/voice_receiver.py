@@ -25,6 +25,19 @@ from src.stt.dispatcher import SpeechDispatcher
 logger = logging.getLogger(__name__)
 
 
+def _calc_pcm_rms_fast(pcm: bytes) -> float:
+    """16-bit PCM フレームの概算 RMS 音量を4サンプル間引きで高速算出 (UDPスレッド負荷75%削減)"""
+    aligned = len(pcm) & ~1
+    if aligned < 2:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(memoryview(pcm)[:aligned])
+    sub = samples[::4] if len(samples) >= 8 else samples
+    if not sub:
+        return 0.0
+    return math.sqrt(sum(s * s for s in sub) / len(sub))
+
+
 class VoiceStreamReceiver:
     """
     Discord VC から音声パケットを受信し、SSRCごとに完全独立デコード・独立ストリーミングして
@@ -90,6 +103,8 @@ class VoiceStreamReceiver:
 
         # Discord Voice WebSocket フックの保持
         self._orig_hook: Optional[Callable] = None
+        self._hooked_ws_obj: Any = None
+        self._last_deaf_heal_time: float = 0.0
 
     async def start(self) -> bool:
         """音声受信および早耳ストリーミングを開始"""
@@ -221,6 +236,7 @@ class VoiceStreamReceiver:
                 logger.debug(f"Error calling original ws hook: {ex}")
 
         ws._hook = _hook_wrapper
+        self._hooked_ws_obj = ws
 
     def _decrypt_transport_rtp(self, data: bytes) -> Optional[bytes]:
         """Discord Voice Transport 暗号化 (AEAD XChaCha20 / AES256-GCM / XSalsa20) を復号してペイロードを抽出"""
@@ -339,13 +355,15 @@ class VoiceStreamReceiver:
         self._rtp_recv_count += 1
         now = time.time()
 
-        # 5秒に1回、届いているパケット総数と復号・デコード成否をINFO出力
-        if now - self._last_stat_log_time >= 5.0:
+        # 初回または30秒に1回、届いているパケット総数と復号・デコード成否を集約出力
+        if self._last_stat_log_time == 0.0 or (now - self._last_stat_log_time >= 30.0):
+            is_first_stat = (self._last_stat_log_time == 0.0)
             self._last_stat_log_time = now
             state = getattr(self.vc, "_connection", None)
             mode = getattr(state, "mode", None) if state else None
             mode_str = mode if isinstance(mode, str) else "unknown"
-            logger.info(
+            log_fn = logger.info if is_first_stat else logger.debug
+            log_fn(
                 f"📊 [RTP Stats] Recv {self._rtp_recv_count} UDP pkts | "
                 f"Decoded={self._decoded_frame_count} DecErr={self._decode_err_count} "
                 f"TransErr={self._transport_err_count} DaveErr={self._dave_err_count} | "
@@ -482,13 +500,6 @@ class VoiceStreamReceiver:
 
             self._decoded_frame_count += 1
 
-            def _calc_rms() -> float:
-                samples = array.array("h")
-                samples.frombytes(memoryview(pcm)[: len(pcm) & ~1])
-                if not samples:
-                    return 0.0
-                return math.sqrt(sum(s * s for s in samples) / len(samples))
-
             # 5. SSRC 専用の早耳 Live セッションへの送信 (音声混在を物理的に遮断)
             session = self._sessions.get(ssrc) or (self._sessions.get(user_id) if user_id else None)
             if session and session.is_connected:
@@ -501,13 +512,14 @@ class VoiceStreamReceiver:
                 last_push_log = self._last_push_log_time.get(ssrc, 0.0)
 
                 # ログ出力候補タイミングのみ RMS を計算 (UDP スレッドでの毎秒数百回の Python ループを排除)
-                if now - last_push_log >= 1.0 or p_cnt == 1:
-                    rms = _calc_rms()
+                if now - last_push_log >= 5.0 or p_cnt == 1:
+                    rms = _calc_pcm_rms_fast(pcm)
                     is_voice = rms >= 100.0
-                    if now - last_push_log >= 3.0 or p_cnt == 1 or is_voice:
+                    if now - last_push_log >= 15.0 or p_cnt == 1 or is_voice:
                         self._last_push_log_time[ssrc] = now
                         level_tag = "🗣️ Voice" if is_voice else "🔈 Low/Noise"
-                        logger.info(
+                        log_fn = logger.info if p_cnt == 1 else logger.debug
+                        log_fn(
                             f"🎙️ [VoiceReceiver] Stream -> Hayamimi: {session.user_name} (SSRC: {ssrc}) "
                             f"| {level_tag} RMS={rms:.1f} | Frame #{p_cnt} ({p_cnt*20}ms sent)"
                         )
@@ -517,7 +529,7 @@ class VoiceStreamReceiver:
                     buf.append(pcm)
                 if ssrc not in self._connecting_ssrcs:
                     self._connecting_ssrcs.add(ssrc)
-                    rms = _calc_rms()
+                    rms = _calc_pcm_rms_fast(pcm)
                     logger.info(f"⏳ [VoiceReceiver] Connecting session for SSRC {ssrc}, buffering frame #{len(buf)} (RMS={rms:.1f})")
                     asyncio.run_coroutine_threadsafe(
                         self._get_or_create_ssrc_session(ssrc, user_id),
@@ -536,13 +548,39 @@ class VoiceStreamReceiver:
         """
         silence_chunk = b"\x00" * 3840  # 20ms = 3840 bytes (48kHz Stereo 16-bit)
         last_heartbeat_time = 0.0
+        last_ws_check_time = 0.0
         try:
             while self._is_running:
                 await asyncio.sleep(0.04)
                 now = time.time()
 
-                # 10秒に1回、VC受信状況・VC参加者・セッション状態を詳細サマリー出力
-                if now - last_heartbeat_time >= 10.0:
+                # 2秒に1回、Voice WebSocket 再接続後のフック剥がれおよび self_deaf 戻りを自己修復
+                if now - last_ws_check_time >= 2.0:
+                    last_ws_check_time = now
+                    state = getattr(self.vc, "_connection", None)
+                    ws = getattr(state, "ws", None) if state else None
+                    if ws is not None and ws is not self._hooked_ws_obj:
+                        logger.info(f"🔄 [VoiceReceiver] Detected new Discord Voice WS instance in guild {self.vc.guild.id}; re-installing hook & priming pipe...")
+                        self._install_ws_hook()
+                        asyncio.create_task(self._prime_audio_pipe(), name=f"stt_reprime_{self.vc.guild.id}")
+                    guild = getattr(self.vc, "guild", None)
+                    me = getattr(guild, "me", None) if guild else None
+                    if (
+                        me
+                        and getattr(me, "voice", None)
+                        and getattr(me.voice, "self_deaf", False)
+                        and getattr(self.vc, "channel", None)
+                        and (now - self._last_deaf_heal_time) >= 15.0
+                    ):
+                        self._last_deaf_heal_time = now
+                        try:
+                            await guild.change_voice_state(channel=self.vc.channel, self_mute=False, self_deaf=False)
+                            logger.info(f"🔊 [VoiceReceiver] Auto-cleared self_deaf after reconnect in guild {guild.id}")
+                        except Exception as deaf_ex:
+                            logger.debug(f"Auto self_deaf heal skipped: {deaf_ex}")
+
+                # 60秒に1回、VC受信状況・VC参加者・セッション状態をデバッグ出力
+                if now - last_heartbeat_time >= 60.0:
                     last_heartbeat_time = now
                     ch = self.vc.channel if self.vc else None
                     human_members = [
@@ -556,7 +594,7 @@ class VoiceStreamReceiver:
                         if s.is_connected
                     ]
                     targets_str = "All (全員)" if not self.target_user_ids else list(self.target_user_ids)
-                    logger.info(
+                    logger.debug(
                         f"💓 [STT Heartbeat] VC: '{getattr(ch, 'name', 'N/A')}' | "
                         f"VC Humans: {human_members} | "
                         f"Target: {targets_str} | "
@@ -567,12 +605,17 @@ class VoiceStreamReceiver:
 
                 for ssrc, session in list(self._sessions.items()):
                     last_time = self._last_recv_time.get(ssrc, 0.0)
-                    # 切断済みまたは15分以上完全無通信の古いSSRCセッションを掃除して枠枯渇を防止
+                    # 切断済みまたは15分以上完全無通信の古いSSRCセッションを掃除して枠枯渇・マップ肥大化を防止
                     if not session.is_connected or (last_time > 0 and (now - last_time) > 900.0):
                         dead_sess = self._sessions.pop(ssrc, None)
                         self._decoders.pop(ssrc, None)
                         self._last_recv_time.pop(ssrc, None)
                         self._silence_injected.pop(ssrc, None)
+                        self._ssrc_to_user.pop(ssrc, None)
+                        self._ssrc_pkt_counts.pop(ssrc, None)
+                        self._pushed_frame_counts.pop(ssrc, None)
+                        self._last_push_log_time.pop(ssrc, None)
+                        self._pending_pcm.pop(ssrc, None)
                         if dead_sess:
                             asyncio.create_task(dead_sess.close())
                         continue

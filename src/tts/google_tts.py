@@ -112,14 +112,39 @@ class GoogleTTSClient(BaseTTSClient):
         self._cooldown_until = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
+        cur_loop = asyncio.get_running_loop()
+        if (
+            self._session is None
+            or self._session.closed
+            or getattr(self, "_session_loop", None) is not cur_loop
+        ):
+            if self._session and not self._session.closed:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             self._session = aiohttp.ClientSession(timeout=timeout)
+            self._session_loop = cur_loop
         return self._session
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception:
+                pass
+        self._session = None
+        if self._async_client is not None:
+            try:
+                transport = getattr(self._async_client, "transport", None)
+                if transport is not None and hasattr(transport, "close"):
+                    res = transport.close()
+                    if asyncio.iscoroutine(res):
+                        await res
+            except Exception:
+                pass
+            self._async_client = None
 
     def _convert_pitch_to_semitones(self, pitch_str: str) -> float:
         """Azure等のパーセント表記 (+10%, -5%) をGoogleのセミトーン値 (-20.0 〜 20.0) に概算変換"""

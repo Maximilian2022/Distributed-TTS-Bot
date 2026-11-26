@@ -38,9 +38,9 @@ tts:
     stream_tl_speculative: "shadow"   # 投機締切を再生タイムライン基準に (最大許容沈黙)
     head_route_earliest: "shadow"     # 先頭本文パーツを完了予測最短ノードへ
     head_dynamic_length: "shadow"     # 先頭本文パーツ長の動的決定 (on は stream_tl_speculative=on 時のみ有効)
-    chunk_singleflight: "shadow"      # 同一パーツのローカル合成の二重発注防止
+    chunk_singleflight: "on"          # 同一パーツのローカル合成の二重発注防止 (先行プリフェッチと再生側で共有)
     max_silence_default_seconds: 1.5
-    az_margin_seconds: 0.45           # Azure 実測 p95=424ms
+    az_margin_seconds: 0.68           # Azure 実測マージン (src/config.py 既定値と統一)
     head_plan_pessimism: 1.5
   google_monthly_limit_chars: 950000 # 無料枠(100万文字)の95%で自動フォールバック
   azure:

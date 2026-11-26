@@ -18,11 +18,13 @@ document.addEventListener("DOMContentLoaded", () => {
   initDynamicRedirectUri();
   initAppLoginUsername();
   if (typeof initCommonDictListeners === "function") initCommonDictListeners();
+  if (typeof initUserDictListeners === "function") initUserDictListeners();
 
   // ログイン済みの場合にデータを初期ロード
   if (window.APP_IS_LOGGED_IN) {
     updatePermissionsUI();
     loadUserProfile();
+    if (typeof loadUserDict === "function") loadUserDict();
     loadVoices();
     loadGuilds();
     loadCharacterTerms();
@@ -31,6 +33,18 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   renderCharacterTermsTable();
 });
+
+function safeEncodeAttrUri(value) {
+  return encodeURIComponent(String(value ?? "")).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+}
+
+function safeExternalUrl(rawUrl) {
+  const s = String(rawUrl ?? "").trim();
+  if (/^https?:\/\//i.test(s)) {
+    return escapeHtml(s);
+  }
+  return "#";
+}
 
 // --- トースト通知 ---
 function showToast(message, type = "success") {
@@ -329,11 +343,14 @@ async function switchGuild(guildId) {
     loadGuildChannels(currentGuildId)
   ]);
 
-  const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin;
+  const isSystemAdmin = Boolean(window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+  const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin || isSystemAdmin;
   if (hasAccess) {
     await loadBotConfig(currentGuildId);
     loadStats(currentGuildId);
-    loadCacheExplorerFiles();
+    if (isSystemAdmin) {
+      loadCacheExplorerFiles();
+    }
     loadCacheStatsSummary();
     checkModelsStatus();
     loadMemberVoices(currentGuildId);
@@ -415,6 +432,10 @@ function updatePermissionsUI() {
   const ngSelectAll = document.getElementById("ng-select-all");
   if (ngRegCard) ngRegCard.style.display = hasGuildAccess ? "block" : "none";
   if (ngSelectAll) ngSelectAll.style.display = hasGuildAccess ? "inline-block" : "none";
+  const btnResetLat = document.getElementById("btn-reset-latency");
+  if (btnResetLat) btnResetLat.style.display = isSystemAdmin ? "inline-block" : "none";
+  const incPanel = document.getElementById("latency-incidents-panel");
+  if (incPanel) incPanel.style.display = isSystemAdmin ? "block" : "none";
   if (Array.isArray(currentFilteredNgWords) && document.getElementById("ng-table-body")) {
     renderNgTable(currentFilteredNgWords);
   }
@@ -1129,7 +1150,7 @@ function renderNgTable(words) {
   words.forEach(word => {
     const isChecked = selectedNgWords.has(word);
     if (!isChecked) allSelected = false;
-    const encodedWord = encodeURIComponent(word);
+    const encodedWord = safeEncodeAttrUri(word);
 
     const tr = document.createElement("tr");
     if (isChecked && canManageNg) tr.style.background = "rgba(237, 66, 69, 0.08)";
@@ -1549,7 +1570,8 @@ function renderDictionaryTable(words) {
   words.forEach((item, idx) => {
     const isChecked = selectedDictWords.has(item.word);
     if (!isChecked) allSelected = false;
-    const encodedWord = encodeURIComponent(item.word);
+    const encodedWord = safeEncodeAttrUri(item.word);
+    const encodedReading = safeEncodeAttrUri(item.reading);
 
     const tr = document.createElement("tr");
     tr.id = `dict-row-${idx}`;
@@ -1568,7 +1590,7 @@ function renderDictionaryTable(words) {
           <input type="text" id="edit-reading-input" class="form-input" style="padding:6px 10px;font-size:13px;width:100%;" value="${escapeHtml(item.reading)}" placeholder="読み方" required>
         </td>
         <td style="text-align:right;white-space:nowrap;padding:6px 12px;">
-          <button type="button" class="btn btn-secondary btn-sm" onclick="playDictWordPreview(encodeURIComponent(document.getElementById('edit-reading-input').value), this)" title="入力中の読み方を試聴" style="margin-right:6px;">🔊 試聴</button>
+          <button type="button" class="btn btn-secondary btn-sm" onclick="playDictWordPreview(safeEncodeAttrUri(document.getElementById('edit-reading-input').value), this)" title="入力中の読み方を試聴" style="margin-right:6px;">🔊 試聴</button>
           <button type="button" class="btn btn-primary btn-sm" onclick="saveEditDictWord(${idx})" style="margin-right:6px;">保存</button>
           <button type="button" class="btn btn-secondary btn-sm" onclick="cancelEditDictWord()">取消</button>
         </td>
@@ -1582,7 +1604,7 @@ function renderDictionaryTable(words) {
         <td style="font-weight:600;">${escapeHtml(item.word)}</td>
         <td>${escapeHtml(item.reading)}</td>
         <td style="text-align:right;white-space:nowrap;">
-          <button type="button" class="btn btn-secondary btn-sm" onclick="playDictWordPreview('${encodeURIComponent(item.reading)}', this)" title="読み方を試聴" style="margin-right:6px;">🔊 試聴</button>
+          <button type="button" class="btn btn-secondary btn-sm" onclick="playDictWordPreview('${encodedReading}', this)" title="読み方を試聴" style="margin-right:6px;">🔊 試聴</button>
           <button type="button" class="btn btn-secondary btn-sm" onclick="startEditDictWord(${idx})" style="margin-right:6px;">編集</button>
           <button type="button" class="btn btn-danger btn-sm" onclick="deleteDictWord('${encodedWord}')">削除</button>
         </td>
@@ -1830,6 +1852,153 @@ async function deleteDictWord(encodedWord) {
     showToast("削除中にエラーが発生しました", "error");
   }
 }
+
+// --- 👤 マイ個人辞書管理 (/api/me/dict) ---
+
+function initUserDictListeners() {
+  const form = document.getElementById("user-dict-add-form");
+  if (form && !form.dataset.bound) {
+    form.dataset.bound = "1";
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      await addUserDictWord();
+    });
+  }
+}
+
+async function loadUserDict() {
+  const tbody = document.getElementById("user-dict-table-body");
+  const countBadge = document.getElementById("user-dict-count");
+  const noticeEl = document.getElementById("user-dict-password-notice");
+  const bodyWrap = document.getElementById("user-dict-body");
+  if (!tbody) return;
+
+  try {
+    const res = await fetch("/api/me/dict");
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.requires_discord_login) {
+      if (noticeEl) noticeEl.style.display = "block";
+      if (bodyWrap) bodyWrap.style.display = "none";
+      if (countBadge) countBadge.textContent = "0件";
+      return;
+    }
+    if (noticeEl) noticeEl.style.display = "none";
+    if (bodyWrap) bodyWrap.style.display = "block";
+
+    const list = Array.isArray(data.dictionary) ? data.dictionary : [];
+    if (countBadge) countBadge.textContent = `${list.length}件`;
+
+    tbody.replaceChildren();
+    if (list.length === 0) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 3;
+      td.style.textAlign = "center";
+      td.style.color = "var(--text-muted)";
+      td.style.fontSize = "12px";
+      td.style.padding = "14px";
+      td.textContent = "まだ個人辞書に単語は登録されていません";
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+
+    list.forEach((entry) => {
+      const tr = document.createElement("tr");
+      const tdWord = document.createElement("td");
+      tdWord.style.fontWeight = "600";
+      tdWord.textContent = entry.word || "";
+
+      const tdRead = document.createElement("td");
+      tdRead.textContent = entry.reading || "";
+
+      const tdAct = document.createElement("td");
+      tdAct.style.textAlign = "right";
+      tdAct.style.whiteSpace = "nowrap";
+
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "btn btn-secondary btn-sm";
+      editBtn.style.marginRight = "6px";
+      editBtn.textContent = "転記";
+      editBtn.addEventListener("click", () => {
+        const wInp = document.getElementById("user-dict-word");
+        const rInp = document.getElementById("user-dict-reading");
+        if (wInp) wInp.value = entry.word || "";
+        if (rInp) {
+          rInp.value = entry.reading || "";
+          rInp.focus();
+        }
+      });
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "btn btn-danger btn-sm";
+      delBtn.textContent = "削除";
+      delBtn.addEventListener("click", () => {
+        deleteUserDictWord(entry.word || "");
+      });
+
+      tdAct.appendChild(editBtn);
+      tdAct.appendChild(delBtn);
+      tr.appendChild(tdWord);
+      tr.appendChild(tdRead);
+      tr.appendChild(tdAct);
+      tbody.appendChild(tr);
+    });
+  } catch (err) {
+    console.error("Failed to load user dict:", err);
+  }
+}
+
+async function addUserDictWord() {
+  const wInp = document.getElementById("user-dict-word");
+  const rInp = document.getElementById("user-dict-reading");
+  if (!wInp || !rInp) return;
+  const word = wInp.value.trim();
+  const reading = rInp.value.trim();
+  if (!word || !reading) {
+    showToast("単語と読み方の両方を入力してください", "error");
+    return;
+  }
+  try {
+    const res = await fetch("/api/me/dict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ word, reading }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      showToast(`マイ個人辞書に「${word}」を登録しました`, "success");
+      wInp.value = "";
+      rInp.value = "";
+      await loadUserDict();
+    } else {
+      showToast(data.error || "個人辞書の登録に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("通信エラーが発生しました", "error");
+  }
+}
+
+async function deleteUserDictWord(word) {
+  if (!word) return;
+  try {
+    const res = await fetch(`/api/me/dict/${encodeURIComponent(word)}`, { method: "DELETE" });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      showToast(`マイ個人辞書から「${word}」を削除しました`, "success");
+      await loadUserDict();
+    } else {
+      showToast(data.error || "個人辞書の削除に失敗しました", "error");
+    }
+  } catch (err) {
+    showToast("削除中にエラーが発生しました", "error");
+  }
+}
+
+window.loadUserDict = loadUserDict;
 
 // --- 共通 O(1) 英語カタカナ辞書管理 ---
 
@@ -7518,7 +7687,7 @@ function renderCharacterTermsTable() {
       <td style="padding:10px 12px;"><code style="background:var(--bg-body);padding:3px 6px;border-radius:4px;font-size:12px;color:#23a55a;">${escapeHtml(c.credit)}</code></td>
       <td style="padding:10px 12px;color:var(--text-muted);">${escapeHtml(c.creator)}</td>
       <td style="padding:10px 12px;text-align:center;">
-        <a href="${c.url}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm" style="padding:4px 10px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px;">
+        <a href="${safeExternalUrl(c.url)}" target="_blank" rel="noopener" class="btn btn-secondary btn-sm" style="padding:4px 10px;font-size:11px;text-decoration:none;display:inline-flex;align-items:center;gap:4px;">
           公式規約 ↗
         </a>
       </td>

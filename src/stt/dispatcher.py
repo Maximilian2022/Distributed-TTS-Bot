@@ -122,12 +122,26 @@ class SpeechDispatcher:
             if not self._flush_task or self._flush_task.done():
                 self._flush_task = asyncio.create_task(self._scheduled_flush())
 
+    @staticmethod
+    def _format_translations_map(trans_map: Dict[str, str]) -> str:
+        if not trans_map:
+            return ""
+        if len(trans_map) == 1:
+            k, v = next(iter(trans_map.items()))
+            return v if k == "default" else f"[{k.upper()}] {v}"
+        return " / ".join(
+            (v if k == "default" else f"[{k.upper()}] {v}")
+            for k, v in trans_map.items()
+            if v
+        )
+
     async def on_translation(self, user_id: int, user_name: str, data: Dict[str, Any]) -> None:
-        """翻訳イベントを受信"""
+        """翻訳イベントを受信 (複数言語同時翻訳でも上書き消失させず言語別に統合保持)"""
         trans_text = str(data.get("text", "")).strip()
         if not trans_text:
             return
 
+        lang_key = str(data.get("lang") or "").strip().lower() or "default"
         seq = data.get("seq", 0)
         seq_key = f"{user_id}_{seq}"
 
@@ -135,15 +149,19 @@ class SpeechDispatcher:
         if seq_key in self._seq_map:
             entry = self._seq_map[seq_key]
             if not entry.get("flushed"):
-                entry["trans"] = trans_text
+                trans_map = entry.setdefault("translations", {})
+                trans_map[lang_key] = trans_text
+                entry["trans"] = self._format_translations_map(trans_map)
                 return
+            late_label = trans_text if lang_key == "default" else f"[{lang_key.upper()}] {trans_text}"
             late_entry = {
                 "user_id": user_id,
                 "user_name": user_name,
                 "text": entry.get("text", ""),
-                "trans": trans_text,
+                "trans": late_label,
+                "translations": {lang_key: trans_text},
                 "late_trans_only": True,
-                "seq_key": f"{seq_key}_trans",
+                "seq_key": f"{seq_key}_trans_{lang_key}",
                 "ts": time.time(),
             }
             async with self._buffer_lock:
@@ -152,11 +170,13 @@ class SpeechDispatcher:
                     self._flush_task = asyncio.create_task(self._scheduled_flush())
         else:
             # 万が一字幕より先に翻訳が届いた場合のフォールバック
+            trans_map = {lang_key: trans_text}
             entry = {
                 "user_id": user_id,
                 "user_name": user_name,
                 "text": str(data.get("original", "")).strip() or "...",
-                "trans": trans_text,
+                "trans": self._format_translations_map(trans_map),
+                "translations": trans_map,
                 "seq_key": seq_key,
                 "ts": time.time(),
             }
@@ -223,7 +243,10 @@ class SpeechDispatcher:
             message_content = message_content[:1950] + "..."
 
         try:
-            await channel.send(message_content)
+            await channel.send(
+                message_content,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
             logger.info(f"📤 [STTDispatcher] Posted to text channel {self.text_channel_id} ({len(entries)} speech items)")
         except discord.HTTPException as e:
             if e.status == 429:

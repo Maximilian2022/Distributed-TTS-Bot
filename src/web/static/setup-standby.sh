@@ -89,10 +89,8 @@ fi
 DOCKER_COMPOSE_CMD=""
 if docker compose version &> /dev/null; then
     DOCKER_COMPOSE_CMD="docker compose"
-elif command -v docker-compose &> /dev/null; then
-    DOCKER_COMPOSE_CMD="docker compose"
 else
-    echo -e "${RED}エラー: docker compose が利用できません。${RESET}"
+    echo -e "${RED}エラー: Docker Compose V2 (docker compose) が利用できません。${RESET}"
     exit 1
 fi
 echo -e "  ✓ Docker: ${GREEN}OK${RESET}"

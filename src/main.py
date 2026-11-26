@@ -200,6 +200,10 @@ class TTSBot(commands.Bot):
         )
         await self.add_cog(vc_cog)
 
+        # 永続View (Persistent View: Web版へのマジックリンク遷移ボタン) を全号機に登録 (サブBot送信ボタンの無反応防止)
+        from src.cogs.commands import WebDashboardButtonView
+        self.add_view(WebDashboardButtonView(self))
+
         # 3. メインBot (1号機) のみの追加コンポーネント
         if self.bot_index == 1:
             # CommandsCog の登録 (スラッシュコマンド受付 & 動的ルーティング)
@@ -213,10 +217,6 @@ class TTSBot(commands.Bot):
                 disaster_service=self.disaster_service
             )
             await self.add_cog(cmd_cog)
-
-            # 永続View (Persistent View: Web版へのマジックリンク遷移ボタン) を登録
-            from src.cogs.commands import WebDashboardButtonView
-            self.add_view(WebDashboardButtonView(self))
 
             # メンバーキャッシュスロー巡回タスク (1号機のみが代表してバックグラウンド実行)
             cache_updater_cog = MemberCacheUpdaterCog(
@@ -523,6 +523,15 @@ async def main():
                     await wlc_stop
         except Exception:
             pass
+
+        # 2.5. STT セッションの安全なフラッシュ＆クローズ (再起動後自動復元のため永続化状態は保持)
+        try:
+            from src.stt.manager import STTManager
+            stt_mgr = STTManager.get_instance()
+            if stt_mgr and hasattr(stt_mgr, "stop_all"):
+                await stt_mgr.stop_all(clear_persisted=False)
+        except Exception as e:
+            logging.debug(f"Error stopping STTManager during shutdown: {e}")
 
         # 3. 稼働中Botの全停止
         running_indices = list(bot_pool.bots.keys())

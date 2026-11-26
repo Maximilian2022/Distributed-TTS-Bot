@@ -88,7 +88,7 @@ Automatically profiles connected worker hardware specs (GPU presence, RAMDisk re
 - **Real-Time Masking**: Instantly masks abusive, offensive, or sensitive terms into `＊＊＊` within milliseconds before synthesis.
 - **Longest-Match Algorithm & Zero Overhead**: Scans terms ordered by length to prevent partial-match false positives. Fast in-memory caching ensures zero latency impact on speech.
 - **Default Spam/Troll Preset**: Import standard moderation wordlists with a single click or command.
-- **Dual Support (Slash Commands & WebUI)**: Full management available via Discord chat (`/ng add`, `/ng remove`, `/ng list`, `/ng import_default`) and the web GUI dashboard.
+- **Dual Support (Slash Commands & WebUI)**: Full management available via Discord chat (`/ng add`, `/ng delete`, `/ng list`, `/ng preset`) and the web GUI dashboard.
 
 ---
 
@@ -115,7 +115,7 @@ nano .env
 docker compose up -d --build
 ```
 
-Once started, open your web browser and navigate to `http://localhost:8080` (or your server's IP address) to access the management dashboard.
+Once started, open your web browser and navigate to `http://localhost:8088` (or your server's IP address) to access the management dashboard.
 
 ---
 
@@ -125,15 +125,20 @@ Once started, open your web browser and navigate to `http://localhost:8080` (or 
 | :--- | :--- |
 | `/join` | Summons the bot to your current voice channel |
 | `/leave` | Disconnects the bot from the voice channel |
+| `/skip` | Immediately skips the currently playing or preparing speech |
 | `/voice` | Opens the interactive menu to select speakers, adjust speed, and tune pitch |
-| `/dict add <word> <reading>` | Registers a word in the guild-wide reading dictionary |
-| `/dict delete <word>` | Removes a word from the dictionary |
-| `/userdict` | Configures personal reading dictionary entries |
-| `/ng add <word>` | Registers an NG word (automatically masked with `＊＊＊`) |
-| `/ng remove <word>` | Removes a word from the NG word list |
+| `/userdict add\|delete\|list` | Manages your personal reading dictionary (applied with top priority to your messages) |
+| `/dict add\|delete\|list` | Manages the guild-wide reading dictionary (admin / designated role) |
+| `/ng add <word>` | Registers an NG word (automatically replaced with a censor beep) |
+| `/ng delete <word>` | Removes a word from the NG word list |
 | `/ng list` | Displays the server's registered NG words |
-| `/ng import_default` | Imports the default recommended troll/abuse protection preset |
-| `/help` | Displays a detailed list of commands and troubleshooting tips |
+| `/ng preset` | Imports the default recommended troll/abuse protection preset |
+| `/ignore list\|add\|delete\|set\|reset` | Configures prefixes (default `;`) to skip TTS playback |
+| `/stt start\|stop\|status` | Real-time VC speech-to-text, multi-language translation, and game PC bridge |
+| `/translate status\|set` | Configures automatic bidirectional text translation replies |
+| `/disaster status\|test\|set` | Configures emergency earthquake/tsunami/weather voice alerts |
+| `/info` | Displays supported engines, character terms of use, and attributions |
+| `/help` | Displays a detailed list of all slash commands and usage tips |
 
 ---
 

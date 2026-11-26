@@ -57,19 +57,23 @@ class IntelligentPrewarmService:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._busy = False  # ユーザー発言中は即座に一時停止
+        self._active_speech_count: int = 0
         self._speculative_running = False
         self.last_speculative_run_time: Optional[float] = None
         self.last_speculative_stats: Dict[str, Any] = {}
         self._last_speculative_date: str = ""
 
     def record_user_speech(self) -> None:
-        """ユーザー発言時に呼び出してアイドルタイマーをリセットし、実行中の事前合成を即時中断"""
+        """ユーザー発言時に呼び出してアイドルタイマーをリセットし、実行中の事前合成を即時中断 (マルチBot参照カウント対応)"""
         self._last_user_speech_time = time.time()
+        self._active_speech_count = max(0, self._active_speech_count) + 1
         self._busy = True
 
     def notify_user_speech_done(self) -> None:
-        """ユーザー発言完了時に呼び出し"""
-        self._busy = False
+        """ユーザー発言完了時に呼び出し (全Botのアクティブ再生が終了した時点でのみ解除)"""
+        self._active_speech_count = max(0, self._active_speech_count - 1)
+        if self._active_speech_count == 0:
+            self._busy = False
 
     async def start(self) -> None:
         if self._running:
@@ -111,6 +115,10 @@ class IntelligentPrewarmService:
                 # 2. 日中アイドル時の固定フレーズ自動ウォーム
                 # ユーザーが現在発言中、または直近の会話から一定時間経過していない場合はスキップ
                 now = time.time()
+                # 万一 done 通知が欠落した場合の安全弁 (アイドル閾値の2倍以上経過で自動リセット)
+                if self._busy and (now - self._last_user_speech_time) >= max(self.idle_threshold_seconds * 2.0, 240.0):
+                    self._active_speech_count = 0
+                    self._busy = False
                 if self._busy or (now - self._last_user_speech_time) < self.idle_threshold_seconds:
                     continue
 
@@ -436,7 +444,7 @@ class IntelligentPrewarmService:
             speakers.append(def_spk)
 
         # 代表的な人気話者（設定にあれば）
-        popular = ["nanami", "keiko", "1", "2", "3"]
+        popular = ["nanami", "keita", "1", "2", "3"]
         for p in popular:
             if p in voices and p not in speakers:
                 speakers.append(p)

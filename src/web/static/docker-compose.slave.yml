@@ -43,6 +43,7 @@ services:
       - TZ=Asia/Tokyo
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./src:/app/src
       - ./data:/app/data
       - ./logs:/app/logs
       - tts_cache:/app/cache

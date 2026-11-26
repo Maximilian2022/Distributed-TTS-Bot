@@ -184,6 +184,8 @@ class WebServer:
         self._worker_reachability_cache: Dict[Tuple[str, int, str], Tuple[float, bool]] = {}
         self.runner: Optional[web.AppRunner] = None
         self.site: Optional[web.TCPSite] = None
+        if getattr(self.config, "admin_password", ""):
+            self.auth.set_admin_password_fingerprint(self.config.admin_password, require_match=False)
         self._setup_routes()
 
     def _load_ha_nodes(self):
@@ -569,6 +571,10 @@ class WebServer:
         self.app.router.add_post("/api/me/voice", self.api_update_voice)
         self.app.router.add_get("/api/me/voices_by_guild", self.api_get_user_guild_voices)
         self.app.router.add_post("/api/me/sync_voice", self.api_sync_voice)
+        self.app.router.add_get("/api/me/dict", self.api_get_my_dict)
+        self.app.router.add_post("/api/me/dict", self.api_upsert_my_dict)
+        self.app.router.add_delete("/api/me/dict", self.api_delete_my_dict)
+        self.app.router.add_delete("/api/me/dict/{word}", self.api_delete_my_dict)
         self.app.router.add_post("/api/preview", self.api_preview_audio)
         self.app.router.add_get("/api/voices", self.api_get_voices)
         self.app.router.add_get("/api/guilds", self.api_get_guilds)
@@ -685,6 +691,7 @@ class WebServer:
         # HA (High Availability) & Standby 同期 API
         self.app.router.add_get("/api/ha/db_snapshot", self.api_ha_db_snapshot)
         self.app.router.add_get("/api/ha/code_snapshot", self.api_ha_code_snapshot)
+        self.app.router.add_get("/api/ha/state_files_snapshot", self.api_ha_state_files_snapshot)
         self.app.router.add_get("/api/ha/frequent_cache_snapshot", self.api_ha_frequent_cache_snapshot)
         self.app.router.add_get("/api/ha/status", self.api_ha_status)
         self.app.router.add_post("/api/ha/broadcast_update", self.api_ha_broadcast_update)
@@ -748,6 +755,29 @@ class WebServer:
         """ローカルホストまたはLAN内部からのリクエストかを判定"""
         return not self._is_wan_request(request)
 
+    def _get_client_ip(self, request: web.Request) -> str:
+        """Cloudflare Tunnel / リバースプロキシ配下でも実クライアントIPを安全に特定"""
+        cf_ip = (request.headers.get("CF-Connecting-IP") or "").strip()
+        if cf_ip:
+            return cf_ip
+        peername = request.transport.get_extra_info("peername") if request.transport else None
+        peer_ip = peername[0] if peername else (request.remote or "")
+        xff = (request.headers.get("X-Forwarded-For") or "").strip()
+        if xff and is_private_or_local_ip(peer_ip):
+            first_xff = xff.split(",")[0].strip()
+            if first_xff:
+                return first_xff
+        return peer_ip or "unknown"
+
+    def _is_https_request(self, request: web.Request) -> bool:
+        """リクエストが HTTPS (または WAN トンネル経由) で到達したかを判定"""
+        return (
+            request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+            or "https" in request.headers.get("CF-Visitor", "").lower()
+            or request.scheme == "https"
+            or self._is_wan_request(request)
+        )
+
     @web.middleware
     async def _security_and_rate_limit_middleware(self, request: web.Request, handler):
         """
@@ -759,6 +789,11 @@ class WebServer:
             resp.headers.setdefault("X-Frame-Options", "DENY")
             resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
             resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+            # NOTE(security): Existing SPA template uses inline bootstrap/event handlers; CSP blocks external script origins, framing, object-src, and base-uri hijacking.
+            resp.headers.setdefault(
+                "Content-Security-Policy",
+                "frame-ancestors 'none'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; worker-src 'self' blob:"
+            )
             if request.path in ("/static/agent.py", "/static/setup-worker.sh", "/static/setup-worker.ps1", "/static/update.sh"):
                 resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
                 resp.headers["Pragma"] = "no-cache"
@@ -783,7 +818,7 @@ class WebServer:
                                 path="/",
                                 httponly=True,
                                 samesite="Lax",
-                                secure=True
+                                secure=self._is_https_request(request)
                             )
                 except Exception:
                     pass
@@ -798,42 +833,55 @@ class WebServer:
         """
         path = request.path
         is_wan = self._is_wan_request(request)
+        worker_manage_paths = (
+            "/api/worker/nodes", "/api/worker/logs", "/api/worker/update",
+            "/api/worker/rolling", "/api/worker/rolling/status", "/api/worker/restart",
+            "/api/worker/kick", "/api/worker/broadcast_update",
+        )
 
         # 1. WAN境界セキュリティ防御: Worker 内部通信APIのインターネット直接アクセス遮断
         worker_sensitive_prefixes = (
             "/api/worker/",
         )
         if is_wan and any(path == p or path.startswith(p) for p in worker_sensitive_prefixes):
-            # 例外1: WebUIダッシュボードの管理用API (/api/worker/nodes, /api/worker/logs, /api/worker/update等) は認証済み管理者なら許可
-            if path in ("/api/worker/nodes", "/api/worker/logs", "/api/worker/update",
-                        "/api/worker/rolling", "/api/worker/rolling/status", "/api/worker/restart"):
+            # 例外1: WebUIダッシュボードの管理用APIは認証済みユーザーなら通過 (ハンドラ内で管理者/所有者認可を実施)
+            if path in worker_manage_paths:
                 user = self.auth.get_current_user(request)
                 if not user:
                     return web.json_response({"error": "Forbidden: WAN access requires authentication"}, status=403)
-            # 例外2: リモート Worker / クラスタ Worker 接続エンドポイント (/api/worker/ws, /api/worker/register, /api/worker/heartbeat, /api/worker/models/)
-            # 外部 (Cloudflare Tunnel / インターネット) からの安全な接続のため、正当な共有トークン (WORKER_SHARED_SECRET) または セットアップトークン が【必須】
-            elif path in ("/api/worker/ws", "/api/worker/register", "/api/worker/heartbeat") or path.startswith("/api/worker/models/"):
-                # ボランティア個人トークンおよびクラスタセットアップトークンはハンドラ内でDB照合を行うためミドルウェアを通過
+            # 例外2: リモート Worker / クラスタ Worker 接続エンドポイント (/api/worker/ws, /api/worker/register, /api/worker/heartbeat, /api/worker/manifest, /api/worker/models/)
+            elif path in ("/api/worker/ws", "/api/worker/register", "/api/worker/heartbeat", "/api/worker/manifest") or path.startswith("/api/worker/models/"):
                 raw_token = self._extract_worker_token(request)
                 is_personal_ws = path == "/api/worker/ws" and raw_token.startswith(VOLUNTEER_TOKEN_PREFIX)
-                is_setup_token = raw_token.startswith(CLUSTER_WORKER_TOKEN_PREFIX)
-                if not is_personal_ws and not is_setup_token and not self._verify_worker_auth(request):
-                    client_ip = request.headers.get("CF-Connecting-IP") or request.remote or "unknown"
-                    logger.warning(f"🚫 [Security] Blocked WAN worker request (missing or invalid shared token) to '{path}' from {client_ip}")
+                valid_setup_token = False
+                if raw_token.startswith(CLUSTER_WORKER_TOKEN_PREFIX):
+                    resolved_tok = await self._resolve_setup_token_from_request(request, "worker")
+                    valid_setup_token = resolved_tok is not None
+                if not is_personal_ws and not valid_setup_token and not self._verify_worker_auth(request):
+                    client_ip = self._get_client_ip(request)
+                    logger.warning(f"🚫 [Security] Blocked WAN worker request (missing or invalid worker/setup token) to '{path}' from {client_ip}")
                     return web.json_response(
-                        {"error": "Forbidden: Valid worker shared token is required for WAN access."},
+                        {"error": "Forbidden: Valid worker shared token or active setup token is required for WAN access."},
                         status=403
                     )
             else:
-                client_ip = request.headers.get("CF-Connecting-IP") or request.remote or "unknown"
+                client_ip = self._get_client_ip(request)
                 logger.warning(f"🚫 [Security] Blocked WAN access to worker-internal endpoint '{path}' from {client_ip}")
                 return web.json_response(
                     {"error": "Forbidden: This endpoint is restricted to local LAN access only."},
                     status=403
                 )
 
-        # 2. CSRF防御: 状態変更系API (POST, PUT, DELETE) に対する Origin / Referer 検証 (Worker API除く)
-        if is_wan and request.method in ("POST", "PUT", "DELETE") and path.startswith("/api/") and not path.startswith("/api/worker/"):
+        # 2. CSRF防御: Cookieベースの状態変更系API (POST, PUT, DELETE) に対する Origin / Referer 検証
+        is_machine_worker_api = (
+            path.startswith("/api/worker/")
+            and path not in worker_manage_paths
+            and bool(self._extract_worker_token(request))
+        )
+        is_ha_secret_call = path.startswith("/api/ha/") and bool(
+            request.headers.get("X-HA-Secret") or request.headers.get("Authorization")
+        )
+        if is_wan and request.method in ("POST", "PUT", "DELETE") and path.startswith("/api/") and not is_machine_worker_api and not is_ha_secret_call:
             origin = request.headers.get("Origin") or ""
             referer = request.headers.get("Referer") or ""
             allowed_hosts = set()
@@ -868,10 +916,10 @@ class WebServer:
                 return web.json_response({"error": "Cross-Origin request forbidden."}, status=403)
 
         # 3. レート制限ミドルウェア
-        if not path.startswith("/api/") or path.startswith("/api/worker/") or path == "/health":
+        if not path.startswith("/api/") or (path.startswith("/api/worker/") and path not in worker_manage_paths) or path == "/health":
             return await handler(request)
 
-        client_key = request.remote or "unknown"
+        client_key = self._get_client_ip(request)
         user = self.auth.get_current_user(request)
         if user and "user_id" in user:
             client_key = f"user_{user['user_id']}"
@@ -1667,9 +1715,85 @@ class WebServer:
             "timestamp": time.time(),
             "version": AGENT_VERSION,
             "code_hash": code_hash,
+            "state_files_hash": self._get_state_files_hash(),
             "force_update": force_target or broadcast_force,
             "force_cache_sync": force_cache_target or broadcast_cache_force
         })
+
+    HA_SYNC_STATE_FILES = (
+        "custom_common_reading.json",
+        "custom_english_kana.json",
+        "tier_routing.json",
+        "cluster_workers.json",
+        "voices_cache.json",
+        "mycoeiroink_cache.json",
+    )
+
+    def _get_data_dir_path(self) -> Path:
+        raw_dir = getattr(self.config, "data_dir", None)
+        if raw_dir:
+            return Path(raw_dir)
+        return Path(getattr(self.config, "db_path", "/app/data/bot.db")).parent
+
+    def _get_state_files_hash(self) -> str:
+        """data/ 配下の HA 同期対象 JSON ファイル群の複合ハッシュを計算 (10秒キャッシュ)"""
+        now = time.time()
+        cached_h = getattr(self, "_state_files_hash_cache", None)
+        cached_t = getattr(self, "_state_files_hash_time", 0.0)
+        if cached_h and (now - cached_t) < 10.0:
+            return cached_h
+        data_dir = self._get_data_dir_path()
+        hasher = hashlib.sha256()
+        for fname in self.HA_SYNC_STATE_FILES:
+            fp = data_dir / fname
+            if fp.is_file():
+                try:
+                    st = fp.stat()
+                    hasher.update(f"{fname}:{st.st_mtime_ns}:{st.st_size};".encode("utf-8"))
+                except OSError:
+                    pass
+        digest = hasher.hexdigest()
+        self._state_files_hash_cache = digest
+        self._state_files_hash_time = now
+        return digest
+
+    async def api_ha_state_files_snapshot(self, request: web.Request) -> web.Response:
+        """Slave 同期用 data/*.json 運用状態ファイルバンドル (gzip 圧縮 + ETag 304 対応)"""
+        authed, _ = await self._is_ha_authorized(request)
+        if not authed:
+            return web.json_response({"error": "Unauthorized HA request. Invalid or unconfigured HA secret."}, status=403)
+
+        def _build_bundle():
+            data_dir = self._get_data_dir_path()
+            files_map: Dict[str, str] = {}
+            for fname in self.HA_SYNC_STATE_FILES:
+                fp = validate_safe_path(data_dir, fname)
+                if fp and fp.is_file():
+                    try:
+                        raw_txt = fp.read_text(encoding="utf-8")
+                        # JSON として壊れていないファイルのみ配信
+                        json.loads(raw_txt)
+                        files_map[fname] = raw_txt
+                    except Exception as e:
+                        logger.warning(f"[HA StateFiles] Skipping invalid JSON {fname}: {e}")
+            payload_bytes = json.dumps({"files": files_map}, ensure_ascii=False).encode("utf-8")
+            sha256 = hashlib.sha256(payload_bytes).hexdigest()
+            return gzip.compress(payload_bytes, compresslevel=6), sha256, len(files_map)
+
+        compressed, sha256_hash, count = await asyncio.to_thread(_build_bundle)
+        if request.headers.get("If-None-Match", "").strip('"') == sha256_hash:
+            return web.Response(status=304, headers={"ETag": f'"{sha256_hash}"'})
+
+        return web.Response(
+            body=compressed,
+            headers={
+                "Content-Type": "application/gzip",
+                "ETag": f'"{sha256_hash}"',
+                "X-State-Files-Hash": sha256_hash,
+                "X-State-Files-Count": str(count),
+                "Cache-Control": "no-cache",
+            },
+        )
 
     def _get_code_hash(self) -> str:
         """src/ 配下の Python コードのハッシュ値を計算 (キャッシュ付き)"""
@@ -1851,20 +1975,9 @@ class WebServer:
             return web.json_response({"error": f"Failed to generate code snapshot: {str(e)}"}, status=500)
 
     async def api_ha_broadcast_update(self, request: web.Request) -> web.Response:
-        """Standby Slave ノードへ即時自己アップデートを指示する (HA Secret または 管理者権限 または プライベート/ローカルネットワーク専用)"""
-        authorized = False
-        if self._verify_ha_auth(request):
-            authorized = True
-        else:
-            remote_ip = request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote or ""
-            try:
-                ip_obj = ipaddress.ip_address(remote_ip)
-                if ip_obj.is_private or ip_obj.is_loopback:
-                    authorized = True
-            except ValueError:
-                pass
-
-        if not authorized:
+        """Standby Slave ノードへ即時自己アップデートを指示する (HA Secret / Standby Setup Token または システム最高管理者のみ)"""
+        authed_ha, _ = await self._is_ha_authorized(request)
+        if not authed_ha:
             await self._require_admin(request)
 
         target_node_id = None
@@ -2431,6 +2544,7 @@ class WebServer:
 
         state = secrets.token_urlsafe(32)
         login_url = self.auth.get_login_url(state=state, prompt=prompt)
+        is_https = self._is_https_request(request)
         response = web.HTTPFound(login_url)
         response.set_cookie(
             "oauth_state",
@@ -2438,7 +2552,7 @@ class WebServer:
             max_age=600,
             httponly=True,
             samesite="Lax",
-            secure=True
+            secure=is_https
         )
         raise response
 
@@ -2448,6 +2562,7 @@ class WebServer:
         error_description = request.query.get("error_description", "")
         received_state = request.query.get("state")
         expected_state = request.cookies.get("oauth_state")
+        is_https = self._is_https_request(request)
 
         # prompt=none の場合、未承認ユーザーに対して Discord は interaction_required または consent_required を返す
         # この場合、エラー画面にせず自動的に prompt=consent で通常認可画面へ再リダイレクトする (0クリック自動通過と初回アクセスの両立)
@@ -2462,7 +2577,7 @@ class WebServer:
                 max_age=600,
                 httponly=True,
                 samesite="Lax",
-                secure=True
+                secure=is_https
             )
             raise resp
 
@@ -2533,7 +2648,7 @@ class WebServer:
             path="/",
             httponly=True,
             samesite="Lax",
-            secure=True
+            secure=is_https
         )
         return response
 
@@ -2597,7 +2712,7 @@ class WebServer:
             path="/",
             httponly=True,
             samesite="Lax",
-            secure=True
+            secure=self._is_https_request(request)
         )
         logger.info(f"✨ [MagicLogin] User {user_data.get('username', 'User')} ({user_data.get('id', 0)}) successfully logged in via one-time magic link.")
         raise resp
@@ -2641,10 +2756,10 @@ class WebServer:
         # 対象ユーザーの特定
         target_user = None
 
-        # 1. ID指定の場合
+        # 1. ID指定の場合 (Bot参加サーバーに所属しているメンバーのみ受け付け: 部外者へのDM踏み台・在籍オラクル防止)
         if query.isdigit():
             uid = int(query)
-            if self.bot:
+            if self.bot and await self.auth.is_user_in_bot_guilds(uid):
                 target_user = self.bot.get_user(uid)
                 if not target_user:
                     try:
@@ -2777,7 +2892,7 @@ class WebServer:
                     path="/",
                     httponly=True,
                     samesite="Lax",
-                    secure=True
+                    secure=self._is_https_request(request)
                 )
                 user_data = self.auth.verify_session_token(safe_token)
                 if user_data:
@@ -2887,6 +3002,63 @@ class WebServer:
             )
 
         return web.json_response({"success": True, "voice": updated})
+
+    # --- ユーザー個人専用辞書 API (/api/me/dict) ---
+
+    async def api_get_my_dict(self, request: web.Request) -> web.Response:
+        """ログイン中ユーザー本人の個人専用辞書一覧を取得"""
+        user = self._require_auth(request)
+        uid = int(user.get("user_id") or 0)
+        if uid <= 0:
+            return web.json_response({"user_id": "0", "dictionary": [], "requires_discord_login": True})
+        entries = await self.db.get_user_dictionary_words(uid)
+        return web.json_response({
+            "user_id": str(uid),
+            "dictionary": [{"word": w, "reading": r} for w, r in entries],
+            "requires_discord_login": False,
+        })
+
+    async def api_upsert_my_dict(self, request: web.Request) -> web.Response:
+        """ログイン中ユーザー本人の個人専用辞書に単語を登録・上書き"""
+        user = self._require_auth(request)
+        uid = int(user.get("user_id") or 0)
+        if uid <= 0:
+            return web.json_response({"error": "個人辞書を利用するにはDiscordアカウントでログインしてください。"}, status=403)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(data, dict):
+            return web.json_response({"error": "JSON object required"}, status=400)
+        word = str(data.get("word") or "").strip()
+        reading = str(data.get("reading") or "").strip()
+        if not word or not reading:
+            return web.json_response({"error": "単語と読み方の両方を入力してください。"}, status=400)
+        if len(word) > 50 or len(reading) > 100:
+            return web.json_response({"error": "単語は50文字以内、読み方は100文字以内で指定してください。"}, status=400)
+        if any(ord(c) < 32 for c in word) or any(ord(c) < 32 for c in reading):
+            return web.json_response({"error": "制御文字は使用できません。"}, status=400)
+        existing = await self.db.get_user_dictionary_words(uid)
+        if len(existing) >= 200 and not any(w == word for w, _ in existing):
+            return web.json_response({"error": "個人辞書の登録上限（200件）に達しています。不要な単語を削除してください。"}, status=400)
+        await self.db.add_user_dictionary_word(uid, word, reading)
+        purged = await self.cache_manager.purge_by_word(word) if self.cache_manager else 0
+        return web.json_response({"success": True, "word": word, "reading": reading, "purged_cache_count": purged})
+
+    async def api_delete_my_dict(self, request: web.Request) -> web.Response:
+        """ログイン中ユーザー本人の個人専用辞書から単語を削除"""
+        user = self._require_auth(request)
+        uid = int(user.get("user_id") or 0)
+        if uid <= 0:
+            return web.json_response({"error": "個人辞書を利用するにはDiscordアカウントでログインしてください。"}, status=403)
+        word = (request.match_info.get("word") or request.query.get("word") or "").strip()
+        if not word:
+            return web.json_response({"error": "Word is required"}, status=400)
+        deleted = await self.db.delete_user_dictionary_word(uid, word)
+        if not deleted:
+            return web.json_response({"error": "Word not found"}, status=404)
+        purged = await self.cache_manager.purge_by_word(word) if self.cache_manager else 0
+        return web.json_response({"success": True, "word": word, "purged_cache_count": purged})
 
     async def api_get_user_guild_voices(self, request: web.Request) -> web.Response:
         """ユーザーが所属する各サーバーでの設定一覧（同期元セレクター用）"""
@@ -3772,24 +3944,44 @@ class WebServer:
         updated = await self.db.update_guild_settings(guild.id, **update_fields)
         return web.json_response({"success": True, "settings": updated})
 
+    async def reload_runtime_config(self) -> None:
+        """動的ローカル話者・セッション鍵・DB保存クレデンシャルを失わずに config.yaml / .env を再読込"""
+        reload_config(self.config)
+        if self.db:
+            try:
+                creds = await self.db.get_all_credentials()
+                bots = await self.db.get_bot_tokens()
+                self.config.apply_db_credentials(creds, bots)
+            except Exception as e:
+                logger.warning(f"Could not reapply DB credentials during config reload: {e}")
+            if hasattr(self.db, "invalidate_guild_cache"):
+                self.db.invalidate_guild_cache()
+            if hasattr(self.db, "invalidate_user_cache"):
+                self.db.invalidate_user_cache()
+        if self.tts_manager:
+            if hasattr(self.tts_manager, "load_cached_voices"):
+                try:
+                    self.tts_manager.load_cached_voices()
+                except Exception as e:
+                    logger.debug(f"load_cached_voices notice on reload: {e}")
+            if hasattr(self.tts_manager, "reload_cloud_credentials"):
+                self.tts_manager.reload_cloud_credentials(
+                    azure_key=self.config.azure_speech_key,
+                    azure_region=self.config.azure_speech_region,
+                    google_json=self.config.google_credentials_json,
+                    google_api_key=self.config.google_api_key,
+                )
+            if hasattr(self.tts_manager, "reload_nodes"):
+                self.tts_manager.reload_nodes()
+
     async def api_reload_config(self, request: web.Request) -> web.Response:
         """設定ファイル (config.yaml) および環境変数 (.env) をホットリロード"""
         await self._require_admin(request)
 
         try:
-            reload_config(self.config)
+            await self.reload_runtime_config()
 
-            # DBキャッシュをクリア
-            if hasattr(self.db, "invalidate_guild_cache"):
-                self.db.invalidate_guild_cache()
-            if hasattr(self.db, "invalidate_user_cache"):
-                self.db.invalidate_user_cache()
-
-            # TTS Managerのノード再設定などがあれば反映
-            if hasattr(self.tts_manager, "reload_nodes"):
-                self.tts_manager.reload_nodes()
-
-            logger.info("Configuration reloaded successfully via Web API.")
+            logger.info("Configuration reloaded safely via Web API (DB credentials & local voices preserved).")
             return web.json_response({
                 "success": True,
                 "message": "Configuration (config.yaml and .env) reloaded successfully."
@@ -4262,19 +4454,15 @@ class WebServer:
         })
 
     async def api_reset_latency(self, request: web.Request) -> web.Response:
-        """レイテンシモニターの集計メトリクスを手動リセット"""
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """レイテンシモニターの集計メトリクスを手動リセット (システム最高管理者のみ)"""
+        await self._require_admin(request)
         clear_hist = request.query.get("clear_history", "0") in ("1", "true")
         res = latency_tracker.reset(clear_history=clear_hist)
         return web.json_response(res)
 
     async def api_get_latency_incidents(self, request: web.Request) -> web.Response:
-        """遅延・アンダーラン等の状態悪化インシデント履歴 (原因調査用)"""
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """遅延・アンダーラン等の状態悪化インシデント履歴 (他ギルド発言情報を含むためシステム最高管理者のみ)"""
+        await self._require_admin(request)
         try:
             limit = int(request.query.get("limit", "50"))
         except ValueError:
@@ -4299,10 +4487,8 @@ class WebServer:
         return web.json_response({"success": True, "purged_files": count, "target": target})
 
     async def api_scan_cache(self, request: web.Request) -> web.Response:
-        """キャッシュファイルの整合性スキャン（破損・無音ファイルの検出・自己修復）"""
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """キャッシュファイルの整合性スキャン（破損・無音ファイルの検出・自己修復: システム最高管理者のみ）"""
+        await self._require_admin(request)
 
         result = await self.cache_manager.scan_and_cleanup_corrupted()
         return web.json_response({"success": True, "result": result})
@@ -4354,10 +4540,8 @@ class WebServer:
         })
 
     async def api_list_cache_files(self, request: web.Request) -> web.Response:
-        """キャッシュファイル一覧取得（検索・ソート・ページネーション対応）"""
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """キャッシュファイル一覧取得（他ギルド発言テキストを含むためシステム最高管理者のみ）"""
+        await self._require_admin(request)
 
         target = request.query.get("target", "cloud")
         search = request.query.get("search", "").strip()
@@ -4383,8 +4567,8 @@ class WebServer:
         return web.json_response(result)
 
     async def api_get_cache_audio(self, request: web.Request) -> web.Response:
-        """キャッシュされたWAV音声をインライン再生またはダウンロード用に配信"""
-        user = self._require_auth(request)
+        """キャッシュされたWAV音声をインライン再生またはダウンロード用に配信 (他ギルド音声保護のためシステム最高管理者のみ)"""
+        await self._require_admin(request)
         target = request.match_info.get("target", "cloud")
         filename = request.match_info.get("filename", "")
         
@@ -4403,15 +4587,13 @@ class WebServer:
         headers = {
             "Content-Type": "audio/wav",
             "Content-Disposition": disposition,
-            "Cache-Control": "public, max-age=3600"
+            "Cache-Control": "private, no-store"
         }
         return web.FileResponse(file_path, headers=headers)
 
     async def api_delete_cache_file(self, request: web.Request) -> web.Response:
-        """キャッシュファイルの個別削除"""
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """キャッシュファイルの個別削除 (システム最高管理者のみ)"""
+        await self._require_admin(request)
 
         target = request.match_info.get("target", "cloud")
         filename = request.match_info.get("filename", "")
@@ -4425,11 +4607,9 @@ class WebServer:
         return web.json_response({"success": True, "filename": clean_name, "target": target})
 
     async def api_delete_cache_files_batch(self, request: web.Request) -> web.Response:
-        """キャッシュファイルの一括削除"""
+        """キャッシュファイルの一括削除 (システム最高管理者のみ)"""
+        await self._require_admin(request)
         data = await request.json()
-        guild, perms = await self._get_guild_and_perms(request, data.get("guild_id") or request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
 
         target = data.get("target", "cloud")
         filenames = data.get("filenames", [])
@@ -4449,7 +4629,7 @@ class WebServer:
             "voicevox": {"available": self.tts_manager.voicevox_client is not None, "url": self.config.voicevox_base_url},
             "sharevox": {"available": self.tts_manager.sharevox_client is not None, "url": self.config.sharevox_base_url},
             "coeiroink": {"available": self.tts_manager.coeiroink_client is not None, "url": self.config.coeiroink_base_url},
-            "openjtalk": {"available": getattr(self.tts_manager, "openjtalk_client", None) is not None and self.tts_manager.openjtalk_client.is_available()},
+            "openjtalk": {"available": bool(getattr(self.tts_manager, "openjtalk_client", None) is not None and self.tts_manager.openjtalk_client.is_available())},
             "edge": {"available": self.tts_manager.edge_client is not None},
             "azure": {"available": bool(self.config.azure_speech_key)},
             "google": {"available": bool(self.config.google_credentials_json or os.path.exists("gcp-key.json"))}
@@ -4475,10 +4655,8 @@ class WebServer:
         })
 
     async def api_trigger_model_update(self, request: web.Request) -> web.Response:
-        """モデルのダウンロード・更新を開始"""
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied."}, status=403)
+        """モデルのダウンロード・更新を開始 (ホストストレージ変更のためシステム最高管理者のみ)"""
+        await self._require_admin(request)
 
         if self.coeiroink_model_manager.is_downloading:
             return web.json_response({"error": "Download is already in progress."}, status=400)
@@ -4538,11 +4716,8 @@ class WebServer:
         return web.json_response(data)
 
     async def api_sync_mycoeiroink(self, request: web.Request) -> web.Response:
-        """COEIROINK公式サイトから最新のMYCOEIROINK配布情報を一括同期"""
-        user = self._require_auth(request)
-        guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
-        if not (perms["is_admin"] or perms["has_role"]):
-            return web.json_response({"error": "Access denied. 管理者または指定ロールが必要です。"}, status=403)
+        """COEIROINK公式サイトから最新のMYCOEIROINK配布情報を一括同期 (システム最高管理者のみ)"""
+        await self._require_admin(request)
 
         try:
             res = await self.mycoeiroink.sync_all_from_official()
@@ -5551,9 +5726,21 @@ class WebServer:
             "master_lan_url": self._get_master_lan_url(request),
         })
 
+    async def _verify_worker_or_setup_token(self, request: web.Request) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Worker共有シークレット、有効なクラスタセットアップトークン(cwtok_)、または管理者セッションかを検証"""
+        token_owner = await self._resolve_setup_token_from_request(request, "worker")
+        if token_owner:
+            return True, token_owner
+        if self._verify_worker_auth(request):
+            return True, None
+        if await self._is_admin_user(request):
+            return True, None
+        return False, None
+
     async def api_worker_heartbeat(self, request: web.Request) -> web.Response:
         """Worker からのハートビートを受け付け、ノード生存状態を更新する (未登録時は即座に自動復元)"""
-        if not self._verify_worker_auth(request):
+        authed_worker, _ = await self._verify_worker_or_setup_token(request)
+        if not authed_worker:
             return web.json_response({"error": "Unauthorized worker request"}, status=401)
 
         try:
@@ -6376,6 +6563,9 @@ class WebServer:
         Worker ノード向け構成マニフェスト (Single Source of Truth) を返却。
         各 Worker は本 API を参照して Compose や Dockerfile を自律レンダリング・最新化する。
         """
+        authed_worker, _ = await self._verify_worker_or_setup_token(request)
+        if not authed_worker:
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
         # 一時的な旧Worker再起動トリガー (Python 3.11 クライアントのみ対象)
         user_agent = request.headers.get("User-Agent", "")
         trigger_file = "/app/data/.trigger_worker_reboot"
@@ -6540,6 +6730,9 @@ class WebServer:
 
     async def api_worker_models_list(self, request: web.Request) -> web.Response:
         """Worker 向け COEIROINK モデル一覧 (モデルフォルダ名, 表示名, UUID, スタイル数, 推定サイズ, tree_sha256) を返却"""
+        authed_worker, _ = await self._verify_worker_or_setup_token(request)
+        if not authed_worker:
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
         model_dir = Path(os.getenv("COEIROINK_MODEL_DIR", "/app/coeiroink_models"))
         if not model_dir.exists():
             return web.json_response({"models": [], "total_count": 0})
@@ -6562,6 +6755,9 @@ class WebServer:
 
     async def api_worker_models_manifest(self, request: web.Request) -> web.Response:
         """指定モデルの詳細ファイルマニフェスト（ファイル一覧・各SHA256ハッシュ・サイズ・ツリーハッシュ）を返却"""
+        authed_worker, _ = await self._verify_worker_or_setup_token(request)
+        if not authed_worker:
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
         model_name = request.match_info.get("model_name", "")
         clean_model_name = sanitize_filename(model_name)
         if not clean_model_name or not is_safe_identifier(clean_model_name):
@@ -6579,6 +6775,9 @@ class WebServer:
 
     async def api_worker_models_file(self, request: web.Request) -> web.StreamResponse:
         """モデル内の指定単一ファイルをストリーミング配信（HTTP Range レジューム対応・パストラバーサル防止）"""
+        authed_worker, _ = await self._verify_worker_or_setup_token(request)
+        if not authed_worker:
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
         model_name = request.match_info.get("model_name", "")
         file_path_str = request.match_info.get("file_path", "")
 
@@ -6664,6 +6863,9 @@ class WebServer:
 
     async def api_worker_models_download(self, request: web.Request) -> web.StreamResponse:
         """指定された COEIROINK モデルフォルダを tar ストリームで高速配信"""
+        authed_worker, _ = await self._verify_worker_or_setup_token(request)
+        if not authed_worker:
+            return web.json_response({"error": "Unauthorized worker request"}, status=401)
         model_name = request.match_info.get("model_name", "")
         # 安全性チェック: パストラバーサル防止 (CWE-22)
         clean_model_name = sanitize_filename(model_name)
@@ -6700,14 +6902,8 @@ class WebServer:
             await proc.wait()
             await response.write_eof()
         except asyncio.CancelledError:
-            # タスクキャンセル時はプロセス終了してから再raise
-            if proc.returncode is None:
-                proc.kill()
             raise
         except Exception as e:
-            # ConnectionResetError / ClientConnectionResetError / ConnectionError (Connection lost) 等
-            # Worker Agent がコンテナ再作成中に接続断が発生するのは正常動作
-            # aiohttp の web_protocol.py に伝播させないよう raise せず return する
             err_name = type(e).__name__
             if any(k in err_name for k in ("Connection", "Reset", "Transport", "BrokenPipe")):
                 logger.warning(
@@ -7486,11 +7682,19 @@ class WebServer:
                     self.config.discord_redirect_uri = f"{b_url}/callback"
 
             # 7. Admin Password
+            rotated_admin_cookie: Optional[str] = None
             if "admin_password" in data:
                 new_pwd = str(data["admin_password"]).strip()
                 if new_pwd:
+                    cur_user = self.auth.get_current_user(request)
                     await self.db.set_credential("admin_password", new_pwd, is_secret=True)
                     self.config.admin_password = new_pwd
+                    self.auth.set_admin_password_fingerprint(new_pwd, require_match=True)
+                    if cur_user and int(cur_user.get("user_id", -1)) == 0:
+                        rotated_admin_cookie = self.auth.create_session_token(
+                            {"id": 0, "username": "Administrator", "global_name": "管理者", "avatar": ""},
+                            is_admin=True,
+                        )
 
             # 8. Cloudflare Tunnel Token & 自動起動連動
             tunnel_message = ""
@@ -7525,7 +7729,8 @@ class WebServer:
                 if raw_ec_id.isdigit():
                     await self.db.set_credential("error_contact_user_id", raw_ec_id)
                 elif not raw_ec_id:
-                    await self.db.set_credential("error_contact_user_id", str(alert_service.INITIAL_DEFAULT_CONTACT_ID))
+                    default_ec_id = getattr(alert_service, "DEFAULT_ADMIN_USER_ID", 0) or getattr(self.config, "discord_owner_user_id", 0) or ""
+                    await self.db.set_credential("error_contact_user_id", str(default_ec_id))
 
             # 10. Discord OAuth2 クレデンシャル
             if "discord_client_id" in data:
@@ -7621,11 +7826,22 @@ class WebServer:
                     google_api_key=self.config.google_api_key
                 )
 
-            return web.json_response({
+            resp_save = web.json_response({
                 "status": "ok",
                 "success": True,
                 "message": f"設定を保存し、ホットリロードしました。{tunnel_message}"
             })
+            if rotated_admin_cookie:
+                resp_save.set_cookie(
+                    "ttsbot_session",
+                    rotated_admin_cookie,
+                    max_age=86400 * 7,
+                    path="/",
+                    httponly=True,
+                    samesite="Lax",
+                    secure=self._is_https_request(request),
+                )
+            return resp_save
         except Exception as e:
             logger.exception("api_system_save_credentials failed")
             return web.json_response({"status": "error", "error": f"保存中にエラーが発生しました: {e}"}, status=500)
@@ -7898,7 +8114,7 @@ class WebServer:
 
         # 早耳 Live (Hayamimi) WebSocket 疎通テスト
         if provider.lower() == "hayamimi":
-            ws_url = str(data.get("ws_url") or self.config.hayamimi_ws_url).strip()
+            ws_url = str(data.get("ws_url") or data.get("hayamimi_ws_url") or self.config.hayamimi_ws_url).strip()
             if not ws_url:
                 return web.json_response({
                     "status": "error",
@@ -7914,15 +8130,32 @@ class WebServer:
                     "provider": "hayamimi",
                     "error": "ws:// または wss:// で始まる有効な URL を指定してください。"
                 }, status=400)
-            # SSRF防護: ループバックやリンクローカル/クラウドメタデータIP (169.254.169.254等) を拒否
+            # SSRF防護: ループバック・リンクローカル・クラウドメタデータIP・DNSリバインディングを遮断
             if ws_url != (self.config.hayamimi_ws_url or "").strip():
+                host_low = p_ws.hostname.lower()
+                if host_low == "localhost" or host_low.endswith(".localhost"):
+                    return web.json_response({"status": "error", "success": False, "provider": "hayamimi", "error": "localhost への疎通テストは許可されていません。"}, status=400)
+                is_wan_req = self._is_wan_request(request)
                 try:
-                    addr = ipaddress.ip_address(p_ws.hostname)
-                    if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
-                        return web.json_response({"status": "error", "success": False, "provider": "hayamimi", "error": "指定されたアドレスへの疎通テストは許可されていません。"}, status=400)
-                except ValueError:
-                    if p_ws.hostname.lower() == "localhost":
-                        return web.json_response({"status": "error", "success": False, "provider": "hayamimi", "error": "localhost への疎通テストは許可されていません。"}, status=400)
+                    resolved_infos = await asyncio.to_thread(socket.getaddrinfo, p_ws.hostname, p_ws.port or 80, proto=socket.IPPROTO_TCP)
+                except Exception:
+                    resolved_infos = []
+                check_ips = [info[4][0] for info in resolved_infos if info and len(info) >= 5 and info[4]]
+                if not check_ips:
+                    check_ips = [p_ws.hostname]
+                for ip_str in check_ips:
+                    try:
+                        addr = ipaddress.ip_address(ip_str)
+                        if (
+                            addr.is_loopback
+                            or addr.is_link_local
+                            or addr.is_multicast
+                            or addr.is_unspecified
+                            or (is_wan_req and addr.is_private)
+                        ):
+                            return web.json_response({"status": "error", "success": False, "provider": "hayamimi", "error": "指定されたアドレスへの疎通テストは許可されていません。"}, status=400)
+                    except ValueError:
+                        return web.json_response({"status": "error", "success": False, "provider": "hayamimi", "error": "ホスト名を解決できませんでした。"}, status=400)
 
             t_start = time.perf_counter()
             try:
