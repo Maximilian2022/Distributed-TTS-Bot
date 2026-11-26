@@ -149,23 +149,32 @@ class EdgeTTSClient(BaseTTSClient):
             if not mp3_bytes:
                 raise TTSError("Edge-TTS returned empty audio data")
 
-            # 2. FFmpeg でメモリ内 PCM WAV (24kHz, 16bit, 1ch) に変換
-            process = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "ffmpeg", "-y", "-i", "pipe:0",
-                    "-f", "wav", "-acodec", "pcm_s16le",
-                    "-ar", "24000", "-ac", "1",
-                    "pipe:1",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                ),
-                timeout=dyn_timeout
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=mp3_bytes),
-                timeout=dyn_timeout
-            )
+            # 2. FFmpeg でメモリ内 PCM WAV (24kHz, 16bit, 1ch) に変換 (キャンセル・タイムアウト時のプロセス残留防止)
+            process = None
+            try:
+                process = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        "ffmpeg", "-y", "-i", "pipe:0",
+                        "-f", "wav", "-acodec", "pcm_s16le",
+                        "-ar", "24000", "-ac", "1",
+                        "pipe:1",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    ),
+                    timeout=dyn_timeout
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(input=mp3_bytes),
+                    timeout=dyn_timeout
+                )
+            finally:
+                if process is not None and process.returncode is None:
+                    try:
+                        process.kill()
+                        await process.wait()
+                    except Exception:
+                        pass
 
             if process.returncode != 0:
                 err_text = stderr.decode("utf-8", errors="replace")

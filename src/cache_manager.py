@@ -230,6 +230,7 @@ class CacheManager:
         self.db: Any = None
         self._last_enforce_time: Dict[str, float] = {}
         self._save_counter: Dict[str, int] = {}
+        self._last_utime_map: Dict[str, float] = {}
 
         # L1 インメモリ LRU キャッシュ (定型文・短文のゼロI/O高速化)
         # ホストRAMおよびcgroupメモリ制限に応じて [16MB, 128MB] の範囲で自動スケーリング
@@ -388,6 +389,24 @@ class CacheManager:
             logger.warning(f"Failed to access cache for {cache_key}: {e}")
             return None
 
+    def _touch_l1_utime_debounced(self, cache_key: str, file_path: Path) -> None:
+        """L1ヒット時のディスク mtime 更新をキー単位5分間隔にデバウンスして不要なスレッド起動を抑制"""
+        now = time.time()
+        last_t = self._last_utime_map.get(cache_key, 0.0)
+        if now - last_t < 300.0:
+            return
+        if len(self._last_utime_map) > 4096:
+            self._last_utime_map.clear()
+        self._last_utime_map[cache_key] = now
+
+        def _safe_utime():
+            try:
+                os.utime(file_path, None)
+            except OSError:
+                pass
+
+        safe_create_task(asyncio.to_thread(_safe_utime), name="utime_l1_debounced")
+
     async def get(self, cache_key: str, provider: str = "azure") -> Optional[Path]:
         """
         キャッシュが存在するか確認。
@@ -397,7 +416,7 @@ class CacheManager:
         l1_entry = self._get_l1(cache_key)
         if l1_entry is not None:
             _, _, file_path = l1_entry
-            safe_create_task(asyncio.to_thread(os.utime, file_path, None), name="utime_l1")
+            self._touch_l1_utime_debounced(cache_key, file_path)
             if self.db:
                 safe_create_task(
                     self.db.record_cache_metadata_hit(cache_key) if hasattr(self.db, "record_cache_metadata_hit") else self.db.record_cache_hit(cache_key),
@@ -412,7 +431,7 @@ class CacheManager:
         l1_entry = self._get_l1(cache_key)
         if l1_entry is not None:
             _, audio_bytes, file_path = l1_entry
-            safe_create_task(asyncio.to_thread(os.utime, file_path, None), name="utime_l1_bytes")
+            self._touch_l1_utime_debounced(cache_key, file_path)
             if self.db:
                 safe_create_task(
                     self.db.record_cache_metadata_hit(cache_key) if hasattr(self.db, "record_cache_metadata_hit") else self.db.record_cache_hit(cache_key),
@@ -424,8 +443,12 @@ class CacheManager:
         file_path = await self._get_disk_file(cache_key, provider)
         if file_path is not None:
             try:
-                content = await asyncio.to_thread(file_path.read_bytes)
-                is_valid, reason = validate_wav_bytes(content)
+                def _read_and_validate() -> Tuple[bytes, bool, str]:
+                    raw = file_path.read_bytes()
+                    ok, rsn = validate_wav_bytes(raw)
+                    return raw, ok, rsn
+
+                content, is_valid, reason = await asyncio.to_thread(_read_and_validate)
                 if not is_valid:
                     logger.warning(f"Invalid cached audio detected for {cache_key}: {reason}. Auto-removing.")
                     await asyncio.to_thread(file_path.unlink, True)
@@ -455,30 +478,26 @@ class CacheManager:
         音声バイナリの破損・無音を保存前にバリデーションし、問題なければキャッシュに保存。
         メタデータ（発言内容、話者名、パーツ種別、再生時間）も自動記録。
         """
-        # パイプ出力等による未確定ヘッダーサイズを実サイズで正規化
-        audio_data = fix_wav_header(audio_data)
-
-        # 保存前バリデーション (In-flight validation)
-        is_valid, reason = validate_wav_bytes(audio_data)
-        if not is_valid:
-            logger.error(f"Refusing to save corrupted or silent audio ({provider}): {cache_key} - {reason}")
-            raise ValueError(f"Corrupted or silent audio data: {reason}")
-
         file_path = self.get_file_path(cache_key, provider)
-        
-        def _write():
+
+        def _validate_and_write() -> Tuple[bytes, bool, str, float]:
+            fixed = fix_wav_header(audio_data)
+            ok, rsn = validate_wav_bytes(fixed)
+            if not ok:
+                return fixed, False, rsn, 0.0
+            dur = get_wav_duration(fixed) if (self.db and text) else 0.0
             if file_path.exists():
                 try:
                     os.utime(file_path, None)
                 except OSError:
                     pass
-                return
+                return fixed, True, "OK", dur
 
             # 並行保存時の競合（Race Condition）を防ぐため、UUIDを付与した一意の一時ファイル名を使用
             temp_path = file_path.with_suffix(f".tmp.{uuid.uuid4().hex[:8]}")
             try:
                 with open(temp_path, "wb") as f:
-                    f.write(audio_data)
+                    f.write(fixed)
                 temp_path.replace(file_path)
                 os.utime(file_path, None)
             except FileNotFoundError:
@@ -490,14 +509,19 @@ class CacheManager:
                         temp_path.unlink()
                     except OSError:
                         pass
+            return fixed, True, "OK", dur
 
-        await asyncio.to_thread(_write)
+        audio_data, is_valid, reason, duration = await asyncio.to_thread(_validate_and_write)
+        if not is_valid:
+            logger.error(f"Refusing to save corrupted or silent audio ({provider}): {cache_key} - {reason}")
+            raise ValueError(f"Corrupted or silent audio data: {reason}")
+
         self._put_l1(cache_key, provider, audio_data, file_path)
+        self._last_utime_map[cache_key] = time.time()
         logger.info(f"Saved new cache ({provider}): {cache_key} ({len(audio_data)} bytes)")
 
         # メタデータをDBに非同期記録 (PERF-3: 音声返却をブロックせず即応)
         if self.db and text:
-            duration = get_wav_duration(audio_data)
             async def _bg_record():
                 try:
                     await self.db.record_cache_saved(
@@ -549,6 +573,11 @@ class CacheManager:
                 if res2:
                     all_deleted_keys.extend(res2)
 
+            # L1 メモリキャッシュ無効化は OrderedDict 競合を防ぐため必ずメインイベントループ側で実施
+            for del_key in all_deleted_keys:
+                self._invalidate_l1(del_key)
+                self._last_utime_map.pop(del_key, None)
+
             # DBメタデータ側の孤児レコードも非同期メインループから安全に一括削除 (B-4)
             if self.db and all_deleted_keys:
                 safe_create_task(self.db.delete_cache_metadata_batch(all_deleted_keys), name="delete_cache_metadata_lru")
@@ -596,7 +625,6 @@ class CacheManager:
                     break
                 try:
                     file_path.unlink(missing_ok=True)
-                    self._invalidate_l1(file_path.name)
                     total_size -= size
                     deleted_bytes += size
                     deleted_count += 1

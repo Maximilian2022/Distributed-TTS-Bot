@@ -150,9 +150,9 @@ class WebServer:
             sync_agent_py_version()
         except Exception as _sync_err:
             logger.debug(f"[AgentSync] sync_agent_py_version notice: {_sync_err}")
-        # 大容量モデルZIP (最大2GB) のアップロードを許可するため、client_max_size を 2.5GB に設定
+        # チャンク分割アップロード (最大50MB/パート) を許容しつつ、単発巨大ボディによるOOM DoSを防止するため 64MB に制限
         self.app = web.Application(
-            client_max_size=2560 * 1024 * 1024,
+            client_max_size=64 * 1024 * 1024,
             middlewares=[self._security_and_rate_limit_middleware]
         )
         self._start_time = time.time()
@@ -759,8 +759,14 @@ class WebServer:
             resp.headers.setdefault("X-Frame-Options", "DENY")
             resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
             resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-            if request.path.startswith("/static/"):
-                resp.headers.setdefault("Cache-Control", "public, max-age=86400")
+            if request.path in ("/static/agent.py", "/static/setup-worker.sh", "/static/setup-worker.ps1", "/static/update.sh"):
+                resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+                resp.headers["Pragma"] = "no-cache"
+            elif request.path.startswith("/static/"):
+                resp.headers.setdefault(
+                    "Cache-Control",
+                    "public, max-age=86400" if request.query.get("v") else "no-cache"
+                )
 
             # スライディングセッション (アクセスするたびにセッションCookieを30日間自動延長)
             session_cookie = request.cookies.get("ttsbot_session")
@@ -830,7 +836,7 @@ class WebServer:
         if is_wan and request.method in ("POST", "PUT", "DELETE") and path.startswith("/api/") and not path.startswith("/api/worker/"):
             origin = request.headers.get("Origin") or ""
             referer = request.headers.get("Referer") or ""
-            allowed_hosts = {"localhost", "127.0.0.1"}
+            allowed_hosts = set()
             req_host = (request.host.split(":")[0] if request.host else "").lower()
             if req_host:
                 allowed_hosts.add(req_host)
@@ -838,7 +844,7 @@ class WebServer:
             if dash_url:
                 try:
                     d_host = urlparse(dash_url).hostname
-                    if d_host:
+                    if d_host and d_host.lower() not in ("localhost", "127.0.0.1"):
                         allowed_hosts.add(d_host.lower())
                 except Exception:
                     pass
@@ -848,7 +854,7 @@ class WebServer:
                 if check_url:
                     try:
                         p_host = urlparse(check_url).hostname
-                        if p_host and (p_host.lower() in allowed_hosts or p_host.startswith("192.168.") or p_host.startswith("10.") or p_host.startswith("172.")):
+                        if p_host and p_host.lower() in allowed_hosts:
                             valid_csrf = True
                             break
                     except Exception:
@@ -907,9 +913,11 @@ class WebServer:
                 del self._rate_limits[k]
 
         resp = await handler(request)
-        if path.startswith("/static/"):
-            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        if path in ("/static/agent.py", "/static/setup-worker.sh", "/static/setup-worker.ps1", "/static/update.sh"):
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             resp.headers["Pragma"] = "no-cache"
+        elif path.startswith("/static/") and request.query.get("v"):
+            resp.headers["Cache-Control"] = "public, max-age=86400"
         return resp
 
     async def handle_health(self, request: web.Request) -> web.Response:
@@ -922,11 +930,11 @@ class WebServer:
         latency_ms = round(self.bot.latency * 1000, 2) if (self.bot and self.bot.latency is not None) else None
         guilds_cnt = len(self.bot.guilds) if self.bot else 0
 
-        # DB疎通チェック
+        # DB疎通チェック (持続コネクションプールを利用し毎回の新規スレッド起動オーバーヘッドを排除)
         db_ok = False
         db_err = None
         try:
-            async with aiosqlite.connect(self.db.db_path) as db:
+            async with self.db.get_connection() as db:
                 async with db.execute("SELECT 1") as cur:
                     await cur.fetchone()
             db_ok = True
@@ -1009,23 +1017,47 @@ class WebServer:
             )
         return user
 
+    def _is_system_admin_uid(self, user_id: int) -> bool:
+        """指定された Discord ユーザーIDがシステム最高管理者 (DISCORD_OWNER_USER_ID / ADMIN_USER_IDS) かを判定"""
+        if not user_id or user_id <= 0:
+            return False
+        env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+        if env_owner_id > 0 and user_id == env_owner_id:
+            return True
+        admin_user_ids = getattr(self.config, "admin_user_ids", None) or []
+        if user_id in admin_user_ids:
+            return True
+        # 環境変数未指定環境でのロックアウト防止: 既に master_primary にバインド済みのオーナーIDと一致する場合のみ許可
+        if env_owner_id == 0 and not admin_user_ids and self._worker_settings_cache:
+            master_uid = int(self._worker_settings_cache.get("master_primary", {}).get("owner_user_id") or 0)
+            if master_uid > 0 and user_id == master_uid:
+                return True
+        return False
+
     async def _is_admin_user(self, request: web.Request) -> bool:
-        """ログインユーザーが管理者権限を持つか判定 (パスワード認証の管理者 または Discordギルド管理者)"""
+        """
+        ログインユーザーがシステム最高管理者権限を持つか判定。
+        (パスワード認証の管理者 ID=0、または DISCORD_OWNER_USER_ID / ADMIN_USER_IDS のみ許可。
+         単一Discordサーバーのサーバー管理者はギルド固有設定のみ許可しシステム特権は付与しない)
+        """
         user = self.auth.get_current_user(request)
         if not user or "user_id" not in user:
             return False
-        # パスワード認証による管理者フラグ、またはID 0
-        if user.get("is_admin") or user.get("user_id") == 0:
+        uid = int(user.get("user_id") or 0)
+        if uid == 0 and user.get("is_admin"):
             return True
-        user_id = user["user_id"]
-        admin_user_ids = getattr(self.config, "admin_user_ids", []) or []
-        if user_id in admin_user_ids:
-            return True
-        if self.bot and getattr(self.bot, "guilds", None):
-            for guild in self.bot.guilds:
-                member = await self._get_or_fetch_member(guild, user_id)
-                if member and (member.guild_permissions.administrator or guild.owner_id == user_id):
-                    return True
+        if uid > 0:
+            if self._is_system_admin_uid(uid):
+                return True
+            env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+            admin_user_ids = getattr(self.config, "admin_user_ids", None) or []
+            if env_owner_id == 0 and not admin_user_ids:
+                w_st = await self._worker_settings()
+                master_uid = int(w_st.get("master_primary", {}).get("owner_user_id") or 0)
+                if master_uid > 0:
+                    return uid == master_uid
+                # オーナー環境変数も master_primary も未設定の初期セットアップ状態では署名済みセッションの is_admin をフォールバック許可
+                return bool(user.get("is_admin"))
         return False
 
     async def _require_admin(self, request: web.Request) -> Dict[str, Any]:
@@ -1075,7 +1107,7 @@ class WebServer:
                 content_type="application/json"
             )
 
-        is_bot_admin = user_id in getattr(self.config, "admin_user_ids", [])
+        is_bot_admin = self._is_system_admin_uid(user_id) or (user_id == 0 and bool(user.get("is_admin")))
         is_admin = is_bot_admin or member.guild_permissions.administrator or (guild.owner_id == user_id)
         guild_settings = await self.db.get_guild_settings(guild.id, self.config)
         admin_role_id = guild_settings.get("admin_role_id", 0)
@@ -1098,13 +1130,9 @@ class WebServer:
         if not template_path.exists():
             return web.Response(text="index.html not found", status=500)
 
-        html = template_path.read_text(encoding="utf-8")
+        html_doc = template_path.read_text(encoding="utf-8")
         user = self.auth.get_current_user(request)
-
-        # テンプレート内の簡易変数置換 (Reflected XSS 防護: 外部入力由来の文字列は埋め込まず boolean のみ展開)
-        is_logged_in = "true" if user else "false"
-        client_configured = "true" if self.auth.is_configured() else "false"
-        user_json = json.dumps({"is_admin": bool(user.get("is_admin", False))}) if user else "null"
+        is_sys_admin = await self._is_admin_user(request) if user else False
 
         # 静的アセットキャッシュバスター (ファイルのmtimeを付与してCloudflare等のエッジキャッシュを強制バイパス)
         app_js_path = Path(__file__).resolve().parent / "static" / "app.js"
@@ -1113,19 +1141,24 @@ class WebServer:
         css_mtime = int(style_css_path.stat().st_mtime) if style_css_path.exists() else 0
         asset_v = f"{BUILD_VERSION}-{max(js_mtime, css_mtime)}"
 
-        # 共有ワーカートークンは管理者セッションにのみ埋め込む
-        worker_token = getattr(self.config, "worker_shared_secret", "").strip() if (user and user.get("is_admin")) else ""
+        # 共有ワーカートークンはシステム最高管理者セッションにのみ埋め込む
+        worker_token = getattr(self.config, "worker_shared_secret", "").strip() if is_sys_admin else ""
+        server_payload = {
+            "is_logged_in": bool(user),
+            "client_configured": bool(self.auth.is_configured()),
+            "user_data": {"is_admin": is_sys_admin} if user else None,
+            "worker_token": worker_token,
+            "agent_version": AGENT_VERSION,
+        }
+        server_data_json = json.dumps(server_payload, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
-        html = html.replace("{{IS_LOGGED_IN}}", is_logged_in)
-        html = html.replace("{{CLIENT_CONFIGURED}}", client_configured)
-        html = html.replace("{{USER_DATA}}", user_json)
-        html = html.replace("{{WORKER_TOKEN}}", worker_token)
-        html = html.replace("{{BUILD_ID}}", BUILD_VERSION)
-        html = html.replace("{{BUILD_DATE}}", BUILD_DATE)
-        html = html.replace("{{ASSET_V}}", asset_v)
-        html = html.replace("{{AGENT_VERSION}}", AGENT_VERSION)
+        html_doc = html_doc.replace("{{SERVER_DATA_JSON}}", server_data_json)
+        html_doc = html_doc.replace("{{BUILD_ID}}", BUILD_VERSION)
+        html_doc = html_doc.replace("{{BUILD_DATE}}", BUILD_DATE)
+        html_doc = html_doc.replace("{{ASSET_V}}", asset_v)
+        html_doc = html_doc.replace("{{AGENT_VERSION}}", AGENT_VERSION)
 
-        response = web.Response(text=html, content_type="text/html")
+        response = web.Response(text=html_doc, content_type="text/html")
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -1345,7 +1378,9 @@ class WebServer:
             return web.Response(text=content, content_type="text/plain", charset="utf-8")
 
         ct = "text/plain" if safe_filename.endswith((".py", ".md")) else "application/octet-stream"
-        return web.Response(body=file_path.read_bytes(), content_type=ct, charset="utf-8" if ct.startswith("text") else None)
+        body_bytes = file_path.read_bytes()
+        headers = {"X-Script-SHA256": hashlib.sha256(body_bytes).hexdigest()}
+        return web.Response(body=body_bytes, content_type=ct, charset="utf-8" if ct.startswith("text") else None, headers=headers)
 
     async def handle_volunteer_zip(self, request: web.Request) -> web.Response:
         """Windows向けボランティアツール一式 (zip) をオンザフライ生成して配信"""
@@ -1400,12 +1435,35 @@ class WebServer:
         )
 
     async def api_stt_stream(self, request: web.Request) -> web.WebSocketResponse:
-        """早耳 Live ゲームPC連携用リアルタイム WebSocket ストリーム (出口B)"""
+        """早耳 Live ゲームPC連携用リアルタイム WebSocket ストリーム (出口B: 認証・スコープ検証付き)"""
+        forced_user_id: Optional[int] = None
+        user = self.auth.get_current_user(request)
+        if user:
+            if not await self._is_admin_user(request):
+                forced_user_id = int(user.get("user_id") or 0)
+        else:
+            token = self._extract_worker_token(request)
+            if token.startswith(VOLUNTEER_TOKEN_PREFIX):
+                v_owner = await self.db.resolve_volunteer_token(token)
+                if not v_owner:
+                    raise web.HTTPUnauthorized(text="Invalid or revoked volunteer token")
+                forced_user_id = int(v_owner["discord_user_id"])
+            elif token.startswith(CLUSTER_WORKER_TOKEN_PREFIX):
+                c_owner = await self.db.resolve_node_setup_token(token, "worker")
+                if not c_owner:
+                    raise web.HTTPUnauthorized(text="Invalid or revoked setup token")
+                if not self._is_system_admin_uid(int(c_owner["discord_user_id"])):
+                    forced_user_id = int(c_owner["discord_user_id"])
+            elif token and self._verify_worker_auth(request):
+                forced_user_id = None
+            elif self._is_wan_request(request):
+                raise web.HTTPUnauthorized(text="Authentication required for WAN STT stream")
+
         from src.stt.manager import STTManager
         stt_mgr = STTManager.get_instance()
         if not stt_mgr:
             stt_mgr = STTManager(self.bot, self.db, self.config)
-        return await stt_mgr.handle_game_ws(request)
+        return await stt_mgr.handle_game_ws(request, forced_user_id=forced_user_id)
 
     def _load_or_create_master_instance_id(self) -> str:
         """
@@ -2437,11 +2495,11 @@ class WebServer:
 
         user_id = int(user_info["id"])
 
-        # サーバー参加判定
+        # サーバー参加判定 (Reflected XSS 防護および部外者への導入先サーバー名非開示)
         is_member = await self.auth.is_user_in_bot_guilds(user_id)
         if not is_member:
-            guild_names = [g.name for g in self.bot.guilds]
-            guild_list_str = "、".join(guild_names) if guild_names else "なし"
+            import html as _html_mod
+            safe_uname = _html_mod.escape(str(user_info.get("username") or "Unknown"))
             error_html = (
                 "<!DOCTYPE html><html lang='ja'><head><meta charset='utf-8'>"
                 "<title>アクセス制限 - Distributed TTS</title>"
@@ -2450,8 +2508,7 @@ class WebServer:
                 "h2{color:#ff4757;margin-top:0;}p{line-height:1.6;color:#a0a4ab;}.btn{display:inline-block;margin-top:20px;padding:10px 24px;background:#5865F2;color:white;text-decoration:none;border-radius:8px;font-weight:bold;}"
                 "</style></head><body><div class='card'>"
                 "<h2>⚠️ アクセスできません</h2>"
-                f"<p>アカウント <strong>{user_info.get('username')}</strong> は、このBotが導入されているDiscordサーバーに参加していません。</p>"
-                f"<p style='font-size:13px;'>Bot導入中サーバー: <strong>{guild_list_str}</strong></p>"
+                f"<p>アカウント <strong>{safe_uname}</strong> は、このBotが導入されているDiscordサーバーに参加していません。</p>"
                 "<a href='/' class='btn'>トップへ戻る</a>"
                 "</div></body></html>"
             )
@@ -2459,18 +2516,8 @@ class WebServer:
             resp.del_cookie("oauth_state")
             return resp
 
-        # 管理者判定 (サーバーオーナー / サーバー管理者 / .env 指定管理者)
-        is_admin = False
-        if self.bot and getattr(self.bot, "guilds", None):
-            for guild in self.bot.guilds:
-                m = await self._get_or_fetch_member(guild, user_id)
-                if m and (m.guild_permissions.administrator or guild.owner_id == user_id):
-                    is_admin = True
-                    break
-        admin_ids = getattr(self.config, "admin_user_ids", []) or []
-        env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
-        if user_id in admin_ids or (env_owner_id > 0 and user_id == env_owner_id):
-            is_admin = True
+        # システム最高管理者判定 (DISCORD_OWNER_USER_ID / ADMIN_USER_IDS のみ。単一ギルド管理者はギルド権限APIで個別評価)
+        is_admin = self._is_system_admin_uid(user_id)
 
         # Master (主系) / 同居 Worker の所有者自動バインド (アイデア A & B ハイブリッド)
         await self._auto_bind_host_nodes_owner(user_info, is_admin=is_admin)
@@ -2637,18 +2684,8 @@ class WebServer:
                 "error": f"ユーザー「{username}」宛ての承認リクエストは直前に送信されたばかりです。60秒以上あけてから再度お試しください。"
             }, status=429)
 
-        # 管理者判定
-        is_admin = False
-        if self.bot and getattr(self.bot, "guilds", None):
-            for guild in self.bot.guilds:
-                m = guild.get_member(user_id)
-                if m and (m.guild_permissions.administrator or guild.owner_id == user_id):
-                    is_admin = True
-                    break
-        admin_ids = getattr(self.config, "admin_user_ids", []) or []
-        env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
-        if user_id in admin_ids or (env_owner_id > 0 and user_id == env_owner_id):
-            is_admin = True
+        # システム最高管理者判定 (DISCORD_OWNER_USER_ID / ADMIN_USER_IDS のみ)
+        is_admin = self._is_system_admin_uid(user_id)
 
         user_agent = request.headers.get("User-Agent", "Unknown Browser")
         req_id, verify_code = self.auth.create_app_login_request(
@@ -3362,6 +3399,10 @@ class WebServer:
     async def api_add_ng(self, request: web.Request) -> web.Response:
         data = await request.json()
         guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to add NG words."
+            }, status=403)
 
         word = data.get("word", "").strip()
         if not word:
@@ -3374,6 +3415,10 @@ class WebServer:
     async def api_delete_ng(self, request: web.Request) -> web.Response:
         word = request.match_info.get("word", "").strip()
         guild, perms = await self._get_guild_and_perms(request, request.query.get("guild_id"))
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to delete NG words."
+            }, status=403)
 
         if not word:
             return web.json_response({"error": "Word is required"}, status=400)
@@ -3387,6 +3432,10 @@ class WebServer:
     async def api_delete_ng_batch(self, request: web.Request) -> web.Response:
         data = await request.json()
         guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to delete NG words."
+            }, status=403)
 
         words = data.get("words") or []
         if not isinstance(words, list) or not words:
@@ -3407,6 +3456,10 @@ class WebServer:
     async def api_import_ng_preset(self, request: web.Request) -> web.Response:
         data = await request.json()
         guild, perms = await self._get_guild_and_perms(request, data.get("guild_id"))
+        if not (perms["is_admin"] or perms["has_role"]):
+            return web.json_response({
+                "error": "Access denied. Administrator or assigned role required to import NG word presets."
+            }, status=403)
 
         count = await self.db.import_default_ng_words(guild.id)
         return web.json_response({"success": True, "imported_count": count})
@@ -4541,8 +4594,9 @@ class WebServer:
         return web.json_response(res)
 
     async def api_upload_mycoeiroink_zip(self, request: web.Request) -> web.Response:
-        """ユーザーが手動ダウンロードしたZIPファイルをWebUI経由で安全にアップロード・配置（管理者のみ）"""
+        """ユーザーが手動ダウンロードしたZIPファイルをWebUI経由で安全にアップロード・配置（管理者のみ・OOM防止ストリーミング保存）"""
         await self._require_admin(request)
+        tmp_zip_path: Optional[Path] = None
         try:
             reader = await request.multipart()
             field = await reader.next()
@@ -4554,23 +4608,25 @@ class WebServer:
             speaker_uuid_hint = request.query.get("speaker_uuid")
             logger.info(f"[MYCOEIROINK Upload] アップロード受信開始: {filename} (target_uuid: {speaker_uuid_hint or '自動判定'})")
 
-            chunks = []
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
+                tmp_zip_path = Path(tf.name)
+
             size = 0
             max_size = 2048 * 1024 * 1024  # 2GB
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > max_size:
-                    logger.warning(f"[MYCOEIROINK Upload Rejected] ファイルサイズ上限超過 ({filename}): {size / 1024 / 1024:.1f}MB > 2048MB")
-                    return web.json_response({"error": "ファイルサイズが上限 (2GB) を超過しています。"}, status=400)
-                chunks.append(chunk)
+            with open(tmp_zip_path, "wb") as out_f:
+                while True:
+                    chunk = await field.read_chunk()
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_size:
+                        logger.warning(f"[MYCOEIROINK Upload Rejected] ファイルサイズ上限超過 ({filename}): {size / 1024 / 1024:.1f}MB > 2048MB")
+                        return web.json_response({"error": "ファイルサイズが上限 (2GB) を超過しています。"}, status=400)
+                    await asyncio.to_thread(out_f.write, chunk)
 
-            zip_bytes = b"".join(chunks)
-            logger.info(f"[MYCOEIROINK Upload] 受信完了 ({len(zip_bytes) / 1024 / 1024:.2f} MB)。セキュリティ検証およびZIP展開を開始します...")
+            logger.info(f"[MYCOEIROINK Upload] 受信完了 ({size / 1024 / 1024:.2f} MB)。セキュリティ検証およびZIP展開を開始します...")
 
-            res = self.mycoeiroink.safe_extract_zip(zip_bytes, speaker_uuid_hint=speaker_uuid_hint)
+            res = await asyncio.to_thread(self.mycoeiroink.safe_extract_zip, tmp_zip_path, speaker_uuid_hint)
             logger.info(f"[MYCOEIROINK Upload Success] モデル展開完了: {res.get('speaker_name', '不明')} (UUID: {res.get('speaker_uuid')}, スタイル数: {len(res.get('styles', []))})")
 
             # COEIROINK の初期化を再実行して config.voices に最新モデルを登録
@@ -4584,6 +4640,12 @@ class WebServer:
         except Exception as e:
             logger.error(f"[MYCOEIROINK Upload Error] 展開処理中の予期せぬ例外: {e}", exc_info=True)
             return web.json_response({"error": f"展開処理中にエラーが発生しました: {e}"}, status=500)
+        finally:
+            if tmp_zip_path and tmp_zip_path.exists():
+                try:
+                    tmp_zip_path.unlink()
+                except Exception:
+                    pass
 
     async def api_upload_mycoeiroink_chunk(self, request: web.Request) -> web.Response:
         """
@@ -4639,29 +4701,35 @@ class WebServer:
 
             # 最終チャンクか判定
             if chunk_index + 1 == total_chunks:
-                logger.info(f"[MYCOEIROINK Chunk Upload] 全 {total_chunks} パート受信完了。結合を開始します ({filename})...")
-                # 全チャンクの存在確認と結合
-                combined_chunks = []
-                total_size = 0
-                for i in range(total_chunks):
-                    cf = chunk_dir / f"chunk_{i:05d}"
-                    if not cf.exists():
-                        raise ValueError(f"チャンク欠落を検知しました (chunk_{i:05d} が見つかりません)")
-                    c_bytes = cf.read_bytes()
-                    total_size += len(c_bytes)
-                    if total_size > 2048 * 1024 * 1024:
-                        raise ValueError(f"結合後のファイルサイズが上限 (2GB) を超過しています: {total_size / 1024 / 1024:.1f}MB")
-                    combined_chunks.append(c_bytes)
+                logger.info(f"[MYCOEIROINK Chunk Upload] 全 {total_chunks} パート受信完了。ストリーミング結合を開始します ({filename})...")
+                assembled_zip = chunk_dir / "assembled.zip"
 
-                combined_zip = b"".join(combined_chunks)
-                logger.info(f"[MYCOEIROINK Chunk Upload] 結合完了 ({len(combined_zip) / 1024 / 1024:.2f} MB)。安全展開を実施します...")
+                def _assemble_and_extract() -> Dict[str, Any]:
+                    total_size = 0
+                    with open(assembled_zip, "wb") as out_f:
+                        for i in range(total_chunks):
+                            cf = chunk_dir / f"chunk_{i:05d}"
+                            if not cf.exists():
+                                raise ValueError(f"チャンク欠落を検知しました (chunk_{i:05d} が見つかりません)")
+                            with open(cf, "rb") as in_f:
+                                while True:
+                                    buf = in_f.read(1024 * 1024)
+                                    if not buf:
+                                        break
+                                    total_size += len(buf)
+                                    if total_size > 2048 * 1024 * 1024:
+                                        raise ValueError(f"結合後のファイルサイズが上限 (2GB) を超過しています: {total_size / 1024 / 1024:.1f}MB")
+                                    out_f.write(buf)
+                            cf.unlink(missing_ok=True)
+                    logger.info(f"[MYCOEIROINK Chunk Upload] 結合完了 ({total_size / 1024 / 1024:.2f} MB)。安全展開を実施します...")
+                    return self.mycoeiroink.safe_extract_zip(assembled_zip, speaker_uuid_hint=speaker_uuid)
 
-                # 一時ディレクトリのクリーンアップ
-                shutil.rmtree(chunk_dir, ignore_errors=True)
-                chunk_dir = None
+                try:
+                    res = await asyncio.to_thread(_assemble_and_extract)
+                finally:
+                    shutil.rmtree(chunk_dir, ignore_errors=True)
+                    chunk_dir = None
 
-                # 安全展開とモデル配置
-                res = self.mycoeiroink.safe_extract_zip(combined_zip, speaker_uuid_hint=speaker_uuid)
                 logger.info(
                     f"[MYCOEIROINK Upload Success] モデル展開完了: {res.get('speaker_name', '不明')} "
                     f"(UUID: {res.get('speaker_uuid')}, スタイル数: {len(res.get('styles', []))})"
@@ -5883,8 +5951,17 @@ class WebServer:
         })
 
     async def api_worker_broadcast_update(self, request: web.Request) -> web.Response:
-        """接続中の全 Volunteer Worker ノードへ自己アップデート命令を一斉ブロードキャスト (管理者専用)"""
+        """接続中の全 Volunteer Worker ノードへ自己アップデート命令を一斉ブロードキャスト (管理者専用・SHA256署名付き)"""
         await self._require_admin(request)
+        expected_sha = ""
+        for cand in [
+            Path(__file__).resolve().parent / "static" / "volunteer" / "volunteer_worker.py",
+            Path("/app/worker/volunteer_worker.py"),
+            Path(__file__).resolve().parent.parent.parent / "worker" / "volunteer_worker.py",
+        ]:
+            if cand.is_file():
+                expected_sha = hashlib.sha256(cand.read_bytes()).hexdigest()
+                break
         count = 0
         failed = 0
         for node_id, ws in list(self.worker_ws_connections.items()):
@@ -5893,6 +5970,7 @@ class WebServer:
                     await ws.send_json({
                         "type": "update",
                         "action": "update",
+                        "sha256": expected_sha,
                         "timestamp": time.time(),
                         "message": "Update triggered by administrator"
                     })
@@ -5901,7 +5979,7 @@ class WebServer:
                 logger.warning(f"Failed to send update signal to volunteer worker {node_id}: {e}")
                 failed += 1
         logger.info(f"📢 [Worker Update] Broadcasted update signal to {count} volunteer worker(s) (failed: {failed})")
-        return web.json_response({"status": "ok", "broadcast_count": count, "failed_count": failed})
+        return web.json_response({"status": "ok", "broadcast_count": count, "failed_count": failed, "sha256": expected_sha})
 
     async def api_worker_trigger_update(self, request: web.Request) -> web.Response:
         """指定ノードまたは全ノードの Worker Agent に自己アップデート・完全再構成を指示する (管理者権限必須)"""
@@ -6207,16 +6285,17 @@ class WebServer:
         return self._start_rolling_job("restart", full=False, only_ip=ip)
 
     async def api_worker_logs(self, request: web.Request) -> web.Response:
-        """指定 Worker または全 Worker のログを取得して返却 (ローカルファイルキャッシュ & オンデマンド取得対応)"""
-        peername = request.transport.get_extra_info('peername')
-        client_ip = peername[0] if peername else ""
-        is_local = is_private_or_local_ip(client_ip)
-        if not is_local:
-            user = self.auth.get_current_user(request)
-            if not user:
-                return web.json_response({"error": "Unauthorized"}, status=401)
+        """指定 Worker または全 Worker のログを取得して返却 (システム管理者またはノード所有者のみ)"""
+        is_local = self._is_local_request(request)
+        user = self.auth.get_current_user(request)
+        is_sys_admin = await self._is_admin_user(request) if user else False
+        if not is_local and not user:
+            return web.json_response({"error": "Unauthorized"}, status=401)
 
         node_id = request.query.get("node_id", "").strip()
+        if not is_sys_admin and not (is_local and not user):
+            if not node_id or not await self._can_edit_node_settings(user, node_id):
+                return web.json_response({"error": "Forbidden: Administrator or node owner permission required."}, status=403)
         target = request.query.get("target", "agent").lower()
         lines = int(request.query.get("lines", request.query.get("tail", "100")))
         refresh = request.query.get("refresh", "0") in ("1", "true")
@@ -7254,7 +7333,8 @@ class WebServer:
         # システム共通エラー通知先DiscordユーザーID
         system_contact_id = await self.db.get_credential("error_contact_user_id")
         if not system_contact_id:
-            system_contact_id = str(alert_service.INITIAL_DEFAULT_CONTACT_ID)
+            default_cid = getattr(alert_service, "INITIAL_DEFAULT_CONTACT_ID", None) or getattr(self.config, "discord_owner_user_id", 0) or ""
+            system_contact_id = str(default_cid) if default_cid else ""
 
         # HA共有認証シークレット (Master-Slave間)
         ha_secret = self.config.ha_secret
@@ -7826,6 +7906,23 @@ class WebServer:
                     "provider": "hayamimi",
                     "error": "早耳 Live Gateway URL (HAYAMIMI_WS_URL) が未設定です。"
                 }, status=400)
+            p_ws = urlparse(ws_url)
+            if (p_ws.scheme or "").lower() not in ("ws", "wss") or not p_ws.hostname:
+                return web.json_response({
+                    "status": "error",
+                    "success": False,
+                    "provider": "hayamimi",
+                    "error": "ws:// または wss:// で始まる有効な URL を指定してください。"
+                }, status=400)
+            # SSRF防護: ループバックやリンクローカル/クラウドメタデータIP (169.254.169.254等) を拒否
+            if ws_url != (self.config.hayamimi_ws_url or "").strip():
+                try:
+                    addr = ipaddress.ip_address(p_ws.hostname)
+                    if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
+                        return web.json_response({"status": "error", "success": False, "provider": "hayamimi", "error": "指定されたアドレスへの疎通テストは許可されていません。"}, status=400)
+                except ValueError:
+                    if p_ws.hostname.lower() == "localhost":
+                        return web.json_response({"status": "error", "success": False, "provider": "hayamimi", "error": "localhost への疎通テストは許可されていません。"}, status=400)
 
             t_start = time.perf_counter()
             try:
@@ -7987,11 +8084,21 @@ class WebServer:
         return {"enabled": True, "timeout_sec": int(st.get("idle_minutes") or 15) * 60}
 
     async def _can_edit_node_settings(self, user: Dict[str, Any], node_key: str) -> bool:
-        if user.get("is_admin"):
-            return True
         uid = int(user.get("user_id") or user.get("id") or 0)
-        # クラスタワーカー / Managerノードの所有者チェック
+        if (uid == 0 and user.get("is_admin")) or self._is_system_admin_uid(uid):
+            return True
         w_settings = await self._worker_settings()
+        if uid > 0:
+            env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+            admin_user_ids = getattr(self.config, "admin_user_ids", None) or []
+            if env_owner_id == 0 and not admin_user_ids:
+                master_uid = int(w_settings.get("master_primary", {}).get("owner_user_id") or 0)
+                if master_uid > 0:
+                    if uid == master_uid:
+                        return True
+                elif user.get("is_admin"):
+                    return True
+        # クラスタワーカー / Managerノードの所有者チェック
         node_st = w_settings.get(node_key, {})
         if uid > 0 and node_st.get("owner_user_id") and node_st["owner_user_id"] == uid:
             return True
@@ -7999,10 +8106,11 @@ class WebServer:
         return owner is not None and owner == uid
 
     async def api_node_settings_list(self, request: web.Request) -> web.Response:
-        """設定一覧 (管理者は全ノード、一般ユーザーは自分のノード・端末のみ、未ログインは全ノード)"""
-        user = self.auth.get_current_user(request)
+        """設定一覧 (システム管理者は全ノード、一般ログインユーザーは自分の所有ノード・端末のみ、未ログインは401拒否)"""
+        user = self._require_auth(request)
+        is_sys_admin = await self._is_admin_user(request)
         settings = await self._worker_settings()
-        if user and not user.get("is_admin"):
+        if not is_sys_admin:
             uid = int(user.get("user_id") or user.get("id") or 0)
             own = {d["node_id"] for d in await self.db.list_volunteer_devices(uid)}
             for k, v in settings.items():
@@ -8077,9 +8185,10 @@ class WebServer:
         return web.json_response({"status": "ok", "token_id": token_id, "token": token, "owner_name": owner_name})
 
     async def api_volunteer_tokens_list(self, request: web.Request) -> web.Response:
-        """自分のトークンと端末の一覧 (管理者は ?all=1 で全員分)"""
+        """自分のトークンと端末の一覧 (システム管理者は ?all=1 で全員分)"""
         user = self._require_login_user(request)
-        scope_user = None if (user.get("is_admin") and request.query.get("all") == "1") else int(user["user_id"])
+        is_sys_admin = await self._is_admin_user(request)
+        scope_user = None if (is_sys_admin and request.query.get("all") == "1") else int(user["user_id"])
         tokens = await self.db.list_volunteer_tokens(scope_user)
         devices = await self.db.list_volunteer_devices(scope_user)
         online = set(getattr(self.tts_manager, "ws_worker_nodes", {}).keys()) if self.tts_manager else set()
@@ -8088,10 +8197,11 @@ class WebServer:
         return web.json_response({"status": "ok", "tokens": tokens, "devices": devices})
 
     async def api_volunteer_tokens_revoke(self, request: web.Request) -> web.Response:
-        """トークンを失効し、そのトークンで接続中の端末を切断 (本人、または管理者)"""
+        """トークンを失効し、そのトークンで接続中の端末を切断 (本人、またはシステム管理者)"""
         user = self._require_login_user(request)
+        is_sys_admin = await self._is_admin_user(request)
         token_id = request.match_info.get("token_id", "")
-        ok = await self.db.revoke_volunteer_token(token_id, None if user.get("is_admin") else int(user["user_id"]))
+        ok = await self.db.revoke_volunteer_token(token_id, None if is_sys_admin else int(user["user_id"]))
         if not ok:
             return web.json_response({"status": "error", "message": "Token not found"}, status=404)
         for ws in list(self.volunteer_ws_by_token.pop(token_id, set())):
@@ -8103,9 +8213,9 @@ class WebServer:
         return web.json_response({"status": "ok"})
 
     async def api_admin_setup_tokens(self, request: web.Request) -> web.Response:
-        """ログイン中の管理者向けにノードセットアップ用トークン (Worker / Standby) を取得"""
+        """ログイン中のシステム最高管理者向けにノードセットアップ用トークン (Worker / Standby) を取得"""
         user = self._require_login_user(request)
-        if not user.get("is_admin"):
+        if not await self._is_admin_user(request):
             raise web.HTTPForbidden(text="Admin permission required")
 
         user_id = int(user.get("user_id") or user.get("id") or 0)
@@ -8123,9 +8233,9 @@ class WebServer:
         })
 
     async def api_admin_setup_tokens_rotate(self, request: web.Request) -> web.Response:
-        """ログイン中管理者のセットアップ用トークンを失効・再生成"""
+        """ログイン中システム最高管理者のセットアップ用トークンを失効・再生成"""
         user = self._require_login_user(request)
-        if not user.get("is_admin"):
+        if not await self._is_admin_user(request):
             raise web.HTTPForbidden(text="Admin permission required")
 
         user_id = int(user.get("user_id") or user.get("id") or 0)

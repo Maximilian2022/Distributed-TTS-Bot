@@ -186,6 +186,7 @@ class OpenJTalkTTSClient(BaseTTSClient):
             "-ow", "/dev/stdout",
         ]
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -209,13 +210,16 @@ class OpenJTalkTTSClient(BaseTTSClient):
             return stdout
 
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
             raise TTSError(f"OpenJTalk synthesis timed out after {self.timeout_seconds}s")
         except Exception as e:
             if isinstance(e, TTSError):
                 raise
             logger.error(f"Unexpected error in OpenJTalk synthesis: {e}")
             raise TTSError(f"OpenJTalk synthesis failed: {e}") from e
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass

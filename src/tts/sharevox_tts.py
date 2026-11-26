@@ -126,7 +126,8 @@ class SharevoxTTSClient(BaseTTSClient):
         speed: float = 1.0,
         is_longest_chunk: bool = False,
         prefer_earliest_finish: bool = False,
-        avoid_nodes: Optional[Set[str]] = None
+        avoid_nodes: Optional[Set[str]] = None,
+        guild_id: Optional[Any] = None,
     ) -> bytes:
         """
         指定されたテキストとスタイルIDでSHAREVOX音声合成を実行
@@ -139,6 +140,7 @@ class SharevoxTTSClient(BaseTTSClient):
                 timeout=self.timeout_seconds,
                 text_len=len(text),
                 is_longest_chunk=is_longest_chunk,
+                guild_id=guild_id,
                 prefer_earliest_finish=prefer_earliest_finish,
                 avoid_nodes=avoid_nodes
             )

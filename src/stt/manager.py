@@ -79,7 +79,20 @@ class STTManager:
             text_channel_id=text_channel_id,
             buffer_seconds=buf_sec,
         )
+        # /stt start より先に接続していた GameBridge クライアントを新規ディスパッチャへ引き継ぎ
+        async with self.global_dispatcher._game_clients_lock:
+            existing_game_clients = [c for c in self.global_dispatcher._game_clients if not c.ws.closed]
+        for gc_conn in existing_game_clients:
+            await dispatcher.register_game_client(gc_conn.ws, gc_conn.target_user_id)
         self.dispatchers[guild.id] = dispatcher
+
+        # STT受信のため、Bot自身がスピーカーミュート (self_deaf=True) 状態なら安全に解除を試行
+        try:
+            me = getattr(guild, "me", None)
+            if me and getattr(me, "voice", None) and getattr(me.voice, "self_deaf", False) and vc.channel:
+                await guild.change_voice_state(channel=vc.channel, self_mute=False, self_deaf=False)
+        except Exception as deaf_err:
+            logger.debug(f"Could not unset self_deaf on STT start for guild {guild.id}: {deaf_err}")
 
         # レシーバーの生成 (モジュールから動的参照してリロード時も常に最新クラスを使用)
         receiver = src.stt.voice_receiver.VoiceStreamReceiver(
@@ -227,16 +240,19 @@ class STTManager:
             except Exception as e:
                 logger.warning(f"⚠️ [STTManager] Error restoring STT session for {gid_str}: {e}")
 
-    async def handle_game_ws(self, request: web.Request) -> web.WebSocketResponse:
+    async def handle_game_ws(self, request: web.Request, forced_user_id: Optional[int] = None) -> web.WebSocketResponse:
         """ゲームPCクライアント向け WebSocket ハンドラ (/api/stt/stream)"""
         ws = web.WebSocketResponse(heartbeat=15.0)
         await ws.prepare(request)
 
-        user_id_raw = request.query.get("user_id", "0")
-        try:
-            target_user_id = int(user_id_raw)
-        except ValueError:
-            target_user_id = 0
+        if forced_user_id is not None and forced_user_id > 0:
+            target_user_id = forced_user_id
+        else:
+            user_id_raw = request.query.get("user_id", "0")
+            try:
+                target_user_id = int(user_id_raw)
+            except ValueError:
+                target_user_id = 0
 
         logger.info(f"🎮 [GameBridge] New connection from {request.remote} for user_id={target_user_id}")
         await ws.send_json({

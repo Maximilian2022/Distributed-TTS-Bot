@@ -173,7 +173,8 @@ class CoeiroinkTTSClient(BaseTTSClient):
         speed: float = 1.0,
         is_longest_chunk: bool = False,
         prefer_earliest_finish: bool = False,
-        avoid_nodes: Optional[Set[str]] = None
+        avoid_nodes: Optional[Set[str]] = None,
+        guild_id: Optional[Any] = None,
     ) -> bytes:
         """
         指定されたテキストと話者・スタイルIDでCOEIROINK音声合成を実行
@@ -188,6 +189,7 @@ class CoeiroinkTTSClient(BaseTTSClient):
                 is_longest_chunk=is_longest_chunk,
                 prefer_earliest_finish=prefer_earliest_finish,
                 model_name=voice_name,
+                guild_id=guild_id,
                 avoid_nodes=avoid_nodes
             )
             if not lease:

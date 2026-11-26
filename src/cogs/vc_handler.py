@@ -273,6 +273,7 @@ class QueueItem:
     synth_task: Optional[asyncio.Task] = None
     speculative_timeout: Optional[float] = None
     local_tts_kanji_reading: bool = True
+    guild_id: Optional[int] = None
     # 先行合成と再生側で共有する分割結果 (キャッシュキー一致のため。永続化対象外)
     chunks: Optional[List[Any]] = None
 
@@ -319,13 +320,17 @@ class PlaybackTimeline:
     def mark_fed(self, idx: int, duration_sec: float) -> None:
         self.fed[idx] = duration_sec
 
-    def deadline_for(self, idx: int) -> float:
+    def depletion_time_for(self, idx: int) -> float:
+        """当該パーツの直前までの音声が再生枯渇する（または最大許容沈黙に達する）予定絶対時刻"""
         unfed_before = sum(self.est_play[j] for j in range(min(idx, len(self.est_play))) if j not in self.fed)
         if self.t_play is None:
             base = self.t_turn + self.max_silence + sum(self.fed.values())
         else:
             base = time.time() + float(getattr(self.stream_source, "buffer_remaining_seconds", 0.0) or 0.0)
-        return base + unfed_before - self.az_margin
+        return base + unfed_before
+
+    def deadline_for(self, idx: int) -> float:
+        return self.depletion_time_for(idx) - self.az_margin
 
 
 class SafeAsyncQueue:
@@ -443,6 +448,7 @@ class GuildVCState:
         self.play_task: Optional[asyncio.Task] = None
         self.deduplicator = Deduplicator()
         self.play_finished_event = asyncio.Event()
+        self.abort_current_event = asyncio.Event()
         # 接続世代カウンタ: disconnect_vc のたびに +1。進行中の connect_vc リトライが
         # 自分の開始時世代と異なることを検知したら後追い接続を中止する (無人VC取り残し対策)
         self.connect_epoch: int = 0
@@ -483,6 +489,7 @@ class GuildVCState:
                 break
         if self.current_item and self.current_item.synth_task and not self.current_item.synth_task.done():
             self.current_item.synth_task.cancel()
+        self.abort_current_event.set()
         self.is_playing = False
         self.current_item = None
         if self.play_task and not self.play_task.done():
@@ -536,6 +543,23 @@ class VCHandlerCog(commands.Cog):
         # 遅延インシデント発生時のワーカーノード状態スナップショット取得元を登録 (1号機のみで十分)
         if bot_index == 1:
             latency_tracker.set_node_snapshot_provider(self._snapshot_worker_nodes)
+
+    def cog_unload(self) -> None:
+        """Cogアンロード・Bot停止時に全バックグラウンドタスクを確実にキャンセル"""
+        for task in (self._auto_leave_task, self._nick_reconcile_task, self._auto_join_reconcile_task):
+            if task and not task.done():
+                task.cancel()
+        for task in list(self._prewarm_batch_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        self._prewarm_batch_tasks.clear()
+        for task in list(self._pending_bot_leave_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+        self._pending_bot_leave_tasks.clear()
+        for st in list(self.guild_states.values()):
+            if st.play_task and not st.play_task.done():
+                st.play_task.cancel()
 
     # --- 動的サーバーネーム（ニックネーム）同期ロジック ---
 
@@ -1010,6 +1034,8 @@ class VCHandlerCog(commands.Cog):
                     last_err = None
                     start_epoch = state.connect_epoch
                     for attempt in range(1, max_retries + 1):
+                        if state.connect_epoch != start_epoch:
+                            raise VCConnectAborted(f"connect to '{channel.name}' aborted (concurrent disconnect_vc)")
                         # Gateway 再確立を跨いだリトライでも常に最新の Guild / VoiceChannel を参照する
                         channel = self._resolve_live_channel(channel.guild, channel) or channel
                         # 試行前ガード: VCが無人化した場合は後追い接続しない (人間がいる場合は接続継続)
@@ -1079,7 +1105,14 @@ class VCHandlerCog(commands.Cog):
                     if self.bot_pool:
                         self.bot_pool.release_vc_reservation(guild_id, channel.id, self.bot_index)
 
-                # ハンドシェイク中にも Gateway 再接続が起き得るため最新チャンネルへ更新・修復して判定
+                # ハンドシェイク中にも Gateway 再接続や切断要求が起き得るため最新状態・世代を検証
+                if state.connect_epoch != start_epoch:
+                    if vc is not None:
+                        try:
+                            await vc.disconnect(force=True)
+                        except Exception:
+                            pass
+                    raise VCConnectAborted(f"connect to '{channel.name}' aborted after handshake (concurrent disconnect_vc)")
                 channel = self._resolve_live_channel(channel.guild, channel, vc=vc) or channel
                 # 接続完了後ガード: VCが無人化した場合は退出（人間がいる場合は絶対に切断しない）
                 if self._count_humans(channel) == 0:
@@ -1309,13 +1342,13 @@ class VCHandlerCog(commands.Cog):
 
     # --- バックグラウンド先行合成 (非同期プリフェッチ) ---
 
-    def _share_chunks_for_prefetch(self, item: QueueItem) -> None:
+    async def _share_chunks_for_prefetch(self, item: QueueItem) -> None:
         """シングルフライト有効時、キュー投入時点の分割結果を先行合成と再生側で共有する (分割の揺れによるキャッシュミス防止)"""
         if getattr(self.config, "chunk_singleflight", "off") != "on":
             return
         try:
             voice_cfg = self.tts_manager._get_voice_config(item.speaker_id)
-            item.chunks = TextCleaner.split_into_chunks(
+            item.chunks = await TextCleaner.split_into_chunks_async(
                 item.text,
                 author_prefix=item.author_prefix,
                 engine=voice_cfg.provider if voice_cfg else None,
@@ -1375,6 +1408,7 @@ class VCHandlerCog(commands.Cog):
                         speculative_timeout=speculative_timeout,
                         local_only=local_only,
                         local_tts_kanji_reading=item.local_tts_kanji_reading,
+                        guild_id=item.guild_id,
                     )
                 except Exception as e:
                     logger.debug(f"Prefetch chunk failed for '{ch.text[:15]}...': {e}")
@@ -1402,6 +1436,7 @@ class VCHandlerCog(commands.Cog):
             text=item.text,
             author_prefix=item.author_prefix,
             local_tts_kanji_reading=item.local_tts_kanji_reading,
+            guild_id=item.guild_id,
         )
         t_end = time.time()
         meta = getattr(self.tts_manager, "last_synthesis_meta", {}) or {}
@@ -1492,6 +1527,7 @@ class VCHandlerCog(commands.Cog):
                             text=item.text,
                             author_prefix=item.author_prefix,
                             local_tts_kanji_reading=item.local_tts_kanji_reading,
+                            guild_id=guild.id,
                         )
                         t_synth_end = time.time()
                         meta = getattr(self.tts_manager, "last_synthesis_meta", {}) or {}
@@ -1598,6 +1634,11 @@ class VCHandlerCog(commands.Cog):
         preroll_wait_ms = 0.0
 
         state.play_finished_event.clear()
+        abort_ev = getattr(state, "abort_current_event", None)
+        if abort_ev is not None:
+            abort_ev.clear()
+        else:
+            abort_ev = asyncio.Event()
         def after_playing(error):
             if error:
                 logger.error(f"Streaming playback error in guild {guild.id}: {error}")
@@ -1770,16 +1811,20 @@ class VCHandlerCog(commands.Cog):
                 except Exception:
                     chunk_spec_timeout = spec_timeout
 
-            # 再生タイムライン基準の投機締切 (shadow は記録のみ)
+            # 再生タイムライン基準の投機締切 & 枯渇予定時刻 (Early Hedge + Late Commit)
             extra = chunk_extra.setdefault(chunk_idx, {})
             deadline_fn = None
+            depletion_fn = None
             if tl_mode != "off" and is_local_engine:
                 def _deadline(idx: int = chunk_idx, t0: float = t_s) -> float:
                     return max(timeline.deadline_for(idx), t0 + MIN_LOCAL_TRY_SEC)
+                def _depletion(idx: int = chunk_idx, t0: float = t_s) -> float:
+                    return max(timeline.depletion_time_for(idx), t0 + MIN_LOCAL_TRY_SEC + 0.08)
                 extra["tl_deadline_rel_ms"] = round((_deadline() - t_s) * 1000.0, 1)
                 extra["legacy_spec_ms"] = round(chunk_spec_timeout * 1000.0, 1)
                 if tl_mode == "on":
                     deadline_fn = _deadline
+                    depletion_fn = _depletion
 
             is_head = (route_mode == "on" and chunk_idx == head_idx)
             chunk_avoid = None if is_head else avoid_nodes
@@ -1796,6 +1841,8 @@ class VCHandlerCog(commands.Cog):
                 prefer_earliest_finish=is_head,
                 avoid_nodes=chunk_avoid,
                 local_tts_kanji_reading=item.local_tts_kanji_reading,
+                depletion_deadline_fn=depletion_fn,
+                guild_id=guild.id,
             )
             t_e = time.time()
             c_meta = (
@@ -1859,6 +1906,9 @@ class VCHandlerCog(commands.Cog):
                     est_headroom_sec=0.0,
                     avoid_nodes=turn_avoid_nodes
                 )
+
+            if abort_ev.is_set():
+                return True
 
             # 第1チャンクをストリームに投入
             if getattr(first_chunk, "is_beep", False):
@@ -1995,12 +2045,19 @@ class VCHandlerCog(commands.Cog):
 
                 t_preroll_start = time.time()
                 if dynamic_wait_timeout > 0.03:
-                    # 不足分だけプレフィックス発声を遅らせて第1文を待機 (重い推論のアンダーラン完全防止)
+                    # 不足分だけプレフィックス発声を遅らせて第1文を待機 (/skip や防災速報の割り込みにも即応)
+                    abort_waiter = asyncio.create_task(abort_ev.wait())
                     try:
-                        ch1, b1, p1, w1, c1, ts1, te1, fb1, fp1 = await asyncio.wait_for(
-                            asyncio.shield(remaining_tasks[0]),
-                            timeout=dynamic_wait_timeout
+                        done_pr, _ = await asyncio.wait(
+                            [remaining_tasks[0], abort_waiter],
+                            timeout=dynamic_wait_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
                         )
+                        if abort_waiter in done_pr or abort_ev.is_set():
+                            return True
+                        if remaining_tasks[0] not in done_pr:
+                            raise asyncio.TimeoutError()
+                        ch1, b1, p1, w1, c1, ts1, te1, fb1, fp1 = remaining_tasks[0].result()
                         if getattr(ch1, "is_beep", False):
                             dur1 = stream_source.feed_raw_pcm(b1, pause_after_ms=ch1.pause_after_ms)
                         else:
@@ -2039,6 +2096,9 @@ class VCHandlerCog(commands.Cog):
                             f"Dynamic preroll wait ({dynamic_wait_timeout:.2f}s) finished for guild {guild.id}. "
                             f"Starting playback with prefix buffer ({dur0*1000:.0f}ms) to let body chunk catch up."
                         )
+                    finally:
+                        if not abort_waiter.done():
+                            abort_waiter.cancel()
                 else:
                     # プレフィックス音声長が十分にあるため待機ゼロで即座に発声開始可能！
                     # ただし既に第1文タスクが完了していれば直ちにストリームに投入
@@ -2082,15 +2142,31 @@ class VCHandlerCog(commands.Cog):
 
                 preroll_wait_ms = (time.time() - t_preroll_start) * 1000.0
 
+            if abort_ev.is_set():
+                return True
+
             # vc.play を開始！ (プレフィックスまたは第1文までの最適バッファでアンダーランゼロ再生)
             _ensure_dave_session_ready(vc)
             vc.play(volume_transformer, after=after_playing)
             t_play_start = time.time()
             timeline.t_play = t_play_start
 
-            # 残りの後続チャンクを完了次第、パイプライン逐次投入 (全タスク完了待ちによるアンダーランを完全防止)
+            # 残りの後続チャンクを完了次第、パイプライン逐次投入 (/skip や防災速報での中断時は残タスクを待たず即時終了)
             for task in remaining_tasks:
-                ch, b, p, w, c, t_s, t_e, is_fb, failed_provs = await task
+                if abort_ev.is_set() or state.play_finished_event.is_set():
+                    break
+                abort_w = asyncio.create_task(abort_ev.wait())
+                try:
+                    done_t, _ = await asyncio.wait(
+                        [task, abort_w],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not abort_w.done():
+                        abort_w.cancel()
+                if abort_ev.is_set() or task not in done_t:
+                    break
+                ch, b, p, w, c, t_s, t_e, is_fb, failed_provs = task.result()
 
                 # チャンクfeed前のバッファ余裕度 (正=余裕, 負=ギャップ/アンダーラン)
                 elapsed_play = time.time() - t_play_start
@@ -2258,7 +2334,8 @@ class VCHandlerCog(commands.Cog):
             queued_at=now_ts
         )
 
-        # 現在再生中なら停止して割り込み
+        # 現在再生中またはPreroll合成待機中なら即時中断させて割り込み
+        state.abort_current_event.set()
         if vc.is_playing():
             vc.stop()
 
@@ -2522,6 +2599,7 @@ class VCHandlerCog(commands.Cog):
             queued_at=time.time(),
             speculative_timeout=spec_timeout,
             local_tts_kanji_reading=local_tts_kanji_reading,
+            guild_id=message.guild.id,
         )
 
         if record_dedup:
@@ -2529,7 +2607,7 @@ class VCHandlerCog(commands.Cog):
 
         is_busy = state.is_playing or not state.queue.empty()
         if is_busy:
-            self._share_chunks_for_prefetch(item)
+            await self._share_chunks_for_prefetch(item)
             item.synth_task = safe_create_task(
                 self._prefetch_chunks(item, speculative_timeout=spec_timeout),
                 name=f"prefetch_chunks_{item.user_id}_{int(time.time()*1000)}"
@@ -2746,11 +2824,15 @@ class VCHandlerCog(commands.Cog):
                     stripped = _RE_STRIP_NAME_BRACKETS.sub("", raw_display_name).strip()
                     if stripped:
                         raw_display_name = stripped
-                ng_words = await self.db.get_ng_words(guild.id)
+                dict_words, ng_words, guild_settings = await asyncio.gather(
+                    self.db.get_dictionary_words(guild.id),
+                    self.db.get_ng_words(guild.id),
+                    self.db.get_guild_settings(guild.id, self.config),
+                )
                 cleaned_author = self.text_cleaner.clean(
                     raw_text=raw_display_name,
                     guild=guild,
-                    dictionary_entries=[],
+                    dictionary_entries=dict_words,
                     ng_words=ng_words,
                     max_length=20
                 ).replace(" 以下略", "").strip()
@@ -2760,16 +2842,22 @@ class VCHandlerCog(commands.Cog):
                     if '<<__BEEP' in cleaned_author or '<<ピー音' in cleaned_author:
                         return
                     name_prefix = f"{cleaned_author}、"
+                    local_kanji = bool(guild_settings.get("local_tts_kanji_reading", 1))
+                    voice_cfg = self.config.voices.get(spk_id)
+                    provider = getattr(voice_cfg, "provider", "")
+                    eff_name_prefix = (
+                        self.tts_manager.resolve_cache_text(name_prefix, provider, local_tts_kanji_reading=local_kanji)
+                        if hasattr(self.tts_manager, "resolve_cache_text")
+                        else name_prefix
+                    )
                     # 全文キャッシュの有無を事前チェック（存在すれば合成不要）
                     cache_key = CacheManager.generate_cache_key(
                         speaker_id=spk_id,
                         pitch=settings.get("pitch", "0%"),
                         speed=float(settings.get("speed", 1.0)),
-                        text=name_prefix,
+                        text=eff_name_prefix,
                         user_id=member.id
                     )
-                    voice_cfg = self.config.voices.get(spk_id)
-                    provider = getattr(voice_cfg, "provider", "")
                     cached = await self.cache_manager.get(cache_key, provider=provider)
                     if cached:
                         logger.debug(f"[Pre-warm] Name prefix '{name_prefix}' already in cache for {member.display_name}")
@@ -2781,7 +2869,9 @@ class VCHandlerCog(commands.Cog):
                             speaker_id=spk_id,
                             pitch=settings.get("pitch", "0%"),
                             speed=float(settings.get("speed", 1.0)),
-                            text=name_prefix
+                            text=name_prefix,
+                            local_tts_kanji_reading=local_kanji,
+                            guild_id=guild.id,
                         ),
                         timeout=5.0
                     )
@@ -3173,7 +3263,7 @@ class VCHandlerCog(commands.Cog):
                             )
                             try:
                                 from src.cogs.commands import WebDashboardButtonView
-                                view = WebDashboardButtonView(self.bot, label="Webダッシュボードにログイン")
+                                view = WebDashboardButtonView(assigned_bot or self.bot, label="Webダッシュボードにログイン")
                                 await bot_text.send(embed=embed, view=view)
                             except Exception as e:
                                 logger.warning(f"[AutoJoinReconcile] Failed to send announcement in {bot_text.name}: {e}")
@@ -3408,7 +3498,7 @@ class VCHandlerCog(commands.Cog):
                             )
                             try:
                                 from src.cogs.commands import WebDashboardButtonView
-                                view = WebDashboardButtonView(self.bot, label="Webダッシュボードにログイン")
+                                view = WebDashboardButtonView(assigned_bot or self.bot, label="Webダッシュボードにログイン")
                                 await bot_text.send(embed=embed, view=view)
                             except Exception as e:
                                 logger.warning(f"Failed to send auto-join announcement in {bot_text.name}: {e}")
@@ -3678,9 +3768,9 @@ class MisreadSuggestionEditModal(discord.ui.Modal, title="読み方を編集し�
             if suggestion_id is not None:
                 approved = await self.cog.db.approve_ai_suggestion(int(suggestion_id), reading=new_reading)
                 if not approved:
-                    await self.cog.db.add_dict_word(self.guild_id, word, new_reading)
+                    await self.cog.db.add_dictionary_word(self.guild_id, word, new_reading)
             else:
-                await self.cog.db.add_dict_word(self.guild_id, word, new_reading)
+                await self.cog.db.add_dictionary_word(self.guild_id, word, new_reading)
 
             purged = await self.cog.cache_manager.purge_by_word(word) if self.cog.cache_manager else 0
             self.entry["reading"] = new_reading
@@ -3887,9 +3977,9 @@ class MisreadSuggestionApprovalView(discord.ui.View):
             if suggestion_id is not None:
                 approved = await self.cog.db.approve_ai_suggestion(int(suggestion_id))
                 if not approved:
-                    await self.cog.db.add_dict_word(self.guild_id, word, reading)
+                    await self.cog.db.add_dictionary_word(self.guild_id, word, reading)
             else:
-                await self.cog.db.add_dict_word(self.guild_id, word, reading)
+                await self.cog.db.add_dictionary_word(self.guild_id, word, reading)
 
             if self.cog.cache_manager:
                 total_purged += await self.cog.cache_manager.purge_by_word(word)

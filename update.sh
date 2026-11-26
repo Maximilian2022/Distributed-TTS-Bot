@@ -155,7 +155,7 @@ fi
 # 5. 最小瞬断ロールオーバー (コンテナ切り替え、所要時間 約2秒)
 log_step "5. コンテナの安全ロールオーバー (最小瞬断切り替え)"
 log_info "新イメージへのコンテナ再作成を実行します..."
-docker compose up -d --no-deps app
+docker compose up -d --no-deps --force-recreate app
 log_ok "新コンテナ起動完了！"
 
 # 6. ヘルスチェック・復帰確認 (最大30秒待機)

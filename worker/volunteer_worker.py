@@ -508,8 +508,9 @@ class VolunteerWorker:
                                 asyncio.create_task(self._handle_synthesize(ws, data))
 
                             elif m_type in ("update", "update_request"):
+                                expected_sha256 = str(data.get("sha256") or "").strip().lower()
                                 logger.info("🔄 [Update] サーバーからリモート自己アップデート指示を受信しました。最新版の取得を開始します...")
-                                asyncio.create_task(self._handle_self_update())
+                                asyncio.create_task(self._handle_self_update(expected_sha256=expected_sha256))
 
                             elif m_type == "heartbeat_ack":
                                 self.idle_policy = data.get("idle_policy")
@@ -655,9 +656,10 @@ class VolunteerWorker:
 
         raise ValueError(f"Unknown engine: {engine}")
 
-    async def _handle_self_update(self):
-        """Master から最新の volunteer_worker.py を取得して自プロセスを再起動 (os.execv)"""
+    async def _handle_self_update(self, expected_sha256: str = ""):
+        """Master から最新の volunteer_worker.py を取得して整合性検証後に自プロセスを再起動"""
         try:
+            import hashlib
             raw_url = self.server_url
             http_base = re.sub(r'^wss://', 'https://', raw_url)
             http_base = re.sub(r'^ws://', 'http://', http_base)
@@ -667,19 +669,31 @@ class VolunteerWorker:
             my_script = os.path.abspath(__file__)
             logger.info(f"📥 [Update] 最新コードをダウンロード中: {update_url}")
 
+            headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
             timeout = aiohttp.ClientTimeout(total=15.0)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(update_url) as resp:
+                async with session.get(update_url, headers=headers) as resp:
                     if resp.status == 200:
                         new_code = await resp.read()
+                        actual_sha = hashlib.sha256(new_code).hexdigest().lower()
+                        header_sha = (resp.headers.get("X-Script-SHA256") or "").strip().lower()
+                        check_sha = expected_sha256 or header_sha
+                        if check_sha and actual_sha != check_sha:
+                            logger.error(f"❌ [Update] SHA-256 ハッシュ不一致のため更新を拒否しました (expected={check_sha[:12]}..., got={actual_sha[:12]}...)")
+                            return
                         if len(new_code) > 1000 and b"class VolunteerWorker" in new_code:
+                            compile(new_code.decode("utf-8"), "volunteer_worker.py", "exec")
                             tmp_path = my_script + ".tmp"
                             with open(tmp_path, "wb") as f:
                                 f.write(new_code)
                             os.replace(tmp_path, my_script)
-                            logger.info("✨ [Update] 最新コードの保存完了！プロセスを即座に再起動します...")
+                            logger.info("✨ [Update] 最新コードの検証・保存完了！プロセスを安全に再起動します...")
                             await asyncio.sleep(0.5)
-                            os.execv(sys.executable, [sys.executable] + sys.argv)
+                            if platform.system() == "Windows":
+                                subprocess.Popen([sys.executable] + sys.argv)
+                                os._exit(0)
+                            else:
+                                os.execv(sys.executable, [sys.executable] + sys.argv)
                         else:
                             logger.warning("⚠️ [Update] 取得したファイルが不正なサイズまたは内容のため、更新を中止しました。")
                     else:

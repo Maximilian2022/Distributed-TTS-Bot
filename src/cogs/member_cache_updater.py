@@ -70,10 +70,11 @@ class MemberCacheUpdaterCog(commands.Cog):
                 if vc and vc.is_connected():
                     return True
 
-            # 2. サブBotプール各機の接続判定
+            # 2. サブBotプール各機の接続判定 (bots は {bot_index: TTSBot} 辞書)
             if self.bot_pool:
-                sub_bots = getattr(self.bot_pool, "bots", [])
-                for s_bot in sub_bots:
+                sub_bots = getattr(self.bot_pool, "bots", {})
+                bot_iter = sub_bots.values() if isinstance(sub_bots, dict) else sub_bots
+                for s_bot in bot_iter:
                     for vc in getattr(s_bot, "voice_clients", []):
                         if vc and vc.is_connected():
                             return True
@@ -181,6 +182,13 @@ class MemberCacheUpdaterCog(commands.Cog):
         """
         try:
             guild = self.bot.get_guild(guild_id)
+            if not guild and self.bot_pool:
+                sub_bots = getattr(self.bot_pool, "bots", {})
+                bot_iter = sub_bots.values() if isinstance(sub_bots, dict) else sub_bots
+                for s_bot in bot_iter:
+                    guild = s_bot.get_guild(guild_id)
+                    if guild:
+                        break
             if not guild:
                 return
 

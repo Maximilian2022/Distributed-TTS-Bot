@@ -173,17 +173,22 @@ class GoogleTTSClient(BaseTTSClient):
                     ),
                     timeout=self.timeout_seconds
                 )
+                if not response.audio_content or len(response.audio_content) <= 44:
+                    raise TTSError("Google Cloud TTS SDK returned empty audio")
                 self._record_success()
                 return response.audio_content
             except asyncio.TimeoutError:
                 self._record_failure()
                 raise TTSConnectionError(f"Google Cloud TTS SDK request timed out after {self.timeout_seconds}s")
+            except TTSError:
+                raise
             except Exception as e:
                 err_str = str(e)
                 if "429" in err_str or "ResourceExhausted" in err_str or "Quota" in err_str:
                     self._record_failure(is_quota=True)
                     raise RateLimitError(f"Google Cloud TTS quota exceeded: {err_str}")
-                if not self.api_key:
+                is_param_err = ("400" in err_str or "InvalidArgument" in err_str)
+                if not self.api_key and not is_param_err:
                     is_auth = any(k in err_str for k in ("401", "403", "Unauthenticated", "PermissionDenied"))
                     self._record_failure(is_auth=is_auth)
                 logger.warning(f"Google Cloud TTS SDK error, attempting REST fallback if available: {e}")
@@ -231,6 +236,8 @@ class GoogleTTSClient(BaseTTSClient):
                     data = await resp.json()
                     audio_content_b64 = data.get("audioContent", "")
                     decoded = base64.b64decode(audio_content_b64)
+                    if len(decoded) <= 44:
+                        raise TTSError(f"Google TTS returned empty audio ({len(decoded)} bytes)")
                     self._record_success()
                     return decoded
                 elif resp.status == 429:
@@ -241,6 +248,9 @@ class GoogleTTSClient(BaseTTSClient):
                     text_err = await resp.text()
                     self._record_failure(is_auth=True)
                     raise TTSConnectionError(f"Google TTS Auth Error ({resp.status}): {text_err}")
+                elif resp.status == 400:
+                    text_err = await resp.text()
+                    raise TTSError(f"Google TTS HTTP 400: {text_err}")
                 else:
                     text_err = await resp.text()
                     self._record_failure()

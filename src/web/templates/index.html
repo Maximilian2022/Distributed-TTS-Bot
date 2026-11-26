@@ -11,18 +11,15 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css?v={{ASSET_V}}">
-  <script id="server-data" type="application/json">
-    {
-      "is_logged_in": {{IS_LOGGED_IN}},
-      "client_configured": {{CLIENT_CONFIGURED}},
-      "user_data": {{USER_DATA}},
-      "worker_token": "{{WORKER_TOKEN}}",
-      "agent_version": "{{AGENT_VERSION}}"
-    }
-  </script>
+  <script id="server-data" type="application/json">{{SERVER_DATA_JSON}}</script>
   <script>
     const serverDataEl = document.getElementById("server-data");
-    const serverData = JSON.parse(serverDataEl ? serverDataEl.textContent : "{}");
+    let serverData = {};
+    try {
+      serverData = JSON.parse(serverDataEl ? serverDataEl.textContent : "{}");
+    } catch (e) {
+      serverData = {};
+    }
     window.APP_IS_LOGGED_IN = serverData.is_logged_in;
     window.APP_CLIENT_CONFIGURED = serverData.client_configured;
     window.APP_USER_DATA = serverData.user_data;
@@ -512,10 +509,10 @@
                 登録されたNGワードが使われた際、音声を電子的な自主規制ピー音（1000Hz）に置き換えて読み上げ、Discord発言に🤫リアクションを付与します。
               </div>
 
-            <div class="card">
+            <div id="ng-register-card" class="card">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
                 <h3 style="font-size:15px;margin:0;">➕ 新規NGワード登録</h3>
-                <button type="button" class="btn btn-secondary btn-sm" onclick="importDefaultNgWords()">📋 標準NGプリセットを一括適用</button>
+                <button type="button" id="ng-preset-btn" class="btn btn-secondary btn-sm" onclick="importDefaultNgWords()">📋 標準NGプリセットを一括適用</button>
               </div>
 
               <form onsubmit="addNgWord(event)" style="display:flex;gap:12px;flex-wrap:wrap;">

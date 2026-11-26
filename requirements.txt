@@ -10,3 +10,5 @@ zstandard>=0.25.0
 janome>=0.5.2
 sudachipy>=0.7.0
 sudachidict_core>=20261015
+cryptography>=44.0.0
+PyNaCl>=1.5.0

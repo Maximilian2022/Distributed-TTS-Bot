@@ -29,8 +29,9 @@ services:
       - TTSBOT_HA_SECRET=${TTSBOT_HA_SECRET}
       - TTSBOT_HA_PRIORITY=${TTSBOT_HA_PRIORITY:-1}
       - TTSBOT_PEER_URLS=${TTSBOT_PEER_URLS:-}
+      - TTSBOT_MASTER_LAN_URL=${TTSBOT_MASTER_LAN_URL:-}
       - TTSBOT_CHECK_INTERVAL=${TTSBOT_CHECK_INTERVAL:-5}
-      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-6}
+      - TTSBOT_FAIL_THRESHOLD=${TTSBOT_FAIL_THRESHOLD:-18}
       - TTSBOT_SYNC_INTERVAL=${TTSBOT_SYNC_INTERVAL:-60}
       - TTSBOT_LOCAL_DB_PATH=/app/data/bot.db
       - TTSBOT_IMAGE=${TTSBOT_IMAGE:-madpiero/ttsbot:latest}
@@ -44,6 +45,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
       - ./logs:/app/logs
+      - tts_cache:/app/cache
+      - voicevox_cache:/app/cache_voicevox
+      - coeiroink_models:/app/coeiroink_models
       - ./.env:/app/.env
     deploy:
       resources:
@@ -66,6 +70,12 @@ services:
     init: true
     ports:
       - "${HOST_WEB_PORT:-8088}:${WEB_PORT:-8080}"
+    networks:
+      default:
+        aliases:
+          - ttsbot
+          - router
+          - ttsbot-router
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/app

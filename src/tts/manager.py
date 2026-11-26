@@ -480,6 +480,18 @@ class TTSManager:
         await self.coeiroink_client.close()
         await self.edge_client.close()
         await self.openjtalk_client.close()
+        for ws_node in list(self.ws_worker_nodes.values()):
+            try:
+                await ws_node.close()
+            except Exception:
+                pass
+        self.ws_worker_nodes.clear()
+        for pool in (self.voicevox_pool, self.sharevox_pool, self.coeiroink_pool):
+            if pool and hasattr(pool, "close"):
+                try:
+                    await pool.close()
+                except Exception:
+                    pass
 
     def register_ws_worker_node(self, ws_node: Any):
         """ボランティア型 WebSocket ワーカーノードを対応プールに動的配備"""
@@ -504,6 +516,10 @@ class TTSManager:
                     self.coeiroink_pool.remove_node(node_id)
                 elif eng == "sharevox":
                     self.sharevox_pool.remove_node(node_id)
+            try:
+                safe_create_task(ws_node.close(), name=f"close_ws_worker_{node_id}")
+            except Exception:
+                pass
             logger.info(f"🔌 [TTSManager] WS Worker '{node_id}' unregistered from pools.")
 
     async def start_heartbeat_monitor(self, interval_sec: float = 30.0):
@@ -642,7 +658,7 @@ class TTSManager:
                     is_loaded = best_node.has_model_in_ram(model_name) if model_name else bool(best_node.specs.get("ram_models"))
                 est_ms = None
                 try:
-                    prof = latency_profiler.get_or_create(best_node)
+                    prof = latency_profiler.get_or_create(best_node, engine_name=prov)
                     if prof.sample_count >= 2:
                         est_ms = prof.estimate(text_len)
                 except Exception:
@@ -807,6 +823,24 @@ class TTSManager:
             w.writeframes(b"".join(pcm_frames))
         return out_io.getvalue()
 
+    @staticmethod
+    def _build_beep_wav_24k_mono(duration_sec: float = 0.4) -> bytes:
+        """ファイル結合フォールバック (get_audio_path) 用に 24kHz 16-bit Mono WAV 形式の自主規制ピー音を生成"""
+        from src.utils.streaming_audio import generate_beep_pcm
+        stereo_pcm = generate_beep_pcm(duration_sec=max(0.15, float(duration_sec or 0.4)), sample_rate=24000)
+        # stereo (L, R 同一) から L チャンネルのみを抽出して 24kHz Mono 16-bit PCM 化
+        n_frames = len(stereo_pcm) // 4
+        mono_pcm = bytearray(n_frames * 2)
+        mono_pcm[0::2] = stereo_pcm[0 : n_frames * 4 : 4]
+        mono_pcm[1::2] = stereo_pcm[1 : n_frames * 4 : 4]
+        out_io = io.BytesIO()
+        with wave.open(out_io, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(bytes(mono_pcm))
+        return out_io.getvalue()
+
     async def _try_local_engine(
         self,
         engine_name: str,
@@ -818,7 +852,8 @@ class TTSManager:
         speed: float,
         is_longest_chunk: bool = False,
         prefer_earliest_finish: bool = False,
-        avoid_nodes: Optional[Set[str]] = None
+        avoid_nodes: Optional[Set[str]] = None,
+        guild_id: Optional[Any] = None,
     ) -> Optional[bytes]:
         """
         ローカルTTSエンジン（VOICEVOX, SHAREVOX, COEIROINK）の共通合成処理 (A-5, E-4)。
@@ -826,11 +861,13 @@ class TTSManager:
         """
         if not client.is_available():
             return None
-        route_kwargs = {}
+        route_kwargs: Dict[str, Any] = {}
         if prefer_earliest_finish:
             route_kwargs["prefer_earliest_finish"] = True
         if avoid_nodes:
             route_kwargs["avoid_nodes"] = avoid_nodes
+        if guild_id is not None:
+            route_kwargs["guild_id"] = guild_id
 
         # 外部GPUノードが稼働している場合は、Master自機コンテナ起動とホスト排他ロックをバイパスして即時並行実行
         if pool.has_active_external_gpu_node():
@@ -885,11 +922,16 @@ class TTSManager:
         local_only: bool = False,
         avoid_nodes: Optional[Set[str]] = None,
         local_tts_kanji_reading: bool = True,
+        depletion_deadline_fn: Optional[Callable[[], float]] = None,
+        pre_resolved_local_text: Optional[str] = None,
+        guild_id: Optional[Any] = None,
     ) -> Tuple[bytes, str, str]:
         """
         単一のテキストパーツを合成。
         - speculative_deadline_fn: 投機発火の絶対時刻 (time.time() 基準) を返す関数。指定時は毎回再評価しながら待つ
           (再生タイムライン基準)。未指定時は従来の speculative_timeout (相対秒)
+        - depletion_deadline_fn: 再生バッファが実際に枯渇する絶対時刻を返す関数 (Early Hedge + Late Commit 用)。
+          クラウド音声が先に到着しても、枯渇直前まではローカルGPUの完了を優先待機して声変わりを防ぐ。
         - local_only: ローカルエンジンのみで合成し、投機・フォールバックしない (先行合成のキャッシュ温め用)
         - avoid_nodes: 同一発話内で別チャンクが割り当て済みのノード (分散ロードバランシング)
         - local_tts_kanji_reading: ローカルTTS送信時のみ SudachiPy 漢字かな補完を適用するか
@@ -900,8 +942,9 @@ class TTSManager:
         voice_cfg = self._get_voice_config(speaker_id)
         primary_provider = voice_cfg.provider
 
-        # ローカルTTS専用: 初回利用時のみ遅延変換してクラウドTTS側の原文には影響させない
-        _local_text_cache: Optional[str] = None
+        # ローカルTTS専用: 事前解決済みテキストがあれば再利用して二重Sudachi解析を排除
+        _local_text_cache: Optional[str] = pre_resolved_local_text
+        _extra_local_kw: Dict[str, Any] = {"guild_id": guild_id} if guild_id is not None else {}
 
         def _get_local_text() -> str:
             nonlocal _local_text_cache
@@ -914,13 +957,13 @@ class TTSManager:
             return _local_text_cache
 
         async def _try_voicevox(style_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("voicevox", self.voicevox_client, self.voicevox_pool, _get_local_text(), style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
+            return await self._try_local_engine("voicevox", self.voicevox_client, self.voicevox_pool, _get_local_text(), style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes, **_extra_local_kw)
 
         async def _try_sharevox(style_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("sharevox", self.sharevox_client, self.sharevox_pool, _get_local_text(), style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
+            return await self._try_local_engine("sharevox", self.sharevox_client, self.sharevox_pool, _get_local_text(), style_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes, **_extra_local_kw)
 
         async def _try_coeiroink(voice_val: str) -> Optional[bytes]:
-            return await self._try_local_engine("coeiroink", self.coeiroink_client, self.coeiroink_pool, _get_local_text(), voice_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes)
+            return await self._try_local_engine("coeiroink", self.coeiroink_client, self.coeiroink_pool, _get_local_text(), voice_val, pitch, speed, is_longest_chunk, prefer_earliest_finish, avoid_nodes, **_extra_local_kw)
 
         preview_text = text[:30] + ("..." if len(text) > 30 else "")
 
@@ -1202,7 +1245,7 @@ class TTSManager:
                 if speculative_deadline_fn is None and speculative_timeout is None:
                     base_spec_timeout = float(os.getenv("SPECULATIVE_TIMEOUT_SECONDS", getattr(self.config, "speculative_timeout_seconds", 2.5)))
                     try:
-                        pool = self._get_pool_for_provider(prim_prov) if hasattr(self, "_get_pool_for_provider") else None
+                        pool = self._local_pool_for(prim_prov) if hasattr(self, "_local_pool_for") else None
                         cand_nodes = pool.nodes if pool and hasattr(pool, "nodes") else None
                         speculative_timeout = latency_profiler.calculate_dynamic_speculative_timeout(
                             base_timeout=base_spec_timeout,
@@ -1249,41 +1292,75 @@ class TTSManager:
                     )
                     cloud_task = asyncio.create_task(_call_provider(cloud_prov, cloud_param))
 
-                    # 先に成功した方を即時採用！
+                    # Early Hedge + Late Commit:
+                    # ローカルが先に完了すれば即採用。クラウドが先に完了した場合でも、depletion_deadline_fn 指定時は
+                    # 再生バッファ枯渇直前 (80ms前) まではローカル完了を待ち、間に合えばローカル声質を維持、
+                    # 枯渇直前になっても未完了なら手元に到着済みのクラウド音声を 0ms で即時採用する。
                     pending = {prim_task, cloud_task}
                     while pending:
                         done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                        for finished_task in done_set:
-                            if finished_task is prim_task:
-                                res_audio = _prim_result()
-                            else:
-                                try:
-                                    res_audio = finished_task.result()
-                                except Exception:
-                                    res_audio = None
-                                if res_audio is not None and not _is_valid_wav(res_audio):
-                                    res_audio = None
-
-                            if res_audio is not None:
-                                winner_prov, winner_param = (prim_prov, prim_param) if finished_task is prim_task else (cloud_prov, cloud_param)
-                                if finished_task is cloud_task:
-                                    logger.info(f"🚀 [Speculative TTS] Cloud fallback ({cloud_prov.upper()}) responded first! Adopting to eliminate conversation stall.")
-                                    _mark_prov_failed(prim_prov)
-                                    # 共有中のローカル合成は他の待ち手のために残す (最後の待ち手なら従来どおり取り消し)
-                                    self._release_local_task(inflight_entry, cancel_if_last=True)
-                                    inflight_entry = None
-                                else:
-                                    if not cloud_task.done():
-                                        cloud_task.cancel()
+                        if prim_task in done_set:
+                            prim_audio = _prim_result()
+                            if prim_audio is not None:
+                                if not cloud_task.done():
+                                    cloud_task.cancel()
                                 self._store_chunk_meta(
                                     text=text,
                                     speaker_id=speaker_id,
                                     original_provider=primary_provider,
-                                    used_provider=winner_prov,
+                                    used_provider=prim_prov,
                                     failed_providers=failed_providers,
-                                    pure_synth_ms=provider_synth_ms_map.get(winner_prov, 0.0),
+                                    pure_synth_ms=provider_synth_ms_map.get(prim_prov, 0.0),
                                 )
-                                return res_audio, winner_prov, winner_param
+                                return prim_audio, prim_prov, prim_param
+
+                        if cloud_task in done_set:
+                            try:
+                                cloud_audio = cloud_task.result()
+                            except Exception:
+                                cloud_audio = None
+                            if cloud_audio is not None and not _is_valid_wav(cloud_audio):
+                                cloud_audio = None
+
+                            if cloud_audio is not None:
+                                # Late Commit グレース待機: 再生枯渇までにまだ余裕があればローカルGPU完了を待つ
+                                if depletion_deadline_fn is not None and not prim_task.done():
+                                    while not prim_task.done():
+                                        grace_rem = (depletion_deadline_fn() - 0.08) - time.time()
+                                        if grace_rem <= 0.01:
+                                            break
+                                        await asyncio.wait([prim_task], timeout=min(grace_rem, 0.05))
+                                    if prim_task.done():
+                                        late_prim_audio = _prim_result()
+                                        if late_prim_audio is not None:
+                                            logger.info(
+                                                f"✨ [Speculative TTS] {prim_prov.upper()} finished within playback grace window! "
+                                                f"Preserving local voice over pre-fetched {cloud_prov.upper()}."
+                                            )
+                                            self._store_chunk_meta(
+                                                text=text,
+                                                speaker_id=speaker_id,
+                                                original_provider=primary_provider,
+                                                used_provider=prim_prov,
+                                                failed_providers=failed_providers,
+                                                pure_synth_ms=provider_synth_ms_map.get(prim_prov, 0.0),
+                                            )
+                                            return late_prim_audio, prim_prov, prim_param
+
+                                logger.info(f"🚀 [Speculative TTS] Cloud fallback ({cloud_prov.upper()}) adopted at commit deadline to eliminate conversation stall.")
+                                _mark_prov_failed(prim_prov)
+                                # 共有中のローカル合成は他の待ち手のために残す (最後の待ち手なら従来どおり取り消し)
+                                self._release_local_task(inflight_entry, cancel_if_last=True)
+                                inflight_entry = None
+                                self._store_chunk_meta(
+                                    text=text,
+                                    speaker_id=speaker_id,
+                                    original_provider=primary_provider,
+                                    used_provider=cloud_prov,
+                                    failed_providers=failed_providers,
+                                    pure_synth_ms=provider_synth_ms_map.get(cloud_prov, 0.0),
+                                )
+                                return cloud_audio, cloud_prov, cloud_param
 
                     # 両方並行実行して両方失敗した場合は、上位2プロバイダを消費して次へ
                     _mark_prov_failed(prim_prov)
@@ -1345,6 +1422,8 @@ class TTSManager:
         local_only: bool = False,
         avoid_nodes: Optional[Set[str]] = None,
         local_tts_kanji_reading: bool = True,
+        depletion_deadline_fn: Optional[Callable[[], float]] = None,
+        guild_id: Optional[Any] = None,
     ) -> Tuple[bytes, str, str, bool]:
         """
         単一チャンク（文パーツや発言者名プレフィックス等）の音声バイト列を取得。
@@ -1355,6 +1434,7 @@ class TTSManager:
         """
         voice_cfg = self._get_voice_config(speaker_id)
         provider = voice_cfg.provider
+        is_local = self._is_local_provider(provider)
         cache_text = self.resolve_cache_text(text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
         cache_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, cache_text, user_id=user_id)
 
@@ -1373,16 +1453,19 @@ class TTSManager:
             )
             if self.db:
                 safe_create_task(
-                    self.db.record_cache_hit(len(text), is_local=self._is_local_provider(provider)),
+                    self.db.record_cache_hit(len(text), is_local=is_local),
                     name="record_cache_hit_chunk"
                 )
             return cached_bytes, provider, "L1/L2 キャッシュ", True
 
-        # 2. 合成実行
+        # 2. 合成実行 (resolve_cache_text 済みのローカルテキストを渡して二重Sudachi解析を排除)
         audio_bytes, used_provider, used_param = await self._synthesize_single_chunk(
             text, speaker_id, pitch, speed, is_longest_chunk=is_longest_chunk, speculative_timeout=speculative_timeout,
             speculative_deadline_fn=speculative_deadline_fn, prefer_earliest_finish=prefer_earliest_finish, local_only=local_only,
-            avoid_nodes=avoid_nodes, local_tts_kanji_reading=local_tts_kanji_reading
+            avoid_nodes=avoid_nodes, local_tts_kanji_reading=local_tts_kanji_reading,
+            depletion_deadline_fn=depletion_deadline_fn,
+            pre_resolved_local_text=cache_text if is_local else None,
+            guild_id=guild_id,
         )
         worker_lbl = self._get_worker_label_for_provider(used_provider)
         is_fb = (used_provider != provider)
@@ -1438,6 +1521,7 @@ class TTSManager:
         chunks: Optional[List[TextChunk]] = None,
         speculative_timeout: Optional[float] = None,
         local_tts_kanji_reading: bool = True,
+        guild_id: Optional[Any] = None,
     ) -> Path:
         """
         スマートパーツ分割・並列合成・ゼロ遅延WAV結合による音声ファイル取得。
@@ -1481,8 +1565,9 @@ class TTSManager:
         voice_cfg = self.config.voices.get(speaker_id)
         speaker_name = voice_cfg.name if voice_cfg else speaker_id
 
-        # 単一チャンクかつプレフィックス無しの場合はシンプル処理
-        if len(chunks) == 1 and not author_prefix and chunks[0].text == text:
+        # 単一チャンクかつプレフィックス無し・非ピー音の場合はシンプル処理
+        is_local = self._is_local_provider(provider)
+        if len(chunks) == 1 and not author_prefix and not getattr(chunks[0], "is_beep", False) and chunks[0].text == text:
             single_chunk = chunks[0]
             chunk_cache_key = full_cache_key
             cached_bytes = await self.cache_manager.get_bytes(chunk_cache_key, provider=provider)
@@ -1494,12 +1579,14 @@ class TTSManager:
                     "provider": provider
                 }
                 if self.db:
-                    safe_create_task(self.db.record_cache_hit(len(single_chunk.text), is_local=self._is_local_provider(provider)), name="record_cache_hit_single")
+                    safe_create_task(self.db.record_cache_hit(len(single_chunk.text), is_local=is_local), name="record_cache_hit_single")
                 return self.cache_manager.get_file_path(chunk_cache_key, provider=provider)
 
             audio_bytes, used_provider, used_param = await self._synthesize_single_chunk(
                 single_chunk.text, speaker_id, pitch, speed, is_longest_chunk=True, speculative_timeout=speculative_timeout,
-                local_tts_kanji_reading=local_tts_kanji_reading
+                local_tts_kanji_reading=local_tts_kanji_reading,
+                pre_resolved_local_text=full_cache_text if is_local else None,
+                guild_id=guild_id,
             )
             worker_lbl = self._get_worker_label_for_provider(used_provider)
             is_fb_single = (used_provider != provider)
@@ -1538,28 +1625,36 @@ class TTSManager:
                     is_chunk=False
                 )
 
-        # 3. 複数チャンクのキャッシュ確認 (並列 I/O 走査)
+        # 3. 複数チャンクのキャッシュ確認 (並列 I/O 走査 + 自主規制ピー音チャンクのインメモリWAV生成)
         chunk_results: List[Optional[bytes]] = [None] * len(chunks)
+        resolved_chunk_texts: List[str] = [""] * len(chunks)
         missed_indices: List[int] = []
 
         async def _check_chunk(i: int, ch: TextChunk):
+            if getattr(ch, "is_beep", False):
+                beep_wav = self._build_beep_wav_24k_mono(getattr(ch, "beep_duration_sec", 0.4))
+                return i, ch, beep_wav, True
             ch_cache_text = self.resolve_cache_text(ch.text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+            resolved_chunk_texts[i] = ch_cache_text
             k = CacheManager.generate_cache_key(speaker_id, pitch, speed, ch_cache_text, user_id=user_id)
             b = await self.cache_manager.get_bytes(k, provider=provider)
-            return i, ch, b
+            return i, ch, b, False
 
         check_results = await asyncio.gather(*[_check_chunk(i, c) for i, c in enumerate(chunks)])
-        for idx, chunk, c_bytes in check_results:
-            if c_bytes is not None:
+        for idx, chunk, c_bytes, is_beep_ch in check_results:
+            if is_beep_ch:
+                chunk_results[idx] = c_bytes
+            elif c_bytes is not None:
                 chunk_results[idx] = c_bytes
                 logger.debug(f"Chunk cache hit ({provider}): '{chunk.text[:10]}...' ({len(chunk.text)} chars)")
                 if self.db:
-                    safe_create_task(self.db.record_cache_hit(len(chunk.text), is_local=self._is_local_provider(provider)), name="record_cache_hit_chunk")
+                    safe_create_task(self.db.record_cache_hit(len(chunk.text), is_local=is_local), name="record_cache_hit_chunk")
             else:
                 missed_indices.append(idx)
 
         # 4. キャッシュミスしたチャンクの並列合成 (asyncio.gather)
         last_used_provider = provider
+        has_fallback_chunk = False
         if missed_indices:
             logger.info(
                 f"Synthesizing {len(missed_indices)} missed chunk(s) in parallel (total chunks: {len(chunks)})..."
@@ -1579,13 +1674,14 @@ class TTSManager:
                     speed,
                     is_longest_chunk=(i == longest_idx),
                     speculative_timeout=speculative_timeout,
-                    local_tts_kanji_reading=local_tts_kanji_reading
+                    local_tts_kanji_reading=local_tts_kanji_reading,
+                    pre_resolved_local_text=resolved_chunk_texts[i] if is_local else None,
+                    guild_id=guild_id,
                 )
                 for i in missed_indices
             ]
             synth_results = await asyncio.gather(*synth_tasks)
 
-            has_fallback_chunk = False
             for i, (audio_bytes, used_provider, used_param) in zip(missed_indices, synth_results):
                 chunk_results[i] = audio_bytes
                 last_used_provider = used_provider
@@ -1605,7 +1701,7 @@ class TTSManager:
                         is_chunk=True
                     ), name=f"save_chunk_cache_{i}")
                 else:
-                    ch_cache_text = self.resolve_cache_text(chunks[i].text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
+                    ch_cache_text = resolved_chunk_texts[i] or self.resolve_cache_text(chunks[i].text, provider, local_tts_kanji_reading=local_tts_kanji_reading)
                     c_key = CacheManager.generate_cache_key(speaker_id, pitch, speed, ch_cache_text, user_id=user_id)
                     safe_create_task(self.cache_manager.save(
                         c_key,
@@ -1682,7 +1778,7 @@ class TTSManager:
         if not pool:
             return
 
-        nodes = [n for n in pool.get_nodes() if n.is_available]
+        nodes = [n for n in pool.get_nodes() if n.is_available and not getattr(n, "is_ws", False)]
         if not nodes:
             return
 
@@ -1755,8 +1851,9 @@ class TTSManager:
         voice_cfg = self._get_voice_config(speaker_id)
         if not voice_cfg:
             return None
+        eff_sample_text = self.resolve_cache_text(self.PREVIEW_SAMPLE_TEXT, voice_cfg.provider)
         cache_key = CacheManager.generate_cache_key(
-            speaker_id, self.PREVIEW_PITCH, self.PREVIEW_SPEED, self.PREVIEW_SAMPLE_TEXT, user_id=self.PREVIEW_USER_ID
+            speaker_id, self.PREVIEW_PITCH, self.PREVIEW_SPEED, eff_sample_text, user_id=self.PREVIEW_USER_ID
         )
         cached_file = await self.cache_manager.get(cache_key, provider=voice_cfg.provider)
         if cached_file is not None and os.path.exists(cached_file):
@@ -1802,8 +1899,9 @@ class TTSManager:
                 fail_cnt += 1
                 continue
 
+            eff_sample_text = self.resolve_cache_text(self.PREVIEW_SAMPLE_TEXT, prov)
             cache_key = CacheManager.generate_cache_key(
-                spk_id, self.PREVIEW_PITCH, self.PREVIEW_SPEED, self.PREVIEW_SAMPLE_TEXT, user_id=self.PREVIEW_USER_ID
+                spk_id, self.PREVIEW_PITCH, self.PREVIEW_SPEED, eff_sample_text, user_id=self.PREVIEW_USER_ID
             )
             cached_file = await self.cache_manager.get(cache_key, provider=prov)
             if cached_file is not None and os.path.exists(cached_file):

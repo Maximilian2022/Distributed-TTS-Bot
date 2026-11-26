@@ -1447,11 +1447,11 @@ class Database:
         return imported_count
 
     async def delete_dictionary_word(self, guild_id: int, word: str) -> bool:
-        """指定ギルドの単語辞書から削除"""
+        """指定ギルドの単語辞書から削除 (guild_id != 0 時は当該ギルド登録語のみ削除しグローバル辞書を保護)"""
         async with self.get_connection() as db:
             cursor = await db.execute(
-                "DELETE FROM guild_dictionary WHERE (guild_id = ? OR guild_id = 0) AND word = ?",
-                (guild_id, word.strip())
+                "DELETE FROM guild_dictionary WHERE guild_id = ? AND word = ?",
+                (int(guild_id), word.strip())
             )
             await db.commit()
             deleted = cursor.rowcount > 0
@@ -1472,8 +1472,8 @@ class Database:
                 chunk = clean_words[i:i + 500]
                 placeholders = ",".join("?" for _ in chunk)
                 cursor = await db.execute(
-                    f"DELETE FROM guild_dictionary WHERE (guild_id = ? OR guild_id = 0) AND word IN ({placeholders})",
-                    [guild_id] + chunk
+                    f"DELETE FROM guild_dictionary WHERE guild_id = ? AND word IN ({placeholders})",
+                    [int(guild_id)] + chunk
                 )
                 deleted_total += max(0, cursor.rowcount)
             await db.commit()
@@ -1496,16 +1496,30 @@ class Database:
                     """
                     UPDATE guild_dictionary
                     SET reading = ?, created_at = CURRENT_TIMESTAMP
-                    WHERE (guild_id = ? OR guild_id = 0) AND word = ?
+                    WHERE guild_id = ? AND word = ?
                     """,
-                    (new_r, guild_id, old_w)
+                    (new_r, int(guild_id), old_w)
                 )
                 await db.commit()
                 updated = cursor.rowcount > 0
+                if not updated and int(guild_id) != 0:
+                    # グローバル語(guild_id=0)を当該ギルド向けにオーバーライド登録
+                    await db.execute(
+                        """
+                        INSERT INTO guild_dictionary (guild_id, word, reading, created_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(guild_id, word) DO UPDATE SET
+                            reading = excluded.reading,
+                            created_at = CURRENT_TIMESTAMP
+                        """,
+                        (int(guild_id), new_w, new_r)
+                    )
+                    await db.commit()
+                    updated = True
             else:
                 await db.execute(
-                    "DELETE FROM guild_dictionary WHERE (guild_id = ? OR guild_id = 0) AND word = ?",
-                    (guild_id, old_w)
+                    "DELETE FROM guild_dictionary WHERE guild_id = ? AND word = ?",
+                    (int(guild_id), old_w)
                 )
                 await db.execute(
                     """

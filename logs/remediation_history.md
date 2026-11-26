@@ -1,3 +1,32 @@
+## 2026-11-26 22:51 PJ全体再監査に基づく全29項目（セキュリティS-1〜S-8・不具合B-1〜B-10・不整合I-1〜I-6・高速化P-1〜P-5）の一括改修と本番反映
+- **背景・目的**:
+  - PJ全体の再監査で検出された全29項目について、プロジェクト本来の目的（20msフレーム無音切れ目なしの超低遅延Discord読み上げ・早耳LiveリアルタイムSTT・マルチノード分散GPU協調・本番無停止HA運用）を守りつつ一括改修・検証・本番反映を実施。
+  - ユーザー合意に基づき、①システム最高管理者（パスワード認証 `uid=0` または `DISCORD_OWNER_USER_ID` / `ADMIN_USER_IDS`）とギルド管理者（各サーバーの管理者・`admin_role_id` 保持者）の厳格2階層分離、②NGワード変更権限の単語辞書との完全統一（サーバー管理者・指定ロール保持者のみ変更可、所属メンバー全員閲覧可）を適用。
+- **実施内容**:
+  1. **Web認証・権限2階層分離・境界防御 (`src/config.py`, `src/web/server.py`, `src/cogs/commands.py`, `src/tts/mycoeiroink.py`, `src/web/templates/index.html`, `src/web/static/app.js`)**:
+     - **S-1**: `/api/stt/stream` に WAN 認証必須化を導入し、ボランティア個人トークン (`vt_`) 利用時は本人の `discord_user_id` のみに強制バインド（`user_id=0` 全員傍受を遮断）。`hayamimi_game_bridge.py` にも任意トークン対応を追加。
+     - **S-2**: `_is_system_admin_uid` / `_is_admin_user` によりシステム最高管理者とギルド管理者を分離。OAuth callback / App Login / Magic Link での過剰な `is_admin=True` 付与を廃止し、Hayamimi 疎通テスト API に SSRF 防御と `alert_service` 未定義定数参照バグ修正を適用。WebUI でも `isSystemAdmin` と `hasGuildAccess` の表示制御を分離。
+     - **S-3 & S-4**: `/api/node_settings` の未ログインアクセスを `401` 拒否、`/api/worker/logs` を管理者・所有者限定に制限。`/api/ng` 変更系4API（追加・削除・一括削除・プリセット）および Discord `/ng` コマンドにギルド管理者/指定ロール権限ガードを必須化。
+     - **S-5**: WAN CSRF ミドルウェアから `10.` / `172.` / `192.168.` / `localhost` 前方一致許可を廃止し、正規ホスト完全一致のみ許可。
+     - **S-6**: `client_max_size=64MB` 制限、MYCOEIROINK ZIP アップロードの一時ファイルストリーミング保存＋ `asyncio.to_thread` 展開、`try_auto_install` の `https` 限定＆リダイレクト毎プライベートIP SSRF 遮断。
+     - **S-7 & S-8**: `index.html` の `server-data` を `safe_json_for_html_script()` で一括安全埋め込み、403画面の `html.escape` ＆導入サーバー名一覧非表示化、配布スクリプトへの `X-Script-SHA256` 付与および `volunteer_worker.py` 自己更新時の SHA-256 照合。
+  2. **音声ストリーム排他・ゼロコピー・投機TTS最適化 (`src/utils/streaming_audio.py`, `src/tts/manager.py`, `src/cogs/vc_handler.py`)**:
+     - **B-1 & P-3**: `StreamingAudioSource` に `threading.Lock` 排他保護を導入し、アップサンプリング前サンプル配列段階での末尾無音トリム（演算75%削減）、`memoryview` 直接 `extend` による中間バイトコピー削減、8/16/24/32-bit ＆ 16kHz/24kHz/44.1kHz/48kHz リサンプル対応、`trim_trailing_silence` の4バイト境界保証、`feed_raw_pcm(trim_tail=...)` 対応を実装。
+     - **P-2**: `PlaybackTimeline.depletion_time_for` と `depletion_deadline_fn` による **Early Hedge + Late Commit**（先行クラウド投機発射＋再生枯渇 80ms 前までローカル GPU 完了を待機して声変わりを防止、間に合わない場合は到着済みクラウド音声を 0ms 即時採用）を実装。`az_margin_seconds` 既定値も `0.68` に統一。
+  3. **テキスト前処理・キャッシュ整合性・非同期I/O改善 (`src/utils/text_cleaner.py`, `src/cache_prewarm.py`, `src/cache_manager.py`, `src/tts/node_pool.py`, `src/main.py`)**:
+     - **B-4 & B-5 & P-1**: `normalize_cache_key_text` から異モーラ語（`"おつ"`, `"よろしくです"`）を除外。ギルド辞書の単一複合正規表現 LRU キャッシュ化＋私用領域プレースホルダ保護、`clean()` の `<<__BEEP:N__>>` タグ途中切断防止、`_RE_HAS_READABLE` から中黒 `・` 等の非発音記号を除外＆先頭記号チャンクの前方吸着、`_SPLIT_EXECUTOR` 拡張＆タイムアウト退避の非ブロッキング化、`pre_resolved_local_text` による二重 Sudachi 解析排除、`get_audio_path` での `is_beep` WAV 生成対応。
+     - **I-2 & P-4 & P-5**: 名前プリウォームへのギルド辞書適用と `resolve_cache_text` 統一、`/health` の `self.db.get_connection()` 利用、`validate_wav_bytes` の `to_thread` 内包化、L1 `os.utime` の5分デバウンス、LRU削除時 L1 無効化のメインスレッド実行、`TTSNode.to_dict` ホスト情報キャッシュ、`/static/` キャッシュヘッダ整理、`main.py` 重複 `init_db()` ガード＆シャットダウン停止漏れ解消。
+  4. **Workerプール・VC制御・マルチBot・DB・STT・配布同期 (`src/tts/ws_node_adapter.py`, `src/tts/*_tts.py`, `src/database.py`, `src/stt/*`, 各種配布スクリプト・CI)**:
+     - **B-2, B-3, I-1**: `commands.py` の `import os` と `add_dictionary_word` 修正、`_local_pool_for` 修正、`WSWorkerNode` のクールダウン・`draining`・`engine_status` 遵守・分割バイナリチャンク結合・`synthesize_cancel` 送信・統計二重計上防止・`engine_name` 伝播・不要 HTTP ウォームアップ抑止、`guild_id` 一貫伝播による `exclusive_guild_id` 有効化と対象ノード0台時の即時フォールバック。
+     - **B-6, B-7, B-9, B-10, I-3, I-6**: `abort_current_event` による Preroll/後続合成中の即時中断、`connect_epoch` 検証、`WebDashboardButtonView(assigned_bot)`・`sub_bots.values()` 修正、サブプロセス `finally` 終了、SSML `quoteattr` エスケープ＆400/空音声でのサーキットブレーカー誤遮断防止、RAM降格 TOCTOU 防止、ギルド辞書削除での `guild_id=0` 保護、`requirements.txt` への `cryptography` / `PyNaCl` 明記。
+     - **B-8, I-4, I-5**: `HayamimiSession.close()` の自己キャンセル回避による `ClientSession` 確実クローズ、`ws.receive()` タイムアウト＆ロック外接続＆切断自動再接続、無通信 SSRC 掃除、UDP 暗号器キャッシュ＆RMS 間引き、先行接続 GameBridge 引き継ぎ、`self_deaf=False` 試行、遅延翻訳追記送信。ルートと `src/web/static/` の配布ファイル完全同期、`scripts/rolling_update.sh` の `.ha_updating` ＋ `--force-recreate` 化、`.github/workflows/docker-publish.yml` と `RELEASE_NOTES.md` 整備。
+  5. **単体テスト (`tests/test_full_project_audit_fixes.py`, `tests/test_audit_remediation_11_to_19.py`)**:
+     - Security Verification Plan 全5項目、並列音声ストリーム排他・無音トリム、Early Hedge + Late Commit、テキスト前処理・キャッシュキー、WSWorkerNode、Hayamimi close 等を網羅する新規単体テストを追加。
+- **検証・本番反映結果**:
+  - `node --check src/web/static/app.js` および各シェルスクリプト `bash -n` 構文チェック合格。
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh python3 -m unittest discover -s tests -p "test_*.py"`): **全 256 件合格** (`Ran 256 tests in 14.648s`, OK)、一時コンテナ・一時データの完全自動破棄（ゼロフットプリント）を確認済み。
+  - 本番反映実施: `./scripts/rolling_update.sh` により `.ha_updating` 保護下で 1.5秒の最小瞬断切り替えを実施。`ttsbot-app-1` `healthy` 復帰、`/health` HTTP 200 OK (`status="ok"`, `is_ready=true`, `guilds_count=2`)、HA Watchdog 誤昇格なし、14 スラッシュコマンド同期、Bot #1〜#5 全号機接続および稼働中 VC の自動再接続完了（エラーログ 0 件）を実機確認完了。
+
 ## 2026-11-26 16:27 Dependabot PR #23 (`janome>=0.5.2`)・PR #24 (`azure-cognitiveservices-speech>=1.53.1`) の互換性検証とマージ・ローカル同期
 - **背景・目的**:
   - Dependabot から作成された依存パッケージ最小バージョン要件引き上げの Pull Request 2件（PR #23, PR #24）について、本番 Python `3.14` 環境との互換性を検証のうえ `main` ブランチへ取り込む。

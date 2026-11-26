@@ -80,9 +80,15 @@ if [ "$DO_BUILD" -eq 1 ]; then
   log_ok "イメージビルド完了！"
 fi
 
-# 3. 最小瞬断リロード (所要時間 約0.8〜1.5秒)
+# 3. 最小瞬断リロード (所要時間 約0.8〜1.5秒: .ha_updating でHA副系誤昇格を保護し --force-recreate でPythonコード確実に再読込)
+mkdir -p data
+HA_UPDATE_LOCK="data/.ha_updating"
+cleanup_ha_lock() { rm -f "$HA_UPDATE_LOCK"; }
+trap cleanup_ha_lock EXIT
+touch "$HA_UPDATE_LOCK"
+
 log_info "⚡ コンテナの安全切り替え・リロードを実行中..."
-docker compose up -d --no-deps app
+docker compose up -d --no-deps --force-recreate app
 
 # 4. ヘルスチェック・復帰確認 (最大30秒)
 log_info "新コンテナのヘルスチェック (/health 200 OK) を待機中..."
@@ -99,6 +105,7 @@ for i in {1..30}; do
 done
 
 if [ "$HEALTHY" -eq 1 ]; then
+  rm -f "$HA_UPDATE_LOCK"
   log_ok "✨ 新コンテナの健全復帰 (/health 200 OK) を確認しました！"
 else
   log_err "⚠️ ヘルスチェックがタイムアウトしました。ログを確認してください:"

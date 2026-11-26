@@ -65,10 +65,12 @@ def load_or_create_config() -> configparser.ConfigParser:
             server_url = f"ws://{server_url}"
 
     user_id = input("あなたの Discord ユーザー ID (空欄で全話者対象): ").strip()
+    token = input("認証トークン (WAN/インターネット経由の場合は個人トークン vt_... 等を入力、LAN直結は空欄可): ").strip()
 
     config["settings"] = {
         "server_url": server_url,
         "target_user_id": user_id or "0",
+        "token": token,
         "enter_delay_ms": "50",
         "auto_enter": "true",
         "paused": "false",
@@ -85,6 +87,7 @@ class GameBridgeClient:
         self.config = config
         self.server_base = config.get("settings", "server_url", fallback="ws://192.168.11.244:8088").rstrip("/")
         self.target_user_id = config.get("settings", "target_user_id", fallback="0").strip()
+        self.token = config.get("settings", "token", fallback=os.getenv("TTSBOT_WORKER_TOKEN", "")).strip()
         self.enter_delay = float(config.get("settings", "enter_delay_ms", fallback="50")) / 1000.0
         self.auto_enter = config.getboolean("settings", "auto_enter", fallback=True)
         self.paused = config.getboolean("settings", "paused", fallback=False)
@@ -94,6 +97,11 @@ class GameBridgeClient:
         if "/api/stt/stream" not in base:
             base = f"{base}/api/stt/stream"
         return f"{base}?user_id={self.target_user_id}"
+
+    def build_headers(self) -> dict:
+        if self.token:
+            return {"Authorization": f"Bearer {self.token}"}
+        return {}
 
     def paste_and_send(self, text: str, user_name: str) -> None:
         """クリップボードにコピーしてゲームチャットに貼り付け＆Enter"""
@@ -132,7 +140,7 @@ class GameBridgeClient:
         while True:
             try:
                 logger.info(f"Connecting to {ws_url}...")
-                async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as ws:
+                async with websockets.connect(ws_url, additional_headers=self.build_headers(), ping_interval=20, ping_timeout=10) as ws:
                     logger.info("✨ TTSBot との接続が確立されました！音声待機中...")
                     async for message in ws:
                         try:
@@ -169,4 +177,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

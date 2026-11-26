@@ -116,9 +116,13 @@ jobs:
               try:
                   with open('logs/remediation_history.md', 'r', encoding='utf-8') as f:
                       content = f.read()
-                  entries = re.split(r'\n(?=## \[)', content)
-                  if len(entries) > 1:
-                      body = entries[1].strip()
+                  entries = [
+                      e.strip()
+                      for e in re.split(r'(?:^|\n)(?=## )', content)
+                      if e.strip().startswith('## ')
+                  ]
+                  if entries:
+                      body = entries[0]
               except Exception as e:
                   print(f'Error reading remediation history: {e}')
 

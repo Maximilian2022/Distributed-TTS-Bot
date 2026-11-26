@@ -131,10 +131,25 @@ class SpeechDispatcher:
         seq = data.get("seq", 0)
         seq_key = f"{user_id}_{seq}"
 
-        # 既存のバッファエントリがあればインライン統合
+        # 既存のバッファエントリがあればインライン統合 (既にフラッシュ送信済みの場合は遅延翻訳として追記送信)
         if seq_key in self._seq_map:
             entry = self._seq_map[seq_key]
-            entry["trans"] = trans_text
+            if not entry.get("flushed"):
+                entry["trans"] = trans_text
+                return
+            late_entry = {
+                "user_id": user_id,
+                "user_name": user_name,
+                "text": entry.get("text", ""),
+                "trans": trans_text,
+                "late_trans_only": True,
+                "seq_key": f"{seq_key}_trans",
+                "ts": time.time(),
+            }
+            async with self._buffer_lock:
+                self._buffer.append(late_entry)
+                if not self._flush_task or self._flush_task.done():
+                    self._flush_task = asyncio.create_task(self._scheduled_flush())
         else:
             # 万が一字幕より先に翻訳が届いた場合のフォールバック
             entry = {
@@ -159,6 +174,8 @@ class SpeechDispatcher:
             if not self._buffer:
                 return
             entries = list(self._buffer)
+            for e in entries:
+                e["flushed"] = True
             self._buffer.clear()
 
         # レートリミット (最大 1秒に1回) のインターバル制御
@@ -192,8 +209,11 @@ class SpeechDispatcher:
         for e in entries:
             name = e["user_name"]
             txt = e["text"]
-            trans = f" ({e['trans']})" if e["trans"] else ""
-            lines.append(f"🎙️ **{name}**: {txt}{trans}")
+            if e.get("late_trans_only") and e.get("trans"):
+                lines.append(f"🌐 **{name}**: {e['trans']}")
+            else:
+                trans = f" ({e['trans']})" if e["trans"] else ""
+                lines.append(f"🎙️ **{name}**: {txt}{trans}")
 
         if not lines:
             return

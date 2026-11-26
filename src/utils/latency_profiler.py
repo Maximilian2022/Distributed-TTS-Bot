@@ -204,11 +204,11 @@ class EngineLatencyProfiler:
     def __init__(self):
         self._profiles: Dict[Tuple[str, str], NodeLatencyProfile] = {}
 
-    def get_or_create(self, node: Any) -> NodeLatencyProfile:
+    def get_or_create(self, node: Any, engine_name: Optional[str] = None) -> NodeLatencyProfile:
         """ノードオブジェクトからプロファイルを取得または新規作成"""
         node_id = getattr(node, "id", str(node))
-        engine_name = getattr(node, "engine_name", "UNKNOWN").upper()
-        key = (node_id, engine_name)
+        resolved_engine = (engine_name or getattr(node, "engine_name", "UNKNOWN")).upper()
+        key = (node_id, resolved_engine)
 
         specs = getattr(node, "specs", {}) or {}
         has_gpu = bool(getattr(node, "has_gpu", False) or specs.get("gpu", False))
@@ -226,7 +226,7 @@ class EngineLatencyProfiler:
         if key not in self._profiles:
             self._profiles[key] = NodeLatencyProfile(
                 node_id=node_id,
-                engine_name=engine_name,
+                engine_name=resolved_engine,
                 has_gpu=has_gpu,
                 gpu_name=gpu_name,
                 vram_mb=vram_mb,
@@ -249,9 +249,9 @@ class EngineLatencyProfiler:
 
         return self._profiles[key]
 
-    def record_synth(self, node: Any, text_len: int, synth_ms: float) -> None:
+    def record_synth(self, node: Any, text_len: int, synth_ms: float, engine_name: Optional[str] = None) -> None:
         """推論実績を記録"""
-        profile = self.get_or_create(node)
+        profile = self.get_or_create(node, engine_name=engine_name)
         profile.record(text_len, synth_ms)
         logger.debug(
             f"📊 [Profiler] Updated {profile.node_id}/{profile.engine_name}: "

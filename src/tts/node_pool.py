@@ -31,6 +31,8 @@ from src.utils.worker_auth import agent_auth_headers
 
 logger = logging.getLogger(__name__)
 
+_RE_STRIP_STYLE_SUFFIX = re.compile(r'[_\:]\d+$')
+
 # 動的Tierルーティング設定 (デフォルト: GPU+RAMDisk, CPU+RAMDisk, GPU+SSD, CPU+SSD)
 DEFAULT_TIER_ROUTING_ORDER: List[str] = ["gpu_ram", "cpu_ram", "gpu_ssd", "cpu_ssd"]
 
@@ -308,7 +310,7 @@ class TTSNode:
 
     async def try_remote_start(self, timeout: float = 35.0) -> bool:
         """ワーカーのAgentに対してエンジンのオンデマンド遠隔起動を試みる (GPU・CPU・自ホスト問わず自律復帰)"""
-        if not self.url:
+        if not self.url or getattr(self, "is_ws", False) or str(self.url).startswith("ws://"):
             return False
         self.last_start_attempt = time.time()
         try:
@@ -461,7 +463,7 @@ class TTSNode:
         raw = str(model_name).strip().lower()
         # スタイルIDサフィックス (_0, _10 等) やポート等の除去
         # 単純な split('_')[0] は 'model_a' などの名前を 'model' に破壊するため正規表現で末尾の数値のみ除去
-        uuid_or_key = re.sub(r'[_\:]\d+$', '', raw).strip()
+        uuid_or_key = _RE_STRIP_STYLE_SUFFIX.sub('', raw).strip()
 
         candidates = {raw, uuid_or_key}
         mapped = COEIROINK_MODEL_MAPPING.get(uuid_or_key) or COEIROINK_MODEL_MAPPING.get(raw)
@@ -488,7 +490,7 @@ class TTSNode:
 
         for item in items_to_check:
             item_lower = item.strip().lower()
-            item_stripped = re.sub(r'[_\:]\d+$', '', item_lower).strip()
+            item_stripped = _RE_STRIP_STYLE_SUFFIX.sub('', item_lower).strip()
             item_mapped = COEIROINK_MODEL_MAPPING.get(item_lower, "") or COEIROINK_MODEL_MAPPING.get(item_stripped, "")
             item_mapped = item_mapped.lower() if item_mapped else ""
 
@@ -621,25 +623,27 @@ class TTSNode:
         engine_running = (self.engine_running is not False) and (self.specs.get("engine_running", True) is not False)
         engine_healthy = self.specs.get("engine_healthy", True) is not False
 
-        merged_specs = dict(self.specs)
-        # 自機マスターノード、または specs にホスト詳細が不足している場合の自動補完
-        if not self.is_external or not merged_specs.get("os_name") or not merged_specs.get("docker_version"):
-            try:
-                sys_info = get_host_system_info()
-                if not self.is_external:
-                    if not merged_specs.get("hostname") or merged_specs.get("hostname") == "local_master":
-                        merged_specs["hostname"] = sys_info.get("hostname", "PrimaryNode")
-                        merged_specs["host_hostname"] = sys_info.get("hostname", "PrimaryNode")
-                    if not merged_specs.get("os_name") or merged_specs.get("os_name") == "Linux":
-                        merged_specs["os_name"] = sys_info.get("os_name", "Linux")
-                        merged_specs["os"] = sys_info.get("os_name", "Linux")
-                    if not merged_specs.get("docker_version") or merged_specs.get("docker_version") == "N/A":
-                        merged_specs["docker_version"] = sys_info.get("docker_version", "N/A")
-                else:
-                    if not merged_specs.get("os_name") and merged_specs.get("os"):
-                        merged_specs["os_name"] = merged_specs["os"]
-            except Exception:
-                pass
+        # 自機マスターノード、または specs にホスト詳細が不足している場合の初回自動補完 (specsへキャッシュ保存しDocker Socket再照会を防止)
+        if not self.specs.get("_host_info_enriched"):
+            if not self.is_external:
+                try:
+                    sys_info = get_host_system_info()
+                    if not self.specs.get("hostname") or self.specs.get("hostname") == "local_master":
+                        self.specs["hostname"] = sys_info.get("hostname", "PrimaryNode")
+                        self.specs["host_hostname"] = sys_info.get("hostname", "PrimaryNode")
+                    if not self.specs.get("os_name") or self.specs.get("os_name") == "Linux":
+                        self.specs["os_name"] = sys_info.get("os_name", "Linux")
+                        self.specs["os"] = sys_info.get("os_name", "Linux")
+                    if not self.specs.get("docker_version") or self.specs.get("docker_version") == "N/A":
+                        self.specs["docker_version"] = sys_info.get("docker_version", "N/A")
+                except Exception:
+                    pass
+            else:
+                if not self.specs.get("os_name") and self.specs.get("os"):
+                    self.specs["os_name"] = self.specs["os"]
+            self.specs["_host_info_enriched"] = True
+
+        merged_specs = {k: v for k, v in self.specs.items() if k != "_host_info_enriched"}
 
         resolved_host = merged_specs.get("host_hostname") or merged_specs.get("hostname") or self.hostname
 
@@ -705,7 +709,7 @@ class NodeLease:
             if exc_type is None:
                 self.node.mark_success(latency_ms)
                 if self.text_len > 0:
-                    latency_profiler.record_synth(self.node, self.text_len, latency_ms)
+                    latency_profiler.record_synth(self.node, self.text_len, latency_ms, engine_name=self.pool.engine_name)
             else:
                 if isinstance(exc_val, (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, TTSConnectionError, TTSError, OSError)):
                     self.node.mark_failed(
@@ -727,7 +731,7 @@ class TTSNodePool:
         self.nodes.sort(key=lambda n: (n.priority, n.id))
         for n in self.nodes:
             try:
-                latency_profiler.get_or_create(n)
+                latency_profiler.get_or_create(n, engine_name=self.engine_name)
             except Exception:
                 pass
 
@@ -769,7 +773,7 @@ class TTSNodePool:
 
         self.nodes.sort(key=lambda n: (n.priority, n.id))
         try:
-            latency_profiler.get_or_create(target)
+            latency_profiler.get_or_create(target, engine_name=self.engine_name)
         except Exception:
             pass
         return target
@@ -779,11 +783,16 @@ class TTSNodePool:
         existing = next((n for n in self.nodes if n.id == node.id), None)
         if existing:
             self.nodes.remove(existing)
+            if existing is not node and not getattr(existing, "is_ws", False):
+                try:
+                    asyncio.get_running_loop().create_task(existing.close())
+                except RuntimeError:
+                    pass
             logger.info(f"🔄 [NodePool] Replaced existing node '{node.id}' in pool '{self.engine_name}'.")
         self.nodes.append(node)
         self.nodes.sort(key=lambda n: (n.priority, n.id))
         try:
-            latency_profiler.get_or_create(node)
+            latency_profiler.get_or_create(node, engine_name=self.engine_name)
         except Exception:
             pass
         logger.info(f"✨ [NodePool] Node '{node.id}' ({node.summary_label}) added to pool '{self.engine_name}'.")
@@ -793,6 +802,11 @@ class TTSNodePool:
         target = next((n for n in self.nodes if n.id == node_id), None)
         if target:
             self.nodes.remove(target)
+            if not getattr(target, "is_ws", False):
+                try:
+                    asyncio.get_running_loop().create_task(target.close())
+                except RuntimeError:
+                    pass
             logger.info(f"🔌 [NodePool] Node '{node_id}' removed from pool '{self.engine_name}'.")
             return target
         return None
@@ -832,11 +846,14 @@ class TTSNodePool:
         return any(n.is_available and n.is_external and n.has_gpu for n in self.nodes)
 
     def get_primary_url(self) -> str:
-        """最も優先度が高く利用可能なノードのURLを取得"""
+        """最も優先度が高く利用可能なHTTPノードのURLを取得 (WS仮想URLは除外)"""
         for node in self.nodes:
-            if node.is_available:
+            if node.is_available and not getattr(node, "is_ws", False) and str(node.url).startswith("http"):
                 return node.url
-        return self.nodes[0].url if self.nodes else ""
+        for node in self.nodes:
+            if not getattr(node, "is_ws", False) and str(node.url).startswith("http"):
+                return node.url
+        return ""
 
     async def wake_up_nodes(self, wait_healthy: bool = True, timeout: float = 35.0) -> bool:
         """
@@ -926,9 +943,9 @@ class TTSNodePool:
         long_threshold = max(8, int(dyn_max * 0.6))
 
         if is_longest_chunk or text_len >= long_threshold:
-            gpu_sort_key = lambda n: (is_avoided(n), n.active_count, -latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
+            gpu_sort_key = lambda n: (is_avoided(n), n.active_count, -latency_profiler.get_or_create(n, engine_name=self.engine_name).gpu_power_score, n.priority, n.last_latency_ms)
         else:
-            gpu_sort_key = lambda n: (is_avoided(n), n.active_count, latency_profiler.get_or_create(n).gpu_power_score, n.priority, n.last_latency_ms)
+            gpu_sort_key = lambda n: (is_avoided(n), n.active_count, latency_profiler.get_or_create(n, engine_name=self.engine_name).gpu_power_score, n.priority, n.last_latency_ms)
 
         cpu_sort_key = lambda n: (is_avoided(n), n.active_count, n.priority, n.last_latency_ms)
 
@@ -945,7 +962,7 @@ class TTSNodePool:
     def estimate_node_ms(self, node: TTSNode, text_len: int) -> float:
         """ノード×エンジンの実測プロファイルから単発合成時間 (ms) を推定"""
         try:
-            return float(latency_profiler.get_or_create(node).estimate(max(1, int(text_len))))
+            return float(latency_profiler.get_or_create(node, engine_name=self.engine_name).estimate(max(1, int(text_len))))
         except Exception:
             return 0.0
 
@@ -1040,7 +1057,7 @@ class TTSNodePool:
         # 現在設定されている Tier 優先順位の上位 Tier に属し、かつ Agent が生存しているノードが停止中の場合のみ起動をトリガー
         candidates_to_start = []
         for n in self.nodes:
-            if n.enabled and not n.is_available and not n.draining and n.is_agent_reachable:
+            if n.enabled and not getattr(n, "is_ws", False) and not n.is_available and not n.draining and n.is_agent_reachable:
                 candidates_to_start.append(n)
 
         if candidates_to_start:
@@ -1080,6 +1097,25 @@ class TTSNodePool:
 
             available = filtered_nodes
             if not available:
+                # 起動試行中またはタイムアウト内にクールダウン復帰する条件一致ノードが1台も無ければ無駄に待たず即座にフォールバック
+                deadline_ts = start + timeout
+                can_recover = False
+                for n in self.nodes:
+                    if not n.enabled or n.draining:
+                        continue
+                    if not n.supports_model(self.engine_name, model_name):
+                        continue
+                    ex_gid = getattr(n, "exclusive_guild_id", None)
+                    if ex_gid and (not target_gid_str or target_gid_str != str(ex_gid)):
+                        continue
+                    if n in candidates_to_start:
+                        can_recover = True
+                        break
+                    if 0 < getattr(n, "unhealthy_until", 0.0) <= deadline_ts:
+                        can_recover = True
+                        break
+                if not can_recover:
+                    break
                 await asyncio.sleep(0.1)
                 continue
 

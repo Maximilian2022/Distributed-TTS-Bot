@@ -361,66 +361,77 @@ function updatePermissionsUI() {
   const btnBots = document.getElementById("tab-btn-bots");
   const btnCreds = document.getElementById("tab-btn-credentials");
 
-  const hasAccess = currentGuildPerms.has_role || currentGuildPerms.is_admin || (window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+  const isSystemAdmin = Boolean(window.APP_USER_DATA && window.APP_USER_DATA.is_admin);
+  const hasGuildAccess = Boolean(currentGuildPerms.has_role || currentGuildPerms.is_admin || isSystemAdmin);
 
   if (btnServer) {
-    btnServer.style.display = hasAccess ? "inline-block" : "none";
+    btnServer.style.display = hasGuildAccess ? "inline-block" : "none";
   }
   if (btnInfra) {
-    btnInfra.style.display = hasAccess ? "inline-block" : "none";
+    btnInfra.style.display = isSystemAdmin ? "inline-block" : "none";
   }
 
   if (btnBots) {
-    btnBots.style.display = hasAccess ? "inline-block" : "none";
+    btnBots.style.display = isSystemAdmin ? "inline-block" : "none";
   }
   if (btnCreds) {
-    btnCreds.style.display = hasAccess ? "inline-block" : "none";
+    btnCreds.style.display = isSystemAdmin ? "inline-block" : "none";
   }
 
   if (btnMemberVoices) {
-    btnMemberVoices.style.display = hasAccess ? "inline-block" : "none";
+    btnMemberVoices.style.display = hasGuildAccess ? "inline-block" : "none";
   }
   if (cardMemberVoicesForbidden && areaMemberVoicesContent) {
-    cardMemberVoicesForbidden.style.display = hasAccess ? "none" : "block";
-    areaMemberVoicesContent.style.display = hasAccess ? "block" : "none";
+    cardMemberVoicesForbidden.style.display = hasGuildAccess ? "none" : "block";
+    areaMemberVoicesContent.style.display = hasGuildAccess ? "block" : "none";
   }
 
   if (btnConfig) {
-    btnConfig.style.display = hasAccess ? "inline-block" : "none";
+    btnConfig.style.display = hasGuildAccess ? "inline-block" : "none";
   }
   if (btnSystem) {
-    btnSystem.style.display = hasAccess ? "inline-block" : "none";
+    btnSystem.style.display = isSystemAdmin ? "inline-block" : "none";
   }
 
   if (cardConfigForbidden && cardConfigForm) {
-    cardConfigForbidden.style.display = hasAccess ? "none" : "block";
-    cardConfigForm.style.display = hasAccess ? "block" : "none";
+    cardConfigForbidden.style.display = hasGuildAccess ? "none" : "block";
+    cardConfigForm.style.display = hasGuildAccess ? "block" : "none";
   }
 
   if (cardConfigStandby) {
-    cardConfigStandby.style.display = hasAccess ? "block" : "none";
+    cardConfigStandby.style.display = isSystemAdmin ? "block" : "none";
   }
-  if (hasAccess) {
+  if (isSystemAdmin) {
     updateStandbyOneliner();
     updateClusterWorkerOneliner();
   }
 
   if (cardSystemForbidden && areaSystemContent) {
-    cardSystemForbidden.style.display = hasAccess ? "none" : "block";
-    areaSystemContent.style.display = hasAccess ? "block" : "none";
+    cardSystemForbidden.style.display = isSystemAdmin ? "none" : "block";
+    areaSystemContent.style.display = isSystemAdmin ? "block" : "none";
+  }
+
+  const ngRegCard = document.getElementById("ng-register-card");
+  const ngSelectAll = document.getElementById("ng-select-all");
+  if (ngRegCard) ngRegCard.style.display = hasGuildAccess ? "block" : "none";
+  if (ngSelectAll) ngSelectAll.style.display = hasGuildAccess ? "inline-block" : "none";
+  if (Array.isArray(currentFilteredNgWords) && document.getElementById("ng-table-body")) {
+    renderNgTable(currentFilteredNgWords);
   }
 
   // 管理者専用コントロール
   const adminBadge = document.getElementById("role-admin-badge");
   const roleSelect = document.getElementById("cfg-admin-role");
-  if (adminBadge) adminBadge.style.display = currentGuildPerms.is_admin ? "inline-block" : "none";
-  if (roleSelect) roleSelect.disabled = !currentGuildPerms.is_admin;
+  if (adminBadge) adminBadge.style.display = (currentGuildPerms.is_admin || isSystemAdmin) ? "inline-block" : "none";
+  if (roleSelect) roleSelect.disabled = !(currentGuildPerms.is_admin || isSystemAdmin);
 
   // 権限がないのにアクセス制限タブを開いている場合はマイ音声タブに遷移
   const activeTabBtn = document.querySelector(".tab-btn.active");
   if (activeTabBtn) {
     const tabName = activeTabBtn.dataset.tab;
-    if ((tabName === "config" || tabName === "system" || tabName === "member-voices" || tabName === "bots" || tabName === "credentials" || tabName === "server" || tabName === "infrastructure") && !hasAccess) {
+    const isInfraTab = (tabName === "system" || tabName === "bots" || tabName === "credentials" || tabName === "infrastructure");
+    const isGuildTab = (tabName === "config" || tabName === "member-voices" || tabName === "server");
+    if ((isInfraTab && !isSystemAdmin) || (isGuildTab && !hasGuildAccess)) {
       const voiceBtn = document.querySelector(".tab-btn[data-tab='voice']");
       if (voiceBtn) voiceBtn.click();
     }
@@ -1113,6 +1124,7 @@ function renderNgTable(words) {
     return;
   }
 
+  const canManageNg = Boolean(currentGuildPerms.has_role || currentGuildPerms.is_admin || (window.APP_USER_DATA && window.APP_USER_DATA.is_admin));
   let allSelected = true;
   words.forEach(word => {
     const isChecked = selectedNgWords.has(word);
@@ -1120,14 +1132,14 @@ function renderNgTable(words) {
     const encodedWord = encodeURIComponent(word);
 
     const tr = document.createElement("tr");
-    if (isChecked) tr.style.background = "rgba(237, 66, 69, 0.08)";
+    if (isChecked && canManageNg) tr.style.background = "rgba(237, 66, 69, 0.08)";
     tr.innerHTML = `
       <td style="text-align:center;">
-        <input type="checkbox" class="ng-word-checkbox" data-word="${encodedWord}" ${isChecked ? "checked" : ""} onchange="onNgWordSelectChange(this)" style="cursor:pointer;">
+        ${canManageNg ? `<input type="checkbox" class="ng-word-checkbox" data-word="${encodedWord}" ${isChecked ? "checked" : ""} onchange="onNgWordSelectChange(this)" style="cursor:pointer;">` : ""}
       </td>
       <td style="font-weight:600;color:#ff4757;">🚫 ${escapeHtml(word)}</td>
       <td style="text-align:right;white-space:nowrap;">
-        <button type="button" class="btn btn-danger btn-sm" onclick="deleteNgWord('${encodedWord}')">削除</button>
+        ${canManageNg ? `<button type="button" class="btn btn-danger btn-sm" onclick="deleteNgWord('${encodedWord}')">削除</button>` : ""}
       </td>
     `;
     tbody.appendChild(tr);

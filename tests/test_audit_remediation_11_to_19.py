@@ -463,7 +463,8 @@ class TestAuditRemediation11To19(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(index_html_path.exists())
         index_html_text = index_html_path.read_text(encoding="utf-8")
         self.assertIn("最新 Agent v{{AGENT_VERSION}} (自律同期対応)", index_html_text)
-        self.assertIn('"agent_version": "{{AGENT_VERSION}}"', index_html_text)
+        self.assertIn("{{SERVER_DATA_JSON}}", index_html_text)
+        self.assertIn("serverData.agent_version", index_html_text)
         self.assertNotIn("最新 Agent v3.13.2", index_html_text)
 
         # 4. JS 側のハードコード廃止検証

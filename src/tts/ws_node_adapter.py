@@ -61,6 +61,7 @@ class WSWorkerNode(TTSNode):
             for k, v in (supported_models or {}).items()
         }
         self.pending_requests: Dict[str, asyncio.Future] = {}
+        self._chunk_buffers: Dict[str, bytearray] = {}
         # 接続時のトークン種別で確定 (個人トークン = ボランティア / 共有トークン + Agent トンネル = クラスタ)
         self.is_volunteer: bool = True
         self.owner_user_id: Optional[int] = None
@@ -99,7 +100,7 @@ class WSWorkerNode(TTSNode):
         """WebSocket 接続中かつ生存しているか"""
         if self.ws.closed:
             return False
-        if not self.enabled:
+        if not self.enabled or self.draining:
             return False
         if not self.is_healthy:
             return False
@@ -108,19 +109,29 @@ class WSWorkerNode(TTSNode):
         # 直近45秒以内にハートビート受信があるか
         if time.time() - self.last_heartbeat > 45.0:
             return False
+        eng_st = self.specs.get("engine_status")
+        if isinstance(eng_st, dict) and self.supported_engines:
+            if not any(eng_st.get(e, True) is not False for e in self.supported_engines):
+                return False
         return True
 
     def update_from_heartbeat(self, msg: HeartbeatMessage):
-        """ハートビート情報からスペック・負荷・死活・保有モデルを更新"""
-        self.last_heartbeat = time.time()
-        self.is_healthy = True
-        self.unhealthy_until = 0.0
+        """ハートビート情報からスペック・負荷・死活・保有モデルを更新 (クールダウン隔離期間を遵守)"""
+        now = time.time()
+        self.last_heartbeat = now
+        if msg.engine_status:
+            self.specs["engine_status"] = msg.engine_status
+        eng_st = self.specs.get("engine_status")
+        any_engine_ok = True
+        if isinstance(eng_st, dict) and self.supported_engines:
+            any_engine_ok = any(eng_st.get(e, True) is not False for e in self.supported_engines)
+        if not self.is_healthy and now >= self.unhealthy_until and any_engine_ok:
+            self.is_healthy = True
+            self.unhealthy_until = 0.0
         self.specs["cpu_percent"] = msg.cpu_percent
         self.specs["memory_percent"] = msg.memory_percent
         self.specs["active_tasks"] = msg.active_tasks
         self.specs["uptime_sec"] = msg.uptime_sec
-        if msg.engine_status:
-            self.specs["engine_status"] = msg.engine_status
         if msg.supported_models:
             self.update_supported_models(msg.supported_models)
 
@@ -141,6 +152,9 @@ class WSWorkerNode(TTSNode):
         """
         eng = engine.lower()
         if eng not in self.supported_engines:
+            return False
+        eng_st = self.specs.get("engine_status")
+        if isinstance(eng_st, dict) and eng_st.get(eng) is False:
             return False
 
         if not model_name:
@@ -183,11 +197,13 @@ class WSWorkerNode(TTSNode):
         pitch: str = "0%",
         speed: float = 1.0,
         timeout_seconds: float = 8.0,
-        chunk_index: int = 0
+        chunk_index: int = 0,
+        record_metrics: bool = False,
     ) -> bytes:
         """
         WebSocket を通じて Worker へ音声合成リクエストを送信し、
         バイナリ音声データを受信して返却する
+        (NodeLease 経由時は NodeLease 側で統計・死活が一元記録されるため record_metrics=False とし二重計上を防ぐ)
         """
         if self.ws.closed:
             raise TTSConnectionError(f"Worker {self.id} WebSocket connection is closed")
@@ -217,38 +233,61 @@ class WSWorkerNode(TTSNode):
         )
 
         t0 = time.time()
-        self.total_requests += 1
+        if record_metrics:
+            self.total_requests += 1
 
-        try:
-            await self.ws.send_json(asdict(req))
-            audio_data = await asyncio.wait_for(fut, timeout=timeout_seconds)
-            latency_ms = (time.time() - t0) * 1000.0
-            self.mark_success(latency_ms)
-            return audio_data
-        except asyncio.TimeoutError:
-            self.mark_failed(cooldown_seconds=20.0, reason=f"WS synthesis timeout ({timeout_seconds}s)")
-            # Worker 側にキャンセル通知を試行 (fire-and-forget)
+        async def _send_cancel() -> None:
             try:
                 if not self.ws.closed:
                     await self.ws.send_json({"type": "synthesize_cancel", "req_id": req_id})
             except Exception:
                 pass
+
+        try:
+            await self.ws.send_json(asdict(req))
+            audio_data = await asyncio.wait_for(fut, timeout=timeout_seconds)
+            latency_ms = (time.time() - t0) * 1000.0
+            if record_metrics:
+                self.mark_success(latency_ms)
+            else:
+                self.last_latency_ms = latency_ms
+            return audio_data
+        except asyncio.CancelledError:
+            await _send_cancel()
+            raise
+        except asyncio.TimeoutError:
+            if record_metrics:
+                self.mark_failed(cooldown_seconds=20.0, reason=f"WS synthesis timeout ({timeout_seconds}s)")
+            await _send_cancel()
             raise TTSConnectionError(f"Worker {self.id} timed out synthesizing text ({timeout_seconds}s)")
         except Exception as e:
-            self.mark_failed(cooldown_seconds=15.0, reason=str(e))
+            if record_metrics:
+                self.mark_failed(cooldown_seconds=15.0, reason=str(e))
             raise
         finally:
             self.pending_requests.pop(req_id, None)
+            self._chunk_buffers.pop(req_id, None)
 
     def on_binary_chunk(self, req_id: str, chunk_index: int, is_final: bool, payload: bytes):
-        """ワーカーからバイナリ音声フレームを受信した際のディスパッチ"""
+        """ワーカーからバイナリ音声フレームを受信した際のディスパッチ (分割フレーム蓄積対応)"""
         fut = self.pending_requests.get(req_id)
-        if fut and not fut.done():
-            # 現状は一括または最終チャンクで完了
+        if not fut or fut.done():
+            self._chunk_buffers.pop(req_id, None)
+            return
+        if not is_final:
+            buf = self._chunk_buffers.setdefault(req_id, bytearray())
+            buf.extend(payload)
+            return
+        buf = self._chunk_buffers.pop(req_id, None)
+        if buf is not None:
+            buf.extend(payload)
+            fut.set_result(bytes(buf))
+        else:
             fut.set_result(payload)
 
     def on_error(self, req_id: str, error_message: str):
         """ワーカーからのエラー通知ディスパッチ"""
+        self._chunk_buffers.pop(req_id, None)
         fut = self.pending_requests.get(req_id)
         if fut and not fut.done():
             fut.set_exception(TTSError(f"Worker {self.id} error: {error_message}"))
@@ -260,6 +299,7 @@ class WSWorkerNode(TTSNode):
             if not fut.done():
                 fut.set_exception(TTSConnectionError("Node closed"))
         self.pending_requests.clear()
+        self._chunk_buffers.clear()
         if not self.ws.closed:
             try:
                 await self.ws.close()

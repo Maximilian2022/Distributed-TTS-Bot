@@ -162,8 +162,10 @@ class TTSBot(commands.Bot):
             # 障害検知・管理者DM通知サービスの初期化
             alert_service.set_bot(self, db=self.db)
 
-            # データベース初期化 (WALモード・マイグレーション)
-            await self.db.init_db()
+            # データベース初期化 (WALモード・マイグレーション: main()で初期化済みの場合は二重実行をスキップ)
+            if not getattr(self.db, "_initialized", False):
+                await self.db.init_db()
+                self.db._initialized = True
             # レイテンシトラッカーへのDB連携 & 過去計測履歴の復元 (Profilerのウォームスタート含む)
             latency_tracker.set_db(self.db)
             saved_latencies = await self.db.get_recent_playback_latencies(limit=200)
@@ -354,6 +356,7 @@ async def main():
     # 1. 共有リソースの生成 & データベース先行初期化
     db = Database(config.db_path)
     await db.init_db()
+    db._initialized = True
 
     # DBに保存された認証情報およびBotトークンを config に動的適用
     try:
@@ -501,9 +504,23 @@ async def main():
         except Exception as e:
             logging.error(f"Error stopping WebServer: {e}")
 
-        # 2. 防災サービスの停止
+        # 2. 防災サービス・リソース監視・ワーカーログ収集の停止
         try:
             disaster_service.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(resource_manager, "stop_idle_monitor"):
+                res_stop = resource_manager.stop_idle_monitor()
+                if asyncio.iscoroutine(res_stop):
+                    await res_stop
+        except Exception:
+            pass
+        try:
+            if hasattr(worker_log_collector, "stop"):
+                wlc_stop = worker_log_collector.stop()
+                if asyncio.iscoroutine(wlc_stop):
+                    await wlc_stop
         except Exception:
             pass
 

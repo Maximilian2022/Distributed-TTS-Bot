@@ -208,13 +208,15 @@ class CoeiroinkRamManager:
             # 2. 全モデルについて hybrid 内のシンボリックリンクを初期化
             for model_dir in self._uuid_to_model_dir.values():
                 link_path = os.path.join(self.hybrid_dir, model_dir)
-                target_rel_path = f"../storage/ssd/{model_dir}"
+                ssd_model_path = os.path.join(self.ssd_dir, model_dir)
+                ram_model_path = os.path.join(self.ram_dir, model_dir)
+                target_rel_path = os.path.relpath(ssd_model_path, self.hybrid_dir)
+                ram_rel_path = os.path.relpath(ram_model_path, self.hybrid_dir)
 
                 # 現在のリンク先が RAM に存在するか確認
-                ram_model_path = os.path.join(self.ram_dir, model_dir)
                 if os.path.islink(link_path):
                     current_target = os.readlink(link_path)
-                    if "../storage/ram/" in current_target and os.path.exists(ram_model_path):
+                    if (current_target == ram_rel_path or "../storage/ram/" in current_target) and os.path.exists(ram_model_path):
                         # 既にRAMに存在し健全な場合は維持
                         continue
 
@@ -291,11 +293,12 @@ class CoeiroinkRamManager:
         async with self._lock:
             ram_path = os.path.join(self.ram_dir, model_dir)
             link_path = os.path.join(self.hybrid_dir, model_dir)
+            ram_rel_path = os.path.relpath(ram_path, self.hybrid_dir)
 
             # 既にRAM上に存在する場合はタイムスタンプ更新のみ
             if os.path.exists(ram_path) and os.path.islink(link_path):
                 cur_link = os.readlink(link_path)
-                if "../storage/ram/" in cur_link:
+                if cur_link == ram_rel_path or "../storage/ram/" in cur_link:
                     self._active_ram_models[model_dir] = now
                     return True
 
@@ -336,7 +339,7 @@ class CoeiroinkRamManager:
                 tmp_link = os.path.join(self.hybrid_dir, f".{model_dir}.tmp_link")
                 if os.path.exists(tmp_link) or os.path.islink(tmp_link):
                     os.unlink(tmp_link)
-                os.symlink(f"../storage/ram/{model_dir}", tmp_link)
+                os.symlink(ram_rel_path, tmp_link)
                 os.replace(tmp_link, link_path)
 
             try:
@@ -355,10 +358,11 @@ class CoeiroinkRamManager:
         """シンボリックリンクをSSDへ同期的に即時切り替え"""
         link_path = os.path.join(self.hybrid_dir, model_dir)
         tmp_link = os.path.join(self.hybrid_dir, f".{model_dir}.tmp_link")
+        ssd_rel_path = os.path.relpath(os.path.join(self.ssd_dir, model_dir), self.hybrid_dir)
         try:
             if os.path.exists(tmp_link) or os.path.islink(tmp_link):
                 os.unlink(tmp_link)
-            os.symlink(f"../storage/ssd/{model_dir}", tmp_link)
+            os.symlink(ssd_rel_path, tmp_link)
             os.replace(tmp_link, link_path)
         except Exception as e:
             logger.warning(f"[CoeiroinkRamManager] SSDリンク差し戻し失敗 ({model_dir}): {e}")
@@ -367,7 +371,7 @@ class CoeiroinkRamManager:
         """
         指定モデルを RAMDisk から解放し SSD 参照へ戻す (二段階遅延解放)
         - force=False の場合、ピン留めモデルは解放を保護
-        - delay_seconds: 進行中の推論fd完了待ちディレイ
+        - delay_seconds: 進行中の推論fd完了待ちディレイ (再取得ロックでTOCTOU競合を保護)
         """
         if not force and model_dir in self._pinned_models:
             logger.debug(f"[CoeiroinkRamManager] ピン留めモデルのため解放スキップ: {model_dir}")
@@ -389,11 +393,17 @@ class CoeiroinkRamManager:
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
 
-        def _cleanup():
-            if os.path.exists(ram_path):
-                shutil.rmtree(ram_path, ignore_errors=True)
+        async with self._lock:
+            # 待機中に別タスクから再昇格されていた場合は削除を中止して実体を保護 (TOCTOU防止)
+            if model_dir in self._active_ram_models:
+                logger.info(f"ℹ️ [CoeiroinkRamManager] 解放待機中に '{model_dir}' が再昇格されたため実体削除をスキップしました。")
+                return False
 
-        await asyncio.to_thread(_cleanup)
+            def _cleanup():
+                if os.path.exists(ram_path):
+                    shutil.rmtree(ram_path, ignore_errors=True)
+
+            await asyncio.to_thread(_cleanup)
         logger.info(f"✨ [CoeiroinkRamManager] モデル解放完了 (RAMDisk空き容量返還): {model_dir}")
         return True
 

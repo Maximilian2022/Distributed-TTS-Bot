@@ -91,7 +91,7 @@ class AppConfig:
     head_dynamic_length: str = "off"       # 先頭本文パーツ長の動的決定
     chunk_singleflight: str = "off"        # 同一パーツのローカル合成の二重発注防止
     max_silence_default_seconds: float = 1.5  # 最大許容沈黙 (遅い・止まったと感じるまで)
-    az_margin_seconds: float = 0.45        # 投機先クラウドの応答マージン (Azure 実測 p95=424ms)
+    az_margin_seconds: float = 0.68        # 投機先クラウドの先行発射マージン (Azure 実測 p99=674ms + Early Hedge / Late Commit)
     head_plan_pessimism: float = 1.5       # 先頭長計画時の合成時間悲観係数
     google_monthly_limit_chars: int = 950000  # 無料枠(100万文字)の95%
     azure_region: str = "japaneast"
@@ -127,6 +127,8 @@ class AppConfig:
     worker_shared_secret_previous: str = ""
     # ホスト / 主系ノードの所有者 Discord ユーザーID (.env 指定で最優先バインド)
     discord_owner_user_id: int = 0
+    # システム最高管理者として許可する Discord ユーザーID一覧 (ADMIN_USER_IDS / DISCORD_OWNER_USER_ID)
+    admin_user_ids: List[int] = field(default_factory=list)
 
     # Voice defaults
     default_speaker: str = "nanami"
@@ -450,6 +452,18 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         cfg.discord_owner_user_id = int(raw_owner_id) if raw_owner_id else 0
     except ValueError:
         cfg.discord_owner_user_id = 0
+
+    parsed_admin_ids: List[int] = []
+    raw_admin_ids = os.getenv("ADMIN_USER_IDS", os.getenv("ADMIN_USER_ID", "")).strip()
+    if raw_admin_ids:
+        for tok_id in re.split(r"[,;\s]+", raw_admin_ids):
+            if tok_id and tok_id.isdigit():
+                uid_val = int(tok_id)
+                if uid_val > 0 and uid_val not in parsed_admin_ids:
+                    parsed_admin_ids.append(uid_val)
+    if cfg.discord_owner_user_id > 0 and cfg.discord_owner_user_id not in parsed_admin_ids:
+        parsed_admin_ids.append(cfg.discord_owner_user_id)
+    cfg.admin_user_ids = parsed_admin_ids
 
     base_url = os.getenv("WEB_BASE_URL", "").strip().rstrip("/")
     if not base_url:

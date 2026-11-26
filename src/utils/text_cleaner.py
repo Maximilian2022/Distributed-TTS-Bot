@@ -178,10 +178,10 @@ def _rebuild_common_reading_matcher_locked() -> None:
         if _RE_KANJI_ONLY.match(kw):
             pat_part = rf'(?<![\u4e00-\u9faf]){esc}(?![\u4e00-\u9faf])'
         elif _RE_ALNUM_ONLY.match(kw):
-            pat_part = rf'(?<![a-zA-Z0-9])(?i:{esc})(?![a-zA-Z0-9])'
+            pat_part = rf'(?<![a-zA-Z0-9_])(?i:{esc})(?![a-zA-Z0-9_])'
         elif _RE_HAS_ASCII_ALNUM.search(kw):
-            prefix = r'(?<![a-zA-Z0-9])' if _RE_HAS_ASCII_ALNUM.match(kw[0]) else ''
-            suffix = r'(?![a-zA-Z0-9])' if _RE_HAS_ASCII_ALNUM.match(kw[-1]) else ''
+            prefix = r'(?<![a-zA-Z0-9_])' if _RE_HAS_ASCII_ALNUM.match(kw[0]) else ''
+            suffix = r'(?![a-zA-Z0-9_])' if _RE_HAS_ASCII_ALNUM.match(kw[-1]) else ''
             body = f'(?i:{esc})' if _RE_ASCII_ALPHA.search(kw) else esc
             pat_part = f'{prefix}{body}{suffix}'
         else:
@@ -255,12 +255,60 @@ _RE_SPLIT_COMMA = re.compile(r'(、+)')
 _RE_STRIP_PUNCT_SPACES = re.compile(r'[、。！？\s]')
 _RE_KANJI_ONLY = re.compile(r'^[\u4e00-\u9faf]+$')
 _RE_ALNUM_ONLY = re.compile(r'^[a-zA-Z0-9]+$')
-_RE_HAS_READABLE = re.compile(r'[a-zA-Z0-9\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf]')
+_RE_HAS_READABLE = re.compile(r'[a-zA-Z0-9ａ-ｚＡ-Ｚ０-９\u3041-\u3096\u309d-\u309f\u30a1-\u30fa\u30fd-\u30ff\u4e00-\u9faf\u3400-\u4dbf々]')
 _RE_CONTAINS_KANJI = re.compile(r'[\u4e00-\u9faf\u3400-\u4dbf々ヶ]')
 _RE_HAS_DIGITS = re.compile(r'[0-9０-９]')
 _RE_KANJI_NUM_ONLY = re.compile(r'^[一二三四五六七八九十百千万億兆〇]+$')
 _RE_VALID_KATAKANA_READING = re.compile(r'^[\u30a1-\u30f6ー]+$')
-_RE_GDICT_PLACEHOLDER = re.compile(r'\x00GDICT_(\d+)\x00')
+_RE_GDICT_PLACEHOLDER = re.compile(r'[\ue000-\uefff]|\x00GDICT_(\d+)\x00')
+_GUILD_DICT_CACHE_LOCK = threading.Lock()
+_GUILD_DICT_MATCHER_CACHE: "OrderedDict[Tuple[Tuple[str, str], ...], Tuple[Optional[re.Pattern], Dict[str, str], Dict[str, str]]]" = OrderedDict()
+_GUILD_DICT_CACHE_MAX = 128
+
+
+def _get_compiled_guild_dict_matcher(
+    dictionary_entries: List[Tuple[str, str]]
+) -> Tuple[Optional[re.Pattern], Dict[str, str], Dict[str, str]]:
+    """サーバー個別辞書エントリ列から最長一致・境界ガード付き単一正規表現をLRUキャッシュ取得する"""
+    norm_key = tuple((w.strip(), r) for w, r in dictionary_entries if w and w.strip())
+    if not norm_key:
+        return None, {}, {}
+    with _GUILD_DICT_CACHE_LOCK:
+        cached = _GUILD_DICT_MATCHER_CACHE.get(norm_key)
+        if cached is not None:
+            _GUILD_DICT_MATCHER_CACHE.move_to_end(norm_key)
+            return cached
+
+    sorted_entries = sorted(norm_key, key=lambda x: len(x[0]), reverse=True)
+    parts: List[str] = []
+    exact_map: Dict[str, str] = {}
+    lower_map: Dict[str, str] = {}
+    seen_words = set()
+
+    for w, reading in sorted_entries:
+        is_alnum = bool(_RE_ALNUM_ONLY.match(w))
+        dedup_k = ("ci", w.lower()) if is_alnum else ("cs", w)
+        if dedup_k in seen_words:
+            continue
+        seen_words.add(dedup_k)
+
+        esc = re.escape(w)
+        if _RE_KANJI_ONLY.match(w):
+            exact_map.setdefault(w, reading)
+            parts.append(rf'(?<![\u4e00-\u9faf]){esc}(?![\u4e00-\u9faf])')
+        elif is_alnum:
+            lower_map.setdefault(w.lower(), reading)
+            parts.append(rf'(?<![a-zA-Z0-9_])(?i:{esc})(?![a-zA-Z0-9_])')
+        else:
+            exact_map.setdefault(w, reading)
+            parts.append(esc)
+
+    compiled = (re.compile("|".join(parts)) if parts else None, exact_map, lower_map)
+    with _GUILD_DICT_CACHE_LOCK:
+        _GUILD_DICT_MATCHER_CACHE[norm_key] = compiled
+        while len(_GUILD_DICT_MATCHER_CACHE) > _GUILD_DICT_CACHE_MAX:
+            _GUILD_DICT_MATCHER_CACHE.popitem(last=False)
+    return compiled
 
 
 def _build_kata_to_hira_trans() -> Dict[int, str]:
@@ -426,7 +474,8 @@ def warmup_morphological_tokenizers():
 
 _SPLIT_DIAG_THRESHOLD_MS = 500.0
 _SPLIT_TIMEOUT_S = 0.3
-_SPLIT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="text-split")
+_SPLIT_EXECUTOR = ThreadPoolExecutor(max_workers=min(8, max(4, os.cpu_count() or 4)), thread_name_prefix="text-split")
+_SPLIT_FALLBACK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="text-split-fb")
 
 @dataclass
 class TextChunk:
@@ -568,10 +617,16 @@ class TextCleaner:
         text = self._newline_pattern.sub("。 ", text)
         text = self._space_pattern.sub(" ", text).strip()
 
-        # 8. 文字数制限 (超過部分は切り捨てて「以下略」を付与)
+        # 8. 文字数制限 (超過部分は切り捨てて「以下略」を付与。NGワードBEEPタグの途中切断を防止)
         limit = max_length if max_length is not None else self.max_length
         if len(text) > limit:
-            text = text[:limit] + " 以下略"
+            cut_pos = limit
+            for m in _RE_BEEP_TAG.finditer(text):
+                if m.start() < cut_pos < m.end():
+                    cut_pos = m.end()
+                    break
+            if len(text) > cut_pos:
+                text = text[:cut_pos].rstrip() + " 以下略"
 
         return text
 
@@ -655,41 +710,22 @@ class TextCleaner:
         protected_replacements: List[str] = []
 
         if dictionary_entries:
-            # 単語長の降順でソート（最長一致）
-            sorted_entries = sorted(dictionary_entries, key=lambda x: len(x[0]), reverse=True)
+            guild_regex, guild_exact, guild_lower = _get_compiled_guild_dict_matcher(dictionary_entries)
+            if guild_regex is not None and text:
+                def _replace_guild_match(m: re.Match) -> str:
+                    matched = m.group(0)
+                    reading_val = guild_exact.get(matched)
+                    if reading_val is None:
+                        reading_val = guild_lower.get(matched.lower(), matched)
+                    if _COMMON_READING_REGEX is None:
+                        return reading_val
+                    idx = len(protected_replacements)
+                    protected_replacements.append(reading_val)
+                    if idx < 0x1000:
+                        return chr(0xE000 + idx)
+                    return f"\x00GDICT_{idx}\x00"
 
-            def _protect_guild_reading(reading_val: str) -> str:
-                if _COMMON_READING_REGEX is None:
-                    return reading_val
-                idx = len(protected_replacements)
-                protected_replacements.append(reading_val)
-                return f"\x00GDICT_{idx}\x00"
-
-            for word, reading in sorted_entries:
-                w = word.strip()
-                if not w or w not in text:
-                    continue
-
-                token_val = _protect_guild_reading(reading)
-                # 1. 漢字のみで構成された単語（例: 「表」）: 前後に漢字がない場合のみ置換
-                if _RE_KANJI_ONLY.match(w):
-                    cache_key = ("kanji", w)
-                    pat = _DICT_REGEX_CACHE.get(cache_key)
-                    if pat is None:
-                        pat = re.compile(rf'(?<![\u4e00-\u9faf]){re.escape(w)}(?![\u4e00-\u9faf])')
-                        _DICT_REGEX_CACHE[cache_key] = pat
-                    text = pat.sub(lambda _m, tv=token_val: tv, text)
-                # 2. 英数字のみで構成された単語（例: 「in」）: 前後に英数字がない場合のみ置換
-                elif _RE_ALNUM_ONLY.match(w):
-                    cache_key = ("alnum", w.lower())
-                    pat = _DICT_REGEX_CACHE.get(cache_key)
-                    if pat is None:
-                        pat = re.compile(rf'(?<![a-zA-Z0-9]){re.escape(w)}(?![a-zA-Z0-9])', re.IGNORECASE)
-                        _DICT_REGEX_CACHE[cache_key] = pat
-                    text = pat.sub(lambda _m, tv=token_val: tv, text)
-                # 3. ひらがな・カタカナ・記号・混在語
-                else:
-                    text = text.replace(w, token_val)
+                text = guild_regex.sub(_replace_guild_match, text)
 
         # 全サーバー共通日本語/ゲーム用語辞書 (単一パス複合正規表現 + O(1) ルックアップ)
         with _COMMON_READING_LOCK:
@@ -703,10 +739,15 @@ class TextCleaner:
             )
 
         if protected_replacements:
-            text = _RE_GDICT_PLACEHOLDER.sub(
-                lambda m: protected_replacements[int(m.group(1))],
-                text
-            )
+            def _restore_placeholder(m: re.Match) -> str:
+                tok = m.group(0)
+                if len(tok) == 1:
+                    idx = ord(tok) - 0xE000
+                else:
+                    idx = int(m.group(1))
+                return protected_replacements[idx] if 0 <= idx < len(protected_replacements) else tok
+
+            text = _RE_GDICT_PLACEHOLDER.sub(_restore_placeholder, text)
 
         return text
 
@@ -1800,11 +1841,11 @@ class TextCleaner:
                 is_first_plain_segment=True
             ))
 
-        # 分割結果が空なら全文を1パーツとして扱う
+        # 分割結果が空なら全文を1パーツとして扱う (ただし発音可能文字を1文字も含まない記号列は除外)
         if not chunks and text.strip():
             if '<<__BEEP' in text or '<<ピー音' in text:
                 chunks.append(TextChunk(text="", pause_after_ms=0, is_beep=True))
-            else:
+            elif _RE_HAS_READABLE.search(text):
                 chunks.append(TextChunk(text=text.strip(), pause_after_ms=0))
 
         if head_chunk_chars:
@@ -1849,11 +1890,13 @@ class TextCleaner:
         except asyncio.TimeoutError:
             fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
             logger.warning(f"⏱️ [TextCleaner] 文分割が {timeout_s * 1000:.0f}ms を超過したため、正規表現のみの簡易分割へ退避します。")
-            token = _skip_morph.set(True)
-            try:
-                return TextCleaner.split_into_chunks(*args, **kwargs)
-            finally:
-                _skip_morph.reset(token)
+            def _fallback_regex_only() -> List['TextChunk']:
+                token = _skip_morph.set(True)
+                try:
+                    return TextCleaner.split_into_chunks(*args, **kwargs)
+                finally:
+                    _skip_morph.reset(token)
+            return await loop.run_in_executor(_SPLIT_FALLBACK_EXECUTOR, _fallback_regex_only)
 
     @staticmethod
     def apply_head_chunk_limit(chunks: List['TextChunk'], head_chars: int) -> List['TextChunk']:
@@ -2083,9 +2126,14 @@ class TextCleaner:
             chunks.append(TextChunk(text=sentence, pause_after_ms=pause_ms, is_followed_by_beep=is_followed))
 
         # 9. 記号のみチャンクの安全統合 (Azure/Edge-TTSの44byte空音声・発音不能エラー完全防止)
+        # 先頭チャンクが記号のみの場合は次チャンク先頭へ前方吸着し、全文が記号のみなら空リストを返却する
         cleaned_chunks: List[TextChunk] = []
+        pending_symbol_prefix = ""
         for c in chunks:
             if _RE_HAS_READABLE.search(c.text):
+                if pending_symbol_prefix:
+                    c.text = pending_symbol_prefix + c.text
+                    pending_symbol_prefix = ""
                 cleaned_chunks.append(c)
             else:
                 if cleaned_chunks:
@@ -2093,7 +2141,7 @@ class TextCleaner:
                     cleaned_chunks[-1].pause_after_ms = max(cleaned_chunks[-1].pause_after_ms, c.pause_after_ms)
                     cleaned_chunks[-1].is_followed_by_beep = c.is_followed_by_beep
                 else:
-                    cleaned_chunks.append(c)
+                    pending_symbol_prefix += c.text
 
         return cleaned_chunks
 
@@ -2102,23 +2150,21 @@ class TextCleaner:
         """
         キャッシュキー（SHA-256）計算専用のテキスト正規化。
         音声合成時の感情表現や語尾ゆれ（！、ー、〜、w）を吸収し、キャッシュHIT率を最大化する。
-        ※ イントネーションに影響する疑問符「？」は保持する。
+        ※ イントネーションに影響する疑問符「？」および発音モーラ数が異なる語（「おつ」≠「お疲れ」等）は同一視しない。
         """
         if not text:
             return ""
         t = text.strip()
 
-        # 1. 頻出挨拶・相槌のかな/漢字表記ゆれの統一
+        # 1. 同音のかな/漢字表記ゆれのみ統一 (異音・異モーラ語は含めない)
         greeting_map = {
             "おつかれさまでした": "お疲れ様でした",
             "おつかれさまです": "お疲れ様です",
             "おつかれさま": "お疲れ様",
             "おつかれ": "お疲れ",
-            "おつ": "お疲れ",
             "ありがとうございました": "有難うございました",
             "ありがとうございます": "有難うございます",
             "よろしくおねがいします": "よろしくお願いします",
-            "よろしくです": "よろしく",
             "りょうかいです": "了解です",
             "りょうかい": "了解",
         }

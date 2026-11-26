@@ -56,7 +56,20 @@ class AzureTTSClient(BaseTTSClient):
         self._cooldown_until = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
+        try:
+            curr_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            curr_loop = None
+        if (
+            self._session is None
+            or self._session.closed
+            or (curr_loop is not None and getattr(self._session, "_loop", None) is not curr_loop)
+        ):
+            if self._session and not self._session.closed:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
@@ -66,7 +79,7 @@ class AzureTTSClient(BaseTTSClient):
             await self._session.close()
 
     def _build_ssml(self, text: str, voice_name: str, pitch: str, speed: float) -> str:
-        # XMLエスケープ
+        # XMLエスケープ (本文および属性値すべてを安全にクォート)
         escaped_text = saxutils.escape(text)
 
         # 速度の表現 (+0%, +20%, -10% など)
@@ -76,14 +89,18 @@ class AzureTTSClient(BaseTTSClient):
             rate_percent = "0%"
 
         # ピッチの表現 (例: +0%, +10%, -5%)
-        pitch_str = pitch if pitch else "0%"
+        pitch_str = str(pitch) if pitch else "0%"
         if not (pitch_str.endswith("%") or pitch_str.endswith("Hz") or pitch_str.endswith("st")):
             pitch_str = f"{pitch_str}%"
 
+        q_voice = saxutils.quoteattr(str(voice_name or "ja-JP-NanamiNeural"))
+        q_rate = saxutils.quoteattr(rate_percent)
+        q_pitch = saxutils.quoteattr(pitch_str)
+
         ssml = (
             f"<speak version='1.0' xml:lang='ja-JP'>"
-            f"<voice xml:lang='ja-JP' name='{voice_name}'>"
-            f"<prosody rate='{rate_percent}' pitch='{pitch_str}'>"
+            f"<voice xml:lang='ja-JP' name={q_voice}>"
+            f"<prosody rate={q_rate} pitch={q_pitch}>"
             f"{escaped_text}"
             f"</prosody>"
             f"</voice>"
@@ -117,7 +134,7 @@ class AzureTTSClient(BaseTTSClient):
                 if resp.status == 200:
                     data = await resp.read()
                     if len(data) <= 44 or not data.startswith(b"RIFF"):
-                        self._record_failure()
+                        # 記号のみテキスト等の入力起因空音声ではAPI全体のサーキットブレーカーを開かない
                         raise TTSError(f"Azure Speech returned invalid or empty audio ({len(data)} bytes)")
                     self._record_success()
                     return data
@@ -131,6 +148,10 @@ class AzureTTSClient(BaseTTSClient):
                     self._record_failure(status_code=resp.status)
                     logger.error(f"Azure Speech Authentication Error ({resp.status}): {error_msg}")
                     raise TTSConnectionError(f"Azure Auth Error ({resp.status}): {error_msg}")
+                elif resp.status == 400:
+                    error_msg = await resp.text()
+                    logger.warning(f"Azure Speech parameter/input error (400): {error_msg}")
+                    raise TTSError(f"Azure TTS HTTP 400: {error_msg}")
                 else:
                     error_msg = await resp.text()
                     self._record_failure(status_code=resp.status)

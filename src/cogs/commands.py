@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import logging
 from typing import Optional, List, Tuple, Any, Dict
@@ -56,25 +57,22 @@ def generate_magic_login_url(
     if not web_server and hasattr(bot, "bot_pool"):
         web_server = getattr(bot.bot_pool, "web_server", None)
 
+    cfg = getattr(bot, "app_config", None) or getattr(bot, "config", None)
     auth = getattr(web_server, "auth", None)
     if not auth:
         from src.web.auth import DiscordAuth
-        session_secret = getattr(bot.config, "web_session_secret", "") or "default_secret"
+        session_secret = getattr(cfg, "web_session_secret", "") or "default_secret"
         auth = DiscordAuth(
-            client_id=getattr(bot.config, "discord_client_id", ""),
-            client_secret=getattr(bot.config, "discord_client_secret", ""),
-            redirect_uri=getattr(bot.config, "discord_redirect_uri", ""),
+            client_id=getattr(cfg, "discord_client_id", ""),
+            client_secret=getattr(cfg, "discord_client_secret", ""),
+            redirect_uri=getattr(cfg, "discord_redirect_uri", ""),
             session_secret=session_secret
         )
 
-    # 管理者判定 (サーバーオーナー / サーバー管理者 / .env 指定管理者)
+    # システム最高管理者判定 (DISCORD_OWNER_USER_ID / ADMIN_USER_IDS のみ。ギルド管理者は各ギルドAPIで評価)
     is_admin = False
-    if guild:
-        m = guild.get_member(user.id)
-        if m and (m.guild_permissions.administrator or guild.owner_id == user.id):
-            is_admin = True
-    admin_ids = getattr(bot.config, "admin_user_ids", []) or []
-    env_owner_id = int(getattr(bot.config, "discord_owner_user_id", 0) or 0)
+    admin_ids = getattr(cfg, "admin_user_ids", []) or []
+    env_owner_id = int(getattr(cfg, "discord_owner_user_id", 0) or 0)
     if user.id in admin_ids or (env_owner_id > 0 and user.id == env_owner_id):
         is_admin = True
 
@@ -87,7 +85,7 @@ def generate_magic_login_url(
         expires_in=600
     )
 
-    base_url = (getattr(bot.config, "web_dashboard_url", "") or "http://localhost:8088").rstrip("/")
+    base_url = (getattr(cfg, "web_dashboard_url", "") or "http://localhost:8088").rstrip("/")
     magic_url = f"{base_url}/magic?token={token}"
     return magic_url, base_url
 
@@ -481,8 +479,11 @@ class CommandsCog(commands.Cog):
         vc = target_guild.voice_client if target_guild else None
         state = target_vc_cog.get_guild_state(interaction.guild_id) if target_vc_cog else None
 
-        if vc and vc.is_playing():
-            vc.stop()
+        if (vc and vc.is_playing()) or (state and state.is_playing):
+            if state and hasattr(state, "abort_current_event"):
+                state.abort_current_event.set()
+            if vc and vc.is_playing():
+                vc.stop()
             await interaction.response.send_message("⏭️ 現在の音声をスキップしました。")
         elif state and not state.queue.empty():
             try:
@@ -683,6 +684,27 @@ class CommandsCog(commands.Cog):
         )
         await ctx.reply(f"🔊 読み上げ音量を **{percent}%** に設定しました！")
 
+    async def _require_guild_manage_perm(self, interaction: discord.Interaction) -> bool:
+        """サーバー管理者・オーナー・指定管理ロール・システム最高管理者のいずれかであるか検証"""
+        if not interaction.guild_id or not interaction.guild:
+            await interaction.response.send_message("❌ このコマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+            return False
+        uid = interaction.user.id
+        admin_ids = getattr(self.config, "admin_user_ids", []) or []
+        env_owner_id = int(getattr(self.config, "discord_owner_user_id", 0) or 0)
+        if uid in admin_ids or (env_owner_id > 0 and uid == env_owner_id) or interaction.guild.owner_id == uid:
+            return True
+        member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(uid)
+        if member:
+            if member.guild_permissions.administrator:
+                return True
+            g_settings = await self.db.get_guild_settings(interaction.guild_id, self.config)
+            admin_role_id = int(g_settings.get("admin_role_id", 0) or 0)
+            if admin_role_id > 0 and any(r.id == admin_role_id for r in member.roles):
+                return True
+        await interaction.response.send_message("❌ この操作にはサーバー管理者権限または管理ロールが必要です。", ephemeral=True)
+        return False
+
     # --- 単語辞書コマンド (/dict) ---
 
     dict_group = app_commands.Group(name="dict", description="単語辞書の登録・削除・一覧表示を行います。")
@@ -690,8 +712,7 @@ class CommandsCog(commands.Cog):
     @dict_group.command(name="add", description="単語とその読み方をサーバー辞書に登録します。")
     @app_commands.describe(word="登録する単語", reading="読み方 (ひらがな・カタカナ等)")
     async def dict_add(self, interaction: discord.Interaction, word: str, reading: str):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ 辞書コマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
 
         w = word.strip()
@@ -721,8 +742,7 @@ class CommandsCog(commands.Cog):
     @dict_group.command(name="delete", description="単語をサーバー辞書から削除します。")
     @app_commands.describe(word="削除する単語")
     async def dict_delete(self, interaction: discord.Interaction, word: str):
-        if not interaction.guild_id:
-            await interaction.response.send_message("❌ 辞書コマンドはDiscordサーバー内で実行してください。", ephemeral=True)
+        if not await self._require_guild_manage_perm(interaction):
             return
 
         w = word.strip()
@@ -796,6 +816,8 @@ class CommandsCog(commands.Cog):
     @ng_group.command(name="add", description="NGワードをサーバーに登録します。発言時にピー音に置き換えられます。")
     @app_commands.describe(word="登録するNGワード")
     async def ng_add(self, interaction: discord.Interaction, word: str):
+        if not await self._require_guild_manage_perm(interaction):
+            return
         w = word.strip()
         if not w:
             await interaction.response.send_message("❌ NGワードを正しく入力してください。", ephemeral=True)
@@ -823,6 +845,8 @@ class CommandsCog(commands.Cog):
     @ng_group.command(name="delete", description="NGワードをサーバーから削除します。")
     @app_commands.describe(word="削除するNGワード")
     async def ng_delete(self, interaction: discord.Interaction, word: str):
+        if not await self._require_guild_manage_perm(interaction):
+            return
         w = word.strip()
         if not w:
             await interaction.response.send_message("❌ 削除するNGワードを指定してください。", ephemeral=True)
@@ -883,6 +907,8 @@ class CommandsCog(commands.Cog):
 
     @ng_group.command(name="preset", description="一般的な標準NGワードプリセット（差別用語・露骨な性的語句等）を一括登録します。")
     async def ng_preset(self, interaction: discord.Interaction):
+        if not await self._require_guild_manage_perm(interaction):
+            return
         dashboard_url = getattr(self.config, "web_dashboard_url", "http://localhost:8088") or "http://localhost:8088"
         count = await self.db.import_default_ng_words(interaction.guild_id)
         embed = discord.Embed(

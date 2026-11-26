@@ -134,10 +134,15 @@ class IntelligentPrewarmService:
                         if not self._running or self._speculative_running or self._busy or (time.time() - self._last_user_speech_time) < self.idle_threshold_seconds:
                             break
 
-                        # キャッシュ有無を高速確認
+                        # キャッシュ有無を高速確認 (TTSManager保存時と同じ resolve_cache_text を通してキー一致させる)
                         voice_cfg = getattr(self.tts, "_get_voice_config", lambda s: None)(spk)
                         provider = voice_cfg.provider if voice_cfg else "edge"
-                        cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
+                        eff_phrase = (
+                            self.tts.resolve_cache_text(phrase, provider)
+                            if hasattr(self.tts, "resolve_cache_text")
+                            else phrase
+                        )
+                        cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, eff_phrase, user_id=0)
 
                         cached = await self.cache.get(cache_key, provider=provider)
                         if cached is not None:
@@ -232,8 +237,13 @@ class IntelligentPrewarmService:
             for prov in sorted_providers:
                 prov_speakers = speakers_by_provider[prov]
                 for phrase in target_phrases:
+                    eff_phrase = (
+                        self.tts.resolve_cache_text(phrase, prov)
+                        if hasattr(self.tts, "resolve_cache_text")
+                        else phrase
+                    )
                     for spk in prov_speakers:
-                        cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
+                        cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, eff_phrase, user_id=0)
                         cached = await self.cache.get(cache_key, provider=prov)
                         if cached is not None:
                             skipped_count += 1
@@ -294,7 +304,12 @@ class IntelligentPrewarmService:
                         await asyncio.sleep(2.0)
 
                     # 実行直前の再確認（並行リクエスト等で既に生成された場合）
-                    cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, phrase, user_id=0)
+                    eff_phrase = (
+                        self.tts.resolve_cache_text(phrase, prov)
+                        if hasattr(self.tts, "resolve_cache_text")
+                        else phrase
+                    )
+                    cache_key = CacheManager.generate_cache_key(spk, "0", 1.0, eff_phrase, user_id=0)
                     cached = await self.cache.get(cache_key, provider=prov)
                     if cached is not None:
                         skipped_count += 1

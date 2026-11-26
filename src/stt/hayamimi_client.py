@@ -349,6 +349,16 @@ class HayamimiSession:
         delimiter = "&" if "?" in self.gateway_url else "?"
         return f"{self.gateway_url}{delimiter}{query_str}"
 
+    def build_headers(self) -> Dict[str, str]:
+        """秘密情報を安全に送信するためのHTTPヘッダーを生成"""
+        headers: Dict[str, str] = {}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+            headers["X-Hayamimi-Token"] = self.token
+        if self.gemini_key:
+            headers["X-Gemini-Key"] = self.gemini_key
+        return headers
+
     async def start(self) -> bool:
         """WebSocket 接続を開始し、ready 受信後に送受信タスクを立ち上げる"""
         if self._closed:
@@ -362,10 +372,14 @@ class HayamimiSession:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=None, connect=5.0)
             )
-            self._ws = await self._session.ws_connect(target_url, heartbeat=15.0)
+            self._ws = await self._session.ws_connect(
+                target_url,
+                headers=self.build_headers(),
+                heartbeat=15.0,
+            )
 
-            # サーバーからの ready メッセージを待機 (初期化完了を確実に保証)
-            ready_msg = await self._ws.receive()
+            # サーバーからの ready メッセージを待機 (ハング防止のため5秒タイムアウト付き)
+            ready_msg = await asyncio.wait_for(self._ws.receive(), timeout=5.0)
             if ready_msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(ready_msg.data)
@@ -374,6 +388,8 @@ class HayamimiSession:
                         logger.info(f"✨ [Hayamimi] Session ready: {self.session_id} (user: {self.user_name})")
                 except Exception:
                     pass
+            elif ready_msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise ConnectionError(f"WebSocket closed before ready (type={ready_msg.type})")
 
             self.is_connected = True
 
@@ -382,7 +398,9 @@ class HayamimiSession:
             logger.info(f"🎙️ [Hayamimi] Connected session for user {self.user_name} ({self.user_id})")
             return True
         except Exception as e:
-            logger.error(f"❌ [Hayamimi] Failed to connect for user {self.user_id}: {e}")
+            # ログへのクエリ秘密値露出を防ぐため例外文字列からクエリ以降をマスク
+            safe_err = re.sub(r'(\?|&)(gemini_key|token)=[^&\s\'"]+', r'\1\2=***', str(e))
+            logger.error(f"❌ [Hayamimi] Failed to connect for user {self.user_id} ({self.gateway_url}): {safe_err}")
             await self.close()
             return False
 
@@ -494,16 +512,30 @@ class HayamimiSession:
                 await self.close()
 
     async def close(self) -> None:
-        """セッションの正常終了"""
+        """セッションの正常終了 (自己タスクキャンセルによる ClientSession リークを完全防止)"""
         self._closed = True
         self.is_connected = False
-        if self._send_task and not self._send_task.done():
+        try:
+            curr_task = asyncio.current_task()
+        except RuntimeError:
+            curr_task = None
+
+        if self._send_task and not self._send_task.done() and self._send_task is not curr_task:
             self._send_task.cancel()
-        if self._recv_task and not self._recv_task.done():
+        if self._recv_task and not self._recv_task.done() and self._recv_task is not curr_task:
             self._recv_task.cancel()
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        if self._session and not self._session.closed:
-            await self._session.close()
+
+        try:
+            if self._ws and not self._ws.closed:
+                await self._ws.close()
+        except BaseException:
+            pass
+        finally:
+            if self._session and not self._session.closed:
+                try:
+                    await self._session.close()
+                except BaseException:
+                    pass
+            self._session = None
         logger.debug(f"🛑 [Hayamimi] Session closed for user {self.user_id}")
 

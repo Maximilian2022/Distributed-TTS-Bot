@@ -377,24 +377,39 @@ class MyCoeiroinkManager:
                 break
         self._save_cache_data()
 
-    def safe_extract_zip(self, zip_data: bytes, speaker_uuid_hint: Optional[str] = None) -> Dict[str, Any]:
+    def safe_extract_zip(self, zip_source: Any, speaker_uuid_hint: Optional[str] = None) -> Dict[str, Any]:
         """
-        ZIPバイナリを厳格にセキュリティ検証して展開・配置する。
+        ZIPバイナリまたはファイルパスを厳格にセキュリティ検証してストリーミング展開・配置する。
         - Zip Slip 対策 (パストラバーサル防止)
         - 危険拡張子の遮断 (.exe, .sh, .py, .dll 等)
-        - サイズ上限チェック (最大 2GB / 展開後最大 5GB)
+        - サイズ上限チェック (最大 2GB / 展開後最大 1.5GB)
         - metas.json の構造検証
+        - OOM防止のためファイルは1MBチャンクでストリーミング展開
         """
-        if len(zip_data) > MAX_UPLOAD_SIZE:
-            raise ValueError(f"ZIPファイルサイズが上限 (2GB) を超えています: {len(zip_data) / 1024 / 1024:.1f}MB")
+        import shutil
 
-        if not zip_data.startswith(b"PK\x03\x04"):
-            raise ValueError("有効なZIPアーカイブではありません（シグネチャ不一致）。")
+        if isinstance(zip_source, (str, Path)):
+            zip_path = Path(zip_source)
+            fsize = zip_path.stat().st_size
+            if fsize > MAX_UPLOAD_SIZE:
+                raise ValueError(f"ZIPファイルサイズが上限 (2GB) を超えています: {fsize / 1024 / 1024:.1f}MB")
+            with open(zip_path, "rb") as sig_f:
+                sig = sig_f.read(4)
+            if sig != b"PK\x03\x04":
+                raise ValueError("有効なZIPアーカイブではありません（シグネチャ不一致）。")
+            zf_ctx = zipfile.ZipFile(zip_path, "r")
+        else:
+            zip_data = bytes(zip_source)
+            if len(zip_data) > MAX_UPLOAD_SIZE:
+                raise ValueError(f"ZIPファイルサイズが上限 (2GB) を超えています: {len(zip_data) / 1024 / 1024:.1f}MB")
+            if not zip_data.startswith(b"PK\x03\x04"):
+                raise ValueError("有効なZIPアーカイブではありません（シグネチャ不一致）。")
+            zf_ctx = zipfile.ZipFile(io.BytesIO(zip_data), "r")
 
         self.model_dir.mkdir(parents=True, exist_ok=True)
         resolved_base = self.model_dir.resolve()
 
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+        with zf_ctx as z:
             infolist = z.infolist()
             total_uncompressed = sum(info.file_size for info in infolist)
             if total_uncompressed > MAX_EXTRACT_SIZE:
@@ -409,9 +424,10 @@ class MyCoeiroinkManager:
                 if info.file_size > MAX_SINGLE_FILE_SIZE:
                     raise ValueError(f"単一ファイルサイズが異常に巨大です ({info.filename}): {info.file_size / 1024 / 1024:.1f}MB")
 
-                # パストラバーサルチェック
-                p = Path(info.filename)
-                if p.is_absolute() or ".." in p.parts:
+                # パストラバーサルチェック (Windowsバックスラッシュも正規化)
+                norm_entry = info.filename.replace("\\", "/")
+                p = Path(norm_entry)
+                if p.is_absolute() or norm_entry.startswith("/") or ".." in p.parts:
                     raise ValueError(f"パストラバーサルの恐れがあるファイル名です: {info.filename}")
 
                 # 危険拡張子チェック
@@ -431,13 +447,15 @@ class MyCoeiroinkManager:
 
             # 2. metas.json のパースとUUID検証
             try:
+                if metas_member.file_size > 2 * 1024 * 1024:
+                    raise ValueError("metas.json のサイズが異常です。")
                 meta_content = z.read(metas_member.filename).decode("utf-8")
                 meta_json = json.loads(meta_content)
                 meta_uuid = str(meta_json.get("speakerUuid", "")).strip()
                 speaker_name = str(meta_json.get("speakerName", "不明")).strip()
                 styles = meta_json.get("styles", [])
-                if not meta_uuid:
-                    raise ValueError("metas.json 内に speakerUuid が存在しません。")
+                if not meta_uuid or not re.fullmatch(r"[A-Za-z0-9_\-]+", meta_uuid):
+                    raise ValueError("metas.json 内に有効な speakerUuid が存在しません。")
             except Exception as e:
                 raise ValueError(f"metas.json の解析に失敗しました: {e}")
 
@@ -451,18 +469,18 @@ class MyCoeiroinkManager:
             target_speaker_dir.mkdir(parents=True, exist_ok=True)
             target_speaker_resolved = target_speaker_dir.resolve()
 
-            # 4. 各ファイルの安全な展開
+            # 4. 各ファイルの安全なストリーミング展開 (メモリスパイク防止)
             extracted_files_count = 0
             for info in infolist:
-                rel_filename = info.filename
+                rel_filename = info.filename.replace("\\", "/")
                 # metas.json が入っていたサブフォルダ階層をストリップ
                 if metas_prefix:
-                    if rel_filename.startswith(metas_prefix + "/") or rel_filename.startswith(metas_prefix + "\\"):
-                        rel_filename = rel_filename[len(metas_prefix) + 1:]
-                    elif rel_filename == metas_prefix:
+                    norm_prefix = metas_prefix.replace("\\", "/")
+                    if rel_filename.startswith(norm_prefix + "/"):
+                        rel_filename = rel_filename[len(norm_prefix) + 1:]
+                    elif rel_filename == norm_prefix:
                         continue
                     else:
-                        # 共通ルート外の不要ファイルはスキップ
                         continue
 
                 if not rel_filename or rel_filename.endswith("/"):
@@ -474,8 +492,8 @@ class MyCoeiroinkManager:
                     raise ValueError(f"展開先がモデルディレクトリ外です: {dest_path}")
 
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(dest_path, "wb") as f_out:
-                    f_out.write(z.read(info.filename))
+                with z.open(info, "r") as z_in, open(dest_path, "wb") as f_out:
+                    shutil.copyfileobj(z_in, f_out, length=1024 * 1024)
                 extracted_files_count += 1
 
             self.mark_auto_install_success(target_uuid)
@@ -526,7 +544,28 @@ class MyCoeiroinkManager:
             }
 
         parsed_url = urllib.parse.urlparse(raw_url)
+        scheme = (parsed_url.scheme or "").lower()
         hostname = (parsed_url.hostname or "").lower()
+        if scheme != "https" or not hostname:
+            self.mark_auto_install_failed(speaker_uuid, "セキュリティ上 https URL のみ自動取得可能です。")
+            return {
+                "success": False,
+                "requires_manual": True,
+                "source_url": raw_url,
+                "message": "HTTPS 以外の配布URLは自動取得できません。手動でダウンロードしてアップロードしてください。"
+            }
+
+        def _assert_public_host(host_to_check: str) -> None:
+            import socket
+            import ipaddress
+            if host_to_check in ("localhost",):
+                raise RuntimeError("ローカルホストへの接続は禁止されています。")
+            infos = socket.getaddrinfo(host_to_check, None)
+            for info in infos:
+                ip_s = info[4][0]
+                addr = ipaddress.ip_address(ip_s)
+                if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
+                    raise RuntimeError(f"内部・プライベートアドレスへの自動接続は遮断されました ({host_to_check})")
 
         # Google Drive の共有リンクをダイレクトダウンロードURLに変換試行
         dl_url = raw_url
@@ -547,38 +586,51 @@ class MyCoeiroinkManager:
 
         logger.info(f"Attempting auto-download for {speaker_name} from: {dl_url}")
 
+        import tempfile
+        tmp_zip_path: Optional[Path] = None
         try:
-            timeout = aiohttp.ClientTimeout(total=90)
+            await asyncio.to_thread(_assert_public_host, hostname)
+            timeout = aiohttp.ClientTimeout(total=180, connect=10)
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             }
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tf:
+                tmp_zip_path = Path(tf.name)
+
             async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-                async with session.get(dl_url, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"HTTPエラー {resp.status} が返されました。")
+                current_url = dl_url
+                for _hop in range(6):
+                    p_cur = urllib.parse.urlparse(current_url)
+                    if (p_cur.scheme or "").lower() != "https" or not p_cur.hostname:
+                        raise RuntimeError("リダイレクト先が安全な HTTPS URL ではありません。")
+                    await asyncio.to_thread(_assert_public_host, p_cur.hostname.lower())
+                    async with session.get(current_url, allow_redirects=False) as resp:
+                        if resp.status in (301, 302, 303, 307, 308):
+                            loc = resp.headers.get("Location", "")
+                            if not loc:
+                                raise RuntimeError("リダイレクト先 Location が空です。")
+                            current_url = urllib.parse.urljoin(current_url, loc)
+                            continue
+                        if resp.status != 200:
+                            raise RuntimeError(f"HTTPエラー {resp.status} が返されました。")
 
-                    # Content-Type または 最初のヘッダーで HTML 判定
-                    content_type = resp.headers.get("Content-Type", "").lower()
-                    if "text/html" in content_type:
-                        raise RuntimeError("ダウンロードリンクではなくWebページ（HTML）が返却されました。")
+                        content_type = resp.headers.get("Content-Type", "").lower()
+                        if "text/html" in content_type:
+                            raise RuntimeError("ダウンロードリンクではなくWebページ（HTML）が返却されました。")
 
-                    # ストリーミングダウンロード（最大 2GB）
-                    chunks = []
-                    downloaded = 0
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        downloaded += len(chunk)
-                        if downloaded > MAX_UPLOAD_SIZE:
-                            raise RuntimeError("ファイルサイズが上限 (2GB) を超過しました。")
-                        chunks.append(chunk)
+                        downloaded = 0
+                        with open(tmp_zip_path, "wb") as out_f:
+                            async for chunk in resp.content.iter_chunked(256 * 1024):
+                                downloaded += len(chunk)
+                                if downloaded > MAX_UPLOAD_SIZE:
+                                    raise RuntimeError("ファイルサイズが上限 (2GB) を超過しました。")
+                                await asyncio.to_thread(out_f.write, chunk)
+                        break
+                else:
+                    raise RuntimeError("リダイレクト回数が上限を超えました。")
 
-                    zip_data = b"".join(chunks)
-
-            # ZIPのシグネチャチェック
-            if not zip_data.startswith(b"PK\x03\x04"):
-                raise RuntimeError("ダウンロードされたデータが有効なZIPファイルではありません。")
-
-            # 安全解凍
-            result = self.safe_extract_zip(zip_data, speaker_uuid)
+            # 安全解凍 (イベントループをブロックしないよう別スレッドでストリーミング展開)
+            await asyncio.to_thread(self.safe_extract_zip, tmp_zip_path, speaker_uuid)
             return {
                 "success": True,
                 "speaker_name": speaker_name,
@@ -595,3 +647,9 @@ class MyCoeiroinkManager:
                 "source_url": raw_url,
                 "message": f"自動導入に失敗しました ({e})。手動でZIPをダウンロードしてアップロードしてください。"
             }
+        finally:
+            if tmp_zip_path and tmp_zip_path.exists():
+                try:
+                    tmp_zip_path.unlink()
+                except Exception:
+                    pass

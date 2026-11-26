@@ -1,9 +1,10 @@
+import array
 import asyncio
 import logging
 import math
 import struct
 import time
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import discord
 from discord.opus import Decoder as OpusDecoder
 import nacl.secret
@@ -84,6 +85,8 @@ class VoiceStreamReceiver:
         self._is_running = False
         self._lock = asyncio.Lock()
         self._silence_task: Optional[asyncio.Task] = None
+        self._cached_cipher_key: Optional[Tuple[str, bytes]] = None
+        self._cached_cipher_obj: Any = None
 
         # Discord Voice WebSocket フックの保持
         self._orig_hook: Optional[Callable] = None
@@ -255,6 +258,22 @@ class VoiceStreamReceiver:
             return None
 
         try:
+            # 暗号器インスタンスを (mode, key_bytes) でキャッシュして毎秒数百パケットの生成コストを排除
+            cipher = self._cached_cipher_obj
+            if self._cached_cipher_key != (mode, key_bytes) or cipher is None:
+                if mode == "aead_xchacha20_poly1305_rtpsize":
+                    cipher = nacl.secret.Aead(key_bytes)
+                elif mode == "aead_aes256_gcm_rtpsize":
+                    if AESGCM is None:
+                        raise RuntimeError("cryptography AESGCM is not installed")
+                    cipher = AESGCM(key_bytes)
+                elif mode in ("xsalsa20_poly1305_lite", "xsalsa20_poly1305_suffix", "xsalsa20_poly1305"):
+                    cipher = nacl.secret.SecretBox(key_bytes)
+                else:
+                    cipher = None
+                self._cached_cipher_key = (mode, key_bytes)
+                self._cached_cipher_obj = cipher
+
             plain: bytes
             if mode in ("aead_xchacha20_poly1305_rtpsize", "aead_aes256_gcm_rtpsize"):
                 # rtpsize モード: 拡張ヘッダの先頭4バイトまでが AAD、拡張ボディは暗号化ペイロードに含まれる
@@ -267,12 +286,10 @@ class VoiceStreamReceiver:
 
                 if mode == "aead_xchacha20_poly1305_rtpsize":
                     nonce = nonce_tail + (b"\x00" * 20)
-                    plain = nacl.secret.Aead(key_bytes).decrypt(ciphertext, aad, nonce)
+                    plain = cipher.decrypt(ciphertext, aad, nonce)
                 else:
-                    if AESGCM is None:
-                        raise RuntimeError("cryptography AESGCM is not installed")
                     nonce = nonce_tail + (b"\x00" * 8)
-                    plain = AESGCM(key_bytes).decrypt(nonce, ciphertext, aad)
+                    plain = cipher.decrypt(nonce, ciphertext, aad)
 
                 if has_ext and ext_len_words > 0:
                     ext_bytes = ext_len_words * 4
@@ -283,17 +300,17 @@ class VoiceStreamReceiver:
                 if len(data) <= header_len_plain + 4:
                     return None
                 nonce = data[-4:] + (b"\x00" * 20)
-                plain = nacl.secret.SecretBox(key_bytes).decrypt(data[header_len_plain:-4], nonce)
+                plain = cipher.decrypt(data[header_len_plain:-4], nonce)
             elif mode == "xsalsa20_poly1305_suffix":
                 if len(data) <= header_len_plain + 24:
                     return None
                 nonce = data[-24:]
-                plain = nacl.secret.SecretBox(key_bytes).decrypt(data[header_len_plain:-24], nonce)
+                plain = cipher.decrypt(data[header_len_plain:-24], nonce)
             elif mode == "xsalsa20_poly1305":
                 if len(data) <= header_len_plain:
                     return None
                 nonce = data[:12] + (b"\x00" * 12)
-                plain = nacl.secret.SecretBox(key_bytes).decrypt(data[header_len_plain:], nonce)
+                plain = cipher.decrypt(data[header_len_plain:], nonce)
             else:
                 if len(data) <= header_len_plain:
                     return None
@@ -465,10 +482,12 @@ class VoiceStreamReceiver:
 
             self._decoded_frame_count += 1
 
-            # 音声レベル (RMS) の計算 (3840 bytes = 960 stereo samples)
-            shorts = struct.unpack(f"<{len(pcm)//2}h", pcm)
-            sum_sq = sum(s * s for s in shorts)
-            rms = math.sqrt(sum_sq / len(shorts)) if shorts else 0.0
+            def _calc_rms() -> float:
+                samples = array.array("h")
+                samples.frombytes(memoryview(pcm)[: len(pcm) & ~1])
+                if not samples:
+                    return 0.0
+                return math.sqrt(sum(s * s for s in samples) / len(samples))
 
             # 5. SSRC 専用の早耳 Live セッションへの送信 (音声混在を物理的に遮断)
             session = self._sessions.get(ssrc) or (self._sessions.get(user_id) if user_id else None)
@@ -481,20 +500,24 @@ class VoiceStreamReceiver:
                 self._pushed_frame_counts[ssrc] = p_cnt
                 last_push_log = self._last_push_log_time.get(ssrc, 0.0)
 
-                is_voice = rms >= 100.0
-                if now - last_push_log >= 3.0 or p_cnt == 1 or (is_voice and now - last_push_log >= 1.0):
-                    self._last_push_log_time[ssrc] = now
-                    level_tag = "🗣️ Voice" if is_voice else "🔈 Low/Noise"
-                    logger.info(
-                        f"🎙️ [VoiceReceiver] Stream -> Hayamimi: {session.user_name} (SSRC: {ssrc}) "
-                        f"| {level_tag} RMS={rms:.1f} | Frame #{p_cnt} ({p_cnt*20}ms sent)"
-                    )
+                # ログ出力候補タイミングのみ RMS を計算 (UDP スレッドでの毎秒数百回の Python ループを排除)
+                if now - last_push_log >= 1.0 or p_cnt == 1:
+                    rms = _calc_rms()
+                    is_voice = rms >= 100.0
+                    if now - last_push_log >= 3.0 or p_cnt == 1 or is_voice:
+                        self._last_push_log_time[ssrc] = now
+                        level_tag = "🗣️ Voice" if is_voice else "🔈 Low/Noise"
+                        logger.info(
+                            f"🎙️ [VoiceReceiver] Stream -> Hayamimi: {session.user_name} (SSRC: {ssrc}) "
+                            f"| {level_tag} RMS={rms:.1f} | Frame #{p_cnt} ({p_cnt*20}ms sent)"
+                        )
             else:
                 buf = self._pending_pcm.setdefault(ssrc, [])
                 if len(buf) < 150:
                     buf.append(pcm)
                 if ssrc not in self._connecting_ssrcs:
                     self._connecting_ssrcs.add(ssrc)
+                    rms = _calc_rms()
                     logger.info(f"⏳ [VoiceReceiver] Connecting session for SSRC {ssrc}, buffering frame #{len(buf)} (RMS={rms:.1f})")
                     asyncio.run_coroutine_threadsafe(
                         self._get_or_create_ssrc_session(ssrc, user_id),
@@ -543,9 +566,17 @@ class VoiceStreamReceiver:
                     )
 
                 for ssrc, session in list(self._sessions.items()):
-                    if not session.is_connected:
-                        continue
                     last_time = self._last_recv_time.get(ssrc, 0.0)
+                    # 切断済みまたは15分以上完全無通信の古いSSRCセッションを掃除して枠枯渇を防止
+                    if not session.is_connected or (last_time > 0 and (now - last_time) > 900.0):
+                        dead_sess = self._sessions.pop(ssrc, None)
+                        self._decoders.pop(ssrc, None)
+                        self._last_recv_time.pop(ssrc, None)
+                        self._silence_injected.pop(ssrc, None)
+                        if dead_sess:
+                            asyncio.create_task(dead_sess.close())
+                        continue
+
                     injected = self._silence_injected.get(ssrc, True)
 
                     # 最後の音声から 120ms 経過し、まだ無音を送出していない場合
@@ -564,35 +595,50 @@ class VoiceStreamReceiver:
             logger.warning(f"Error in silence watchdog: {e}")
 
     async def _get_or_create_ssrc_session(self, ssrc: int, user_id: Optional[int] = None) -> Optional[HayamimiSession]:
-        """SSRC 専用の早耳 Live WebSocket セッションを取得または新規作成"""
-        async with self._lock:
-            if ssrc in self._sessions:
-                sess = self._sessions[ssrc]
-                if user_id and sess.user_id != user_id:
-                    sess.user_id = user_id
-                    member = self.vc.guild.get_member(user_id) if self.vc and self.vc.guild else None
-                    if member:
-                        sess.user_name = member.display_name
-                return sess
+        """SSRC 専用の早耳 Live WebSocket セッションを取得または新規作成 (ロック外接続＆切断セッション自動再接続)"""
+        stale_session: Optional[HayamimiSession] = None
+        try:
+            async with self._lock:
+                existing = self._sessions.get(ssrc)
+                if existing is not None:
+                    if existing.is_connected and not getattr(existing, "_closed", False):
+                        if user_id and existing.user_id != user_id:
+                            existing.user_id = user_id
+                            member = self.vc.guild.get_member(user_id) if self.vc and self.vc.guild else None
+                            if member:
+                                existing.user_name = member.display_name
+                        return existing
+                    # 切断済みの古いセッションは除外して再作成へ進む
+                    stale_session = self._sessions.pop(ssrc, None)
 
-            if len(self._sessions) >= self.max_speakers:
-                logger.warning(f"⚠️ [Hayamimi] Reached max simultaneous speaker sessions ({self.max_speakers})")
+                active_count = sum(1 for s in self._sessions.values() if s.is_connected)
+                if active_count >= self.max_speakers:
+                    logger.warning(f"⚠️ [Hayamimi] Reached max simultaneous speaker sessions ({self.max_speakers})")
+                    return None
+
+                resolved_uid = user_id or self._ssrc_to_user.get(ssrc)
+                resolved_name = None
+                if resolved_uid:
+                    member = self.vc.guild.get_member(resolved_uid) if self.vc and self.vc.guild else None
+                    resolved_name = member.display_name if member else f"User_{resolved_uid}"
+                elif len(self.target_user_ids) == 1:
+                    resolved_uid = next(iter(self.target_user_ids))
+                    member = self.vc.guild.get_member(resolved_uid) if self.vc and self.vc.guild else None
+                    resolved_name = member.display_name if member else f"User_{resolved_uid}"
+                else:
+                    resolved_uid = ssrc
+                    resolved_name = f"Speaker_{ssrc}"
+
+            if stale_session is not None:
+                try:
+                    await stale_session.close()
+                except Exception:
+                    pass
+
+            if not self._is_running:
                 return None
 
-            resolved_uid = user_id
-            resolved_name = None
-            if resolved_uid:
-                member = self.vc.guild.get_member(resolved_uid) if self.vc and self.vc.guild else None
-                resolved_name = member.display_name if member else f"User_{resolved_uid}"
-            elif len(self.target_user_ids) == 1:
-                resolved_uid = next(iter(self.target_user_ids))
-                member = self.vc.guild.get_member(resolved_uid) if self.vc and self.vc.guild else None
-                resolved_name = member.display_name if member else f"User_{resolved_uid}"
-            else:
-                # まだ user_id が特定されていない場合、VCの人間メンバーから未割当のメンバーを推測、または Speaker_{ssrc}
-                resolved_uid = ssrc
-                resolved_name = f"Speaker_{ssrc}"
-
+            # WebSocket ハンドシェイクは他話者をブロックしないようロック外で実行
             session = HayamimiSession(
                 user_id=resolved_uid,
                 user_name=resolved_name,
@@ -606,25 +652,41 @@ class VoiceStreamReceiver:
                 loop=self.vc.loop,
             )
             success = await session.start()
-            if success:
+            if not success:
+                self._pending_pcm.pop(ssrc, None)
+                return None
+
+            # 接続中にターゲット外ユーザーと判明した場合または停止済みの場合は即クローズ
+            mapped_uid = self._ssrc_to_user.get(ssrc)
+            if not self._is_running or (self.target_user_ids and mapped_uid and mapped_uid not in self.target_user_ids):
+                self._pending_pcm.pop(ssrc, None)
+                await session.close()
+                return None
+
+            if mapped_uid and session.user_id != mapped_uid:
+                session.user_id = mapped_uid
+                member = self.vc.guild.get_member(mapped_uid) if self.vc and self.vc.guild else None
+                if member:
+                    session.user_name = member.display_name
+
+            async with self._lock:
+                prev = self._sessions.get(ssrc)
+                if prev and prev.is_connected and prev is not session:
+                    await session.close()
+                    return prev
                 self._sessions[ssrc] = session
-                logger.info(f"🎙️ [VoiceReceiver] Started dedicated Hayamimi stream for SSRC {ssrc} ({resolved_name})")
-
-                # 保留されていたパケットを即時全量フラッシュ
                 pending = self._pending_pcm.pop(ssrc, [])
-                if pending:
-                    logger.info(f"🚀 [VoiceReceiver] Flushing {len(pending)} buffered frames to SSRC {ssrc} ({resolved_name})")
-                    for chunk in pending:
-                        session.push_audio(chunk)
-                    self._last_recv_time[ssrc] = time.time()
-                    self._silence_injected[ssrc] = False
 
-                self._connecting_ssrcs.discard(ssrc)
-                return session
-
+            logger.info(f"🎙️ [VoiceReceiver] Started dedicated Hayamimi stream for SSRC {ssrc} ({session.user_name})")
+            if pending:
+                logger.info(f"🚀 [VoiceReceiver] Flushing {len(pending)} buffered frames to SSRC {ssrc} ({session.user_name})")
+                for chunk in pending:
+                    session.push_audio(chunk)
+                self._last_recv_time[ssrc] = time.time()
+                self._silence_injected[ssrc] = False
+            return session
+        finally:
             self._connecting_ssrcs.discard(ssrc)
-            self._pending_pcm.pop(ssrc, None)
-            return None
 
     async def stop(self) -> None:
         """音声受信および全セッションのクリーンアップ"""
