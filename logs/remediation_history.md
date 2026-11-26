@@ -1,3 +1,22 @@
+## 2026-11-25 21:56 Worker Agent 一時ヘルパーコンテナ (`tts-compose-helper-*`) 残留防止・自動ガベージコレクションの実装 (`v3.15.1`)
+- **背景・原因**:
+  - `docker` CLI を内包しないコンテナ環境（主に Windows Docker Desktop 上の Worker Agent）において、`src/web/static/agent.py` の `DockerAPI.run_compose_via_helper()` が以下の理由で `tts-compose-helper-<timestamp>` コンテナを残留させていた：
+    1. `detach=True` 呼び出し時に `"AutoRemove": not detach` (`False`) が指定されたまま誰も `DELETE` せず終了するため、100% `Exited` コンテナとして残留していた。
+    2. `/containers/{cid}/start` 失敗時（`Created` 状態）や `/wait` タイムアウト・例外発生時に `try ... finally` が無く削除処理に到達しないケースがあった（また秒単位命名のため同時起動時に名前衝突の可能性があった）。
+    3. Docker Desktop 再起動や Agent 再起動を跨いで過去に残留した `tts-compose-helper-*` を回収する仕組みが無かった。
+- **実施内容**:
+  1. `src/web/static/agent.py`:
+     - `DockerAPI.cleanup_stale_compose_helpers(max_age_seconds=600)` を新設。厳密に `^tts-compose-helper-(\d+)(?:-[0-9a-f]+)?$` に一致するコンテナのみを対象とし、停止済み (`exited` / `dead` / `created`) または作成から10分以上経過したスタック個体を `DELETE /containers/{cid}?force=1&v=1` で自動削除（直近実行中のヘルパーや他コンテナには一切触れない安全設計）。
+     - `run_compose_via_helper()` にて：① 実行前に `cleanup_stale_compose_helpers()` を呼び出し、② コンテナ名へランダム16進サフィックスを付与し同時実行衝突を防止、③ `detach=True` 時は `AutoRemove=True`（`start` 失敗時は即時 `DELETE`）、`detach=False` 時は `AutoRemove=False` で確実にログ回収の上 `try ... finally` で無条件に `DELETE ?force=1&v=1` を実行するよう修正。
+     - `WorkerAgent.startup_sequence()` 冒頭および `engine_watchdog_loop()`（5分周期）に `cleanup_stale_compose_helpers()` 呼び出しを組み込み、既存ワーカーに残っている過去の残骸もアップデート直後に自動一掃されるよう構成。
+  2. `src/version.py` & `src/web/static/agent.py`:
+     - `AGENT_VERSION` を `"3.15.0"` → `"3.15.1"` に更新（Master 本番反映時にハートビート相乗りで全ワーカーへ自動配信・Graceful Restart 反映させるため）。
+  3. `tests/test_compose_helper_cleanup.py`:
+     - GC フィルタの厳密なスコープ検証、`detach=True` の `AutoRemove=True` と `start` 失敗時削除、`detach=False` の `/wait` 例外時 `finally` 確実削除の単体テスト 3 件を追加。
+- **検証・状態**:
+  - サンドボックス隔離コンテナ (`IMAGE=madpiero/ttsbot:latest ./scripts/run_sandbox_test.sh`): 新規テスト 3 件合格 (`Ran 3 tests in 0.004s`, OK)、全単体テスト 245 件合格 (`Ran 245 tests in 16.478s`, OK)、一時コンテナ完全破棄確認済み。
+  - 本番反映実施: `docker compose up -d --no-deps --force-recreate app` にて 19秒で Ready・`healthy` 復帰を確認。`/health` HTTP 200 OK (`status="ok"`, `is_ready=true`, `guilds_count=2`)、`/static/agent.py` 配信バージョン `3.15.1` (`cleanup_stale_compose_helpers` 含有)、および Bot #1〜#5 全号機の正常登録を確認完了（各ワーカーはハートビート経由で順次 `v3.15.1` へ自動更新・起動時に残留 `tts-compose-helper-*` を自動一掃）。
+
 ## 2026-11-25 06:26 Gateway再接続跨ぎの古いVoiceChannel参照による無人VCソロ居残り・ゴースト滞在の恒久修正
 - **背景・原因**:
   - `2026-11-25 00:32:52` の `AutoJoinReconcile` VC接続リトライ中に Discord Gateway セッション無効化 (`session has been invalidated`) と `READY` 再受信が重なった際、先行タスクが掴んでいた旧 `Guild` / `VoiceChannel` インスタンス（当時の在室者 1名が凍結された孤立キャッシュ）が `vc.channel` に格納されたまま接続完了し、後続の `on_voice_state_update` や `_auto_leave_watchdog_loop` が `vc.channel.members` の凍結メンバーを見続けて 5時間以上無人退出できなかった事象の恒久対策。

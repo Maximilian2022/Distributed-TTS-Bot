@@ -10,7 +10,7 @@ from pathlib import Path
 BUILD_VERSION = "v2026.11.06-0643"
 BUILD_DATE = "2026-11-06 06:43:00 JST"
 APP_NAME = "Distributed TTS Discord Bot"
-AGENT_VERSION = "3.15.0"  # 最新 Worker Agent バージョン (単一管理元: SSOT)
+AGENT_VERSION = "3.15.1"  # 最新 Worker Agent バージョン (単一管理元: SSOT)
 
 
 def sync_agent_py_version() -> bool:

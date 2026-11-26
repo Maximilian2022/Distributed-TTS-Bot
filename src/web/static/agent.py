@@ -263,7 +263,7 @@ AUTO_UPDATE_CHECK_INTERVAL = int(os.getenv("AUTO_UPDATE_CHECK_INTERVAL", "60"))
 try:
     from src.version import AGENT_VERSION
 except ImportError:
-    AGENT_VERSION = "3.15.0"
+    AGENT_VERSION = "3.15.1"
 # ハートビート経由の自動更新: 同一ノードでの再試行間隔 (秒) と、Master ドレイン後の推論排出待ち (秒)
 AUTO_UPDATE_COOLDOWN_SECONDS = 900
 AUTO_UPDATE_DRAIN_GRACE_SECONDS = 15
@@ -1362,6 +1362,71 @@ class DockerAPI:
         base = os.path.basename(host_work.rstrip("/\\"))
         return base or "ttsbot-worker-engines"
 
+    def cleanup_stale_compose_helpers(self, max_age_seconds: int = 600) -> int:
+        """
+        停止済み (exited / dead / created) または指定秒数以上経過してスタックした
+        一時ヘルパーコンテナ (tts-compose-helper-*) のみを安全に一掃する。
+        進行中の新しいヘルパーや他コンテナには一切触れない。
+        """
+        if not self.is_available():
+            return 0
+        status, containers = self.request("GET", "/containers/json?all=1", timeout=10)
+        if status != 200 or not isinstance(containers, list):
+            return 0
+
+        now = time.time()
+        removed = 0
+        helper_re = re.compile(r"^tts-compose-helper-(\d+)(?:-[0-9a-f]+)?$")
+
+        for c in containers:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("Id")
+            names = c.get("Names") or []
+            if not cid or not isinstance(names, list):
+                continue
+
+            matched_ts: Optional[int] = None
+            matched_name = ""
+            for raw_name in names:
+                clean_name = str(raw_name).lstrip("/")
+                m = helper_re.match(clean_name)
+                if m:
+                    matched_name = clean_name
+                    try:
+                        matched_ts = int(m.group(1))
+                    except ValueError:
+                        matched_ts = None
+                    break
+
+            if not matched_name:
+                continue
+
+            state = str(c.get("State") or "").lower()
+            created_raw = c.get("Created")
+            created_ts = (
+                float(created_raw)
+                if isinstance(created_raw, (int, float))
+                else (float(matched_ts) if matched_ts else 0.0)
+            )
+            age = (now - created_ts) if created_ts > 0 else (max_age_seconds + 1)
+
+            should_remove = state in ("exited", "dead", "created") or (
+                max_age_seconds >= 0 and age >= max_age_seconds
+            )
+            if not should_remove:
+                continue
+
+            del_status, _ = self.request("DELETE", f"/containers/{cid}?force=1&v=1", timeout=10)
+            if del_status in (200, 204, 404):
+                removed += 1
+
+        if removed > 0:
+            logger.info(
+                f"🧹 [ComposeHelper GC] 残留していた tts-compose-helper コンテナを {removed} 個クリーンアップしました。"
+            )
+        return removed
+
     def run_compose_via_helper(
         self,
         work_dir: str,
@@ -1373,6 +1438,11 @@ class DockerAPI:
         """docker:cli ヘルパーコンテナを起動して docker compose コマンドを実行"""
         if not self.is_available():
             return 1, "docker.sock not available"
+
+        try:
+            self.cleanup_stale_compose_helpers()
+        except Exception:
+            pass
 
         host_work = self.get_host_work_dir() or work_dir
         proj_name = self.get_compose_project_name(compose_file_name)
@@ -1408,6 +1478,8 @@ class DockerAPI:
             rest = bind_work[2:].replace("\\", "/").lstrip("/")
             bind_work = f"//{drive}/{rest}"
 
+        # detach=True (非同期投げっぱなし) は終了後に Docker デーモン側で自動削除 (AutoRemove=True) させ、
+        # detach=False (同期待機) は /logs 回収後に finally で確実に明示削除する。
         payload = {
             "Image": "docker:cli",
             "Cmd": ["sh", "-c", cmd_str],
@@ -1417,32 +1489,37 @@ class DockerAPI:
                     "/var/run/docker.sock:/var/run/docker.sock",
                     f"{bind_work}:/work"
                 ],
-                "AutoRemove": not detach
+                "AutoRemove": bool(detach)
             }
         }
 
-        helper_name = f"tts-compose-helper-{int(time.time())}"
+        helper_name = f"tts-compose-helper-{int(time.time())}-{os.urandom(2).hex()}"
         status, res = self.request("POST", f"/containers/create?name={helper_name}", body=payload)
         if status not in (200, 201) or not isinstance(res, dict) or "Id" not in res:
             return 1, f"Failed to create helper container: {res}"
 
         cid = res["Id"]
-        status, _ = self.request("POST", f"/containers/{cid}/start")
-        if status not in (200, 204):
-            return 1, f"Failed to start helper container: status={status}"
-
         if detach:
+            status, _ = self.request("POST", f"/containers/{cid}/start")
+            if status not in (200, 204):
+                self.request("DELETE", f"/containers/{cid}?force=1&v=1", timeout=10)
+                return 1, f"Failed to start helper container: status={status}"
             return 0, "Helper container started in background"
 
-        status, wait_res = self.request("POST", f"/containers/{cid}/wait", timeout=timeout)
-        exit_code = wait_res.get("StatusCode", 1) if isinstance(wait_res, dict) else 1
+        try:
+            status, _ = self.request("POST", f"/containers/{cid}/start")
+            if status not in (200, 204):
+                return 1, f"Failed to start helper container: status={status}"
 
-        status, raw_logs = self.request("GET", f"/containers/{cid}/logs?stdout=1&stderr=1", timeout=30)
-        log_text = raw_logs if isinstance(raw_logs, str) else str(raw_logs)
+            status, wait_res = self.request("POST", f"/containers/{cid}/wait", timeout=timeout)
+            exit_code = wait_res.get("StatusCode", 1) if isinstance(wait_res, dict) else 1
 
-        # 終了後に明示的破棄
-        self.request("DELETE", f"/containers/{cid}?force=1")
-        return exit_code, log_text
+            status, raw_logs = self.request("GET", f"/containers/{cid}/logs?stdout=1&stderr=1", timeout=30)
+            log_text = raw_logs if isinstance(raw_logs, str) else str(raw_logs)
+            return exit_code, log_text
+        finally:
+            # 正常終了・start失敗・waitタイムアウト・例外のいずれでも確実に破棄
+            self.request("DELETE", f"/containers/{cid}?force=1&v=1", timeout=15)
 
 docker_api = DockerAPI()
 
@@ -2355,6 +2432,11 @@ hosts allow = *
         ステップ 3: [ローカルモデル同期] 最新版保証の元で COEIROINK モデルの同期 (Push/Pull) を開始
         """
         logger.info("🎬 [Startup] Worker Agent 起動時シーケンスを開始します...")
+        if docker_api.is_available():
+            try:
+                await asyncio.to_thread(docker_api.cleanup_stale_compose_helpers)
+            except Exception as e:
+                logger.debug(f"Startup compose helper cleanup skipped: {e}")
 
         # --- ステップ 1: 同一サブネットテスト ---
         logger.info("📡 [Startup 1/3] 同一サブネットテスト: ローカル/LAN Master への直接通信を検証中...")
@@ -2548,9 +2630,15 @@ hosts allow = *
         - 3回連続無応答（約60秒間ハング・無応答状態）を検知した場合は docker restart で自動自己修復 (Auto-Heal)
         """
         logger.info("🐕 [Watchdog] Worker Engine Watchdog loop started.")
+        helper_gc_ticks = 0
         while True:
             try:
                 await asyncio.sleep(20)
+                helper_gc_ticks += 1
+                if helper_gc_ticks >= 15:
+                    helper_gc_ticks = 0
+                    if docker_api.is_available():
+                        await asyncio.to_thread(docker_api.cleanup_stale_compose_helpers)
                 now = time.time()
                 session = await self.get_session()
                 local_ip = get_local_ip()
